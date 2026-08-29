@@ -395,6 +395,18 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 }
 
 static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool small_k = false, bool halve_iters = false) {
+#ifdef P100_NWARPS
+    if (table_id == MMVQ_PARAMETERS_GENERIC) {
+        if (ncols_dst == 1) {
+            return P100_NWARPS;
+        }
+#ifdef P100_MC_NWARPS
+        if (ncols_dst <= 8) {
+            return P100_MC_NWARPS;
+        }
+#endif
+    }
+#endif
     if (table_id == MMVQ_PARAMETERS_GENERIC) {
         switch (ncols_dst) {
             case 1:
@@ -525,7 +537,11 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
         switch (ncols_dst) {
             case 1:
+#ifdef P100_ROWS
+                return P100_ROWS;
+#else
                 return small_k ? nwarps : 1;
+#endif
             case 2:
             case 3:
             case 4:
@@ -533,7 +549,11 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
             case 6:
             case 7:
             case 8:
+#ifdef P100_MC_ROWS
+                return P100_MC_ROWS;
+#else
                 return 2;
+#endif
             default:
                 return 1;
         }
