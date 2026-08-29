@@ -167,7 +167,25 @@ Registers went **71 -> 62** and smem to 10496 B, so occupancy improved as well (
 
 | # | change | t/s | verdict |
 |---|---|---|---|
-| 5 | cooperative shared-memory staging of x in `mul_mat_vec_q` | **20.43 +/- 0.03** | **KEPT** |
+| 5 | cooperative shared-memory staging of x in `mul_mat_vec_q` | **20.43 +/- 0.03** | **KEPT** (PPL 2.7554 +/- 0.02151, identical to stock) |
 
 Correctness: `test-backend-ops -o MUL_MAT -b CUDA0` passed 1193/1193 on 4 consecutive runs.
 Each warp owns its own `x_stage` slice, so there is no cross-warp sharing to race on.
+
+### Where the remaining time goes (post-staging)
+
+Isolated q6_K kernel is now **164.5 us**. The calibrated fetch model says a staged fetch of this
+data volume costs ~98 us, so the split is roughly **98 us fetch + 66 us compute**. The fetch is
+therefore already at its modelled floor for this design.
+
+Consequences for further work:
+- Even a *free* fetch would leave 66 us, capping this kernel design at ~34 t/s.
+- Geometry re-tuned after staging (nwarps x rows): best cell 4x8 = 163.45 us vs current 8x4 =
+  165.56 us, i.e. 1.3% and mixed across types. Launch-geometry tuning is exhausted.
+- Remaining lever inside the design: the staged image keeps the source misalignment, so
+  `get_int_b2` still issues two `LDS.U.U16` per quant word. SASS LSU mix is LDG 13 + LDS 56 +
+  STS 12 = 81 ops. Aligning the staged copy (funnel-shift during staging) would halve the LDS
+  to ~28, giving ~53 LSU ops, an estimated 1.2-1.3x on the fetch and ~23-26 t/s overall.
+  It requires an aligned read path in `get_int_b2` and per-block padding of the smem stride.
+- Reaching 40 t/s would need the weights in a wide-load-friendly layout (16-byte loads), i.e.
+  the rejected CUDA repack buffer type (~800-1200 lines, silent-wrong-answer risk).
