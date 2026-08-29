@@ -104,3 +104,70 @@ independent loads in flight), not warp count and not ALU throughput.** Optimizat
 reduce outstanding loads, or that serialize address generation, lose -- even when they
 strictly reduce work. The next lever should be *fewer/wider load instructions* per byte
 fetched, not fewer arithmetic instructions.
+
+---
+
+## Breakthrough: cooperative staging of x through shared memory
+
+### Diagnosis that led to it
+
+nvprof metrics are unavailable (`RmProfilingAdminOnly: 1`), so the bottleneck was found by
+calibrated microbenchmarks instead. Measured on this machine (GPU1, ECC on):
+
+- streaming read ceiling: **605 GB/s** (not the 732 GB/s spec number)
+- streaming read by per-thread load width: 16B 604, 8B 598, 4B **533**, 2B **328** GB/s
+
+Achieved bandwidth by quant type in mmvq (m=4096,n=1,k=14336): q8_0 332, q4_0 321, q5_K 225,
+q6_K 208, q2_K 126 GB/s. Even q8_0 -- the simplest possible vec_dot -- reaches only 55% of
+streaming, so the cap is structural.
+
+Throughput tracks **bytes fetched per load instruction**:
+a microbenchmark at 64 B/load hits 442 GB/s; q6_K mmvq at 26 B/load hits 208 GB/s (ratios
+2.46 vs 2.12). **The kernel is load-ISSUE bound**, not bandwidth bound and not ALU bound.
+
+Root cause: every ggml block size is 2 mod 4 (block_q6_K 210, block_q8_0 34, block_q4_0 18,
+block_q3_K 110) because each block carries a 2-byte ggml_half beside a multiple-of-4 payload.
+So `get_int_b2` must issue two 16-bit loads per quant word, and the scales and block scale
+cost a load each: ~7 load instructions per block, ~26 bytes per load.
+
+Modelled fetch strategies (48.2 MB, extraction actually performed):
+
+| strategy | us | GB/s | vs current |
+|---|---|---|---|
+| packed 210B via `get_int_b2` (current) | 186 | 259 | 1.00x |
+| aligned 32-bit only (needs padded stride) | 147 | 328 | 1.27x |
+| **cooperative -> shared memory -> extract** | **98** | **491** | **1.90x** |
+
+A padded block stride was investigated and REJECTED: mmvq and mmq share a tensor's physical
+layout (chosen per call by batch size in `ggml_cuda_mul_mat`), so it cannot be scoped to mmvq;
+a full CUDA repack buffer type is ~800-1200 lines with a silent-wrong-answer failure mode.
+Staging needs none of it -- it reads from the 4-byte-aligned base *below* the data and keeps
+the misalignment inside shared memory, so the global side is aligned with the weights untouched.
+
+### Implementation note that decided the result
+
+First cut was SLOWER (244 us vs 204). SASS showed 28 `LD.E ..., P0` -- a runtime loop bound
+(`for k = threadIdx.x; k < nint; k += warp_size`) made ptxas emit predicated *generic* loads
+for the staging reads instead of `LDG`, discarding the entire benefit. Fixing it to a
+compile-time trip count plus an explicit `__ldg` gave `LD.E 0, LDG 13, LDS 56, STS 12`.
+
+Registers went **71 -> 62** and smem to 10496 B, so occupancy improved as well (4 blocks/SM).
+
+### Results (isolated kernel, us/run, m=4096 n=1 k=14336)
+
+| type | before | after |
+|---|---|---|
+| q6_K | 204.1 | **164.5** |
+| q3_K | 286.1 | **151.4** |
+| q8_0 | 187.8 | **152.1** |
+| q2_K | 152.8 | **142.6** |
+| q5_K | 145.0 | 144.1 |
+| q4_0 | 94.1 | 96.1 |
+| q4_K | ~141 | 130.8 |
+
+| # | change | t/s | verdict |
+|---|---|---|---|
+| 5 | cooperative shared-memory staging of x in `mul_mat_vec_q` | **20.43 +/- 0.03** | **KEPT** |
+
+Correctness: `test-backend-ops -o MUL_MAT -b CUDA0` passed 1193/1193 on 4 consecutive runs.
+Each warp owns its own `x_stage` slice, so there is no cross-warp sharing to race on.
