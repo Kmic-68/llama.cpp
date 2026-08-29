@@ -189,3 +189,48 @@ Consequences for further work:
   It requires an aligned read path in `get_int_b2` and per-block padding of the smem stride.
 - Reaching 40 t/s would need the weights in a wide-load-friendly layout (16-byte loads), i.e.
   the rejected CUDA repack buffer type (~800-1200 lines, silent-wrong-answer risk).
+
+---
+
+## Attempts after staging (all reverted)
+
+| # | change | q6_K us/run | t/s | verdict |
+|---|---|---|---|---|
+| 6 | re-tune nwarps x rows on staged kernel | best 163.45 (4x8) vs 165.56 (8x4) | - | REVERTED (1.3%, mixed across types) |
+| 7 | strip misalignment while staging + branch-free funnel-shift `get_int_b2` | 218.79 | - | REVERTED |
+
+Attempt 7 was the plan to halve the 56 `LDS.U.U16`. It failed because ptxas never proved the
+staged pointer was 4-byte aligned, so the `sh == 0` select did not fold: SASS went to
+`LDS 40, SHF 29, LD.E 16`, registers 62 -> 79, instructions 636 -> 768. Paying for a
+funnel-shift everywhere without collapsing any load is strictly worse.
+
+## Ceiling analysis: why 40 t/s is not reachable
+
+Decisive measurement -- the dp4a/float math was stubbed out of `mul_mat_vec_q` while keeping
+**all** staging and field extraction:
+
+| variant | q6_K us/run |
+|---|---|
+| full kernel | 164.5 |
+| **loads only, zero arithmetic** | **114.5** |
+
+So the kernel is 114.5 us of memory work + 50 us of arithmetic (70/30).
+
+- Even with **completely free arithmetic** the kernel cannot go below 114.5 us, which is
+  20.43 * 164.5/114.5 = **29.4 t/s**.
+- 40 t/s would require the whole kernel in 84 us -- *below the memory-only floor*. It is
+  arithmetically unavailable, independent of how good the dot product gets.
+- The memory side already runs at 48.17 MB / 114.5 us = **421 GB/s, 70% of this machine's
+  605 GB/s streaming ceiling**, and the modelled optimum for this access pattern is 491 GB/s
+  (81%). There is roughly 1.17x left in the fetch and maybe 2x in the arithmetic, i.e. a
+  realistic hard ceiling near **25-27 t/s** for this kernel design, with substantial work.
+
+A weight repack buys nothing here: cooperative staging already reaches 491 GB/s modelled,
+essentially equal to the padded + 16-byte-load ceiling of 499 GB/s. The layout problem is
+solved; what remains is the arithmetic cost of emulating DP4A on a GPU that lacks it.
+
+Note on the premise: the 60 t/s figure assumes the 732 GB/s spec bandwidth. **ECC is enabled**
+on both cards and the measured streaming ceiling is 605 GB/s, so the true pure-streaming bound
+for a 22.4 GB model on two cards is ~54 t/s before any compute or overhead. Disabling ECC
+(`nvidia-smi -e 0`, reboot) would recover roughly 10-20% of memory bandwidth -- that is a
+user/system decision, deliberately not made here.
