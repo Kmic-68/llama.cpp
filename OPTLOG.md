@@ -234,3 +234,38 @@ on both cards and the measured streaming ceiling is 605 GB/s, so the true pure-s
 for a 22.4 GB model on two cards is ~54 t/s before any compute or overhead. Disabling ECC
 (`nvidia-smi -e 0`, reboot) would recover roughly 10-20% of memory bandwidth -- that is a
 user/system decision, deliberately not made here.
+
+## Attempt 8: software pipeline (register prefetch) -- REVERTED, but it sharpens the model
+
+Staging is otherwise strictly serial (load, barrier, compute, barrier), so the hypothesis was
+that global load latency is exposed and can be hidden by issuing the next iteration's `__ldg`s
+before the current dot products. Implemented by holding the next blocks in registers
+(no second smem buffer needed).
+
+| type | committed | prefetch pipeline |
+|---|---|---|
+| q6_K | 164.7 | 163.8 |
+| q3_K | 151.4 | 158.7 |
+| q4_0 | 96.1 | 98.1 |
+| q4_K | 131.1 | 127.9 |
+| q8_0 | 152.1 | 151.8 |
+
+A wash, with registers 62 -> 75 and LDG 13 -> 21. **Reverted.**
+
+The negative result is the useful part: the kernel is **not latency bound, it is LSU-ISSUE
+bound.** At 4 blocks/SM the 32 resident warps already hide the load latency, so prefetching
+buys nothing -- it does not reduce the number of load instructions, which is what actually
+limits it. This also retires "overlap the arithmetic behind the memory" as a strategy: there is
+no stall to fill.
+
+Per-iteration LSU mix is **LDG 13 + LDS 56 + STS 12 = 81 ops**, and the 56 shared loads
+dominate. They are 56 rather than 28 because the staged image keeps the source misalignment, so
+`get_int_b2` reads each quant word as two `LDS.U.U16`.
+
+**The one remaining kernel lever** is therefore to make those single 32-bit shared loads:
+strip the misalignment while staging (nearly free -- the data is already in registers on its way
+to shared memory) and give `vec_dot_*_q8_1` a compile-time "source is 4-byte aligned" template
+parameter so `get_int_b2` can use `((const int *) x)[i32]` directly. Attempt 7 failed only
+because it tried to let ptxas *infer* the alignment at run time; asserting it at compile time
+avoids both the funnel-shift cost and the register growth.
+Estimated LDS 56 -> 32, LSU 81 -> 57 (1.42x), i.e. roughly **25 t/s**.
