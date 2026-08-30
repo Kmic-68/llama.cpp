@@ -620,3 +620,39 @@ Geometry re-swept afterwards (registers fell 78 -> 66); 2x2 still optimal: 2x4 2
 | # | change | t/s | verdict |
 |---|---|---|---|
 | 18 | integer accumulator across the vdr group | **27.03 +/- 0.04** | **KEPT** (PPL 2.7554, unchanged) |
+
+## Attempts 19-21: rotate the staged copy to 4-byte alignment -- REVERTED (third and final try)
+
+With the split now at 95.2 us memory / 13.7 us arithmetic, arithmetic is 62% of the *instructions*
+but only 12.5% of the *time*. That says the ALU is idle and the memory pipe binds, so trading LSU
+work for ALU work should win -- which reopened the alignment idea a third time.
+
+Implemented properly this time: each block gets its own 16-byte-aligned slot (padded to a power of
+two so the block index is a shift), the source misalignment is rotated away with funnel shifts on
+the way in, and `get_int_b2` is templated on a compile-time `aligned4` flag so `mul_mat_vec_q`
+reads the staged copy with 32-bit shared loads while the MoE kernel keeps the unaligned path.
+
+It works mechanically -- `LDS.U.U16` 34 -> 2, replaced by 16 `LDS.32` -- and still loses:
+
+| variant | LDG | LDS | LSU | regs | q6_K iso | t/s |
+|---|---|---|---|---|---|---|
+| **kept (unaligned reader)** | **8** | **34** | **46** | **66** | **108.9 us** | **27.03** |
+| rotated + aligned, src_u4 = dst+1 | 14 | 18 | 36 | 71 | 111.4 us | 26.66 |
+| rotated + aligned, src_u4 = dst | 14 | 22 | 40 | 71 | 110.3 us | 26.85 |
+| + clamped indices to keep LDG.128 | 14 | 22 | 40 | 68 | 114.1 us | 26.50 |
+
+**The correction this forces: LDG and LDS are not interchangeable.** The last row has *fewer* total
+LSU operations than the kept version (40 vs 46) and is still 5% slower, because per-block staging
+turns one contiguous run into four separate base addresses and global loads cost far more than
+shared ones. "LSU-bound" was too coarse a model; it is the *global* load count that binds.
+
+Three independent attempts (9, 19-21) now agree: the 2-mod-4 alignment tax cannot be removed
+profitably inside shared memory. Only aligned data in global memory would do it.
+
+## Attempt 22: compile-time staging bound -- REVERTED
+
+`nu4 = (m + nblk*blck_size + 15)/16` costs a 64-bit multiply by a non-power-of-two plus a divide
+per row. Replacing it with the compile-time `stage_u4` cut the loop body 421 -> 383 and address
+XMADs 56 -> 38, but staged ~3% more bytes every iteration and measured 26.65. Using the
+compile-time *product* instead (keeping `m` runtime) still measured 26.72 against 27.03, with
+registers 66 -> 70. The compiler's original form wins; left alone.
