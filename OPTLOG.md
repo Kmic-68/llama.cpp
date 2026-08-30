@@ -444,3 +444,47 @@ staging could be dropped entirely: each thread would read its 16 bytes of `ql` a
 128-bit load each, ~5 memory instructions per vec_dot against 19 today. That is the remaining
 lever, and it is a much larger win than the 1.27x the earlier padded-stride study estimated,
 because it composes with vdr=4.
+
+---
+
+## Attempts 13-15: the non-mmvq 24% -- all REVERTED
+
+After the mmvq work, `mul_mat_vec_q` is 76.3% of GPU time and everything else is 23.7%,
+spread over ~15 kernels of 1-4% each. Reaching 30 t/s from 26.26 needs 12.5% of total time,
+so this became worth attacking.
+
+| # | change | t/s | verdict |
+|---|---|---|---|
+| 13 | enable CUDA graphs on Pascal (gate was `cc < VOLTA`, undocumented) | 25.97 | REVERTED |
+| 14 | 256-thread instead of 1024-thread `rms_norm_f32` block | 26.23 | REVERTED (neutral) |
+| 15 | 32-bit byte-offset indexing for q8_1 blocks in vec_dot (sizeof 36) | XMAD 197 -> 199 | REVERTED (compiler already did it) |
+
+Attempt 13 is the interesting one: the arch gate on CUDA graphs carries no comment and sm_60
+does support them, but capturing and re-validating the graph costs slightly more than the
+launch overhead it saves here. Attempt 14 confirms these kernels are latency bound, not
+reduction bound -- a 5120-element RMS norm takes 9.5 us regardless of block size, because
+at batch 1 it is one block on one SM and the duration is mostly fixed overhead.
+
+Profile after all kept changes (GPU compute, model load excluded, 1148 ms total):
+
+| share | kernel |
+|---|---|
+| 76.3% | `mul_mat_vec_q<q6_K, ncols=1>` |
+| 3.6% | `rms_norm_f32<1024>` (9.5 us x 4386) |
+| 3.5% | `quantize_q8_1` (2.4 us x 16898, one per mmvq) |
+| 2.7% | `k_bin_bcast` |
+| 2.4% | `flash_attn_ext_vec` |
+| 11.5% | ~10 further kernels, each < 1.5% |
+
+The remainder is latency-bound elementwise and normalisation work at batch 1, where every
+kernel costs 2-9 us almost regardless of how little it does. Halving all of it would be worth
+~12% and would take a dozen separate optimisations; CUDA graphs were the one change that could
+have addressed it wholesale, and it does not pay here.
+
+## Final position
+
+**26.26 t/s, +50% over the 17.45 baseline.** mmvq's memory path now runs at ~507 GB/s of the
+machine's 605 GB/s streaming ceiling (84%) and its arithmetic is within a few instructions of
+minimal for a GPU without DP4A, so the kernel itself is close to done. 30 t/s needs either
+aligned weights in global memory (the repack -- see the alignment analysis above) or a broad
+attack on the batch-1 launch-latency tail.
