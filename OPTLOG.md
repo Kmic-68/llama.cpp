@@ -690,3 +690,70 @@ buffer. Added a per-device cache to `ggml_backend_cuda_context` keyed on
 - test-backend-ops -o MUL_MAT: 1193/1193
 - PPL 2.7554 +/- 0.02151 (identical to stock)
 - KEPT
+
+## Session 2026-08-30 (interrupted, safe stopping point)
+
+State: HEAD = 246515a32, **27.49 t/s**. Working tree has two UNCOMMITTED, NON-KEPT edits:
+- `ggml/src/ggml-cuda/norm.cu` — 4x unroll of both rms_norm loops PLUS temporary `DBG_NORM`
+  debug printfs. Neutral (27.46 vs 27.49) and has debug cruft: **`git checkout -- ggml/src/ggml-cuda/norm.cu`**.
+- `ggml/src/ggml-cuda/mmvq.cu` — geometry moved into named constants
+  `P100_MMVQ_NWARPS_1 2` / `P100_MMVQ_ROWS_1 2`. Behaviourally identical to HEAD; keep or revert.
+Then rebuild so the binary matches the source.
+
+### Attempt 36: q8_1 activation-quantization cache — KEPT (commit 246515a32)
+27.03 -> 27.49 t/s. PPL 2.7554 +/- 0.02151 (identical). test-backend-ops MUL_MAT 1193/1193.
+quantize_q8_1 launches dropped from 1-per-mmvq to ~0.52-per-mmvq.
+
+### Attempt 37: rms_norm 4x loop unroll — REVERTED
+rms_norm_f32<1024> is 130 calls/token/GPU at 9.4 us (ncols=5120, nrows=1, ONE block of 1024
+threads on one SM) = 1.22 ms/token = 3.4% of the token. Unrolling both loops 4x to overlap the
+loads only moved the kernel 9.60 -> 9.36 us and the metric 27.49 -> 27.46. The 9.4 us is NOT
+loop memory latency; the real cause is still unidentified (40 KB of traffic in 9.4 us is ~4 GB/s).
+
+### Attempt 38: PROBE — remove all mmvq arithmetic (P100_MEMONLY)
+Replaced `ggml_cuda_dp4a(...)` with `acc[i] += (vil4|vih4) ^ u`, deleting ~64 instructions per
+loop iteration while keeping every load. Result: **27.72 t/s (+0.8%)**.
+**=> mul_mat_vec_q is DRAM-bandwidth bound, not issue bound. All inner-loop instruction-count
+work is dead: FP16/HFMA2 rewrites, cheaper dp4a, cheaper unpack, LOP3 folding. Do not pursue.**
+
+### Attempt 39: PROBE — 4-byte-aligned shared reads (P100_ALIGNPROBE)
+Replaced the two 16-bit `get_int_b2` shared loads with one aligned 32-bit load (wrong data, right
+cost), halving LDS from 40 to 20 per iteration: **27.43 t/s**. No gain. The 2-mod-4 alignment tax
+inside shared memory costs nothing. Corollary: the earlier "LSU-bound" model is wrong too.
+
+### Attempt 40: geometry re-sweep on top of uint4 staging — all worse, 2x2 stays
+| nwarps x rows_per_cuda_block | t/s   |
+|-----------------------------|-------|
+| 2 x 2 (current)             | 27.48 |
+| 2 x 4                       | 26.88 |
+| 2 x 1                       | 24.55 |
+| 4 x 1                       | 22.02 |
+rows_per_cuda_block=1 is catastrophic => q8_1 activation re-reads are expensive despite being
+L2-resident; the y-vector reuse across 2 rows is load-bearing.
+
+### Measured time budget at 27.49 t/s (36.4 ms/token, per GPU)
+- mul_mat_vec_q      24.8 ms  (11.2 GB of weights => **453 GB/s**, vs 605 GB/s measured streaming ceiling)
+- all other kernels   7.5 ms
+- GPU idle           ~4.1 ms  (**11%** — largest single remaining pool)
+Derived from nvprof: 255458 mmvq launches for 256 tokens (499/token/GPU); mmvq = 65% of GPU
+activities at -n 256, 76% at -n 64.
+
+### Tail breakdown (ms per token per GPU, sums to 7.5)
+rms_norm_f32<1024> 1.22 | k_bin_bcast 0.92 | flash_attn_ext_vec 0.88 | quantize_q8_1 0.61 |
+gated_delta_net 0.45 | k_get_rows_float_vec 0.44 | PtoP memcpy 0.34 | unary_gated 0.34 |
+l2_norm 0.33 | cpy_scalar 0.32 | rms_norm<256> 0.30 | rest ~1.3
+~920 kernel launches per token per GPU; most tail kernels sit near a ~1.5-3 us floor.
+
+### Next lead when work resumes (in priority order)
+1. **The 4.1 ms/token GPU idle (11%, worth ~+3 t/s).** Closing it entirely would give ~30.8 t/s,
+   which is exactly the goal. CUDA graphs are hard-disabled on Pascal in
+   `ggml_cuda_graph_set_enabled` (`cc < GGML_CUDA_CC_VOLTA`, ggml-cuda.cu ~4244). Lifting that was
+   tried once and measured worse (25.97 vs 26.21), but that predates several changes and the pool
+   is now the biggest one. I was mid-measurement of whether the CPU launch thread is saturated
+   (sample utime+stime from /proc/<pid>/stat over a 10 s window during generation) when
+   interrupted — that measurement decides whether the idle is CPU launch cost (=> graphs / fewer
+   launches) or cross-device synchronisation in the tensor-split path (=> different fix).
+2. **rms_norm_f32<1024>** — find why 40 KB takes 9.4 us on one block, then fix (float4 loads, or a
+   different block size). Worth ~+0.6 t/s. Unrolling alone is not the answer.
+3. mmvq DRAM efficiency: 453 of 605 GB/s. Geometry is exhausted; whatever the 25% gap is, it is
+   not instructions, not LDS, and not block shape.
