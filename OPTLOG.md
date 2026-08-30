@@ -592,3 +592,31 @@ geometry -- which only shapes the memory access pattern -- has no effect on it. 
 
 Useful consequence for MTP: the marginal cost of a draft column is low (~55 us per extra column
 against 116 us for the first), so speculative decoding amortises well on this kernel.
+
+## Attempt 18: fold the scale and the int->float conversion out of the vdr loop -- **KEPT**
+
+With vdr=4 the inner body was `sumf += d8[i] * (dp4a(...) * sc)` for each of the 8 (l, i) pairs.
+But `scales[4*i]` and the q8_1 scale are **constant across the whole vdr group** -- that is the
+same sharing property vdr exploits for the loads. So the integer accumulator can absorb all four
+`l` values first (dp4a already takes an accumulator, so chaining is free) and the scaling
+collapses to once per `i`:
+
+- the integer multiply by `sc`, **three XMADs each on Pascal, which has no IMAD**, goes from 8 per
+  vec_dot to 2
+- the int->float conversion goes from 8 to 2
+
+Safe because peak `|acc|` is vdr*4*128*128 = 262144, well inside float's exactly-representable
+integer range, so folding the group before the conversion loses nothing. It also rounds twice
+per `i` instead of four times, so it is marginally *more* accurate -- PPL came back unchanged.
+
+| | total instr | XMAD | I2F | regs | q6_K iso | t/s |
+|---|---|---|---|---|---|---|
+| before | 678 | 197 | 16 | 78 | 116.4 us | 26.24 |
+| after | **624** | **161** | **8** | **66** | **108.3 us** | **27.03** |
+
+Geometry re-swept afterwards (registers fell 78 -> 66); 2x2 still optimal: 2x4 26.42,
+4x2 26.37, 1x2 26.91, 4x4 25.26, 1x4 25.95.
+
+| # | change | t/s | verdict |
+|---|---|---|---|
+| 18 | integer accumulator across the vdr group | **27.03 +/- 0.04** | **KEPT** (PPL 2.7554, unchanged) |

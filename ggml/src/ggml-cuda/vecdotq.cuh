@@ -1026,45 +1026,52 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
 
     // mmvq.cu drives kqs = vdr * (tid % (qi/vdr)), so iqs is a multiple of vdr. bq8_offset,
     // scale_offset and vh_shift are floor-divisions whose moduli (QI6_K/4 == 8, QI6_K/8 == 4)
-    // are multiples of vdr, so all vdr consecutive indices land in the same bucket and share
-    // them. The ql index, the qh index and the q8_1 lane index are each consecutive across the
-    // group (iqs % 8 is 0 or 4 for vdr == 4, so qh_idx + l and (iqs + l) % QI8_1 never wrap).
-    // The scales, the block scale and the q8_1 .ds values are therefore fetched once for the
-    // whole group instead of once per lane, which is the entire point: this kernel is bound by
-    // the number of load instructions it issues, not by bandwidth or arithmetic.
+    // are multiples of vdr, so all vdr consecutive indices share them, while the ql index, the
+    // qh index and the q8_1 lane index are each consecutive across the group.
     const int bq8_offset   = 2 * QR6_K * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/4);
     const int scale_offset = (QI6_K/4) * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/8);
     const int vh_shift     = 2 * ((iqs % (QI6_K/2)) / (QI6_K/4));
     const int qh_idx       = (QI6_K/4) * (iqs / (QI6_K/2)) + iqs % (QI6_K/4);
 
-    // ql/qh stay on get_int_b2: block_q6_K is 210 bytes, so they are only 2-byte aligned on
-    // every other row-block. Widening them would need a branch on block parity, which measured
-    // as a loss (registers 71 -> 104, -18%).
     const int8_t * scales = bq6_K->scales + scale_offset;
-    const float    d      = bq6_K->d;
 
-    float d8[QR6_K];
-#pragma unroll
-    for (int i = 0; i < QR6_K; ++i) {
-        d8[i] = __low2float(bq8_1[bq8_offset + 2*i].ds);
-    }
+    // Keep each i's dot product in an integer accumulator across the whole vdr group before
+    // touching floats. scales[4*i] and the q8_1 scale are constant over the group, so the
+    // per-lane integer multiply by the scale -- three XMADs on Pascal, which has no IMAD -- and
+    // the int->float conversion collapse from once per (l, i) pair to once per i. dp4a already
+    // takes an accumulator, so chaining the group costs nothing.
+    //
+    // Peak |acc| is vdr*4*128*128 = 262144, comfortably inside float's exactly-representable
+    // integer range, so folding the group before the conversion loses nothing; it also rounds
+    // twice per i instead of four times per i, so it is slightly more accurate than before.
+    int acc[QR6_K] = { 0 };
 
-    float sumf = 0.0f;
 #pragma unroll
     for (int l = 0; l < vdr; ++l) {
         const int vl = get_int_b2(bq6_K->ql, iqs + l);
         const int vh = get_int_b2(bq6_K->qh, qh_idx + l) >> vh_shift;
 
-        int u[QR6_K];
 #pragma unroll
         for (int i = 0; i < QR6_K; ++i) {
-            u[i] = get_int_b4(bq8_1[bq8_offset + 2*i].qs, (iqs + l) % QI8_1);
-        }
+            // 6-bit quant biased by -32, pre-scaled by 4 so the sign lands in bit 7; the factor
+            // of 4 is undone once in the return statement.
+            const int vil4 = (4*i >= 2 ? (vl >> (4*i - 2)) : (vl << (2 - 4*i))) & 0x3C3C3C3C;
+            const int vih4 = ((vh << (6 - 4*i)) & 0xC0C0C0C0) ^ 0x80808080;
 
-        sumf += vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scales, d, d8);
+            const int u = get_int_b4(bq8_1[bq8_offset + 2*i].qs, (iqs + l) % QI8_1);
+
+            acc[i] = ggml_cuda_dp4a(vil4 | vih4, u, acc[i]);
+        }
     }
 
-    return sumf;
+    float sumf = 0.0f;
+#pragma unroll
+    for (int i = 0; i < QR6_K; ++i) {
+        sumf += (__low2float(bq8_1[bq8_offset + 2*i].ds) * (float) scales[4*i]) * (float) acc[i];
+    }
+
+    const float d = bq6_K->d; // via an initialisation: half * float is ambiguous as an expression
+    return d * 0.25f * sumf;  // 0.25f undoes the pre-scaling above; exact, a power of two
 }
 
 #define VDR_IQ2_XXS_Q8_1_MMVQ 2
