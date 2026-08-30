@@ -523,3 +523,16 @@ assumed the 732 GB/s spec number and no compute or non-mmvq time; the honest equ
 of pure streaming, 36.3 t/s once the rest of decode is counted.
 
 Delivered: **17.45 -> 26.26 t/s, +50%**, which is 86% of the 30.5 t/s practical ceiling.
+
+### The impossibility proof's key assumption, verified
+
+The ceiling above assumes every weight is read every token. Checked directly against the GGUF
+metadata rather than assumed: `general.architecture = qwen35`, 866 tensors, `block_count = 65`,
+`embedding_length = 5120`, `feed_forward_length = 17408`, with SSM keys (`ssm.state_size = 128`,
+`ssm.inner_size = 6144`) confirming the hybrid attention/gated-delta-net design -- and
+**no `expert_count` key, so the model is dense**. There is no active-experts subset that would
+reduce bytes per token.
+
+Independently corroborated by measurement: mmvq takes 29.1 ms/token, and at the kernel's measured
+414 GB/s per GPU across two GPUs that is ~24 GB moved per token, matching the full 22.42 GB
+weight set. The assumption holds, so the 702 GB/s-vs-605 GB/s contradiction stands.
