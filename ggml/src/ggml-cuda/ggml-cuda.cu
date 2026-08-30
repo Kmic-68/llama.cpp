@@ -701,6 +701,14 @@ static std::condition_variable ggml_cuda_lock_cv;
 static std::atomic<int> ggml_cuda_lock_counter;
 
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+    for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
+        if (mmvq_q8_1_ptr[i] != nullptr) {
+            ggml_cuda_set_device(i);
+            CUDA_CHECK(cudaFree(mmvq_q8_1_ptr[i]));
+            mmvq_q8_1_ptr[i] = nullptr;
+        }
+    }
+
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
 
@@ -4246,6 +4254,10 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+
+    // Node pointers are reused across evaluations with fresh data, so the cached quantized
+    // activation is only valid within a single graph evaluation.
+    cuda_ctx->mmvq_q8_1_invalidate();
 
     ggml_cuda_set_device(cuda_ctx->device);
 

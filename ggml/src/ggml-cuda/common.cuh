@@ -1497,11 +1497,35 @@ struct ggml_backend_cuda_context {
     explicit ggml_backend_cuda_context(int device) :
         device(device),
         name(GGML_CUDA_NAME + std::to_string(device)) {
+        mmvq_q8_1_invalidate();
     }
 
     ggml_cuda_stream_context concurrent_stream_context;
 
     ~ggml_backend_cuda_context();
+
+    // Cache of the q8_1-quantized activation used by mul_mat_vec_q. Several matmuls in a
+    // transformer block share one activation -- q/k/v read the same normed input, gate/up read
+    // another -- and it was being re-quantized once per matmul (quantize_q8_1 was called exactly
+    // as many times as mul_mat_vec_q). Keyed on the src1 *node* pointer, which ggml computes
+    // once per graph evaluation so its contents are fixed, plus everything the quantization
+    // depends on. Invalidated at the start of every graph compute, because node pointers are
+    // reused across evaluations with new data.
+    // Per device: one context serves every device it was given work for.
+    const ggml_tensor * mmvq_q8_1_src1[GGML_CUDA_MAX_DEVICES] = { nullptr };
+    const void *        mmvq_q8_1_data[GGML_CUDA_MAX_DEVICES] = { nullptr };
+    ggml_type           mmvq_q8_1_type[GGML_CUDA_MAX_DEVICES];
+    size_t              mmvq_q8_1_need[GGML_CUDA_MAX_DEVICES] = { 0 };
+    void *              mmvq_q8_1_ptr [GGML_CUDA_MAX_DEVICES] = { nullptr };
+    size_t              mmvq_q8_1_cap [GGML_CUDA_MAX_DEVICES] = { 0 };
+
+    void mmvq_q8_1_invalidate() {
+        for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
+            mmvq_q8_1_src1[i] = nullptr;
+            mmvq_q8_1_data[i] = nullptr;
+            mmvq_q8_1_type[i] = GGML_TYPE_COUNT;
+        }
+    }
 
     cudaStream_t stream(int device, int stream) {
         if (streams[device][stream] == nullptr) {

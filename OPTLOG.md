@@ -679,3 +679,14 @@ registers, and at 2 warps/block that outweighs the 8 shared loads saved.
 Every remaining variant now trades one resource for another and nets negative: cutting shared
 loads costs registers or global loads, cutting instructions costs registers, cutting staged bytes
 costs global traffic. 27.03 is a deep local optimum for this kernel structure.
+
+## Attempt 36: q8_1 activation-quantization cache (KEPT)
+`quantize_q8_1` was called exactly once per `mul_mat_vec_q` (16898 times), but q/k/v share one
+normed activation and gate/up share another, so ~40% of those launches recomputed an identical
+buffer. Added a per-device cache to `ggml_backend_cuda_context` keyed on
+(src1 node, src1 data ptr, src0->type, byte size), invalidated at the start of every
+`ggml_backend_cuda_graph_compute`. Backing store is a persistent `cudaMalloc` that only grows.
+- 27.03 -> **27.49 t/s**
+- test-backend-ops -o MUL_MAT: 1193/1193
+- PPL 2.7554 +/- 0.02151 (identical to stock)
+- KEPT
