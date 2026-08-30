@@ -904,3 +904,34 @@ itself down near its 20.3 ms staging-only floor (552 GB/s) *and* the remaining 1
 overhead cut to under 5. Getting there is not a matter of one more kernel: it needs either fewer
 launches (roughly 2150 per token per GPU today) or a weight layout that streams closer to the
 605 GB/s wall.
+
+## Attempt 58: restore bit-identical output — KEPT
+The float4 reductions in the norm kernels changed the summation order (thread t took a contiguous
+quad instead of the reference's strided columns t, t+B, ...), so the per-thread partials and the
+reduction tree differed and perplexity moved 2.7554 -> 2.7565. Reverting just those three blocks,
+keeping the register caching, restores **PPL = 2.7554 +/- 0.02151, exactly stock**. That also
+confirms empirically what was until now only an argument: the fastdiv index-maths changes, the
+contiguous elementwise fast path and the flash-attn tile-size fix are all bit-exact.
+
+Three attempts to buy the speed back without touching the arithmetic, all no better:
+| variant                                                             | t/s   |
+|---------------------------------------------------------------------|-------|
+| bit-exact (register cached, strided ownership)                       | 29.94 |
+| bit-exact reduction + float4 second pass (elementwise, so bit-exact) | 29.40 |
+| bit-exact + float4 contiguous elementwise kernel                     | 29.62 |
+The second-pass idea fails because it must re-read x; the register caching was worth more than the
+wider access. The elementwise float4 fails because it uses four times fewer threads, dropping these
+small launches from 20 blocks to 5 -- they are launch-floor bound, so fewer blocks costs more than
+wider loads save.
+
+## Measurement caveat — read this before trusting any small delta above
+GPU0 also serves Sunshine and the desktop. When the machine is in use it draws cycles from GPU0,
+and because -sm tensor makes both GPUs rendezvous every layer, the whole token rate follows. Three
+*identical* back-to-back runs measured 29.32, 27.97 (+/- 1.25) and 25.16 (+/- 1.87) while the
+machine was being used, against 29.94 +/- 0.10 for the same binary when it was idle. Temperatures
+were 67-69 C with no throttle flags, so this is contention, not thermal.
+
+**Any A/B difference below about 0.5 t/s in this log is inside that noise** unless it was taken on
+an idle machine with repeats. The large results (the activation staging at +5.4%, the fastdiv work,
+the flash-attn fix) are well clear of it; the 0.17 t/s between the bit-exact and float4 norm builds
+is not, and should be treated as unmeasured rather than as a real cost.
