@@ -269,3 +269,59 @@ parameter so `get_int_b2` can use `((const int *) x)[i32]` directly. Attempt 7 f
 because it tried to let ptxas *infer* the alignment at run time; asserting it at compile time
 avoids both the funnel-shift cost and the register growth.
 Estimated LDS 56 -> 32, LSU 81 -> 57 (1.42x), i.e. roughly **25 t/s**.
+
+---
+
+## Attempt 9: templated aligned `get_int_b2` -- REVERTED
+
+Gave `vec_dot_*_q8_1` a `bool aligned4` template parameter and stripped the misalignment while
+staging (neighbour word via warp shuffle). Result: q6_K 193.8 us (vs 164.6) and a correctness
+failure. Two lessons:
+
+- The saving was far smaller than estimated. Only `vl`/`vh` go through `get_int_b2`; the two
+  `scales` bytes and the block scale do not. So alignment can remove at most ~8 of the 81 LSU
+  ops (LDS went 56 -> 48, not 56 -> 32), while the shuffles cost 32 instructions. The lever is
+  smaller than the cost of pulling it.
+- The correctness bug was a divergent `__shfl_sync` with a full mask, called under
+  `if (threadIdx.x == warp_size-1)`. All lanes in the mask must execute the shuffle.
+
+## Attempt 10: vdr = 2 for Q6_K + retuned launch geometry -- **KEPT**
+
+`VDR_Q6_K_Q8_1_MMVQ` 1 -> 2, so each thread handles two consecutive int32 of the quant data.
+For even `iqs`, `bq8_offset`, `scale_offset` and `vh_shift` are identical for `iqs` and `iqs+1`
+(all three are floor-divisions with an even modulus), so the two halves share one `scales`
+pointer, one `bq6_K->d`, and one pair of q8_1 `.ds` scales -- all previously fetched twice.
+Per block: **57.5 vs 81 LSU ops, 29% fewer.** This does *not* widen the ql/qh loads; the 210-byte
+block stride keeps those at 2-byte alignment regardless.
+
+vdr=2 halves the threads per block-group, which moved the launch-geometry optimum. Swept against
+the real benchmark (the isolated single-shape proxy was misleading -- it showed vdr=2 as 1.12x
+while the full model showed no change until the geometry was retuned):
+
+| nwarps x rows | t/s (tg256) |
+|---|---|
+| 8 x 4 (old tuning) | 20.35 |
+| 4 x 4 | 22.97 |
+| **2 x 4** | **23.31** |
+| 2 x 2 | 22.67 |
+| 1 x 4 | 22.22 |
+| 1 x 2 | 22.04 |
+| 2 x 8 / 4 x 8 | 19.96 / 18.78 |
+
+Attribution (all tg256): vdr=1 8x4 = 20.35, vdr=1 4x4 = 21.05, vdr=2 4x4 = 22.95. Both the
+vdr change and the geometry change contribute.
+
+### The tuning now lives in the source, not in build flags
+
+`-DP100_NWARPS/-DP100_ROWS/-DP100_MC_*` are no longer read. The measured Pascal values are
+compiled in, gated on `__CUDA_ARCH_LIST__ == 600` so that MMVQ_PARAMETERS_GENERIC -- which
+Ampere and later also fall through to -- is untouched. `__CUDA_ARCH_LIST__` is the correct test
+because it is visible to **both** the host and device passes, and `calc_nwarps` feeds both
+`__launch_bounds__` and the host-side launch configuration, which must agree.
+
+A flagless build now reproduces the tuned result, so the "17% cliff with no warning" from
+forgetting the flags is gone.
+
+| # | change | t/s | verdict |
+|---|---|---|---|
+| 10 | vdr=2 for Q6_K + Pascal geometry 2x4 baked into source | **23.28 +/- 0.02** | **KEPT** |

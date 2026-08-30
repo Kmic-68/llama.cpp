@@ -624,7 +624,13 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_mmq(
     return dm4f.x*sumf_d - dm4f.y*sumf_m;
 }
 
-#define VDR_Q6_K_Q8_1_MMVQ 1
+// P100 (sm_60): raised from 1 to 2. See vdr2_analysis.md for the derivation. This does NOT
+// widen the ql/qh global loads (block_q6_K's 210-byte stride keeps their alignment at 2 bytes
+// for ~half of all row-blocks, so a uniform, branch-free path must stay on get_int_b2 for both
+// values regardless of vdr). The win is eliminating the *redundant* re-fetch of bq6_K->d, the
+// two `scales` bytes, and the two q8_1 `.ds` scales, all four of which are IDENTICAL between
+// iqs and iqs+1 but were previously re-read from scratch by two separate warp lanes.
+#define VDR_Q6_K_Q8_1_MMVQ 2
 #define VDR_Q6_K_Q8_1_MMQ  8
 
 // contiguous v/x values
@@ -1016,25 +1022,56 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
 
     const block_q6_K * bq6_K = (const block_q6_K *) vbq + kbx;
 
-    const int bq8_offset = 2 * QR6_K * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/4);
+    // iqs is even here (VDR_Q6_K_Q8_1_MMVQ == 2, mmvq.cu drives kqs = vdr * (tid % (qi/vdr))).
+    // bq8_offset, scale_offset and vh_shift are all floor-divisions with an even modulus
+    // (QI6_K/4 == 8, QI6_K/8 == 4), so they take the SAME value for iqs and iqs+1: an even
+    // iqs and its odd successor always land in the same divisor bucket. That means this
+    // thread's two "lanes" (formerly two separate warp threads under vdr=1) share one
+    // scale_offset/bq8_offset/vh_shift, one `scales` pointer, one pair of q8_1 block pointers,
+    // and therefore one pair of d8[] values and one bq6_K->d read -- all of which used to be
+    // fetched twice (once per lane) and are now fetched once.
+    const int bq8_offset   = 2 * QR6_K * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/4);
     const int scale_offset = (QI6_K/4) * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/8);
-    const int vh_shift = 2 * ((iqs % (QI6_K/2)) / (QI6_K/4));
+    const int vh_shift     = 2 * ((iqs % (QI6_K/2)) / (QI6_K/4));
+    const int qh_idx       = (QI6_K/4) * (iqs / (QI6_K/2)) + iqs % (QI6_K/4);
 
-    const int vl = get_int_b2(bq6_K->ql, iqs);
-    const int vh = get_int_b2(bq6_K->qh, (QI6_K/4) * (iqs / (QI6_K/2)) + iqs % (QI6_K/4)) >> vh_shift;
+    // ql/qh remain get_int_b2 (2x LDG.U16 each): block_q6_K is 210 bytes, so its ql/qh fields
+    // are only 4-byte aligned for even-index row-blocks and 2-byte aligned for odd-index ones.
+    // A width upgrade here would have to branch on kbx parity, which is exactly the kind of
+    // branchy duplication that previously blew register usage 71 -> 104 and cost 18%. Left
+    // alone on purpose; see vdr2_analysis.md.
+    const int vl0 = get_int_b2(bq6_K->ql, iqs);
+    const int vl1 = get_int_b2(bq6_K->ql, iqs + 1);
+
+    const int vh0 = get_int_b2(bq6_K->qh, qh_idx)     >> vh_shift;
+    const int vh1 = get_int_b2(bq6_K->qh, qh_idx + 1) >> vh_shift;
 
     const int8_t * scales = bq6_K->scales + scale_offset;
 
-    int    u[QR6_K];
+    // u depends on iqs % QI8_1, which DOES differ between iqs and iqs+1 (they select
+    // adjacent int32 lanes out of the same 32-byte q8_1 block), so u needs two full arrays.
+    // d8 depends only on the block (bq8_offset + 2*i), which is shared -> one array, read once.
+    int    u0[QR6_K];
+    int    u1[QR6_K];
     float d8[QR6_K];
 
 #pragma unroll
     for (int i = 0; i < QR6_K; ++i) {
-        u[i]  = get_int_b4(bq8_1[bq8_offset + 2*i].qs, iqs % QI8_1);
-        d8[i] = __low2float(bq8_1[bq8_offset + 2*i].ds);
+        const block_q8_1 * bq8 = bq8_1 + bq8_offset + 2*i;
+        d8[i] = __low2float(bq8->ds);
+        u0[i] = get_int_b4(bq8->qs,  iqs      % QI8_1);
+        u1[i] = get_int_b4(bq8->qs, (iqs + 1) % QI8_1);
     }
 
-    return vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scales, bq6_K->d, d8);
+    // vec_dot_q6_K_q8_1_impl_mmvq (with its d*0.25f compensation for the vil4/vih4 scaling
+    // trick) is reused verbatim and unmodified for both lanes -- this patch does not touch
+    // that function at all, so its bit-exactness is untouched. The two per-lane results are
+    // added here instead of being combined via the warp-level reduction as two separate
+    // threads' contributions; this reassociates the final sum by one addition and can move
+    // the last ULP or two, which is expected to stay well inside the perplexity tolerance.
+    const float d = bq6_K->d;
+    return vec_dot_q6_K_q8_1_impl_mmvq(vl0, vh0, u0, scales, d, d8)
+         + vec_dot_q6_K_q8_1_impl_mmvq(vl1, vh1, u1, scales, d, d8);
 }
 
 #define VDR_IQ2_XXS_Q8_1_MMVQ 2
