@@ -757,3 +757,30 @@ l2_norm 0.33 | cpy_scalar 0.32 | rms_norm<256> 0.30 | rest ~1.3
    different block size). Worth ~+0.6 t/s. Unrolling alone is not the answer.
 3. mmvq DRAM efficiency: 453 of 605 GB/s. Geometry is exhausted; whatever the 25% gap is, it is
    not instructions, not LDS, and not block shape.
+
+## Attempt 41: PROBES — where mul_mat_vec_q's time actually goes
+Three probes, each keeping the memory traffic and deleting one thing, measured with nvprof at
+-n 256 -r 1 (mmvq total over 255458 launches, both GPUs):
+| variant                                        | mmvq total | vs baseline |
+|------------------------------------------------|-----------:|------------:|
+| baseline                                        |   12.684 s |          -- |
+| staging only (no dot product, no y loads)       |   10.446 s |      -17.6% |
+| dot product kept, q8_1 activation replaced by a constant | 10.975 s | **-13.5%** |
+| dp4a deleted, all loads kept (attempt 38)       |        n/a |       -0.8% |
+So the gap between the kernel's 453 GB/s and the card's 605 GB/s streaming ceiling is almost
+entirely the **q8_1 activation loads**, not the weights, not the arithmetic. The staging pattern
+on its own reaches 552 GB/s (91% of the ceiling).
+
+## Attempt 42: cooperative staging of the q8_1 activation — KEPT
+Root cause: within a warp, consecutive lanes read 32-bit words 16 bytes apart inside a 36-byte
+`block_q8_1` and then jump to the next block, so each of the 8 activation loads per iteration
+fans out into many transactions. The bytes are L2-resident (every block of the grid reads the
+same activation), so this costs request throughput, not bandwidth. In SASS the activation was
+8 LDG.E.CI + 2 LDG.E.CI.U16 per iteration against only 4 LDG.E.CI.128 for the weights.
+Fix: stage the warp's contiguous run of q8_1 blocks into shared memory with coalesced uint4
+loads, exactly like the weights, and read it back from shared. Gated to ncols_dst == 1 on
+Pascal, and to runs of at most 2048 bytes.
+- **27.49 -> 28.98 t/s (+5.4%)**
+- test-backend-ops -o MUL_MAT: 1193/1193
+- PPL 2.7554 +/- 0.02151 (identical to stock)
+- KEPT
