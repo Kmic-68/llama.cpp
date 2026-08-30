@@ -83,8 +83,14 @@ Measured, not assumed. This is the most valuable part of the handoff.
     slower** because it traded shared loads for global ones. **LDG ≫ LDS in cost.**
 - **Current split** (q6_K, m=4096 n=1 k=14336): full **108.9 µs** = **95.2 µs memory + 13.7 µs
   arithmetic**. Arithmetic is 62% of the *instructions* but only 12.5% of the *time*.
-- **Registers are the recurring killer.** At nwarps=2 the kernel sits at 66. Nearly every
+- **Registers are the recurring killer.** At nwarps=2 the kernel sits at 66-67. Nearly every
   optimization that reduces one resource raises registers and nets negative.
+- **Occupancy is NOT the limiter, in either direction.** Forcing *fewer* registers hurts
+  monotonically even with zero spill (67→27.01, 64→26.63, 61→26.68, 56→26.34), and raising
+  occupancy by other means loses too. Per-thread resources matter more than warp count here.
+  Note the two limits: at 64 threads/block registers allow 14 blocks/SM and shared memory allows
+  17, so **registers bind and shared memory has headroom — until you double it, at which point
+  smem binds at 9 blocks.**
 - Decode profile: mmvq **76%** of GPU time; the other 24% is ~15 latency-bound kernels of 1-4%
   each (rms_norm 3.6%, quantize_q8_1 3.5%, k_bin_bcast 2.7%, flash_attn 2.4%).
   GPU is ~95% busy, so launch overhead is not the problem.
@@ -128,6 +134,8 @@ Reducing **bytes per token** (MTP, or a smaller quant) is the only lever that ch
 | `rms_norm` 256- vs 1024-thread block | neutral | latency bound, not reduction bound |
 | 32-bit byte-offset indexing for q8_1 | no-op | compiler already did it |
 | Compile-time staging bound | −1.4% | stages ~3% more bytes every iteration |
+| Force 64/61/56 registers via `__launch_bounds__` | 26.6 / 26.7 / 26.3 | monotonically worse **with zero spill** — ptxas rematerialises instead |
+| Double-buffer the shared stage (remove the WAR barrier) | 26.38 | smem 3712 → 7168 B makes *shared memory* the occupancy limiter (14 → 9 blocks/SM) |
 | Padded/repacked global layout | not attempted | ~800-1200 lines, must be shared with MMQ, and only reaches ~30.5 |
 | Multi-column (MTP) geometry re-sweep | zero sensitivity | that path is compute bound; weights read once regardless of column count |
 | q8_1 activation padding for 128-bit `u` loads | 2% ceiling (measured) | activation is L1/L2-resident; those loads are already nearly free |
