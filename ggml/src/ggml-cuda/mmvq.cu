@@ -580,7 +580,7 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
         switch (ncols_dst) {
             case 1:
 #ifdef GGML_CUDA_MMVQ_PASCAL
-                return 4;
+                return 2;
 #else
                 return small_k ? nwarps : 1;
 #endif

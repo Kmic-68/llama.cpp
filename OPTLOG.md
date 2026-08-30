@@ -325,3 +325,41 @@ forgetting the flags is gone.
 | # | change | t/s | verdict |
 |---|---|---|---|
 | 10 | vdr=2 for Q6_K + Pascal geometry 2x4 baked into source | **23.28 +/- 0.02** | **KEPT** |
+
+## Attempt 11: vdr = 4 for Q6_K + geometry 2x2 -- **KEPT**
+
+Extends the vdr=2 idea. The index-sharing condition holds for groups of 4 as well: verified
+that for every `iqs` that is a multiple of 4, all four consecutive indices share
+`bq8_offset`, `scale_offset` and `vh_shift`, and that the ql index, qh index and q8_1 lane
+index are each consecutive with no wrap (`iqs % 8` is 0 or 4, so `qh_idx + l` and
+`(iqs + l) % QI8_1` stay inside their arrays). `vec_dot_q6_K_q8_1` was rewritten to loop over
+`vdr` so the factor is a single constant.
+
+vdr = 8 was rejected on analysis: `scale_offset` changes at `iqs % 16 == 4`, so a group of 8
+would need two scale reads, cutting the benefit to ~8% for a much larger register footprint.
+
+Raising vdr raises register pressure, which keeps moving the geometry optimum, so the sweep
+has to be redone each time -- and always against the real model, never the isolated shape
+(vdr=4 is *better* than vdr=2 in isolation, 139.2 vs 143.7 us, but worse on the model at the
+old geometry: 21.60 vs 23.28):
+
+| vdr=4, nwarps x rows | regs | t/s (tg256) |
+|---|---|---|
+| **2 x 2** | 87 | **24.35** |
+| 1 x 2 | 87 | 23.96 |
+| 4 x 2 | 87 | 22.03 |
+| 2 x 1 | 75 | 21.70 |
+| 2 x 4 | 103 | 21.59 |
+| 1 x 4 | 103 | 21.36 |
+| 4 x 4 | 102 | 19.97 |
+| 4 x 1 | 74 | 18.32 |
+| 8 x 2 | 87 | 17.63 |
+| 8 x 1 | 74 | 15.84 |
+
+| # | change | t/s | verdict |
+|---|---|---|---|
+| 11 | vdr=4 for Q6_K + Pascal geometry 2x2 | **24.33 +/- 0.04** | **KEPT** |
+
+Split after this change (isolated q6_K, m=4096 n=1 k=14336): full 143.7 us -> loads-only
+121.3 us at vdr=2, i.e. vdr=2 already cut the arithmetic from 50 us to 22 us. Memory is now
+~84% of the kernel, so remaining work has to come off the load path.
