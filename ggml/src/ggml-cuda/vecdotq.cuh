@@ -2,6 +2,11 @@
 
 #include "common.cuh"
 
+// PROBE SWITCHES (sed 0->1); both break results, valid only on fixed-work benchmarks
+#define P100_NOY     0
+#define P100_MEMONLY 0
+
+
 #include <cstdint>
 
 static __device__ __forceinline__ int get_int_b1(const void * x, const int & i32) {
@@ -1058,16 +1063,28 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
             const int vil4 = (4*i >= 2 ? (vl >> (4*i - 2)) : (vl << (2 - 4*i))) & 0x3C3C3C3C;
             const int vih4 = ((vh << (6 - 4*i)) & 0xC0C0C0C0) ^ 0x80808080;
 
+#if P100_NOY
+            const int u = 0x01010101;
+#else
             const int u = get_int_b4(bq8_1[bq8_offset + 2*i].qs, (iqs + l) % QI8_1);
+#endif
 
+#if P100_MEMONLY
+            acc[i] += (vil4 | vih4) ^ u;
+#else
             acc[i] = ggml_cuda_dp4a(vil4 | vih4, u, acc[i]);
+#endif
         }
     }
 
     float sumf = 0.0f;
 #pragma unroll
     for (int i = 0; i < QR6_K; ++i) {
+#if P100_NOY
+        sumf += (1.0f * (float) scales[4*i]) * (float) acc[i];
+#else
         sumf += (__low2float(bq8_1[bq8_offset + 2*i].ds) * (float) scales[4*i]) * (float) acc[i];
+#endif
     }
 
     const float d = bq6_K->d; // via an initialisation: half * float is ambiguous as an expression

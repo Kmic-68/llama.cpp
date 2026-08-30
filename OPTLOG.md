@@ -976,3 +976,83 @@ machine happened to be in. Comparisons made back to back within one command are 
 (both sides hot); comparisons made minutes apart are not. Anything below ~0.5 t/s should be
 re-measured from a controlled thermal state before being believed. The large results are far
 enough clear of this to stand.
+
+# Multi-column path (speculative decoding / MTP, small batches)
+
+MTP with the model's built-in head measured **32.94 t/s at 88% acceptance** -- only 1.11x over
+non-speculative decode, which is poor for that acceptance rate. Profiling the MTP run shows why:
+`mul_mat_vec_q<q6_K, ncols=7>` is **36.7% of GPU time at 196 us a call**, against 99 us for the
+one-column kernel that streams the same weights. Everything done earlier this session was gated to
+`ncols_dst == 1`, so the hottest kernel in this workload ran the *unoptimised* generic path.
+
+## A benchmark that is actually usable
+`llama-bench -p 512 -n 0 -b 7 -ub 7` is 84% `mul_mat_vec_q<ncols=7>`, deterministic, and reports
++/- 0.05 instead of tg256's +/- 0.2. Baseline **61.08 t/s, kernel 188.13 us**.
+
+Note the probe technique used earlier is *invalid* on a speculative workload: replacing the
+activation with a constant drove acceptance to 0%, so every draft was rejected and the run fell
+back to one-column stepping -- the workload itself depends on the model being correct. Prompt
+processing does fixed work regardless, hence the switch.
+
+## Attempt 59: extend the activation staging to ncols_dst > 1 — REVERTED
+The probe said deleting the activation makes the kernel **3.7x faster** (188 -> 50.9 us), so
+staging looked like the answer. It gained ~1% (185.3 us). The probe conflated two things: it
+removes the fan-out *and* the traffic, and staging only fixes the fan-out.
+
+The real problem is **volume**. Every one of the ~2560 blocks re-reads the whole activation:
+~102 MB of L2 traffic per matmul against 21 MB of weights. Staging moves the same bytes, and it
+spends the shared memory that the actual fix needs. Removed.
+
+## Attempt 60: more output rows per block — KEPT
+Activation traffic scales as 1/rows. Raising rows from 2 to 4 (and dropping the staging that was
+competing for shared memory) gives **61.08 -> 79.92 t/s, 188 -> 133.6 us**.
+
+Past 4 rows it collapses -- rows=8 gives 56.09, rows=16 gives 17.83 -- because `tmp[ncols][rows]`
+reaches 112 floats a thread and spills. **Registers, not shared memory, are the limit here**:
+`cuobjdump -res-usage` reports REG:200, SHARED:3456, so occupancy is 10 warps/SM.
+
+Capping registers with `__launch_bounds__` does not help: minblk=16 gives REG:128 with 104 bytes
+of spill and 60.01 t/s; minblk=24 gives REG:80 with 656 bytes of spill. Reverted.
+
+## Attempt 61: each warp owns its own rows — KEPT
+To get more rows per block at constant register pressure, give each warp its own rows and have
+every warp walk the whole of K, instead of the warps splitting K and sharing every row. Per-thread
+accumulators stay at ncols x rows_per_warp, and the cross-warp reduction disappears.
+| nwarps x rows (rows/warp) | pp512 | kernel |
+|---------------------------|-------|--------|
+| 4 x 2  (stock)            | 61.08 | 188.1 us |
+| 1 x 4                     | 79.92 | 133.6 us |
+| **2 x 8 (4)**             | **82.10** | **129.1 us** |
+| 3 x 12 (4)                | 81.12 | 131.0 us |
+| 2 x 12 (6)                | 77.18 | 140.0 us |
+| 2 x 4 (2)                 | 69.68 | 159.8 us |
+
+Also fixes a latent out-of-bounds: a block covers rows_per_cuda_block rows whether the tensor has
+that many left or not, and the surplus rows were only dropped at write-back, so the staging read
+off the end of the weights. Two rows got away with it; eight would not. The row used for addressing
+is now clamped (free: 82.13 vs 82.10).
+
+## Result
+| metric | before | after |
+|---|---|---|
+| pp512 (b=7 ub=7) | 61.08 | **82.12** (+34%) |
+| `mul_mat_vec_q<ncols=7>` | 188.1 us | **129.2 us** |
+| **MTP decode** | **32.94 t/s** | **37.72-37.94 t/s** (+15%) |
+| MTP speedup over plain decode | 1.11x | **1.27x** |
+| tg256 (one-column path, untouched) | 29.9 | 29.5-29.9 |
+
+Verification: test-backend-ops MUL_MAT 1193/1193; full perplexity gate 2.7554 +/- 0.02151.
+
+**Caveat on that gate:** the standard perplexity run uses batch 512, which routes through
+cuBLAS/MMQ and never touches this kernel. Gating the path that actually changed needs `-b 7 -ub 7`:
+**3.6199 +/- 0.08383 optimised against 3.6237 +/- 0.08411 for the stock geometry**, same command --
+a 0.1% shift, well inside the error bar. This path is therefore *not* bit-identical to stock (the
+reduction order changed, which is also why acceptance moved 88.26% -> 83.82% on a fixed seed); the
+one-column decode path still is.
+
+## Remaining headroom
+The no-activation probe at the final geometry is 53.7 us against 129.2, so the multi-column kernel
+is still ~2.4x off its weight-streaming floor. At 8 rows the activation is ~26 MB a matmul against
+21 MB of weights, so the two are now comparable and further row growth is blocked by registers.
+Breaking that wall needs the accumulator count per thread reduced, which means restructuring the
+dot product rather than tuning geometry.

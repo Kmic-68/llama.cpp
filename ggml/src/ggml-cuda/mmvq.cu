@@ -106,6 +106,12 @@ static constexpr __host__ __device__ int get_block_byte_size(ggml_type type) {
 // carrying the tuning in the source means a plain build cannot silently miss it.
 #if defined(__CUDA_ARCH_LIST__) && __CUDA_ARCH_LIST__ == 600
 #define GGML_CUDA_MMVQ_PASCAL 1
+// warps per block for the multi-column (speculative decoding / small batch) path
+#define P100_MMVQ_NWARPS_N 2
+// output rows per block on the multi-column path: the activation is re-read by every block,
+// so its total traffic scales as 1/rows
+#define P100_MMVQ_ROWS_N   8
+// whether the multi-column path also stages the activation (it costs shared memory that rows want)
 #endif
 
 enum mmvq_parameter_table_id {
@@ -445,7 +451,7 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
             return 2;
         }
         if (ncols_dst <= 8) {
-            return 4;
+            return P100_MMVQ_NWARPS_N;
         }
     }
 #endif
@@ -591,7 +597,11 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
             case 6:
             case 7:
             case 8:
+#ifdef GGML_CUDA_MMVQ_PASCAL
+                return P100_MMVQ_ROWS_N;
+#else
                 return 2;
+#endif
             default:
                 return 1;
         }
@@ -619,6 +629,13 @@ static __global__ void mul_mat_vec_q(
     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
     constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
     constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+    // Give each warp its own output rows and let every warp walk the whole of K, instead of the
+    // warps splitting K and sharing every row. The activation is re-read by every block of the
+    // grid, so letting a block cover more rows divides that traffic -- and doing it this way keeps
+    // the per-thread accumulator count, and so the register pressure, unchanged. It also removes
+    // the cross-warp reduction at the end.
+    constexpr bool split_rows = ncols_dst > 1 && !has_fusion && rows_per_cuda_block % nwarps == 0;
+    constexpr int  rows_per_warp = split_rows ? rows_per_cuda_block/nwarps : rows_per_cuda_block;
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
 
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
@@ -707,11 +724,12 @@ static __global__ void mul_mat_vec_q(
     }
 
     // partial sum for each thread
-    float tmp[ncols_dst][rows_per_cuda_block] = {{0.0f}};
-    float tmp_gate[ncols_dst][rows_per_cuda_block] = {{0.0f}};
+    float tmp[ncols_dst][rows_per_warp] = {{0.0f}};
+    float tmp_gate[ncols_dst][rows_per_warp] = {{0.0f}};
 
     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
-    const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
+    const int warp_row0  = split_rows ? row0 + int(threadIdx.y)*rows_per_warp : row0;
+    const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + warp_row0*stride_row_x;
 
     // Cooperative staging of x through shared memory.
     //
@@ -742,7 +760,7 @@ static __global__ void mul_mat_vec_q(
     constexpr int stage_u4     = (blocks_per_warp*blck_size + 15 + 15)/16; // + slack for misalignment
     constexpr int stage_rounds = (stage_u4 + warp_size - 1) / warp_size;
 
-    __shared__ uint4 x_stage[nwarps][rows_per_cuda_block][stage_u4];
+    __shared__ uint4 x_stage[nwarps][rows_per_warp][stage_u4];
 
     // Cooperative staging of the q8_1 activation.
     //
@@ -768,17 +786,23 @@ static __global__ void mul_mat_vec_q(
     const int sub = threadIdx.x / (qi/vdr);  // which of the warp's blocks this thread reads
     const int kqs = vdr * (tid % (qi/vdr));  // x block quant index when casting the quants to int
 
-    int mis[rows_per_cuda_block]; // byte offset of the block run inside its staged copy
+    int mis[rows_per_warp]; // byte offset of the block run inside its staged copy
 
     // The whole warp must iterate together for the staging barriers, so loop over the warp's
     // base block and bound the per-thread work with a guard rather than the loop condition.
-    for (int kbw = threadIdx.y*blocks_per_warp; kbw < blocks_per_row_x; kbw += blocks_per_iter) {
+    constexpr int kb_stride = split_rows ? blocks_per_warp : blocks_per_iter;
+    for (int kbw = split_rows ? 0 : int(threadIdx.y)*blocks_per_warp; kbw < blocks_per_row_x; kbw += kb_stride) {
         const int nblk = min(blocks_per_warp, blocks_per_row_x - kbw);
 
         __syncwarp(); // previous iteration's readers must finish before we overwrite the stage
 #pragma unroll
-        for (int i = 0; i < rows_per_cuda_block; ++i) {
-            const char *   gsrc   = (const char *) vx + size_t(kbx_offset + i*stride_row_x + kbw)*blck_size;
+        for (int i = 0; i < rows_per_warp; ++i) {
+            // Clamp the row used for addressing: a block covers rows_per_cuda_block rows whether or
+            // not the tensor has that many left, and the results for the surplus rows are dropped at
+            // write-back. Without this the staging reads off the end of the weights, which the
+            // original two-row geometry got away with but eight rows would not.
+            const int      irow   = min(warp_row0 + i, int(stride_col_dst) - 1) - warp_row0;
+            const char *   gsrc   = (const char *) vx + size_t(kbx_offset + irow*stride_row_x + kbw)*blck_size;
             const int      m      = (int) ((uintptr_t) gsrc & 15);
             const uint4 *  gsrc16 = (const uint4 *) ((uintptr_t) gsrc - m);
             const int      nu4    = (m + nblk*blck_size + 15) / 16;
@@ -818,7 +842,7 @@ static __global__ void mul_mat_vec_q(
 #pragma unroll
             for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
-                for (int i = 0; i < rows_per_cuda_block; ++i) {
+                for (int i = 0; i < rows_per_warp; ++i) {
                     const char * xs = (const char *) x_stage[threadIdx.y][i] + mis[i] + sub*blck_size;
                     if constexpr (stage_y) {
                         // Derived with char* arithmetic from the shared array itself: a uintptr_t
@@ -841,14 +865,32 @@ static __global__ void mul_mat_vec_q(
         }
     }
 
-    __shared__ float tmp_shared[nwarps-1 > 0 ? nwarps-1 : 1][ncols_dst][rows_per_cuda_block][warp_size];
-    [[maybe_unused]] __shared__ float tmp_shared_gate[(has_fusion && (nwarps-1 > 0)) ? nwarps-1 : 1][ncols_dst][rows_per_cuda_block][warp_size];
+    if constexpr (split_rows) {
+        // Each warp owns its rows outright, so it reduces and writes them itself.
+        float * dst_warp = dst + sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + warp_row0;
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+#pragma unroll
+            for (int i = 0; i < rows_per_warp; ++i) {
+                const float sum = warp_reduce_sum<warp_size>(tmp[j][i]);
+                if (threadIdx.x == i && uint32_t(warp_row0 + i) < stride_col_dst) {
+                    dst_warp[j*stride_col_dst + i] = sum;
+                }
+            }
+        }
+        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, use_scale, use_gate_scale, active_glu,
+                         gate_bias, x_bias, x_scale, gate_scale, tmp_gate, x_scales, gate_scales);
+        return;
+    }
+
+    __shared__ float tmp_shared[nwarps-1 > 0 ? nwarps-1 : 1][ncols_dst][rows_per_warp][warp_size];
+    [[maybe_unused]] __shared__ float tmp_shared_gate[(has_fusion && (nwarps-1 > 0)) ? nwarps-1 : 1][ncols_dst][rows_per_warp][warp_size];
 
     if (threadIdx.y > 0) {
 #pragma unroll
         for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
-            for (int i = 0; i < rows_per_cuda_block; ++i) {
+            for (int i = 0; i < rows_per_warp; ++i) {
                 tmp_shared[threadIdx.y-1][j][i][threadIdx.x] = tmp[j][i];
                 if constexpr (has_fusion) {
                     if (use_gate) {
@@ -869,7 +911,7 @@ static __global__ void mul_mat_vec_q(
 #pragma unroll
     for (int j = 0; j < ncols_dst; ++j) {
 #pragma unroll
-        for (int i = 0; i < rows_per_cuda_block; ++i) {
+        for (int i = 0; i < rows_per_warp; ++i) {
 #pragma unroll
             for (int l = 0; l < nwarps-1; ++l) {
                 tmp[j][i] += tmp_shared[l][j][i][threadIdx.x];
