@@ -732,10 +732,17 @@ static __global__ void mul_mat_vec_q(
     constexpr int blck_size       = get_block_byte_size(type);
     static_assert(blck_size > 0, "get_block_byte_size is missing an entry for this type");
     constexpr int blocks_per_warp = blocks_per_iter / nwarps; // == vdr*warp_size/qi
-    constexpr int stage_ints      = (blocks_per_warp*blck_size)/4 + 2; // +2 ints of slack for misalignment
-    constexpr int stage_rounds    = (stage_ints + warp_size - 1) / warp_size;
+    // Stage in 16-byte units. The warp's run of blocks is contiguous, so the only thing that
+    // stops a uint4 load is alignment -- and shared memory already tolerates an arbitrary byte
+    // offset (see mis[] below), so the run can simply be fetched from the 16-byte-aligned
+    // address below it and the offset carried into the extraction. One uint4 instruction moves
+    // 512 bytes per warp against 128 for a 32-bit one, which cuts both the global load count
+    // and the shared store count by 4x on a kernel bound by the number of memory instructions
+    // it issues.
+    constexpr int stage_u4     = (blocks_per_warp*blck_size + 15 + 15)/16; // + slack for misalignment
+    constexpr int stage_rounds = (stage_u4 + warp_size - 1) / warp_size;
 
-    __shared__ int x_stage[nwarps][rows_per_cuda_block][stage_ints];
+    __shared__ uint4 x_stage[nwarps][rows_per_cuda_block][stage_u4];
 
     const int sub = threadIdx.x / (qi/vdr);  // which of the warp's blocks this thread reads
     const int kqs = vdr * (tid % (qi/vdr));  // x block quant index when casting the quants to int
@@ -750,10 +757,10 @@ static __global__ void mul_mat_vec_q(
         __syncwarp(); // previous iteration's readers must finish before we overwrite the stage
 #pragma unroll
         for (int i = 0; i < rows_per_cuda_block; ++i) {
-            const char * gsrc  = (const char *) vx + size_t(kbx_offset + i*stride_row_x + kbw)*blck_size;
-            const int    m     = (int) ((uintptr_t) gsrc & 3);
-            const int *  gsrc4 = (const int *) ((uintptr_t) gsrc - m);
-            const int    nint  = (m + nblk*blck_size + 3) / 4;
+            const char *   gsrc   = (const char *) vx + size_t(kbx_offset + i*stride_row_x + kbw)*blck_size;
+            const int      m      = (int) ((uintptr_t) gsrc & 15);
+            const uint4 *  gsrc16 = (const uint4 *) ((uintptr_t) gsrc - m);
+            const int      nu4    = (m + nblk*blck_size + 15) / 16;
             mis[i] = m;
             // Compile-time trip count and an explicit __ldg: with a runtime loop bound ptxas
             // emits predicated *generic* loads (LD.E) for the staging reads instead of LDG,
@@ -761,8 +768,8 @@ static __global__ void mul_mat_vec_q(
 #pragma unroll
             for (int r = 0; r < stage_rounds; ++r) {
                 const int k = r*warp_size + threadIdx.x;
-                if (k < nint) {
-                    x_stage[threadIdx.y][i][k] = __ldg(gsrc4 + k);
+                if (k < nu4) {
+                    x_stage[threadIdx.y][i][k] = __ldg(gsrc16 + k);
                 }
             }
         }

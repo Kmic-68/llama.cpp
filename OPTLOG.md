@@ -363,3 +363,24 @@ old geometry: 21.60 vs 23.28):
 Split after this change (isolated q6_K, m=4096 n=1 k=14336): full 143.7 us -> loads-only
 121.3 us at vdr=2, i.e. vdr=2 already cut the arithmetic from 50 us to 22 us. Memory is now
 ~84% of the kernel, so remaining work has to come off the load path.
+
+## Attempt 12: stage in 16-byte units (uint4) -- **KEPT**
+
+The staging loop was moving 32 bits per lane, i.e. 128 bytes per warp per instruction, and at
+vdr=4 that is 7 load + 7 store instructions per row per iteration. The warp's run of blocks is
+contiguous, and shared memory already tolerates an arbitrary byte offset (that is what `mis[]`
+is for), so the run can simply be fetched from the 16-byte-aligned address *below* it and the
+offset carried into the extraction unchanged. One `uint4` instruction moves 512 bytes per warp.
+
+Global loads and shared stores both drop ~4x (7 rounds -> 2). Registers also fell 87 -> 78.
+
+| | q6_K iso us/run | t/s (tg256) |
+|---|---|---|
+| 32-bit staging | 131.5 | 24.33 |
+| **uint4 staging** | **117.0** | **26.21** |
+
+Geometry re-swept afterwards; 2x2 still optimal (2x4 24.69, 4x2 24.76, 1x2 26.00, 4x4 23.49).
+
+| # | change | t/s | verdict |
+|---|---|---|---|
+| 12 | uint4 (128-bit) staging | **26.21 +/- 0.05** | **KEPT** |
