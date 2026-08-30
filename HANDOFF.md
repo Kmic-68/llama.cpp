@@ -138,6 +138,7 @@ Reducing **bytes per token** (MTP, or a smaller quant) is the only lever that ch
 | Double-buffer the shared stage (remove the WAR barrier) | 26.38 | smem 3712 → 7168 B makes *shared memory* the occupancy limiter (14 → 9 blocks/SM) |
 | Padded/repacked global layout | not attempted | ~800-1200 lines, must be shared with MMQ, and only reaches ~30.5 |
 | Multi-column (MTP) geometry re-sweep | zero sensitivity | that path is compute bound; weights read once regardless of column count |
+| Lift the Pascal exclusion on mmvq GLU fusion | 25.49 | upstream's "not universally faster on Pascal" **still holds against the reworked kernel**: the fused kernel reads the *gate* matrix unstaged, and staging it too would double smem to 7424 B, making shared memory the occupancy limiter (14 -> 9 blocks/SM). Fusion's real upside is small anyway -- it saves the intermediate round-trip, ~18 MB/token against 22.4 GB of weights |
 | q8_1 activation padding for 128-bit `u` loads | 2% ceiling (measured) | activation is L1/L2-resident; those loads are already nearly free |
 
 ---
@@ -198,5 +199,10 @@ The only real escape is weights actually aligned in global memory.
    MMQ path (`ggml_cuda_mul_mat` picks mmvq vs MMQ per call on the same tensor, so it cannot be
    scoped to decode). Failure mode is *silently wrong dot products* that can still pass the
    perplexity band — build a bit-exactness harness first.
-4. **The batch-1 latency tail** (24% of decode, ~15 kernels). No single big win; CUDA graphs were
+4. **Algorithm choice was checked, not assumed.** `mmvf` handles only F16/F32 weights and the old
+   dequantize-mul-mat-vec path is gone from modern llama.cpp, so there is no ready-made
+   dequantize-and-FMA alternative to exploit P100's fast FP16 (2:1, the only Pascal with it, and
+   the only one without DP4A). Writing one from scratch would change the numerics materially --
+   FP16 accumulation over 14336 elements -- so it needs a perplexity plan, not just a kernel.
+5. **The batch-1 latency tail** (24% of decode, ~15 kernels). No single big win; CUDA graphs were
    the one change that could have addressed it wholesale and it measures negative.
