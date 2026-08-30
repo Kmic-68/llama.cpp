@@ -384,3 +384,63 @@ Geometry re-swept afterwards; 2x2 still optimal (2x4 24.69, 4x2 24.76, 1x2 26.00
 | # | change | t/s | verdict |
 |---|---|---|---|
 | 12 | uint4 (128-bit) staging | **26.21 +/- 0.05** | **KEPT** |
+
+---
+
+# Final state: 17.45 -> 26.26 t/s (+50%)
+
+| commit | change | t/s |
+|---|---|---|
+| (baseline) | HEAD b44f8fe6f | 17.45 |
+| d8984de0 | remove `__vsubss4` from Q6_K/Q3_K vec_dot | 17.72 |
+| c7e7faf6 | cooperative shared-memory staging of x | 20.35 |
+| f07b913a | vdr=2 for Q6_K + Pascal geometry into source | 23.28 |
+| 0732c729 | vdr=4 for Q6_K + geometry 2x2 | 24.33 |
+| 9fc142d1 | uint4 (16-byte) staging | **26.26** |
+
+Correctness at every kept step: `test-backend-ops -o MUL_MAT -b CUDA0` 1193/1193, and
+**PPL 2.7554 +/- 0.02151, identical to the stock kernel** (the reference for this repo and
+this `ppl.txt`; see the note above about CLAUDE.md's 2.6209).
+
+## Effect across quant types (isolated kernel, m=4096 n=1 k=14336, us/run)
+
+| type | staged-only (c7e7faf6) | final | |
+|---|---|---|---|
+| q6_K | 164.5 | **116.3** | -29% |
+| q3_K | 151.4 | **142.8** | -6% |
+| q8_0 | 152.1 | 150.6 | -1% |
+| q4_0 | 96.1 | 95.4 | -1% |
+| q4_K | 131.1 | 134.1 | +2% |
+| q5_K | 144.1 | 146.8 | +2% |
+| q2_K | 142.6 | 144.9 | +2% |
+
+The ~2% regressions on q4_K/q5_K/q2_K come from the launch geometry, which is Pascal-wide and
+was tuned against the Q6_K model (the only model available here). `calc_nwarps` already takes
+`type`, so a per-type Pascal table would remove them; it needs a model of each type to tune
+against, since the isolated single-shape proxy proved misleading.
+
+## Why this stops around 26-27 t/s
+
+Final measured split of the q6_K kernel: **95 us memory + ~21 us arithmetic**. Even with free
+arithmetic the kernel cannot beat ~32 t/s, and 30 t/s needs the memory side cut as well.
+
+The memory side is stuck on one structural fact: **every ggml block size is 2 mod 4**
+(block_q6_K 210, block_q8_0 34, block_q4_0 18, block_q3_K 110), because each block carries a
+2-byte `ggml_half` beside a multiple-of-4 payload. A 4-byte quant word at a 2-byte-aligned
+address costs two memory instructions instead of one, and that cost cannot be moved, only
+relocated:
+
+- read it directly from global -> two 16-bit global loads (the original code)
+- stage it and read from shared -> two 16-bit shared loads (current code)
+- strip the misalignment while staging -> the funnel shift needs the neighbouring word, which
+  costs a shuffle or a second load per word (attempts 7 and 9, both measured slower)
+- read wider (`LDS.64`/`LDS.128`) -> the 16 useful bytes still straddle two aligned units, so
+  the rotation reappears
+
+Attempts 7 and 9 both confirmed this empirically. The only escape is weights that are actually
+aligned in global memory, i.e. a repacked CUDA buffer layout (~800-1200 lines, and it must be
+shared with the MMQ path -- see `padded_stride_study.md`). With 16-byte-aligned weights the
+staging could be dropped entirely: each thread would read its 16 bytes of `ql` and `qh` with one
+128-bit load each, ~5 memory instructions per vec_dot against 19 today. That is the remaining
+lever, and it is a much larger win than the 1.27x the earlier padded-stride study estimated,
+because it composes with vdr=4.
