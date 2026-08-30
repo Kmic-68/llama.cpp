@@ -536,3 +536,36 @@ reduce bytes per token.
 Independently corroborated by measurement: mmvq takes 29.1 ms/token, and at the kernel's measured
 414 GB/s per GPU across two GPUs that is ~24 GB moved per token, matching the full 22.42 GB
 weight set. The assumption holds, so the 702 GB/s-vs-605 GB/s contradiction stands.
+
+## Attempt 16: pricing the q8_1 activation loads -- NOT WORTH DOING
+
+`quantize_row_q8_1_cuda` is called only from mmvq and `quantize_mmq_q8_1_cuda` only from mmq, so
+mmvq's q8_1 activation buffer is exclusively its own and could legally be padded from 36 to 48
+bytes per block. That would make `qs` 16-byte aligned, turning the four consecutive `u` loads
+per `i` (4 consecutive int32 = 16 contiguous bytes at vdr=4) into a single `uint4`.
+
+Before doing the invasive version (a padded CUDA-only q8_1 struct threaded through all 23
+`vec_dot_*_q8_1` signatures plus the quantize path), the ceiling was measured directly by
+collapsing the four loads into one -- deliberately wrong results, timing only:
+
+| | q6_K iso us/run |
+|---|---|
+| baseline | 116.61 |
+| four `u` loads collapsed to one (upper bound) | 114.28 |
+
+**2%.** The activation is tiny and L1/L2-resident, so those loads are already nearly free. The
+padding work would buy ~26.8 t/s. Not done.
+
+## Every remaining lever, now measured rather than estimated
+
+| lever | measured result |
+|---|---|
+| q8_1 padding for 128-bit activation loads | 2% upper bound |
+| CUDA graphs on Pascal | -1% (capture cost exceeds launch saving) |
+| `rms_norm` 256- vs 1024-thread block | neutral (latency bound, not reduction bound) |
+| 32-bit q8_1 pointer math | no-op (compiler already did it) |
+| aligning the staged copy (3 variants) | structurally break-even: rotation cost and load saving scale with the same bytes |
+| **weight repack to aligned global layout** | **the only real one: ~34 t/s, ~800-1200 lines, shared with the MMQ path, silent-wrong-answer failure mode** |
+
+The optimisation space reachable without the repack is exhausted at **26.26 t/s**, 86% of the
+30.5 t/s practical ceiling and 72% of the 36.3 t/s absolute one.
