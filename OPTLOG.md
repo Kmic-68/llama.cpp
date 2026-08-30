@@ -867,3 +867,19 @@ GROUP_NORM 2/2, ADD 99/99, MUL 91/91, CPY 246/246, CONCAT 177/177, SWIGLU 24/24,
 
 ### Time budget at ~29.9 t/s (per token per GPU)
 mul_mat_vec_q 23.0 ms | other kernels 6.0 ms | GPU idle ~4.6 ms
+
+## Attempt 56: flash-attn vec was told the wrong KV tile size — KEPT
+`ggml_cuda_flash_attn_ext_vec_case_impl` passes `D` to `launch_fattn` as nbatch_fa, but the vec
+kernel steps its KV loop by `nthreads`, not `D`. launch_fattn uses nbatch_fa only to compute
+`ntiles_KV`, which caps how many blocks may split the KV range, so wherever nthreads < D the
+parallelism is understated -- on Pascal nthreads is 128 against D = 256, so it is halved. With a
+256-long KV that made ntiles_KV = 1, pinning parallel_blocks at 1 and running the whole attention
+on **12 blocks of a 56-SM GPU** for 45-51 us a call. Passing `nthreads` is simply the accurate
+value and helps at every context length.
+- flash_attn_ext_vec 44.8 -> ~30 us
+- **29.9 -> 30.11 +/- 0.20 t/s**
+- test-backend-ops -o FLASH_ATTN_EXT: 3949/3949
+- PPL 2.7565 +/- 0.02153 (unchanged from the previous commit -- this change is bit-neutral)
+- KEPT
+
+**30 t/s reached.** 17.51 -> 30.11 = +72%.

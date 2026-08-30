@@ -540,7 +540,11 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
     const bool need_f16_K = type_K == GGML_TYPE_F16;
     const bool need_f16_V = type_V == GGML_TYPE_F16;
     constexpr size_t nbytes_shared = 0;
-    launch_fattn<D, cols_per_block, 1>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, D, need_f16_K, need_f16_V, false);
+    // The KV tile this kernel actually steps by is nthreads, not D. Passing D understates the
+    // number of KV tiles wherever nthreads < D -- Pascal runs 128 threads against D = 256 -- and
+    // launch_fattn caps the KV-parallel block count at that number, so a short context ends up on
+    // a twelfth of the SMs.
+    launch_fattn<D, cols_per_block, 1>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, nthreads, need_f16_K, need_f16_V, false);
 }
 
 template <int D, ggml_type type_K, ggml_type type_V>
