@@ -488,3 +488,38 @@ machine's 605 GB/s streaming ceiling (84%) and its arithmetic is within a few in
 minimal for a GPU without DP4A, so the kernel itself is close to done. 30 t/s needs either
 aligned weights in global memory (the repack -- see the alignment analysis above) or a broad
 attack on the batch-1 launch-latency tail.
+
+---
+
+# Is 40 t/s reachable? No -- proof from measured quantities
+
+All inputs below are measured on this machine, not spec sheets.
+
+- weights 22.42 GB, tensor-split -> **11.21 GB read per GPU per token**
+- streaming read ceiling, measured, ECC on: **605 GB/s** per GPU (spec is 732; 83% is normal)
+- at 26.26 t/s = 38.1 ms/token, split 29.1 ms mmvq / 9.0 ms everything else (nvprof)
+
+```
+40 t/s              = 25.0 ms/token
+  - 9.0 ms non-mmvq = 16.0 ms available for mmvq
+  11.21 GB / 16.0 ms = 702 GB/s per GPU   vs a 605 GB/s ceiling   -> IMPOSSIBLE
+```
+
+Even granting a *perfect* mmvq -- zero arithmetic, running at the full pure-streaming rate while
+still unpacking 6-bit quants, which is not achievable -- the ceiling is:
+
+```
+11.21 GB / 605 GB/s = 18.5 ms  ->  54.0 t/s with zero compute AND zero other kernels
+  + the measured 9.0 ms of non-mmvq work      ->  36.3 t/s ABSOLUTE CEILING
+```
+
+And with the arithmetic cost that actually exists, the measured mmvq memory floor puts the
+practical ceiling at **30.5 t/s**.
+
+**40 t/s cannot be reached by any kernel optimization on this hardware.** It requires reducing
+*bytes read per token*, which means speculative decoding (MTP) or a smaller quant -- both
+explicitly out of scope for this goal. The bandwidth-derived 60 t/s figure in the original brief
+assumed the 732 GB/s spec number and no compute or non-mmvq time; the honest equivalent is 54 t/s
+of pure streaming, 36.3 t/s once the rest of decode is counted.
+
+Delivered: **17.45 -> 26.26 t/s, +50%**, which is 86% of the 30.5 t/s practical ceiling.
