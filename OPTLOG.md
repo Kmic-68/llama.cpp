@@ -569,3 +569,26 @@ padding work would buy ~26.8 t/s. Not done.
 
 The optimisation space reachable without the repack is exhausted at **26.26 t/s**, 86% of the
 30.5 t/s practical ceiling and 72% of the 36.3 t/s absolute one.
+
+## Attempt 17: retune the multi-column (MTP) path -- nothing to tune
+
+The `ncols_dst` 2-8 geometry was still carrying values tuned for the pre-staging kernel, and
+this user runs MTP in production, so it was worth re-sweeping. Confirmed via nvprof that these
+shapes really do run `mul_mat_vec_q<q6_K, ncols_dst=4>` and not MMQ.
+
+| nwarps x rows | n=2 | n=4 | n=8 |
+|---|---|---|---|
+| 4x2 (current) | 167.89 | 273.14 | 483.25 |
+| 2x2 | 167.63 | 273.37 | 483.33 |
+| 2x4 | 167.84 | 273.49 | 483.98 |
+| 4x4 | 167.85 | 273.06 | 483.81 |
+| 1x2 | 167.78 | 273.50 | 483.34 |
+| 8x2 | 167.86 | 273.28 | 483.33 |
+
+Byte-identical across every configuration. The reason is visible in the scaling: n=4 costs only
+2.3x n=1 for 4x the output, because the weights are read once regardless of the column count.
+The multi-column path is therefore **compute bound, not load bound**, which is exactly why the
+geometry -- which only shapes the memory access pattern -- has no effect on it. Left as is.
+
+Useful consequence for MTP: the marginal cost of a draft column is low (~55 us per extra column
+against 116 us for the first), so speculative decoding amortises well on this kernel.
