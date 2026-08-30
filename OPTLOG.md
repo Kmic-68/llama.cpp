@@ -784,3 +784,31 @@ Pascal, and to runs of at most 2048 bytes.
 - test-backend-ops -o MUL_MAT: 1193/1193
 - PPL 2.7554 +/- 0.02151 (identical to stock)
 - KEPT
+
+## Attempt 43: block-wide (instead of per-warp) q8_1 staging — REVERTED
+The warps of a block cover a contiguous run of x blocks, so one staged copy could serve the whole
+block and halve the activation load instructions for the same shared memory. It requires
+__syncthreads instead of __syncwarp, and a uniform loop over the block's base block.
+28.98 -> **28.21**. The block-wide barrier costs more than the saved loads. REVERTED.
+
+## Attempt 44: geometry re-sweep after the activation staging — 2x2 still optimal
+| nwarps x rows_per_cuda_block | t/s   |
+|-----------------------------|-------|
+| 2 x 2 (current)             | 28.98 |
+| 1 x 2                       | 28.72 |
+| 2 x 4                       | 26.71 |
+
+## Attempt 45: PROBE — 4-byte-aligned x reads from shared, re-run
+Halving the 36 LDS.U.U16 per iteration is now worth **+0.35%** (28.98 -> 29.08), up from zero
+before the activation staging but still not worth the repack. The kernel is not LDS bound.
+
+## Attempt 46: keep the rms_norm row in registers — KEPT
+rms_norm_f32<1024> runs with grid (1,1,1) and 1024 threads on ncols=5120: one block owns the row,
+so nothing covers its memory latency, and it read the row twice (sum of squares, then scale).
+When the row fits in a fixed number of registers per thread (max_regs = 8), hold it there and skip
+the second read. Falls back to the strided loops for longer rows.
+- **28.98 -> 29.27 +/- 0.10 t/s** (a variant that also did l2_norm and norm measured 29.29, within
+  noise, so only the rms_norm change was kept)
+- RMS_NORM 51/51, RMS_NORM_MUL_ADD 30/30, NORM 50/50
+- PPL 2.7554 +/- 0.02151 (identical to stock)
+- KEPT

@@ -125,16 +125,55 @@ static __global__ void rms_norm_f32(const float * x,
         add += add_sample * add_stride_sample + add_channel * add_stride_channel + add_row * add_stride_row;
     }
 
-    float tmp = 0.0f; // partial sum for thread in warp
+    // A row is normalised by a single block, so no other block covers this one's memory latency
+    // and the row is read twice: once to accumulate the sum of squares and again to scale it.
+    // When the row fits in a fixed number of registers per thread, hold it there instead: the
+    // loads all issue up front, and the second pass costs nothing.
+    constexpr int max_regs = 8;
+
+    extern __shared__ float s_sum[];
 
     ggml_cuda_pdl_sync();
+
+    if (ncols <= block_size*max_regs) {
+        float xv[max_regs];
+        float tmp = 0.0f;
+#pragma unroll
+        for (int u = 0; u < max_regs; ++u) {
+            const int col = tid + u*block_size;
+            xv[u] = col < ncols ? x[col] : 0.0f;
+            tmp += xv[u] * xv[u];
+        }
+
+        tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+
+        const float mean  = tmp / ncols;
+        const float scale = rsqrtf(mean + eps);
+
+#pragma unroll
+        for (int u = 0; u < max_regs; ++u) {
+            const int col = tid + u*block_size;
+            if (col < ncols) {
+                if constexpr (do_multiply && do_add) {
+                    dst[col] = scale * xv[u] * mul[fastmodulo(col, mul_ncols_packed)] + add[fastmodulo(col, add_ncols_packed)];
+                } else if constexpr (do_multiply) {
+                    dst[col] = scale * xv[u] * mul[fastmodulo(col, mul_ncols_packed)];
+                } else {
+                    dst[col] = scale * xv[u];
+                }
+            }
+        }
+        return;
+    }
+
+    float tmp = 0.0f; // partial sum for thread in warp
+
     for (int col = tid; col < ncols; col += block_size) {
         const float xi = x[col];
         tmp += xi * xi;
     }
 
     // sum up partial sums
-    extern __shared__ float s_sum[];
     tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
 
     const float mean = tmp / ncols;
