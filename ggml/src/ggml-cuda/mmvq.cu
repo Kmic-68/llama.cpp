@@ -107,10 +107,10 @@ static constexpr __host__ __device__ int get_block_byte_size(ggml_type type) {
 #if defined(__CUDA_ARCH_LIST__) && __CUDA_ARCH_LIST__ == 600
 #define GGML_CUDA_MMVQ_PASCAL 1
 // warps per block for the multi-column (speculative decoding / small batch) path
-#define P100_MMVQ_NWARPS_N 2
+#define P100_MMVQ_NWARPS_N 4
 // output rows per block on the multi-column path: the activation is re-read by every block,
 // so its total traffic scales as 1/rows
-#define P100_MMVQ_ROWS_N   8
+#define P100_MMVQ_ROWS_N   16
 // whether the multi-column path also stages the activation (it costs shared memory that rows want)
 #endif
 

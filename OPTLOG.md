@@ -1056,3 +1056,37 @@ is still ~2.4x off its weight-streaming floor. At 8 rows the activation is ~26 M
 21 MB of weights, so the two are now comparable and further row growth is blocked by registers.
 Breaking that wall needs the accumulator count per thread reduced, which means restructuring the
 dot product rather than tuning geometry.
+
+## Attempt 62: row-outer loop nesting — REVERTED
+Every column re-derives the same unpacked weights inside vec_dot, so swapping the loops to
+row-outer/column-inner looked like it would let the compiler hoist that work. It does not:
+REG rises 200 -> 227 and pp512 falls 82.12 -> 78.80. The compiler carries more per-column state
+instead. Reverted. Hoisting it for real needs a vec_dot that takes pre-unpacked weights, which is
+an interface change across every quant type.
+
+## Attempt 63: scale warps and rows together, keeping 4 rows per warp — KEPT
+The earlier sweep varied rows at fixed nwarps and so kept changing *rows per warp*, which is what
+sets register pressure. Holding rows_per_warp at 4 (REG:182) and scaling nwarps and rows together
+lets a block cover far more rows, and the activation traffic keeps falling as 1/rows:
+| nwarps x rows (rows/warp) | pp512 |
+|---------------------------|-------|
+| 4 x 2 (stock)             | 61.08 |
+| 2 x 8  (4)                | 82.10 |
+| **4 x 16 (4)**            | **88.87** |
+| 8 x 32 (4)                | 89.20 |
+| 6 x 24 (4)                | 79.80 |
+| 2 x 10 (5)                | 81.52 |
+8x32 is marginally faster but a block then needs 32 rows to be worth launching; 4x16 is within
+noise of it and degrades better on models with narrower matrices, so 4x16 is kept.
+
+## Multi-column result
+| metric | stock | now |
+|---|---|---|
+| pp512 (b=7 ub=7) | 61.08 | **88.87 (+45%)** |
+| `mul_mat_vec_q<ncols=7>` | 188.1 us | ~118 us |
+| **MTP decode** | **32.94 t/s** | **38.69 t/s (+17%)** |
+| MTP speedup over plain decode | 1.11x | **1.30x** |
+| tg256 (one-column path) | 29.9 | 29.83 |
+
+test-backend-ops MUL_MAT 1193/1193. Perplexity through the changed path (-b 7 -ub 7, 4 chunks):
+3.6199 +/- 0.08383, against 3.6237 +/- 0.08411 for the stock geometry on the identical command.
