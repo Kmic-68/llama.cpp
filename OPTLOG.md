@@ -883,3 +883,24 @@ value and helps at every context length.
 - KEPT
 
 **30 t/s reached.** 17.51 -> 30.11 = +72%.
+
+## Attempt 57: lower vdr for q6_K to buy occupancy — REVERTED
+Every failed mmvq restructure lost the same way: it spent shared memory to save traffic and gave
+up blocks per SM. vdr sets how many quant words a thread takes, so lowering it shrinks both stages
+(vdr=2 would put shared memory at ~3.3 kB and occupancy at 19 blocks/SM against 10). It does not
+help -- the loss from the shorter dot product swamps the extra occupancy:
+| VDR_Q6_K_Q8_1_MMVQ | t/s   |
+|--------------------|-------|
+| 4 (current)        | 30.11 |
+| 2                  | 27.00 |
+| 1                  | 21.34 |
+Both variants pass test-backend-ops MUL_MAT 1193/1193. vdr = 4 stands.
+
+## Where 40 t/s stands
+At 30.11 t/s the token costs 33.2 ms, of which mul_mat_vec_q is 23.0 ms per GPU (11.2 GB of
+weights at ~487 GB/s), other kernels ~5.5 ms and launch/sync overhead ~4.6 ms. 40 t/s is 25 ms, so
+**even a free tail and zero gaps cap the current mmvq at 43.5 t/s** -- the target needs the matmul
+itself down near its 20.3 ms staging-only floor (552 GB/s) *and* the remaining 10 ms of tail and
+overhead cut to under 5. Getting there is not a matter of one more kernel: it needs either fewer
+launches (roughly 2150 per token per GPU today) or a weight layout that streams closer to the
+605 GB/s wall.
