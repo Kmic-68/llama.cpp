@@ -935,3 +935,44 @@ were 67-69 C with no throttle flags, so this is contention, not thermal.
 an idle machine with repeats. The large results (the activation staging at +5.4%, the fastdiv work,
 the flash-attn fix) are well clear of it; the 0.17 t/s between the bit-exact and float4 norm builds
 is not, and should be treated as unmeasured rather than as a real cost.
+
+## Sustained throughput, and a correction to the noise diagnosis above
+
+The "measurement caveat" section above blames desktop/Sunshine contention for the run-to-run
+variance and states "contention, not thermal". **That is wrong.** It was inferred from a sample
+taken at 67 C before the cards had saturated. Sampling the throttle reasons *during* a sustained
+load shows what actually happens:
+
+| state | GPU0 | GPU1 |
+|---|---|---|
+| start of load | 66 C, 1328 MHz, no flags | 69 C, 1328 MHz, no flags |
+| ~1 min in | 72 C, 1265 MHz, **sw_power_cap active** | 76 C, 1265 MHz, **sw_power_cap active** |
+| ~2 min in | 76 C, 1252 MHz, sw_power_cap | 79 C, 1139 MHz, **sw_thermal_slowdown active** |
+| steady state | 79 C, ~1150-1320 MHz, sw_power_cap | 79 C, **949 MHz**, sw_thermal_slowdown |
+
+Both cards hit the 175 W power cap first, then GPU1 hits thermal slowdown at 79 C and drops to
+around 950 MHz - roughly 70% of its 1328 MHz boost. GPU1 runs hotter and throttles harder than
+GPU0 at every point, which points at airflow rather than anything in software.
+
+Measured, same binary, same command:
+
+| condition | t/s |
+|---|---|
+| tg256, cards cold (53/54 C) | **29.59 +/- 0.20** |
+| tg256, cards at steady state (77/78 C) | **24.77 +/- 2.36** |
+| tg2048, from steady state | **22.74 +/- 1.23** |
+| tg4096, from cold (so partly inflated) | 24.19 +/- 2.87 |
+
+So the honest headline is two numbers, not one: **~29.6 t/s burst, ~23-25 t/s sustained**, and the
+gap is entirely power and cooling. Note tg256-hot (24.77) and tg2048-hot (22.74) are close, so the
+growing KV cache costs far less than the throttling does - the flash-attn path scales better with
+context than the thermal envelope does with time.
+
+This is not addressable in kernels, and CLAUDE.md forbids touching nvidia-smi power/clock settings.
+Better airflow over GPU1 specifically would recover most of it.
+
+**Consequence for every A/B number in this log:** they were taken at whatever thermal state the
+machine happened to be in. Comparisons made back to back within one command are roughly fair
+(both sides hot); comparisons made minutes apart are not. Anything below ~0.5 t/s should be
+re-measured from a controlled thermal state before being believed. The large results are far
+enough clear of this to stand.
