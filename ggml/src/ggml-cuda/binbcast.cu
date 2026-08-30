@@ -98,6 +98,37 @@ static __global__ void k_bin_bcast(const src0_t *         src0,
     }
 }
 
+// Every operand has the destination's shape and is contiguous: no broadcasting, no strides, no
+// index arithmetic. This is the shape of a residual add or an elementwise gate, and those launches
+// are small enough that the general kernel's per-element fastmodulo and its two-elements-per-thread
+// stride loop cost more than the memory traffic does.
+template <float (*bin_op)(const float, const float),
+          typename src0_t,
+          typename src1_t,
+          typename dst_t,
+          typename... src1_ptrs>
+static __global__ void k_bin_bcast_flat(const src0_t * src0,
+                                        const src1_t * src1,
+                                        dst_t *        dst,
+                                        const uint32_t ne,
+                                        src1_ptrs...   src1s) {
+    ggml_cuda_pdl_lc();
+    const uint32_t i = blockDim.x*blockIdx.x + threadIdx.x;
+
+    ggml_cuda_pdl_sync();
+    if (i >= ne) {
+        return;
+    }
+
+    float result = (float) src0[i];
+    if constexpr (sizeof...(src1_ptrs) > 0) {
+        result = (..., (result = bin_op(result, (float) src1s[i])));
+    } else {
+        result = bin_op(result, (float) src1[i]);
+    }
+    dst[i] = (dst_t) result;
+}
+
 template <float (*bin_op)(const float, const float),
           typename src0_t,
           typename src1_t,
@@ -169,6 +200,29 @@ static void launch_bin_bcast_pack(const ggml_tensor * src0, const ggml_tensor * 
                                   const src0_t * src0_dd, const src1_t * src1_dd, dst_t * dst_dd,
                                   cudaStream_t stream, std::index_sequence<I...>) {
     GGML_TENSOR_BINARY_OP_LOCALS
+
+    {
+        const bool extras_flat[] = { true,
+            (ggml_is_contiguous(dst->src[I + 1]) && ggml_are_same_shape(dst->src[I + 1], dst))... };
+        bool flat = src0_dd != nullptr && src1_dd != nullptr &&
+                    ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
+                    ggml_are_same_shape(src0, dst) && ggml_are_same_shape(src1, dst);
+        for (size_t k = 0; k < sizeof(extras_flat)/sizeof(bool); ++k) {
+            flat = flat && extras_flat[k];
+        }
+
+        const int64_t ne_flat = ggml_nelements(dst);
+        if (flat && ne_flat <= int64_t(std::numeric_limits<uint32_t>::max())) {
+            const int     block_size = 256;
+            const int64_t block_num  = (ne_flat + block_size - 1) / block_size;
+            const ggml_cuda_kernel_launch_params launch_params =
+                ggml_cuda_kernel_launch_params((dim3) block_num, block_size, 0, stream);
+            ggml_cuda_kernel_launch(k_bin_bcast_flat<bin_op, src0_t, src1_t, dst_t, type_for_index<const src1_t *, I>...>,
+                launch_params, src0_dd, src1_dd, dst_dd, (uint32_t) ne_flat,
+                (const src1_t *) dst->src[I + 1]->data...);
+            return;
+        }
+    }
 
     int nr0 = ne10 / ne0;
     int nr1 = ne11 / ne1;

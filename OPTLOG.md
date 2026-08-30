@@ -812,3 +812,58 @@ the second read. Falls back to the strided loops for longer rows.
 - RMS_NORM 51/51, RMS_NORM_MUL_ADD 30/30, NORM 50/50
 - PPL 2.7554 +/- 0.02151 (identical to stock)
 - KEPT
+
+## Attempts 47-51: mmvq restructures around the activation staging — ALL REVERTED
+The no-activation probe still shows 30.70 t/s, so ~5% of the token is the residual activation
+cost. Five restructures aimed at it, none paid:
+| variant                                                              | t/s   |
+|----------------------------------------------------------------------|-------|
+| baseline (2 warps x 2 rows, per-warp activation stage)                | 29.32 |
+| block-wide activation stage (__syncthreads instead of __syncwarp)     | 28.21 |
+| warps own distinct rows + block-wide stage, 4 rows/block              | 29.19 |
+| same, 2 rows/block                                                    | 29.17 |
+| 4 rows/block with the weight stage chunked 2 rows at a time           | 27.12 |
+| 1 warp x 4 rows (4x less activation traffic, 13 blocks/SM)            | 27.58 |
+| register-carried prefetch pipeline (one iteration ahead)              | 28.74 |
+The 1x4 result is the informative one: it moves a quarter of the activation bytes and is still
+6% slower, so what binds is **warps resident per SM**, not L2 traffic or load instructions.
+Shared memory is the occupancy limiter (6144 B/block -> 10 blocks/SM), which is why every variant
+that spends more shared memory to save traffic loses. mul_mat_vec_q is a firm local optimum here.
+
+## The real find: sm_60 has no integer divider
+64-bit division in per-element index math costs dozens of instructions on Pascal, and several tail
+kernels did four to eight of them per element. Replacing them with the existing 32-bit
+multiply-shift helpers (init_fastdiv_values/fastdiv/fast_div_modulo) is worth more than anything
+left in mul_mat_vec_q.
+
+## Attempt 52: contiguous fast path for the elementwise binary kernels — KEPT
+When every operand has the destination's shape and is contiguous (residual adds, elementwise
+gates) there is no broadcasting to resolve, so skip the generic kernel's per-element fastmodulo
+and its two-elements-per-thread stride loop entirely.
+k_bin_bcast 3.07 -> 2.09 us. **29.32 -> 29.44 t/s.** Block size 64/128/256 all equivalent.
+
+## Attempt 53: fastdiv in cpy_scalar — KEPT
+Eight 64-bit divisions per element. 4.85 -> 2.54 us. **29.44 -> 29.65 t/s.**
+
+## Attempt 54: fastdiv in the gated unary kernels and in concat_cont — KEPT
+Two 64-bit divisions per element each. unary_gated 2.76 -> 2.57 us, concat_cont 4.40 -> 3.95 us.
+**29.65 -> 29.74 t/s.**
+
+## Attempt 55: float4 loads in the norm kernels — KEPT
+rms_norm_f32<1024> runs as a single block on a 5120-wide row, so the SM's request throughput -- not
+bandwidth -- is what limits it; one float4 request carries four times the payload of a float one.
+Guarded on ncols % 4 == 0, 16-byte alignment, and (for the fused mul/add) the operand having the
+same width so the fastmodulo is the identity.
+rms_norm_f32<1024> 6.83 -> ~5 us. **29.74 -> 29.98 t/s** (-r 3), 29.81 +/- 0.20 on a -r 5 rerun.
+The same treatment for l2_norm_f32 and norm_f32 is worth ~0.2 t/s (29.78 without vs 29.98 with).
+
+### Note on perplexity
+This batch measures **PPL 2.7565 +/- 0.02153** against the stock 2.7554 +/- 0.02151 -- the first
+change in the session not to reproduce the stock value exactly. The cause is the norm kernels'
+reassociated FP32 reduction (four floats per register now sum in a different order); the index-math
+changes are bit-exact. The shift is 0.04% of the value and 5% of the error bar, and
+test-backend-ops passes RMS_NORM 51/51, RMS_NORM_MUL_ADD 30/30, L2_NORM 20/20, NORM 50/50,
+GROUP_NORM 2/2, ADD 99/99, MUL 91/91, CPY 246/246, CONCAT 177/177, SWIGLU 24/24, SET_ROWS 159/159.
+
+### Time budget at ~29.9 t/s (per token per GPU)
+mul_mat_vec_q 23.0 ms | other kernels 6.0 ms | GPU idle ~4.6 ms

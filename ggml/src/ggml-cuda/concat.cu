@@ -1,6 +1,7 @@
 #include "concat.cuh"
 
 #include <stdint.h>
+#include <limits>
 
 // contiguous kernels
 template <typename T, int dim>
@@ -12,15 +13,18 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE) concat_cont(con
                                                                              int64_t   ne02,
                                                                              int64_t   ne0,
                                                                              int64_t   ne1,
-                                                                             int64_t   ne2) {
+                                                                             int64_t   ne2,
+                                                                             uint3     split_fd) {
     static_assert(dim >= 0 && dim <= 2, "dim must be in [0, 2]");
 
     const int64_t n = ne0 * ne1 * ne2;
 
+    // split_fd divides by ne0 (dim 0) or by the destination plane (dim 1) with a multiply-shift:
+    // sm_60 has no integer divider, so the 64-bit division this used to do per element dominated.
     ggml_cuda_pdl_sync();
     for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t) blockDim.x * gridDim.x) {
         if constexpr (dim == 0) {
-            const int64_t row = i / ne0;
+            const int64_t row = fastdiv((uint32_t) i, split_fd);
             const int64_t i0  = i - row * ne0;
 
             if (i0 < ne00) {
@@ -32,7 +36,7 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE) concat_cont(con
             const int64_t dst_plane  = ne0 * ne1;
             const int64_t src0_plane = ne0 * ne01;
             const int64_t src1_plane = dst_plane - src0_plane;
-            const int64_t i2         = i / dst_plane;
+            const int64_t i2         = fastdiv((uint32_t) i, split_fd);
             const int64_t i01        = i - i2 * dst_plane;
 
             if (i01 < src0_plane) {
@@ -67,16 +71,21 @@ static void concat_cont_cuda(const T * x,
     const int64_t n          = ne0 * ne1 * ne2;
     const int     num_blocks = (n + CUDA_CONCAT_BLOCK_SIZE - 1) / CUDA_CONCAT_BLOCK_SIZE;
 
+    GGML_ASSERT(n <= int64_t(std::numeric_limits<uint32_t>::max()));
+
     if (dim == 0) {
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, CUDA_CONCAT_BLOCK_SIZE, 0, stream);
-        ggml_cuda_kernel_launch(concat_cont<T, 0>, launch_params, x, y, dst, ne00, ne01, ne02, ne0, ne1, ne2);
+        ggml_cuda_kernel_launch(concat_cont<T, 0>, launch_params, x, y, dst, ne00, ne01, ne02, ne0, ne1, ne2,
+            init_fastdiv_values((uint32_t) ne0));
         return;
     }
     if (dim == 1) {
-        concat_cont<T, 1><<<num_blocks, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(x, y, dst, ne00, ne01, ne02, ne0, ne1, ne2);
+        concat_cont<T, 1><<<num_blocks, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(x, y, dst, ne00, ne01, ne02, ne0, ne1, ne2,
+            init_fastdiv_values((uint32_t) (ne0*ne1)));
         return;
     }
-    concat_cont<T, 2><<<num_blocks, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(x, y, dst, ne00, ne01, ne02, ne0, ne1, ne2);
+    concat_cont<T, 2><<<num_blocks, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(x, y, dst, ne00, ne01, ne02, ne0, ne1, ne2,
+        init_fastdiv_values(1u));
 }
 
 // non-contiguous kernel (slow)
