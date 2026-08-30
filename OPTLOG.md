@@ -656,3 +656,26 @@ per row. Replacing it with the compile-time `stage_u4` cut the loop body 421 -> 
 XMADs 56 -> 38, but staged ~3% more bytes every iteration and measured 26.65. Using the
 compile-time *product* instead (keeping `m` runtime) still measured 26.72 against 27.03, with
 registers 66 -> 70. The compiler's original form wins; left alone.
+
+## Attempts 23-24: wide shared reads with funnel-shift at extraction -- REVERTED
+
+The better form of the alignment idea: leave staging alone (so no extra *global* loads, the
+mistake in attempts 19-21) and instead read the vdr contiguous quant words with vdr+1 aligned
+32-bit shared loads plus funnel shifts. For vdr=4 that is 5 shared loads instead of 8, the shift
+is constant for the whole group, and the shifts land on the idle ALU.
+
+| variant | LDG | LDS | LD.E | regs | q6_K iso | t/s |
+|---|---|---|---|---|---|---|
+| **kept** | **8** | **34** | **0** | **66** | **108.9 us** | **27.03** |
+| wide reads via uintptr_t arithmetic | 14 | 6 | (generic) | 86 | 116.9 us | 25.61 |
+| wide reads, provenance preserved | 14 | 26 | 0 | 77 | 109.5 us | 26.86 |
+
+The first version was sabotaged by a subtle bug worth recording: **casting a shared-memory pointer
+through `uintptr_t` and back loses the address space**, so ptxas emitted generic loads instead of
+`LDS`. Deriving the aligned pointer from the original with `char *` arithmetic fixes it (`LD.E`
+back to 0, `LDS` 6 -> 26) and recovers most of the loss -- but the `vlv`/`vhv` arrays cost 11
+registers, and at 2 warps/block that outweighs the 8 shared loads saved.
+
+Every remaining variant now trades one resource for another and nets negative: cutting shared
+loads costs registers or global loads, cutting instructions costs registers, cutting staged bytes
+costs global traffic. 27.03 is a deep local optimum for this kernel structure.
