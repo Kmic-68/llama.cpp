@@ -1251,3 +1251,71 @@ us, the round 75 -> 68 ms, and MTP to about 53.5 t/s. So **~53-55 t/s is the cei
 structure**, and 60 needs a different one: a kernel whose activation cost does not scale with the
 block count, which means many more rows per block, which means an accumulator layout that does not
 put ncols x rows floats in registers. That is a redesign, not a tuning knob.
+
+---
+
+## Attempt 69 — independent numerical audit + two real defects fixed
+
+Three adversarial auditors were tasked with *falsifying* the bit-exactness
+claim, one per file group. Result: the claim was false, and three genuine
+defects surfaced.
+
+**Refuted (all "fewer or differently-grouped roundings", never worse):**
+- `calc_nwarps` 4->2 at ncols_dst==1 halves the K-loop stride, so each thread
+  accumulates a different subset of K-blocks. 2 partial trees instead of 4.
+- `VDR_Q6_K_Q8_1_MMVQ` 1->4 folds four separately-rounded float lanes into one
+  exact int accumulator (|acc| <= 262144 < 2^24). Strictly *fewer* roundings.
+- The flash-attn tile fix changes `parallel_blocks`, hence the KV partition and
+  the online-softmax combination. Differs in 21.5% of D=64 and 36.6% of D=256
+  configs.
+
+**Confirmed bit-exact (exhaustive machine proof, not sampling):**
+- dp4a PRMT+XMAD emulation: 22,466,048 cases, 0 mismatches.
+- q6_K/q3_K `__vsubss4` removal: exhaustive per-byte; saturation provably
+  unreachable (operands in [-32,31] and [-4,3], never near +/-127).
+- `rms_norm` register path: strided ownership preserved, zero-padding appended
+  after real terms, `tmp` never -0.0 so the added +0.0 is a bit-exact identity.
+- `binbcast` fast path: 384 predicate-satisfying shapes, 0 divergences.
+- q8_1 activation cache: 8 stale-read vectors enumerated, all closed.
+
+**Magnitude (the question that actually matters).** Layer-0 relative RMS error
+is 9.8e-08 -- fp32 machine epsilon is 1.19e-07, i.e. one rounding. Growth is
+smooth and geometric (~1.09x/layer) to 4.4e-02 at layer 63, with no
+discontinuity: chaotic amplification of rounding noise, not a defect. At the
+output: KL 1.97e-03 nats, argmax and full top-10 identical. Control: switching
+the KV cache q4_0 <-> f16 perturbs the model 2.6x *more* (KL 5.14e-03).
+
+**Whole-graph diff.** 2966/3847 tensors differ, first divergence at `node_13`
+(layer-0 QKV projection); the 881 that match are exactly those never routed
+through `mul_mat_vec_q`. Harness in `p100-handoff/tools/`.
+
+**Fixed and committed:**
+- `2c0d39158` MoE OOB *write*: row guards used `stride_col_dst` (== ne0*ne1 for
+  MUL_MAT_ID) instead of `nrows_x`. Upstream immune at 1 row/block; reachable
+  here at 2. Odd `nrows_x` wrote into the next expert's dst slot.
+- `7d004be91` fastdiv guards were off by 2x (2^32 vs the true 2^31 domain);
+  added int64 fallbacks rather than aborting where upstream worked.
+
+Both: MUL_MAT and MUL_MAT_ID 3/3 backends, PPL 2.6209 +/- 0.01994, 29.81 t/s.
+
+## Attempt 70 — the perplexity gate had silently decalibrated
+
+`CLAUDE.md` requires PPL 2.6209 +/- 0.0199. Every build read 2.7554. Cause was
+neither this work nor the prior session's: the corpus recipe
+
+    cat README.md docs/*.md docs/**/*.md | head -c 800000 > /tmp/ppl.txt
+
+reads whatever the docs say *that day*. The Aug 24 upstream pull moved the docs
+from 420,098 to 422,246 bytes, so the gate decalibrated the moment the repo was
+updated, and `/tmp/ppl.txt` was later cleared.
+
+Proof no code regressed -- same corpus, three builds, identical every chunk:
+upstream `f280b2698`, prior `b44f8fe6f`, and this work all 2.7554 +/- 0.02151.
+
+The Aug-18 corpus was reconstructed from git (`p100-handoff/ppl-orig.txt`,
+420,098 bytes) and reproduces the reference exactly: all 30 chunks identical,
+`[1]4.9923 ... [30]2.6209`, final 2.6209 +/- 0.01994.
+
+**Rule: pin the corpus, never regenerate it.** A perplexity gate defined as a
+shell command instead of a fixed file will drift out from under you silently.
+See `p100-handoff/CORPUS.md`.
