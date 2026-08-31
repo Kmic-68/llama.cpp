@@ -5,6 +5,7 @@
 // PROBE SWITCHES (sed 0->1); both break results, valid only on fixed-work benchmarks
 #define P100_NOY     0
 #define P100_MEMONLY 0
+#define P100_NOUNPACK 0
 
 
 #include <cstdint>
@@ -1060,8 +1061,15 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
         for (int i = 0; i < QR6_K; ++i) {
             // 6-bit quant biased by -32, pre-scaled by 4 so the sign lands in bit 7; the factor
             // of 4 is undone once in the return statement.
+#if P100_NOUNPACK
+            // PROBE: keep both loads and the dp4a, drop the shift/mask unpack that every column
+            // currently redoes, to price how much of the kernel that redundancy is worth.
+            const int vil4 = vl;
+            const int vih4 = vh;
+#else
             const int vil4 = (4*i >= 2 ? (vl >> (4*i - 2)) : (vl << (2 - 4*i))) & 0x3C3C3C3C;
             const int vih4 = ((vh << (6 - 4*i)) & 0xC0C0C0C0) ^ 0x80808080;
+#endif
 
 #if P100_NOY
             const int u = 0x01010101;

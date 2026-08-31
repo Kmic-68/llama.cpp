@@ -774,14 +774,23 @@ static __global__ void mul_mat_vec_q(
     constexpr int y_blocks_per_warp = blocks_per_warp * (qk/QK8_1);
     constexpr int y_stage_bytes     = y_blocks_per_warp * (int) sizeof(block_q8_1);
 #ifdef GGML_CUDA_MMVQ_PASCAL
-    constexpr bool stage_y = ncols_dst == 1 && y_stage_bytes <= 2048;
+    // One column, staged per warp: each warp walks its own slice of K.
+    constexpr bool stage_y_warp  = ncols_dst == 1 && y_stage_bytes <= 2048;
+    // Several columns, staged once for the whole block: with split_rows every warp walks the same
+    // K, so a single copy serves them all. The activation is 44% of this kernel and its main
+    // register consumer (removing it takes REG 168 -> 71), and at this geometry occupancy is capped
+    // by registers rather than shared memory, so the stage is effectively free.
+    constexpr bool stage_y_block = split_rows && y_stage_bytes <= 2048;
+    constexpr bool stage_y       = stage_y_warp || stage_y_block;
+    constexpr int  y_slots       = stage_y_block ? ncols_dst : nwarps;
 #else
     constexpr bool stage_y = false;
 #endif
     constexpr int y_stage_u4     = stage_y ? (y_stage_bytes + 15 + 15)/16 : 1;
-    constexpr int y_stage_rounds = (y_stage_u4 + warp_size - 1) / warp_size;
+    constexpr int y_stage_rounds = (y_stage_u4 + nwarps*warp_size - 1) / (nwarps*warp_size);
+    constexpr int y_stage_rounds_warp = (y_stage_u4 + warp_size - 1) / warp_size;
 
-    __shared__ uint4 y_stage[nwarps][y_stage_u4];
+    __shared__ uint4 y_stage[y_slots][y_stage_u4];
 
     const int sub = threadIdx.x / (qi/vdr);  // which of the warp's blocks this thread reads
     const int kqs = vdr * (tid % (qi/vdr));  // x block quant index when casting the quants to int
@@ -794,7 +803,8 @@ static __global__ void mul_mat_vec_q(
     for (int kbw = split_rows ? 0 : int(threadIdx.y)*blocks_per_warp; kbw < blocks_per_row_x; kbw += kb_stride) {
         const int nblk = min(blocks_per_warp, blocks_per_row_x - kbw);
 
-        __syncwarp(); // previous iteration's readers must finish before we overwrite the stage
+        // previous iteration's readers must finish before we overwrite the stage
+        if constexpr (stage_y_block) { __syncthreads(); } else { __syncwarp(); }
 #pragma unroll
         for (int i = 0; i < rows_per_warp; ++i) {
             // Clamp the row used for addressing: a block covers rows_per_cuda_block rows whether or
@@ -819,21 +829,41 @@ static __global__ void mul_mat_vec_q(
             }
         }
 
-        int ymis = 0; // byte offset of the q8_1 run inside its staged copy
-        if constexpr (stage_y) {
+        int ymis[y_slots] = { 0 }; // byte offset of each staged run inside its copy
+        if constexpr (stage_y_warp) {
             const char *  ysrc   = (const char *) (y + kbw*(qk/QK8_1));
-            ymis = (int) ((uintptr_t) ysrc & 15);
-            const uint4 * ysrc16 = (const uint4 *) ((uintptr_t) ysrc - ymis);
-            const int     nyu4   = (ymis + nblk*(qk/QK8_1)*(int) sizeof(block_q8_1) + 15) / 16;
+            ymis[0] = (int) ((uintptr_t) ysrc & 15);
+            const uint4 * ysrc16 = (const uint4 *) ((uintptr_t) ysrc - ymis[0]);
+            const int     nyu4   = (ymis[0] + nblk*(qk/QK8_1)*(int) sizeof(block_q8_1) + 15) / 16;
 #pragma unroll
-            for (int r = 0; r < y_stage_rounds; ++r) {
+            for (int r = 0; r < y_stage_rounds_warp; ++r) {
                 const int k = r*warp_size + threadIdx.x;
                 if (k < nyu4) {
                     y_stage[threadIdx.y][k] = __ldg(ysrc16 + k);
                 }
             }
+            __syncwarp();
+        } else if constexpr (stage_y_block) {
+            // Every warp is on the same kbw here, so the whole block fetches one copy per column.
+#pragma unroll
+            for (int j = 0; j < ncols_dst; ++j) {
+                const char *  ysrc   = (const char *) (y + j*stride_col_y + kbw*(qk/QK8_1));
+                const int     m      = (int) ((uintptr_t) ysrc & 15);
+                const uint4 * ysrc16 = (const uint4 *) ((uintptr_t) ysrc - m);
+                const int     nyu4   = (m + nblk*(qk/QK8_1)*(int) sizeof(block_q8_1) + 15) / 16;
+                ymis[j] = m;
+#pragma unroll
+                for (int r = 0; r < y_stage_rounds; ++r) {
+                    const int k = r*nwarps*warp_size + tid;
+                    if (k < nyu4) {
+                        y_stage[j][k] = __ldg(ysrc16 + k);
+                    }
+                }
+            }
+            __syncthreads();
+        } else {
+            __syncwarp();
         }
-        __syncwarp();
 
         const int kbx = kbw + sub;
         if (kbx < blocks_per_row_x) {
@@ -847,7 +877,8 @@ static __global__ void mul_mat_vec_q(
                     if constexpr (stage_y) {
                         // Derived with char* arithmetic from the shared array itself: a uintptr_t
                         // round trip loses the shared window and ptxas silently emits generic loads.
-                        const char * ys = (const char *) y_stage[threadIdx.y] + ymis
+                        const int    slot = stage_y_block ? j : int(threadIdx.y);
+                        const char * ys = (const char *) y_stage[slot] + ymis[stage_y_block ? j : 0]
                                         + sub*(qk/QK8_1)*(int) sizeof(block_q8_1);
                         tmp[j][i] += vec_dot_q_cuda(xs, (const block_q8_1 *) ys, 0, kqs);
                     } else {

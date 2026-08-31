@@ -1204,3 +1204,50 @@ halved. Neither is a tuning knob:
 One transient `1192/1193` on test-backend-ops MUL_MAT was observed on the committed tree, not
 reproducible in three immediate re-runs (1193/1193 each). Probably a tolerance-borderline case or
 contention from the desktop; recorded here in case it recurs.
+
+## Attempt 67: PROBES — what the multi-column kernel actually spends its time on
+At ncols=4 (pp512 ub=4 baseline 70.55, REG:168), each probe keeps the rest of the kernel intact:
+| probe | pp512 | gain | REG |
+|-------|-------|------|-----|
+| activation replaced by a constant | **101.95** | **+44%** | **71** |
+| dp4a deleted | 75.74 | +7.3% | 126 |
+| weight unpack deleted | 74.56 | +5.7% | 140 |
+
+Two conclusions. The activation is 44% of the kernel *and* its main register consumer -- removing
+it takes REG from 168 to 71, which is why registers cap occupancy at 12 warps/SM. And the
+unpack-once idea is dead: deleting the unpack **entirely** is worth 5.7%, so hoisting it out of the
+column loop recovers at most three quarters of that, ~4% of the kernel and ~1.4% end to end. That
+refactor (a vec_dot taking pre-unpacked weights, across every quant type) is not worth doing.
+
+## Attempt 68: block-wide activation staging for the multi-column path — KEPT
+With split_rows every warp walks the same K, so one staged copy serves the whole block: 4736 bytes
+at ncols=4, and since occupancy here is capped by registers rather than shared memory it is free.
+- pp512 (ub=4) 70.55 -> **71.44**, REG 168 -> 144
+- **MTP 48.6-49.3 -> 50.10 / 50.15 t/s** (two runs)
+- tg256 unchanged at 29.83; MUL_MAT 1193/1193
+- PPL: 2.7554 +/- 0.02151 on the standard gate, 3.6199 +/- 0.08383 through the changed path
+  (stock geometry gives 3.6237 +/- 0.08411 on that command)
+
+Note this recovers only 1.3% of the activation's 44%. Staging fixes the access pattern, not the
+byte count -- the third independent confirmation that past one column the activation cost is volume
+and latency, not fan-out.
+
+## Why 60 t/s is out of reach with this kernel structure
+Round is 75 ms at ~50 t/s; 60 t/s needs 60.7 ms, so -14 ms. The verify kernel is 45 ms of it.
+Everything measurable in that kernel has now been priced:
+| component | worth at most |
+|-----------|---------------|
+| all arithmetic (dp4a + unpack) | ~13% of the kernel |
+| activation access pattern (staging) | 1.3% (measured, taken) |
+| activation *volume* | the remaining ~43%, and only rows-per-block reduces it |
+
+Activation traffic is `nblocks x ncols x row_bytes`, so **only more rows per block reduces it** --
+staging it earlier or differently moves the same bytes. Rows per block is capped by registers
+(REG:168 at 4 rows/warp), and every way of lowering registers costs more than it returns:
+rows/warp 4->2 takes REG to 118 but pp512 to 61.76; __launch_bounds__ capping spills.
+
+Granting *all* the arithmetic for free -- which no real change achieves -- the kernel goes 88 -> 76
+us, the round 75 -> 68 ms, and MTP to about 53.5 t/s. So **~53-55 t/s is the ceiling for this
+structure**, and 60 needs a different one: a kernel whose activation cost does not scale with the
+block count, which means many more rows per block, which means an accumulator layout that does not
+put ncols x rows floats in registers. That is a redesign, not a tuning knob.
