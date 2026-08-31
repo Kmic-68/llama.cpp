@@ -71,7 +71,13 @@ static void concat_cont_cuda(const T * x,
     const int64_t n          = ne0 * ne1 * ne2;
     const int     num_blocks = (n + CUDA_CONCAT_BLOCK_SIZE - 1) / CUDA_CONCAT_BLOCK_SIZE;
 
-    GGML_ASSERT(n <= int64_t(std::numeric_limits<uint32_t>::max()));
+    // dim 2 does not use fastdiv at all; dims 0 and 1 divide the linear index n
+    // by ne0 / (ne0*ne1) respectively, so both numerator and divisor must be in
+    // the fastdiv domain. See GGML_CUDA_FASTDIV_MAX in common.cuh.
+    if (dim != 2) {
+        GGML_ASSERT(n <= int64_t(GGML_CUDA_FASTDIV_MAX));
+        GGML_ASSERT((dim == 0 ? ne0 : ne0*ne1) <= int64_t(GGML_CUDA_FASTDIV_MAX));
+    }
 
     if (dim == 0) {
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, CUDA_CONCAT_BLOCK_SIZE, 0, stream);

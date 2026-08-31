@@ -250,9 +250,9 @@ static void ggml_cpy_scalar_cuda(
         GGML_ASSERT(num_blocks <= INT_MAX);
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream);
 
-        if (ne <= int64_t(std::numeric_limits<uint32_t>::max()) &&
-            ne00*ne01*ne02 <= int64_t(std::numeric_limits<uint32_t>::max()) &&
-            ne10*ne11*ne12 <= int64_t(std::numeric_limits<uint32_t>::max())) {
+        if (ne <= int64_t(GGML_CUDA_FASTDIV_MAX) &&
+            ne00*ne01*ne02 <= int64_t(GGML_CUDA_FASTDIV_MAX) &&
+            ne10*ne11*ne12 <= int64_t(GGML_CUDA_FASTDIV_MAX)) {
             ggml_cuda_kernel_launch(cpy_scalar_fastdiv<cpy_1_scalar<src_t, dst_t>>, launch_params,
                 cx, cdst, (uint32_t) ne,
                 init_fastdiv_values((uint32_t) (ne00*ne01*ne02)), init_fastdiv_values((uint32_t) (ne00*ne01)),

@@ -260,6 +260,24 @@ void ggml_cuda_op_softplus(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 }
 /* gated ops */
 
+// Reference form, used when the element count exceeds the fastdiv domain
+// (GGML_CUDA_FASTDIV_MAX). Correct for any size; just slower on sm_60.
+template <float (*op)(float), typename T>
+static __global__ void unary_gated_op_kernel_i64(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1) {
+    ggml_cuda_pdl_lc();
+    const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+
+    if (i >= k) {
+        return;
+    }
+
+    const int64_t j0 = (i / n) * o0 + (i % n);
+    const int64_t j1 = o0 == o1 ? j0 : (i / n) * o1 + (i % n);
+
+    ggml_cuda_pdl_sync();
+    dst[i] = (T)(op((float)x[j0]) * (float)g[j1]);
+}
+
 // The row/column split is a multiply-shift rather than a division: sm_60 has no integer divider,
 // so the two 64-bit divisions the straightforward form needs dominate this kernel.
 template <float (*op)(float), typename T>
@@ -283,9 +301,12 @@ static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst, 
 template <float (*op)(float), typename T>
 static void unary_gated_cuda(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1, cudaStream_t stream) {
     const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
-    GGML_ASSERT(k <= int64_t(std::numeric_limits<uint32_t>::max()));
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream);
-    ggml_cuda_kernel_launch(unary_gated_op_kernel<op, T>, launch_params, x, g, dst, k, init_fastdiv_values((uint32_t) n), o0, o1);
+    if (k <= int64_t(GGML_CUDA_FASTDIV_MAX) && n <= int64_t(GGML_CUDA_FASTDIV_MAX)) {
+        ggml_cuda_kernel_launch(unary_gated_op_kernel<op, T>, launch_params, x, g, dst, k, init_fastdiv_values((uint32_t) n), o0, o1);
+    } else {
+        ggml_cuda_kernel_launch(unary_gated_op_kernel_i64<op, T>, launch_params, x, g, dst, k, n, o0, o1);
+    }
 }
 
 template <float (*op)(float)>
@@ -365,6 +386,23 @@ void ggml_cuda_op_geglu_quick(ggml_backend_cuda_context & ctx, ggml_tensor * dst
 // swiglu_oai
 
 template <typename T>
+static __global__ void swiglu_oai_kernel_i64(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1, float alpha, float limit) {
+    const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+
+    if (i >= k) {
+        return;
+    }
+
+    const int64_t j0 = (i / n) * o0 + (i % n);
+    const int64_t j1 = o0 == o1 ? j0 : (i / n) * o1 + (i % n);
+
+    float xi = x[j0];
+    float gi = g[j1];
+
+    dst[i] = ggml_cuda_op_swiglu_oai_single(xi, gi, alpha, limit);
+}
+
+template <typename T>
 static __global__ void swiglu_oai_kernel(const T * x, const T * g, T * dst, const int64_t k, const uint3 n, const int64_t o0, const int64_t o1, float alpha, float limit) {
     const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
 
@@ -386,8 +424,11 @@ static __global__ void swiglu_oai_kernel(const T * x, const T * g, T * dst, cons
 template <typename T>
 static void swiglu_oai_cuda(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1, const float alpha, const float limit, cudaStream_t stream) {
     const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
-    GGML_ASSERT(k <= int64_t(std::numeric_limits<uint32_t>::max()));
-    swiglu_oai_kernel<<<num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream>>>(x, g, dst, k, init_fastdiv_values((uint32_t) n), o0, o1, alpha, limit);
+    if (k <= int64_t(GGML_CUDA_FASTDIV_MAX) && n <= int64_t(GGML_CUDA_FASTDIV_MAX)) {
+        swiglu_oai_kernel<<<num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream>>>(x, g, dst, k, init_fastdiv_values((uint32_t) n), o0, o1, alpha, limit);
+    } else {
+        swiglu_oai_kernel_i64<<<num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream>>>(x, g, dst, k, n, o0, o1, alpha, limit);
+    }
 }
 
 void ggml_cuda_op_swiglu_oai(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

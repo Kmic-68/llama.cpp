@@ -941,6 +941,15 @@ static const uint3 init_fastdiv_values(uint64_t d_64) {
     return make_uint3(mp, L, d);
 }
 
+// fastdiv evaluates (mulhi(n, mp) + n) >> L entirely in 32 bits, but the
+// Granlund-Montgomery round-up scheme needs a 33rd bit: the `hi + n` add can
+// carry out and is silently truncated. Verified by exhaustive test over all
+// n in [0, 2^32) for 53 representative divisors: exact for every numerator
+// n <= 2^31, first failure at n = 2^31 + 1 (worst case d = 2^30 + 1).
+// Divisors above 2^31 yield L = 32 and are broken for every n >= d.
+// Callers must bound BOTH the numerator and the divisor by this value.
+#define GGML_CUDA_FASTDIV_MAX 2147483648LL
+
 static __device__ __forceinline__ uint32_t fastdiv(uint32_t n, const uint3 fastdiv_values) {
     // expects fastdiv_values to contain <mp, L, divisor> in <x, y, z>
     // fastdiv_values.z is unused and optimized away by the compiler.
