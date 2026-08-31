@@ -1090,3 +1090,60 @@ noise of it and degrades better on models with narrower matrices, so 4x16 is kep
 
 test-backend-ops MUL_MAT 1193/1193. Perplexity through the changed path (-b 7 -ub 7, 4 chunks):
 3.6199 +/- 0.08383, against 3.6237 +/- 0.08411 for the stock geometry on the identical command.
+
+# MTP flag tuning
+
+`--spec-draft-n-max 6 --spec-draft-p-min 0.75` was tuned against a verification step that this
+session made 45% faster, so the optimum moved. Verification cost scales with the column count and
+acceptance falls as the draft lengthens, so the balance now favours **shorter, more aggressive**
+drafts. All runs: 256 tokens, temp 0, top-k 1, seed 42, cards cold.
+
+Draft length at p-min 0.75:
+| n-max | t/s | accept |
+|-------|-----|--------|
+| 3 | 39.05 | 95.3% |
+| 4 | 40.21 | 93.2% |
+| 5 | 37.47 | 87.9% |
+| 6 (old default) | 38.15 | 83.8% |
+| 7 | 36.44 | 75.7% |
+
+Probability floor at n-max 4 -- this is the big one, worth more than the draft length:
+| p-min | t/s | accept |
+|-------|-----|--------|
+| 0.95 | 34.72 | 96.4% |
+| 0.85 | 38.36 | 94.9% |
+| 0.75 (old default) | 40.21 | 93.2% |
+| 0.6  | 42.02 | 90.3% |
+| 0.4  | 48.09 | 83.2% |
+| 0.2  | 48.21 | 78.2% |
+| 0.05 | 48.42 | 78.2% |
+
+A high p-min stops drafting early, so most rounds verify only one or two tokens and the batched
+forward is wasted. Dropping it lets the head draft its full budget; acceptance falls but tokens per
+round rise much faster. Best overall: **n-max 3, p-min 0.05 -> 48.90 t/s** (n-max 2 gives 44.5, so
+3 is the knee).
+
+## Speed is content-dependent -- quote a range, not a number
+| prompt | tuned (3 / 0.05) | old (6 / 0.75) | accept (tuned) |
+|--------|------------------|----------------|----------------|
+| C++ quicksort (the standard benchmark) | **48.84** | 38.15 | 87.9% |
+| prose (Roman Empire) | 37.68 | 22.05 | 58.3% |
+| explanation (why the sky is blue) | 40.36 | 26.86 | 65.6% |
+
+The flags help everywhere -- +71% on prose, +50% on the explanation -- but only predictable
+content clears 45 t/s. Low-acceptance content prefers a shorter draft still: prose peaks at
+n-max 2 / p-min 0.05 = 39.38. **n-max 3 / p-min 0.05 is the best single setting**; use n-max 2 if
+the workload is mostly prose.
+
+Re-tuning the kernel geometry for the now-dominant 4-column kernel found nothing: 4 rows per warp
+is optimal there too (70.48 pp512 at 4x16, against 65.51 at 4x24 and 59.02 at 4x32 as registers
+climb 168 -> 214 -> 255). The committed 4x16 geometry stands for every column count.
+
+# Session summary
+| workload | start | end |
+|----------|-------|-----|
+| plain decode (tg256), cold | 17.51 | 29.9 |
+| plain decode, sustained (thermally limited) | -- | 23-25 |
+| **MTP decode, code** | 32.94 (11% over plain) | **48.84 (63% over plain)** |
+| MTP decode, prose | 22.05 | 37.68 |
+| pp512 at b=7 ub=7 | 61.08 | 88.87 |
