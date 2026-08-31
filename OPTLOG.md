@@ -1147,3 +1147,60 @@ climb 168 -> 214 -> 255). The committed 4x16 geometry stands for every column co
 | **MTP decode, code** | 32.94 (11% over plain) | **48.84 (63% over plain)** |
 | MTP decode, prose | 22.05 | 37.68 |
 | pp512 at b=7 ub=7 | 61.08 | 88.87 |
+
+# Toward 60 t/s
+
+## Attempt 64: use MMQ instead of mvq for the multi-column path — REVERTED (decisive)
+`ggml_cuda_should_use_mmvq` tunes the mvq->MMQ crossover per architecture ("tuned on RTX 4090",
+"tuned for CDNA2", ...) and its own comment states the problem found above: *"k-quants cost more to
+decode and mvq redoes that per column, so MMQ wins sooner."* MMQ decodes once into shared and
+reuses across a tile of columns -- exactly the structure the multi-column path wants. Pascal has no
+entry and falls to the default, never using MMQ below 8 columns.
+
+Adding a Pascal entry so ne11=4 routes to MMQ: **17.11 t/s against 70.57 for mvq -- 4x slower.**
+MMQ's tiles are arithmetic-dense and assume real DP4A, which sm_60 lacks and this build emulates.
+Upstream's default is correct for Pascal, and the unpack-once structure will not come for free
+from MMQ; it would have to be written into mvq directly.
+
+## Attempt 65: drop the weight staging on the multi-column path — REVERTED
+With several columns each staged word is already reused once per column, so the staging looked like
+it might be buying little while costing registers. It is still essential: 52.88 against 70.52, and
+registers barely move (168 -> 163), so the staging is not where they are going.
+
+## Attempt 66: trade rows per warp for warp count — REVERTED
+Registers scale with rows_per_warp, so halving it should buy occupancy:
+| nwarps x rows (rows/warp) | REG | pp512 (ub=4) |
+|---------------------------|-----|--------------|
+| 4 x 16 (4)                | 168 | **70.52** |
+| 8 x 16 (2)                | 118 | 61.76 |
+| 16 x 32 (2)               | 112 | 55.93 |
+| 8 x 32 (4)                | 164 | 67.35 |
+| 4 x 24 (6)                | 214 | 65.51 |
+| 4 x 32 (8)                | 255 | 59.02 |
+Occupancy is not the whole story: per-thread row reuse is worth more than the extra warps.
+4 rows per warp is optimal at 4 columns as well as at 7, so the committed 4x16 stands.
+
+## Where 60 t/s stands
+Round budget at ~49 t/s (3.9 tokens per round, ~80 ms), per GPU:
+| | ms | share |
+|---|---|---|
+| mul_mat_vec_q ncols=4 (target verify) | 47 | 55% |
+| mul_mat_vec_q ncols=1 (3 draft steps) | 4.5 | 5% |
+| all other kernels | ~10 | 12% |
+| launch / sync gaps | ~24 | 28% |
+
+The verify kernel moves ~29 MB in 88 us = **330 GB/s**, against the 483 GB/s the single-token path
+reaches, and its no-activation floor is ~42% of its current time. So an optimistic bound is
+28 + 4.5 + 10 + 12 = ~55 ms, or about **70 t/s** -- 60 is inside the envelope but needs *both* most
+of the activation cost removed from the multi-column kernel *and* the launch overhead roughly
+halved. Neither is a tuning knob:
+1. An unpack-once multi-column dot product written into mvq (MMQ's version is 4x slower here). It
+   would cut the redundant per-column decode and, more importantly, the registers that cap
+   occupancy at 12 warps/SM.
+2. Fewer launches. CUDA graphs measured no gain (the graph is re-captured almost every token), so
+   this means op fusion.
+
+## Note
+One transient `1192/1193` on test-backend-ops MUL_MAT was observed on the committed tree, not
+reproducible in three immediate re-runs (1193/1193 each). Probably a tolerance-borderline case or
+contention from the desktop; recorded here in case it recurs.
