@@ -715,6 +715,12 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
+    if (work_event != nullptr) {
+        CUDA_CHECK(cudaEventDestroy(work_event));
+    }
+    if (copy_stream != nullptr) {
+        CUDA_CHECK(cudaStreamDestroy(copy_stream));
+    }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
@@ -2447,6 +2453,8 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+
+    cuda_ctx->record_work();
 }
 
 static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -2467,6 +2475,8 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
 
     CUDA_CHECK(cudaMemcpy2DAsync(
         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+
+    cuda_ctx->record_work();
 }
 
 static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const struct ggml_tensor * tensor, void * data,
@@ -2518,7 +2528,39 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
 #ifdef GGML_CUDA_NO_PEER_COPY
             return false;
 #else
-            CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, dst_physical, src->data, src_physical, ggml_nbytes(dst), cuda_ctx_src->stream()));
+            // Issue the peer copy on a dedicated stream rather than the compute stream, so that
+            // opposing copies of a tensor-parallel all-reduce overlap instead of serialising --
+            // see the comment on copy_stream in ggml_backend_cuda_context. The copy stream waits
+            // on work_event (everything already enqueued on the src compute stream) instead of on
+            // the compute stream itself, which is what keeps it independent of waits installed
+            // there by the other direction of the exchange.
+            ggml_cuda_set_device(cuda_ctx_src->device);
+
+            if (!cuda_ctx_src->copy_event) {
+                CUDA_CHECK(cudaEventCreateWithFlags(&cuda_ctx_src->copy_event, cudaEventDisableTiming));
+            }
+
+            cudaStream_t copy_stream = cuda_ctx_src->peer_copy_stream();
+
+            if (cuda_ctx_src->work_event) {
+                CUDA_CHECK(cudaStreamWaitEvent(copy_stream, cuda_ctx_src->work_event, 0));
+            } else {
+                // nothing has been recorded yet: fall back to ordering against the compute stream
+                cuda_ctx_src->record_work();
+                CUDA_CHECK(cudaStreamWaitEvent(copy_stream, cuda_ctx_src->work_event, 0));
+            }
+
+            CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, dst_physical, src->data, src_physical, ggml_nbytes(dst), copy_stream));
+            CUDA_CHECK(cudaEventRecord(cuda_ctx_src->copy_event, copy_stream));
+
+            // the src compute stream must not overwrite the source buffer while the copy is in
+            // flight -- with the copy on the compute stream this was implicit
+            CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx_src->stream(), cuda_ctx_src->copy_event, 0));
+
+            // wait on dst stream for the copy to complete
+            CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx_dst->stream(), cuda_ctx_src->copy_event, 0));
+
+            return true;
 #endif // GGML_CUDA_NO_PEER_COPY
         }
 
@@ -4311,6 +4353,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+
+    // Mark everything this graph enqueued, so a later peer copy can order itself against the
+    // results without having to wait on the compute stream (see copy_stream in the context).
+    cuda_ctx->record_work();
 
     return GGML_STATUS_SUCCESS;
 }

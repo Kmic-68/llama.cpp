@@ -1444,6 +1444,38 @@ struct ggml_backend_cuda_context {
     std::string name;
     cudaEvent_t copy_event = nullptr;
 
+    // Peer copies are issued on a dedicated stream instead of the compute stream.
+    //
+    // The tensor-parallel all-reduce exchanges partial sums in both directions at once. When the
+    // copies sat on the compute streams they serialised: copy 0->1 was issued on stream 0 and
+    // stream 1 was then made to wait on it, so copy 1->0 -- issued on stream 1 -- could not start
+    // until copy 0->1 had finished. PCIe here is full duplex (measured 9.74 GB/s *each way*
+    // simultaneously), so that wasted a full copy duration per exchange.
+    //
+    // work_event marks everything already enqueued on the compute stream. The copy stream waits on
+    // it rather than on the compute stream itself, so a wait installed on the compute stream by
+    // some *other* device's exchange does not push this device's copy behind it.
+    cudaStream_t copy_stream = nullptr;
+    cudaEvent_t  work_event  = nullptr;
+
+    // Record "everything enqueued on the compute stream so far". Must be called after anything
+    // that enqueues work which a later peer copy might read.
+    void record_work() {
+        if (work_event == nullptr) {
+            ggml_cuda_set_device(device);
+            CUDA_CHECK(cudaEventCreateWithFlags(&work_event, cudaEventDisableTiming));
+        }
+        CUDA_CHECK(cudaEventRecord(work_event, stream()));
+    }
+
+    cudaStream_t peer_copy_stream() {
+        if (copy_stream == nullptr) {
+            ggml_cuda_set_device(device);
+            CUDA_CHECK(cudaStreamCreateWithFlags(&copy_stream, cudaStreamNonBlocking));
+        }
+        return copy_stream;
+    }
+
     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
     void * cublas_workspaces[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};

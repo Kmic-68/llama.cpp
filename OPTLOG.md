@@ -1319,3 +1319,53 @@ The Aug-18 corpus was reconstructed from git (`p100-handoff/ppl-orig.txt`,
 **Rule: pin the corpus, never regenerate it.** A perplexity gate defined as a
 shell command instead of a fixed file will drift out from under you silently.
 See `p100-handoff/CORPUS.md`.
+
+## 71 — vectorised q6_K dequant (KEPT)
+
+`dequantize_block_q6_K` gave each of its 64 threads four outputs 32 apart:
+7 single-byte loads and 4 scalar stores per thread. Reassigned each thread four
+*consecutive* outputs instead — they share `ip`, `j` and the scale, so the quant
+reads become 16-bit loads (block_q6_K is 210 bytes, only 2-byte aligned, so not
+32-bit) and the store becomes one vector write. 11 memory instructions -> 6, and
+a warp now stores 128 contiguous elements.
+
+Bit-exactness: only the thread->output assignment changes; every output is an
+independent expression with no reduction whose grouping could shift. Verified by
+replaying both index mappings on 4096 random superblocks — 1,048,576 elements,
+**0 bit mismatches, 0 unwritten**.
+
+pp2048 372.5 -> **375.19 +/- 0.58**. +0.7%. Kept.
+
+## 72 — concurrent bidirectional peer copies (KEPT, +12.2%)
+
+nvprof gap analysis: 86% of all GPU idle time was a **4358 us gap immediately
+after every PtoP copy**, 156 occurrences — exactly one copy duration.
+
+Cause: the tensor-parallel all-reduce (`push_data` in ggml-backend-meta.cpp)
+exchanges partials in both directions. Copy 0->1 was issued on GPU0's *compute*
+stream and GPU1's compute stream was then made to wait on it — so copy 1->0,
+issued on GPU1's compute stream, could not start until copy 0->1 had finished.
+The two directions serialised.
+
+Measured separately: PCIe here is full duplex — 9.74 GB/s *each way
+simultaneously*, 19.5 GB/s aggregate (uni 10.24 GB/s). So the second copy was
+free and we were paying full price for it.
+
+Fix (ggml-cuda.cu, common.cuh): peer copies go on a dedicated per-context
+`copy_stream`. The copy stream waits on `work_event` — a marker recorded at the
+end of every graph compute / set_tensor_async — rather than on the compute
+stream itself, so a wait installed there by the *other* direction cannot push
+this device's copy behind it. The src compute stream then waits on the copy
+event, preserving the write-after-read guarantee that was implicit when the copy
+lived on the compute stream.
+
+pp2048 375.19 -> **421.04 +/- 0.33**. **+12.2%.**
+Perplexity **2.6209 +/- 0.01994** on ppl-orig.txt — exact match, every chunk
+identical including [1] 4.9923. Pure scheduling change, no arithmetic touched.
+
+Also measured and rejected (free flag sweep, pp4096): -ub 2048 380.81,
+-ub 3072 343.78, -ub 4096 377.65. 2048 remains the sweet spot.
+Raw cuBLAS hgemm at real prefill shapes: 14.48-15.21 TFLOPS (76-80% of the
+19.05 fp16 peak) — the GEMM itself has little left. The n=512 test case reads
+7.15 TFLOPS only because n=512 and n=1024 take *identical* time (wave
+quantisation), which is also why -ub 512 was so slow.
