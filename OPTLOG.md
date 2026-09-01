@@ -2066,3 +2066,143 @@ Two stale `nvidia-smi` polling loops from attempt 84 were still running (23 h
 elapsed, 5 s interval) during these measurements, plus the documented ~2%
 thermal spread. The greedy-vs-defaults *comparison* is unaffected — both arms ran
 under identical conditions, back to back, and each reproduced to within 0.5%.
+
+---
+
+## 89 — long-context flash attention: the real prefill bottleneck, and 15 failed attempts at it
+
+**This is the most important measurement in the file for anyone who runs long
+context.** Every prior number in this project was taken at 2048 tokens, where
+flash-attn is 2.1% of prefill. That is not the regime the model is used in.
+
+### The finding
+
+`llama-bench -d <depth>`, prefill:
+
+| depth | pp2048 | note |
+|---|---|---|
+| 0 | 434.21 | what every earlier measurement in this file used |
+| 32768 | 278.43 | **-36%** |
+| 65536 | 179.80 | **-59%** |
+
+Per-2048-batch time goes 4.717 s -> 7.356 s from d=0 to d=32768, i.e. 32k of
+prefix costs 2.64 s/batch. Linear (attention against a prefix is O(batch x depth)),
+so d=262144 projects to ~21 s of attention on a ~26 s batch: **~86% of prefill**.
+
+nvprof at d=65536 (aggregate over the whole depth build, so it *understates* the
+share at final depth):
+
+| kernel | share |
+|---|---|
+| maxwell_hgemm_256x128_tn | 46.1% |
+| **flash_attn_tile<256,256,16,2,0>** | **37.1%** (196 ms avg, 465 ms max) |
+| PtoP | 4.9% |
+| gated_delta_net | 4.7% |
+
+At the deepest batch one FA call is 465 ms for 1.65 TFLOP (12 heads x 2048 queries
+x 65536 keys x 256 dim, QK + AV) = **3.55 TFLOPS, 18.6% of the 19.05 peak**, next
+to a GEMM doing 15.7. Only ~16 of 65 blocks carry a growing KV cache
+(`full_attention_interval 4`, `is_recr[il] = il%4 < 3`); the other ~48 are gated
+delta net with constant state. So FA is the **only** context-scaling cost here.
+
+### 15 configurations tried, stock wins all
+
+Upstream carries `// TODO optimize kernel parameters for FP16 NVIDIA (P100)` in
+`fattn-tile.cuh`. **That TODO is stale** -- the defaults are already a local
+optimum for this shape. pp2048@d65536, baseline 179.80:
+
+| nthreads | occ | nbfa | nbk | ncols | REG | t/s |
+|---|---|---|---|---|---|---|
+| **256** | **2** | **64** | **64** | **32** | **233** | **179.80** |
+| 256 | 3 | 64 | 64 | 32 | - | 169.02 |
+| 256 | 2 | 32 | 64 | 64 | 154 | 168.80 |
+| 256 | 4 | 64 | 64 | 32 | - | 162.96 |
+| 256 | 2 | 32 | 64 | 32 | 128 | 161.42 |
+| 512 | 2 | 64 | 64 | 32 | - | 161.09 |
+| 256 | 2 | 32 | 128 | 32 | 127 | 157.13 |
+| 256 | 2 | 64 | 128 | 32 | - | 155.98 |
+| 256 | 3 | 32 | 64 | 32 | 80 | 152.36 |
+| 512 | 3 | 64 | 64 | 32 | - | 151.32 |
+| 128 | 2 | 32 | 64 | 32 | 182 | 144.24 |
+| 256 | 2 | 64 | 32 | 64 | 168 | 119.96 |
+| 128 | 2 | 64 | 64 | 32 | - | 115.45 |
+| 256 | 2 | 128 | 64 | 32 | - | 112.26 |
+| 128 | 4 | 64 | 64 | 32 | - | 93.21 |
+| 64 | 2 | 64 | 64 | 32 | - | 84.34 |
+
+### Three hypotheses, all falsified -- occupancy is NOT the limit
+
+I predicted each of these and each was wrong:
+
+1. **More threads/block** (nt=512, 1024 threads/SM instead of 512): 161.09. Wrong.
+   Raising nthreads *lowers* `cpw = ncols/nwarps`, the register-blocking factor
+   (`K_k` is loaded once and reused across `cpw` columns), so it trades away
+   arithmetic intensity.
+2. **Higher cpw** (nt=128 -> cpw=8, nt=64 -> cpw=16): 115.45 and 84.34. Wrong.
+3. **Cut registers to raise occupancy.** `cuobjdump` shows the stock kernel at
+   **REG:233**, i.e. 59,648 of the SM's 65,536 registers -> 1 block/SM, 256 threads,
+   **12.5% occupancy**. Cutting registers works but *hurts*, monotonically:
+
+   | REG | blocks/SM | occupancy | t/s |
+   |---|---|---|---|
+   | 233 | 1 | 12.5% | **179.80** |
+   | 128 | 2 | 25% | 161.42 |
+   | 80 | 3 | 37.5% | 152.36 |
+
+   **Performance is inversely monotonic in occupancy.** The kernel wants registers
+   for unrolling/blocking; buying warps with them forces reloads that cost more.
+   This also explains why every `occupancy` value made things worse rather than
+   nothing -- the hint was unsatisfiable at REG:233, so codegen just degraded
+   (`<256,256,32,1,0>` shows STACK:16, real spilling).
+
+### The one real lever, and why it is unreachable
+
+The kernel is **~half memory-bound**, which I had wrongly asserted was not the case.
+Blocks per call = (2048/16) x (12/2) = **768**, and each re-reads its KV head's
+entire cache (67 MB at d=65536) -- **~51 GB of global reads per call**, ~257 ms of
+the measured 465 ms at ~200 GB/s. 67 MB has no chance of staying in a 4 MB L2.
+
+Passes over KV = `Q->ne[1]/cols_per_block`, so doubling cols_per_block to 64 halves
+it. Upstream only builds that path `#ifdef GGML_USE_HIP` and only for DKQ<=128.
+Implemented it for NVIDIA DKQ==256 (new config case + branch + the
+`<256,256,32,2>` instance, which did not previously exist).
+
+**It works, and it is still not enough.** Like-for-like at equal nbatch_fa:
+161.42 -> 168.80, **+4.6%** -- the traffic model is right. But Pascal's 48 kiB/block
+SRAM limit means every way of affording ncols=64 costs more than it returns:
+
+| ncols=64 shape | SRAM | t/s |
+|---|---|---|
+| nbfa=64, nbk=64 | 49.0 kiB | **does not fit** |
+| nbfa=32, nbk=64 | 40.3 kiB | 168.80 |
+| nbfa=64, nbk=32 | 44.5 kiB | 119.96 (nbk=32 doubles the D=256 iterations) |
+
+All of it reverted; `fattn-tile.cuh` is back at HEAD.
+
+### What would actually fix it
+
+**Route attention through cuBLAS.** `maxwell_hgemm` demonstrably reaches 15.7 TFLOPS
+*in this model* while the tile kernel gets 3.55. Chunk the KV; per chunk do QK^T and
+AV as strided-batched GEMM with an online softmax between them. Compute drops from
+465 ms/layer to ~110 ms at 15 TFLOPS, plus ~515 ms/batch of score-matrix traffic ->
+roughly **3x**. Caveats: f16 accumulation over a long chunk is not safe for PV
+(sum of ~4096 terms), so it likely needs CUBLAS_COMPUTE_32F, which this card runs at
+~7.65 TFLOPS -- call it **~2x**, not 3x. It is days of work in generic code.
+
+It would also **eliminate the 512 MiB f16 KV scratch** as a side effect, by
+dequantizing per chunk instead of the whole cache.
+
+### Separately: the 512 MiB f16 KV scratch (not yet fixed)
+
+`fattn.cu:551` sets `need_f16_K = need_f16_V = true` for BEST_FATTN_KERNEL_TILE, and
+`fattn-common.cuh:1029` calls `to_fp16(K_data, K_f16, ggml_nelements(K), ...)` --
+converting the **entire** K and V on **every** call, every layer. The buffer is
+reserved by `ggml_backend_cuda_buffer_type_get_alloc_size` (ggml-cuda.cu:936).
+
+At 262144 context, per GPU: 2 of 4 KV heads x 256 dim x 262144 positions x 2 bytes,
+for K and V = **512 MiB**. At q4_0 the KV cache costs 9 kiB/token/GPU, so that
+scratch is worth **~58,000 tokens of context**.
+
+Prefill only -- decode has `Q->ne[1] == 1` and takes the VEC kernel, which reads
+quantized KV directly. The conversion traffic (~22 GB/batch) is only ~1% of time;
+this is a **VRAM** problem, not a speed one.
