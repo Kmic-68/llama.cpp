@@ -98,7 +98,19 @@ Per-GPU profile at 442 t/s: GEMM 71.0%, PtoP 7.1%, gated_delta_net 7.0%,
 converts 3.0%, flash-attn 2.1%, q6_K dequant 1.9%, rms_norm 1.9%, all-reduce ADD
 1.3%, idle 2.2%. GEMM-only ceiling ~620 t/s.
 
-Ranked by what is actually still available:
+**That profile is at 2048 context, and the user runs 262144.** Only ~16 of the
+65 blocks carry a growing KV cache (`full_attention_interval 4`); the other ~49
+are gated delta net with constant state. So flash-attn is the **only** cost on
+this model that scales with context length — everything else in that profile is
+context-independent. At 2048 it is 2.1% and not worth touching; at 262k it should
+dominate, and the 2.1% figure is actively misleading if quoted at long context.
+**This build has never been profiled at long context. That is the top open
+measurement** -- `llama-bench -d <depth>` sweeping depth 0 / 32k / 131k / 262k,
+which also answers whether 262k even fits alongside the ~22 GB of weights
+(KV at 262k is roughly 4.8 GB: 16 layers, head_count_kv 4, k/v length 256, q4_0).
+
+Ranked by what is actually still available (all context-independent, so the
+above outranks them at 262k):
 
 1. **Fuse the all-reduce widen into the ADD** (~+1%). Today the f16 partial is
    widened to f32 into `node_tmp` (1.4%) and then the meta backend's ADD reads
@@ -175,7 +187,22 @@ exactly the flag that would have addressed the host round trip below.
 The curve is flat-to-falling past n-max 4: accept rate decays faster than the
 extra speculated tokens pay for themselves.
 
-### MTP is host-sync bound -- start here, not with the kernels
+### MTP is host-sync bound -- but do NOT start here (see OPTLOG attempt 88)
+
+> **This whole subsection is superseded.** Attempt 88 priced the host round trip
+> end-to-end instead of trusting nvprof. Default sampling (`top_k 40 / top_p 0.95
+> / min_p 0.05 / temp 0.8`) measures **within noise of `--temp 0 --top-k 1`**
+> (52.07/52.32 vs 51.82/51.76 t/s), so the host-sampling term is not a
+> bottleneck. GPU-side sampling is worth **4-8%, landing 57-59 — not 60** — and
+> needs axis-1 split rules for ARGMAX/TOP_K/SOFT_MAX/GET_ROWS in
+> `ggml-backend-meta.cpp`, which is the silent-wrong-answer risk tier.
+> **Dropped.** Mirroring `output.weight` to sidestep it is a trap: it doubles
+> output-head memory traffic (995 MiB read per GPU instead of 497) and costs
+> +497 MiB/GPU. Net loss. The text below is kept for its profiling detail only.
+>
+> One useful consequence: every MTP number in these docs was measured greedy,
+> and attempt 88 shows that **transfers to real-world default sampling
+> unchanged**.
 
 Steady-state MTP decode is **24% idle**, and **14.5% of wall is the host round
 trip** (95 DtoH events with 1.46 ms of GPU idle after each, plus 817 HtoD):
@@ -183,10 +210,12 @@ logits to the CPU, speculative accept/reject there, tokens back. Removing it
 gives 54.5/(1-0.145) = **63.7 t/s, past the 60 target**. So 60 is reachable, but
 through the decode *pipeline*, not kernel tuning:
 
-1. GPU-side sampling -- llama.cpp has it and disables it for our split mode
-   (`llama-context.cpp`: "backend sampling not supported with
-   SPLIT_MODE_TENSOR"). Same root cause as the meta backend not servicing eval
-   callbacks. Needs the meta backend taught to run the sampling graph.
+1. ~~GPU-side sampling~~ -- **dropped, attempt 88.** For the record, the gate at
+   `llama-context.cpp:1216` is load-bearing, not conservative: `output.weight` is
+   `SPLIT_AXIS_1` (`llama-model.cpp:566`), i.e. vocab-sharded, so neither GPU
+   holds complete logits, while the backend samplers do `ggml_reshape_1d` then
+   `ggml_argmax`/`ggml_top_k` over the whole vocab (`llama-sampler.cpp:1084`,
+   `:1484`). Each GPU would reduce over its own shard and return a local index.
 2. Overlap host verification with GPU work in the speculative loop.
 
 **Caveat: nvprof costs MTP ~11% (48.65 profiled vs 54.5 not), and host-sync gaps

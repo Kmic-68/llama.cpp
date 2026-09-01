@@ -1921,7 +1921,7 @@ vs the 17.51 t/s decode baseline in CLAUDE.md: **1.83x**.
 | `e83a7913a` | f16 all-reduce + pipelined delta-net reduction | +3.2% | yes |
 | `ed42ad15d` | delta-net addressing walked | below noise here | yes |
 
-## Three corrections I made to my own claims
+## Four corrections I made to my own claims
 
 These matter more than the last few percent, because each would have sent the
 next session down a wrong path:
@@ -1933,20 +1933,37 @@ next session down a wrong path:
    1328 MHz to 73 C. Nine causes eliminated; the in-model *minimum* equals
    standalone exactly, so it is call-to-call variation, not a defect.
 3. **MTP is not kernel-bound** (attempt 86). It is 24% idle with 14.5% of wall
-   in the host round trip. This is why 60 t/s is reachable in principle but not
-   by tuning kernels.
+   in the host round trip. This is why 60 t/s is not reachable by tuning kernels.
+4. **But the host round trip is not worth attacking either** (attempt 88).
+   I predicted default sampling would be far more expensive than the greedy
+   benchmark config and that GPU-side sampling would therefore pay 3-5x more
+   than measured. **Wrong — defaults measure within noise of greedy.** Priced
+   properly the lever is 4-8%, tops out at 57-59, and costs high-risk surgery in
+   `ggml-backend-meta.cpp`. Dropped. Correction 3 said 60 was "reachable in
+   principle" via this route; it is not.
 
 ## What is actually left, ranked
 
 | # | item | worth | why not done |
 |---|---|---|---|
-| 1 | MTP host-sync: GPU-side sampling, or overlap host verification | up to +14.5% MTP (see 86 caveat: part is profiler artifact, real ~5-10%) | `--spec-draft-backend-sampling` is disabled for `SPLIT_MODE_TENSOR`; needs the meta backend taught to run the sampling graph |
+| ~~1~~ | ~~MTP host-sync: GPU-side sampling~~ | **DROPPED — see attempt 88** | priced properly at 4-8% (-> 57-59, *not* 60); needs axis-1 split rules for ARGMAX/TOP_K/SOFT_MAX/GET_ROWS in `ggml-backend-meta.cpp`, silent-wrong-answer tier. Mirroring `output.weight` instead is a net loss (doubles output-head traffic, +497 MiB/GPU). |
 | 2 | overlap each weight dequant with the previous GEMM | +1.9% prefill -> ~451 | needs graph lookahead ggml does not expose |
 | 3 | multi-column `vec_dot_q6_K_q8_1` (unpack once, not per column) | +3.5% MTP -> ~56.4 | rewrite of the hottest kernel; bit-exact by construction |
 | 4 | fuse the all-reduce widen into the ADD | +0.8% prefill | needs an accumulating-copy path in `ggml-backend-meta.cpp` |
 
-Items 2 and 4 together would clear 450. **No combination of 1-4 reaches 60 MTP
-except item 1**, and item 1 alone would.
+Items 2 and 4 together would clear 450. ~~No combination of 1-4 reaches 60 MTP
+except item 1, and item 1 alone would.~~ **Retracted by attempt 88: item 1 tops
+out at 57-59. Nothing on this list reaches 60 MTP.** The 60 target needs a shape
+change — the draft head itself, or a decode kernel that does not re-read the
+weights per speculated token — not any item here.
+
+**Flash attention is unranked here because it is context-dependent.** At the
+2048-token bench shape it is 2.1% of prefill / 2.4% of decode and not worth
+touching. But only ~16 of 65 blocks carry a growing KV cache
+(`full_attention_interval 4`); the rest are gated delta net with constant state.
+So FA is the *only* cost on this model that scales with context length, and at
+the 262144 this model supports it should dominate. **Nobody has profiled this
+build at long context.** That is the open measurement.
 
 ## Measured dead ends — do not re-litigate
 
@@ -1956,7 +1973,14 @@ but ALGO3 gets the same for one line); lda padding; chunking the GEMM along m;
 (identical traffic at 2 GPUs); CUDA graphs on Pascal (they engage, they give
 nothing); MMVQ rows-per-block; GDN block width, deeper load pipelining;
 per-shape cuBLAS algo (+0.3%); `--spec-draft-n-min`;
-`--spec-draft-backend-sampling` under `-sm tensor`.
+`--spec-draft-backend-sampling` under `-sm tensor`; **implementing** backend
+sampling under `-sm tensor` (attempt 88: 4-8%, tops out at 57-59, high risk);
+**mirroring `output.weight`** to enable it (attempt 88: doubles output-head
+traffic and costs +497 MiB/GPU — net loss).
+
+**Default sampling costs nothing** (attempt 88): `top_k 40 / top_p 0.95 /
+min_p 0.05 / temp 0.8` measures within noise of `--temp 0 --top-k 1`, so every
+greedy-measured MTP number in this file carries over to real-world use.
 
 ## Hygiene
 
@@ -1966,3 +1990,79 @@ per-shape cuBLAS algo (+0.3%); `--spec-draft-n-min`;
   `./ppl.txt` is a different document (422246 bytes, target 2.7554).
 - Prefill readings carry a **2% thermal spread**. Compare only at equal starting
   temperature. The GEMM kernel itself does not throttle -- this is model-level.
+
+---
+
+## 88 — the MTP host round trip, priced properly (backend sampling is NOT worth it)
+
+**Supersedes attempt 86's framing and the closing summary's ranked item 1.**
+Item 1 claimed GPU-side sampling was the one lever that alone reaches 60 MTP.
+Measured properly, it is not.
+
+### What was actually measured
+
+Host-side sampling cost at this model's real vocab (**248320**), standalone C/C++
+microbenchmarks, per logits row:
+
+| operation | cost/row | distribution-dependent? |
+|---|---|---|
+| logits DtoH (970 KiB) | ~100 us | no |
+| greedy argmax | **372 us** | no — linear scan |
+| candidate-array build (2.9 MiB fill) | **500 us** | no — linear fill |
+| build + bucketed top-k(40), llama.cpp's real algorithm | ~2.2 ms | yes, but only weakly (2.26 uniform vs 2.19 peaked) |
+
+That predicted default sampling (`top_k 40, top_p 0.95, min_p 0.05, temp 0.8` —
+confirmed in `common/common.h`) would cost ~11 ms of a ~60 ms MTP step, ~20% of
+wall, versus ~2.6-5.1 ms for the greedy benchmark config.
+
+### The prediction was wrong
+
+End-to-end, `llama-speculative-simple`, n-max 4, p-min 0.2, seed 42, n=256,
+two runs each:
+
+| sampling | t/s | drafted | accept |
+|---|---|---|---|
+| `--temp 0 --top-k 1` (greedy, what every prior MTP number used) | 51.82, 51.76 | 252 | 197 |
+| **defaults** (top_k 40, top_p 0.95, min_p 0.05, temp 0.8) | **52.07, 52.32** | 240 | 198 |
+
+Defaults are **within noise of greedy, marginally faster**. The 2.2 ms/row
+isolated cost does not appear in wall time. So the host-sampling term is not a
+bottleneck, and every MTP number in this file — all measured with greedy —
+transfers to real-world default sampling unchanged. That last part is the useful
+half of this result.
+
+At n=512 the same comparison gave greedy 46.07 / defaults 51.37, i.e. the gap
+runs the *other* way too; the accept rate is stochastic across configs and
+dominates any host-side term.
+
+### Consequence
+
+Backend sampling under `-sm tensor` is worth at most the greedy-case
+**4-8%** (2.6-5.1 ms of a ~60 ms step) -> **57-59 t/s. It does not reach 60.**
+Against that: it needs new split rules in `ggml-backend-meta.cpp` for `ARGMAX` /
+`TOP_K` / `ARGSORT` / `SOFT_MAX` / `GET_ROWS` on axis-1 tensors, which is the
+silently-wrong-answer risk tier. **Not worth doing. Dropped.**
+
+### Why the gate exists (recorded so nobody re-derives it)
+
+`output.weight` is `GGML_BACKEND_SPLIT_AXIS_1` under `-sm tensor`
+(`llama-model.cpp:566`), i.e. **vocab-sharded**, so neither GPU holds complete
+logits. The backend samplers do `ggml_reshape_1d(logits)` then `ggml_argmax` /
+`ggml_top_k` over the whole vocab (`llama-sampler.cpp:1084`, `:1484`), so each
+GPU would reduce over its own shard and return a local index. The gate at
+`llama-context.cpp:1216` is **load-bearing, not conservative**.
+
+**Mirroring `output.weight` (as dsv4 already does) is a trap.** It would make the
+sampler work unmodified, but `output.weight` is 5120x248320 Q6_K = **995 MiB**;
+each GPU reads its 497 MiB half today, and mirroring makes both read the full
+995 MiB. That doubles output-head memory traffic — ~+1.3 ms per decode step at
+the ~383 GB/s this card achieves — to save 4-8%, plus **+497 MiB per GPU** of
+VRAM. Net loss. Do not do it.
+
+### Note on absolute numbers
+
+These runs read 51.8-52.3 where attempt 87 recorded 54.48 for the same flags.
+Two stale `nvidia-smi` polling loops from attempt 84 were still running (23 h
+elapsed, 5 s interval) during these measurements, plus the documented ~2%
+thermal spread. The greedy-vs-defaults *comparison* is unaffected — both arms ran
+under identical conditions, back to back, and each reproduced to within 0.5%.
