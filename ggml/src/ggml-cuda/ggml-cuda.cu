@@ -1563,14 +1563,40 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
                                            (const float *) src1_ptr, s11,
                     (const float *) beta,  (float       *)  dst_ptr, ne0));
     } else if (ne12 == 1 && ne13 == 1) {
-        CUBLAS_CHECK(
+        // On pre-Volta hardware cuBLAS's default kernel choice for a tall-and-skinny TN f16 GEMM
+        // is not the fastest one it has. Measured on P100 (sm_60) at n=2048, ALGO3 vs the default:
+        // ffn gate/up (m=8704,k=5120) 15.31 -> 16.79 TFLOPS, ffn down (m=5120,k=8704) 15.99 ->
+        // 16.54, attn qkv 14.09 -> 15.50, gdn in 15.24 -> 15.91. The advantage disappears and then
+        // inverts as n shrinks (at n=64 ALGO3 is up to 2x *slower*), so it is only used for the
+        // wide batches that prefill produces -- decode and short tails keep the default.
+        // These legacy algo selectors are meaningful only on the pre-Volta path, hence the cc gate.
+        cublasGemmAlgo_t algo = CUBLAS_GEMM_DEFAULT_TENSOR_OP;
+        if (cc < GGML_CUDA_CC_VOLTA && cu_compute_type == CUBLAS_COMPUTE_16F && ne11 >= 512) {
+            algo = CUBLAS_GEMM_ALGO3;
+        }
+
+        cublasStatus_t gemm_status =
             cublasGemmEx(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
                     ne01, ne11, ne10,
                     alpha, src0_ptr, cu_data_type_a, s01,
                            src1_ptr, cu_data_type_b, s11,
                     beta,   dst_ptr, cu_data_type,   ne0,
                     cu_compute_type,
-                    CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                    algo);
+
+        if (gemm_status != CUBLAS_STATUS_SUCCESS && algo != CUBLAS_GEMM_DEFAULT_TENSOR_OP) {
+            // the tuned algo is not available for this shape -- fall back
+            gemm_status =
+                cublasGemmEx(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
+                        ne01, ne11, ne10,
+                        alpha, src0_ptr, cu_data_type_a, s01,
+                               src1_ptr, cu_data_type_b, s11,
+                        beta,   dst_ptr, cu_data_type,   ne0,
+                        cu_compute_type,
+                        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        }
+
+        CUBLAS_CHECK(gemm_status);
     } else if (r2 == 1 && r3 == 1 && is_src0_cont_2 && is_src1_cont_2) {
         // with a [0, 2, 1, 3] perm. and ne02==1 the matrix strides need to be determined from dim 3:
         const int64_t sma = ne02 == 1 ? s03 : s02;

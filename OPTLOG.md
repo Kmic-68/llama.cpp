@@ -1369,3 +1369,58 @@ Raw cuBLAS hgemm at real prefill shapes: 14.48-15.21 TFLOPS (76-80% of the
 19.05 fp16 peak) — the GEMM itself has little left. The n=512 test case reads
 7.15 TFLOPS only because n=512 and n=1024 take *identical* time (wave
 quantisation), which is also why -ub 512 was so slow.
+
+## 73 — GDN block width sweep (REVERTED)
+
+`gated_delta_net` uses num_warps=4, so a 128-wide state is covered by 32 blocks
+in z, every one of which re-reads the whole 128-element k and q vector for the
+token. Made num_warps a compile-time knob (bit-exact -- columns are independent)
+and swept it. 4 is already optimal:
+
+| num_warps | pp2048 |
+|---|---|
+| 2 | 417.37 |
+| **4 (default)** | **421.04** |
+| 8 | 417.05 |
+| 16 | 409.18 |
+
+Kept the knob (it is now `P100_GDN_NWARPS`, defaulting to 4 = upstream
+behaviour) but no change in value. The kernel is bound by its dependent
+critical path -- two serial warp reductions per token over 2048 tokens -- not
+by load redundancy or occupancy (48 regs, ~40 warps/SM).
+
+## 74 — cuBLAS ALGO3 for wide f16 GEMMs on pre-Volta (KEPT, +1.8%)
+
+cuBLAS's default kernel choice for tall-and-skinny TN f16 GEMMs is not its
+fastest on sm_60. Standalone sweep at n=2048, DEFAULT_TENSOR_OP -> ALGO3:
+
+| shape | default | ALGO3 | delta |
+|---|---|---|---|
+| ffn gate/up m=8704 k=5120 | 15.31 | 16.79 | +9.7% |
+| ffn down m=5120 k=8704 | 15.99 | 16.54 | +3.5% |
+| attn qkv m=4096 k=5120 | 14.09 | 15.50 | +10.0% |
+| attn out m=5120 k=3072 | 15.96 | 16.41 | +2.8% |
+| gdn in m=8240 k=5120 | 15.24 | 15.91 | +4.4% |
+| gdn misc m=2560 k=5120 | 11.83 | 13.98 | +18.2% |
+| lm_head m=124160 k=5120 | 10.59 | 10.58 | -0.1% |
+
+The advantage inverts as n shrinks -- at n=64 ALGO3 is up to 2x *slower* -- so
+it is gated on ne11 >= 512, and on cc < VOLTA since these legacy algo selectors
+only mean anything on the pre-Volta path. Falls back to the default if cuBLAS
+rejects the algo for a shape.
+
+pp2048 421.04 -> **428.69 +/- 2.04**. +1.8%.
+
+**NOT bit-exact** -- unlike 71/72 this is a different kernel, so the f16
+k-accumulation order changes. Perplexity **2.6214 +/- 0.01995** vs the 2.6209
+reference: +0.0005, i.e. 0.03 sigma, well inside the CLAUDE.md band
+(2.6010-2.6408). Per-chunk movement is mixed in direction (chunk [1] 4.9923 ->
+4.9738, i.e. lower). Reverting is a one-line `if`.
+
+Also measured and rejected:
+- NN weight layout would give a similar gain (16.95/16.63 TFLOPS) but needs a
+  transposing dequant; ALGO3 gets the same for one line.
+- lda padding: +5% on gate/up only, ~0 on down.
+- chunking the GEMM along m: strictly worse (15.25 -> 14.96 -> 12.89).
+- f32 GEMM output (would remove the f16->f32 convert): 7.65 TFLOPS, ~half
+  speed. Dead.

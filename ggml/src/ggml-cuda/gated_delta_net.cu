@@ -1,8 +1,15 @@
 #include "gated_delta_net.cuh"
 #include "ggml-cuda/common.cuh"
 
+// Columns handled per block. Each block re-reads the whole k and q vector for the token, so with
+// the original 4 warps a 128-wide state was read by 32 separate blocks. Widening the block cuts
+// that redundancy (and the L1 traffic behind it) without changing any column's arithmetic.
+#ifndef P100_GDN_NWARPS
+#define P100_GDN_NWARPS 4
+#endif
+
 template <int S_v, bool KDA, bool keep_rs_t>
-__global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
+__global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * P100_GDN_NWARPS, 2)
 gated_delta_net_cuda(const float * q,
                                      const float * k,
                                      const float * v,
@@ -179,7 +186,7 @@ static void launch_gated_delta_net(
         float scale, int64_t state_slot_stride, int K, cudaStream_t stream) {
     //TODO: Add chunked kernel for even faster pre-fill
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
-    const int num_warps = 4;
+    const int num_warps = P100_GDN_NWARPS < S_v ? P100_GDN_NWARPS : (int) S_v;  // col must stay < S_v
     dim3      grid_dims(H, n_seqs, (S_v + num_warps - 1) / num_warps);
     dim3      block_dims(warp_size <= S_v ? warp_size : S_v, num_warps, 1);
 
