@@ -1483,3 +1483,85 @@ pp2048 439.16 -> **442.59 +/- 1.44**. +0.8%.
 
 Perplexity for 75+76 together: **2.6214 +/- 0.01995**, chunk [1] 4.9738 --
 identical to every digit to the ALGO3 build, confirming both are lossless.
+
+## 77 — per-shape cuBLAS algo (REJECTED)
+
+Swept all 24 legacy algos at every real shape, n=2048. ALGO3 is already the best
+on all the dominant shapes; only two minor ones prefer something else:
+
+| shape | ALGO3 | best | |
+|---|---|---|---|
+| ffn gate/up | 16.80 | ALGO3 16.80 | — |
+| ffn down | 16.55 | ALGO3 16.55 | — |
+| attn out | 16.41 | ALGO3 16.41 | — |
+| gdn in | 15.90 | ALGO3 15.90 | — |
+| attn qkv | 15.02 | ALGO6 15.55 | +3.5% on a small share |
+| gdn misc | 15.20 | ALGO5 15.53 | +2.2% on a small share |
+
+Worth ~+0.3% overall for a per-shape lookup table. Not taken — the complexity
+and the risk of picking wrong for an unseen shape outweigh it.
+
+## 78 — GDN loads issued a full iteration ahead (REVERTED)
+
+Attempt 76 prefetches token t+1's k but consumes it in the same iteration, so
+the global latency is not actually hidden. Moved the load issue to the *top* of
+the iteration (raw g, expf deferred to hand-over) so it flies during the state
+update. Correct (test-backend-ops passes, no spill) but **slower**: registers
+47 -> 53, which drops occupancy from 10 blocks/SM (40 warps) to 9 (36).
+
+pp2048 442.59 -> 438.80. Reverted.
+
+GDN is now ~7% of prefill and resists the obvious attacks: block width (73),
+reduction fusion (76, +0.8%), deeper load pipelining (78, negative). Measured
+issue efficiency is ~15% of peak, so it is stalled on something that is not the
+warp-reduction critical path and not occupancy. Nsight Compute would say what;
+it does not support Pascal.
+
+## Decode: no regression, and a bonus
+
+The peer-copy stream fix (72) helps decode too -- decode all-reduces are small
+but latency-dominated. Measured with the CLAUDE.md metric command
+(`-p 0 -n 256 -r 3`), at 54 C (not cold):
+
+**tg256 = 31.71 +/- 0.14 t/s**, against the 29.8 cold / 29.2 warm baseline and
+the 17.51 t/s original baseline in CLAUDE.md. **1.81x on the headline metric.**
+
+The f16 all-reduce (75) and ALGO3 (74) both gate on ne11 >= 512, so decode takes
+neither path -- its partials stay f32 and it keeps the default GEMM algo.
+
+## Session summary — prefill 372.5 -> ~440 t/s (+18%)
+
+| step | pp2048 |
+|---|---|
+| start of session | 372.5 |
+| 71 vectorised q6_K dequant | 375.19 |
+| 72 concurrent bidirectional peer copies | 421.04 |
+| 74 cuBLAS ALGO3 | 428.69 |
+| 75 f16 all-reduce | 439.16 |
+| 76 pipelined delta-net reduction | **442.59** |
+
+Cold readings land at 442-443, hot at ~438. Thermal drift of ~1% is real: the
+same build measured 442.59 at 39 C and 438.49 at 55 C. Re-baseline from cold
+before reading anything into a delta of that size.
+
+Perplexity **2.6214 +/- 0.01995** (ppl-orig.txt, 420098 bytes) vs the 2.6209
+reference -- inside the CLAUDE.md band by 0.03 sigma. Of the five kept changes
+only ALGO3 (74) is not bit-exact; 71, 72, 75 and 76 were each verified to
+reproduce the preceding build digit-for-digit.
+
+Where the time goes now (per GPU, nvprof, at 442 t/s):
+
+| item | share |
+|---|---|
+| maxwell_hgemm_256x128_tn | 71.0% |
+| PtoP (was 11.9%) | 7.1% |
+| gated_delta_net | 7.0% |
+| flash_attn_tile | 2.1% |
+| q6_K dequant | 1.9% |
+| f32<->f16 converts | 3.0% |
+| rms_norm | 1.9% |
+| all-reduce ADD | 1.3% |
+| idle | 2.2% |
+
+GEMM-only ceiling is ~620 t/s. The GEMM runs at ~15.7 TFLOPS in-model against a
+19.05 peak (82% at sustained clocks), so it has little left.
