@@ -1,4 +1,4 @@
-# Resume point — prefill 442 t/s, decode 31.7 t/s
+# Resume point — prefill 442.6 t/s, decode 32.1 t/s, MTP 54.5 t/s
 
 All work is committed. Tree is clean apart from your own `CLAUDE.md` edit and
 untracked `ppl.txt` / `p100-handoff/`.
@@ -7,47 +7,73 @@ untracked `ppl.txt` / `p100-handoff/`.
 
 | metric | start of session | now |
 |---|---|---|
-| pp2048 (`-b 2048 -ub 2048`) | 372.5 | **442.6** cold / 434.1 hot |
-| tg256 (CLAUDE.md metric cmd) | 29.8 | **31.7** |
-| MTP decode (best settings) | 48.8 | **54.0** |
+| pp2048 (`-b 2048 -ub 2048`) | 372.5 | **442.6** cold / ~437 hot |
+| tg256 (CLAUDE.md metric cmd) | 29.8 | **32.1** best / ~31.8 typical |
+| MTP decode (n-max 4, p-min 0.2) | 48.8 | **54.5** |
 | perplexity (ppl-orig.txt) | 2.6209 | **2.6214 +/- 0.01995** |
 
-Against CLAUDE.md's original 17.51 t/s decode baseline that is **1.81x**.
+Against CLAUDE.md's original 17.51 t/s decode baseline that is **1.83x**.
 
 Goals were 450 t/s prefill and 60 t/s MTP. **Neither was met**: prefill landed
-at 442.6 (98.4%), MTP at 54.5 (90.8%). See "What is left" below for exactly what
-stands in the way of each -- both are now structural, not tuning.
+at 442.6 (98.4%), MTP at 54.5 (90.8%). Both remaining gaps are structural --
+see "What is left" below, which says exactly what stands in the way and how much
+each is worth.
 
 ## Committed this session
 
+Six code commits (+ eleven docs/log commits), `5d1fafb01..f85e154ed`:
+
 | commit | what | gain |
 |---|---|---|
-| `58c8a73ed` | vectorised q6_K dequant | +0.7% |
-| `a4d1103c5` | **concurrent bidirectional peer copies** | **+12.2%** |
-| `f8edbf816` | cuBLAS ALGO3 for wide f16 GEMMs | +1.8% |
-| `e83a7913a` | **f16 all-reduce** + pipelined delta-net reduction | +3.2% |
+| `58c8a73ed` | vectorised q6_K dequant | +0.7% pp |
+| `a4d1103c5` | **concurrent bidirectional peer copies** | **+12.2% pp** |
+| `f8edbf816` | cuBLAS ALGO3 for wide f16 GEMMs | +1.8% pp |
+| `e83a7913a` | **f16 all-reduce** + pipelined delta-net reduction | +3.2% pp |
+| `ed42ad15d` | delta-net addressing walked, not recomputed | below noise here* |
 
-The big one is `a4d1103c5`. The tensor-parallel all-reduce was serialising its
-two directions: copy 0->1 went on GPU0's compute stream and GPU1's compute
-stream was made to wait on it, so copy 1->0 queued behind that wait. nvprof
-showed it as a 4358us gap after every PtoP copy -- exactly one copy duration,
-86% of all idle time. PCIe here is full duplex (9.74 GB/s *each way*
-simultaneously), so the second copy was free and we were paying full price.
+\* -29% on the kernel at head_count=4, -1.1% at head_count=32; this model runs
+in the regime where it hides behind warp parallelism. Kept because it is
+bit-exact and never slower.
+
+Code touched, whole session:
+
+| file | +/- |
+|---|---|
+| `ggml/src/ggml-cuda/ggml-cuda.cu` | peer-copy stream, f16 all-reduce, ALGO3 |
+| `ggml/src/ggml-cuda/common.cuh` | copy stream, work event, staging buffers |
+| `ggml/src/ggml-cuda/convert.cu` | vectorised q6_K dequant |
+| `ggml/src/ggml-cuda/gated_delta_net.cu` | fused reduction, walked addressing, nwarps knob |
+
+Nothing outside `ggml/src/ggml-cuda/` was modified.
+
+**The big one is `a4d1103c5`.** The tensor-parallel all-reduce was serialising
+its two directions: copy 0->1 went on GPU0's compute stream and GPU1's compute
+stream was then made to wait on it, so copy 1->0 -- issued on GPU1's compute
+stream -- queued behind that wait. nvprof showed it as a 4358us gap after every
+PtoP copy, exactly one copy duration, 86% of all idle time. PCIe here is full
+duplex (9.74 GB/s *each way* simultaneously), so the opposing copy was free and
+we were paying full price for it. This one also carries most of the decode and
+MTP gains, since decode all-reduces are small but latency-dominated.
 
 ## Numerical status
 
-Four of the five kept changes are **bit-exact** and were each verified to
+**Five of the six kept changes are bit-exact** and were each verified to
 reproduce the previous build digit-for-digit (chunk [1] and all 30 chunks).
+
 Only **ALGO3 (`f8edbf816`) is not**: a different cuBLAS kernel means a different
 f16 k-accumulation order. It moved perplexity 2.6209 -> 2.6214, i.e. 0.03 sigma,
 well inside the required 2.6010-2.6408 band, with mixed per-chunk direction.
 Reverting it is a one-line `if` in `ggml-cuda.cu` if you ever want strict
-bit-parity with upstream at the cost of ~1.8%.
+bit-parity with upstream, at the cost of ~1.8%.
 
 The f16 all-reduce is lossless *here* and does not assume it: a one-time runtime
 probe checks every element of the first exchange for f16-exactness and latches
-the answer, and that probe exchange itself still goes uncompressed. It logs
+the answer, and that probe exchange itself still goes uncompressed, so a model
+whose partials are not f16-exact never sees a lossy copy. It logs
 "tensor-parallel partials are f16-exact; peer copies will be sent as f16".
+
+All three `P100_*` probe switches in `vecdotq.cuh` are back at **0** (one was
+used for a measurement in attempt 85) and correctness was re-verified after.
 
 ## Measure like this
 
@@ -119,25 +145,35 @@ still unknown; it is real and it is not thermal.
 
 ## Decode (60 t/s goal still open)
 
-Single-token 31.7 t/s. MTP re-measured after this session's changes with
-`p100-handoff/tools/mtp-bench.sh <n-max> <p-min>`:
+Single-token **32.1 t/s** best, ~31.8 typical. MTP re-measured after this
+session's changes with `p100-handoff/tools/mtp-bench.sh <n-max> <p-min>`.
+**The whole flag space is now swept** -- n-max, p-min, n-min, backend-sampling,
+split mode, cache types:
 
-| n-max | p-min | t/s | accept |
-|---|---|---|---|
-| 2 | 0.05 | 48.92 | 89.2% |
-| 3 | 0.05 | 52.90 | 87.9% |
-| **4** | **0.2** | **54.04** | 78.2% |
-| 4 | 0.05 | 53.79 | 78.2% |
-| 5 | 0.05 | 53.02 | 71.9% |
-| 6 | 0.75 | 41.52 | 83.8% |
+| n-max | p-min | n-min | t/s | accept |
+|---|---|---|---|---|
+| 2 | 0.05 | 0 | 48.92 | 89.2% |
+| 3 | 0.05 | 0 | 52.90 | 87.9% |
+| **4** | **0.2** | **0** | **54.48** | 78.2% |
+| 4 | 0.05 | 0 | 53.79 | 78.2% |
+| 4 | 0.2 | 1 | 54.27 | 78.2% |
+| 4 | 0.2 | 4 | 54.38 | 78.2% |
+| 5 | 0.05 | 0 | 53.02 | 71.9% |
+| 5 | 0.2 | 2 | 54.00 | 71.9% |
+| 6 | 0.2 | 3 | 50.32 | 67.8% |
+| 6 | 0.75 | 0 | 41.52 | 83.8% |
 
 **Use `--spec-draft-n-max 4 --spec-draft-p-min 0.2`** -- the old default of
-n-max 3 leaves ~2% on the table. 48.8 -> 54.0 is +10.7%, and the peer-copy fix
+n-max 3 leaves ~2% on the table. 48.8 -> 54.5 is +11.7%, and the peer-copy fix
 (`a4d1103c5`) is most of it.
 
-That sits right at the 53-55 t/s structural ceiling estimated for the current
-kernel shape, and the curve is flat-to-falling past n-max 4 (accept rate decays
-faster than the extra tokens pay).
+`--spec-draft-n-min` does nothing. `--spec-draft-backend-sampling` is **inert
+under `-sm tensor`** (54.12 vs 53.59, and the "not supported with
+SPLIT_MODE_TENSOR" warning fires either way) -- which matters, because that is
+exactly the flag that would have addressed the host round trip below.
+
+The curve is flat-to-falling past n-max 4: accept rate decays faster than the
+extra speculated tokens pay for themselves.
 
 ### MTP is host-sync bound -- start here, not with the kernels
 

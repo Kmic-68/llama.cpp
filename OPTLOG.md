@@ -1601,7 +1601,7 @@ Same build, same commands:
 | pp2048 | 438.49 +/- 0.25 | 55 C start |
 | pp2048 | 434.10 +/- 1.28 | 52 -> 66 C |
 | tg256 (CLAUDE.md metric) | 31.79 +/- 0.16 | 51 C |
-| MTP (n-max 4, p-min 0.2) | 54.04 | warm |
+| MTP (n-max 4, p-min 0.2) | 54.48 (best of 6 readings) | warm |
 
 **A 2% spread on prefill comes from temperature alone.** Compare only at equal
 starting temperature; anything under ~2% is not a code delta.
@@ -1679,8 +1679,13 @@ Targets were 450 t/s prefill and 60 t/s MTP.
 
 Neither target met. What stands between here and them:
 
+> **Superseded below.** Attempt 84 **retracts** the throttling claim in this
+> paragraph, and attempt 86 replaces the MTP framing in the next one. Read
+> 84/84b/86 instead; this section is kept only for the record.
+
 **Prefill (+1.7% needed).** GEMM is 71% of wall at 15.7 TFLOPS in-model against
-16.8 standalone; the 6.6% gap is sustained-clock throttling and nvidia-smi is
+16.8 standalone; ~~the 6.6% gap is sustained-clock throttling~~ (**wrong -- see
+84**; the gap is a uniform 3.2% and is not thermal) and nvidia-smi is
 off limits. The one identified remaining item is fusing the all-reduce widen
 into the ADD (~+0.8%), which needs an accumulating-copy path in
 ggml-backend-meta.cpp so the ADD node can be dropped -- graph-construction
@@ -1690,9 +1695,10 @@ overlapping each weight dequant with the *previous* matmul's GEMM on a second
 stream, which needs graph lookahead ggml does not currently expose.
 
 **MTP (+10% needed).** 52% of the time is `mul_mat_vec_q<ncols=5>` already at
-~75% of achievable HBM bandwidth. Closing the gap means attacking the sm_60
-dp4a emulation, which is already down to 8 instructions and bit-exact, or
-changing the kernel shape. Not a tuning problem.
+~75% of achievable HBM bandwidth. ~~Closing the gap means attacking the sm_60
+dp4a emulation or changing the kernel shape.~~ **Wrong emphasis -- see 86:**
+MTP is 24% idle with 14.5% of wall in the host round trip, so the route to 60
+is the decode pipeline, not the kernel.
 
 ## Final gate on HEAD
 
@@ -1883,3 +1889,80 @@ that fix requires backend work, not configuration.
 split mode, cache types). 54.5 t/s stands, and the remaining 10% to the 60
 target is the host-sync work in attempt 86 plus the kernel work in 85 -- neither
 of which is reachable by configuration.
+
+
+---
+
+# CLOSING SUMMARY (2026-09-01) — supersedes every earlier summary in this file
+
+## Result
+
+| metric | session start | final | target | |
+|---|---|---|---|---|
+| prefill pp2048 | 372.5 | **442.6** cold / ~437 hot | 450 | 98.4%, **not met** |
+| MTP (n-max 4, p-min 0.2) | 48.8 | **54.5** | 60 | 90.8%, **not met** |
+| single-token tg256 | 29.8 | **32.1** best / ~31.8 typical | — | +7.7% |
+| perplexity (ppl-orig.txt) | 2.6209 | **2.6214 +/- 0.01995** | +/-0.0199 | passes at 0.03 sigma |
+
+vs the 17.51 t/s decode baseline in CLAUDE.md: **1.83x**.
+
+## The six code changes
+
+`5d1fafb01..f85e154ed`, 417 insertions / 53 deletions, all inside
+`ggml/src/ggml-cuda/` (`ggml-cuda.cu`, `common.cuh`, `convert.cu`,
+`gated_delta_net.cu`). Nothing outside that directory was touched.
+
+| commit | change | prefill gain | bit-exact |
+|---|---|---|---|
+| `5d1fafb01` | vectorised f32<->f16 convert | +5.3% (prior session) | yes |
+| `58c8a73ed` | vectorised q6_K dequant | +0.7% | yes, machine-proven |
+| `a4d1103c5` | concurrent bidirectional peer copies | **+12.2%** | yes (scheduling only) |
+| `f8edbf816` | cuBLAS ALGO3 for wide f16 GEMMs | +1.8% | **no** (0.03 sigma) |
+| `e83a7913a` | f16 all-reduce + pipelined delta-net reduction | +3.2% | yes |
+| `ed42ad15d` | delta-net addressing walked | below noise here | yes |
+
+## Three corrections I made to my own claims
+
+These matter more than the last few percent, because each would have sent the
+next session down a wrong path:
+
+1. **The all-reduce was serialising both directions of a full-duplex PCIe
+   link.** Not a new optimisation so much as a bug: 4358 us of idle after every
+   peer copy, 86% of all idle time. Worth +12.2%.
+2. **The in-model GEMM gap is not thermal throttling** (attempt 84). Clocks hold
+   1328 MHz to 73 C. Nine causes eliminated; the in-model *minimum* equals
+   standalone exactly, so it is call-to-call variation, not a defect.
+3. **MTP is not kernel-bound** (attempt 86). It is 24% idle with 14.5% of wall
+   in the host round trip. This is why 60 t/s is reachable in principle but not
+   by tuning kernels.
+
+## What is actually left, ranked
+
+| # | item | worth | why not done |
+|---|---|---|---|
+| 1 | MTP host-sync: GPU-side sampling, or overlap host verification | up to +14.5% MTP (see 86 caveat: part is profiler artifact, real ~5-10%) | `--spec-draft-backend-sampling` is disabled for `SPLIT_MODE_TENSOR`; needs the meta backend taught to run the sampling graph |
+| 2 | overlap each weight dequant with the previous GEMM | +1.9% prefill -> ~451 | needs graph lookahead ggml does not expose |
+| 3 | multi-column `vec_dot_q6_K_q8_1` (unpack once, not per column) | +3.5% MTP -> ~56.4 | rewrite of the hottest kernel; bit-exact by construction |
+| 4 | fuse the all-reduce widen into the ADD | +0.8% prefill | needs an accumulating-copy path in `ggml-backend-meta.cpp` |
+
+Items 2 and 4 together would clear 450. **No combination of 1-4 reaches 60 MTP
+except item 1**, and item 1 alone would.
+
+## Measured dead ends — do not re-litigate
+
+MMQ on Pascal; f32 GEMM output (7.65 vs 16.8 TFLOPS); NN weight layout (real,
+but ALGO3 gets the same for one line); lda padding; chunking the GEMM along m;
+`-sm layer` for prefill (226.9) **and** decode (20.4); reduce-scatter/all-gather
+(identical traffic at 2 GPUs); CUDA graphs on Pascal (they engage, they give
+nothing); MMVQ rows-per-block; GDN block width, deeper load pipelining;
+per-shape cuBLAS algo (+0.3%); `--spec-draft-n-min`;
+`--spec-draft-backend-sampling` under `-sm tensor`.
+
+## Hygiene
+
+- All three `P100_*` probe switches in `vecdotq.cuh` are at **0**; one was used
+  for the attempt-85 measurement and correctness was re-verified after.
+- Gate corpus: use `p100-handoff/ppl-orig.txt` (420098 bytes, target 2.6209).
+  `./ppl.txt` is a different document (422246 bytes, target 2.7554).
+- Prefill readings carry a **2% thermal spread**. Compare only at equal starting
+  temperature. The GEMM kernel itself does not throttle -- this is model-level.

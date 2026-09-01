@@ -25,6 +25,25 @@ The trace gives grid/block/registers/duration per launch, which is how the flash
 caught running on 12 blocks. Beware: nvprof inflates the gaps between kernels, so read kernel
 durations from it but not utilisation.
 
+**That warning was checked and it is half right (2026-09-01).** Kernel
+*durations* are accurate: the same GEMM reads 10.864 ms under nvprof and
+10.863 ms un-profiled. But the *gaps* really do inflate -- nvprof costs MTP
+decode ~11% end to end (48.65 t/s profiled vs 54.5 not), and that overhead lands
+precisely in the host-synchronisation gaps. So:
+
+- kernel time, per-call cost, grid/occupancy: trust nvprof.
+- idle/utilisation on a **prefill** run: usable (442.74 t/s profiled vs 442.6
+  not, i.e. no distortion, because prefill barely touches the host).
+- idle/utilisation on a **decode/MTP** run: treat as an upper bound. The 14.5%
+  host round trip in OPTLOG attempt 86 needs re-measuring with CUDA events
+  inside the decode loop before anything is built on it.
+
+## mtp-bench.sh
+    ./p100-handoff/tools/mtp-bench.sh <n-max> <p-min>
+Runs llama-speculative-simple with MTP and prints t/s plus the accept rate. Best
+known settings are `4 0.2` (54.5 t/s). The whole flag space around this is swept
+in OPTLOG attempt 79 and 87.
+
 ## SASS
     cuobjdump -sass build-opt/ggml/src/ggml-cuda/CMakeFiles/ggml-cuda.dir/mmvq.cu.o
 Instruction histograms of the mmvq inner loop are how the activation loads were identified

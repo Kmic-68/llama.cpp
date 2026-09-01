@@ -3,6 +3,33 @@
 Base `f280b2698` → HEAD `134a4f4a5`. Audited 2026-08-31 by three independent
 adversarial reviewers, each instructed to *falsify* the bit-exactness claim.
 
+> **Scope note (2026-09-01).** This paper covers the patch set up to
+> `134a4f4a5` only. Six further code changes landed afterwards
+> (`5d1fafb01..f85e154ed`); their numerical status is summarised below and
+> argued in full in `OPTLOG.md` attempts 71-80. They were **not** re-audited by
+> the adversarial-reviewer process described here.
+>
+> | change | commit | status |
+> |---|---|---|
+> | vectorised f32<->f16 convert | `5d1fafb01` | bit-exact, index remap only |
+> | vectorised q6_K dequant | `58c8a73ed` | bit-exact, **machine-proven**: both index mappings replayed over 4096 random superblocks, 1048576 elements, 0 mismatches, 0 unwritten |
+> | concurrent peer copies | `a4d1103c5` | bit-exact, scheduling only -- no arithmetic touched |
+> | cuBLAS ALGO3 | `f8edbf816` | **NOT bit-exact** -- different kernel, different f16 k-accumulation order. PPL 2.6209 -> 2.6214 (0.03 sigma) |
+> | f16 all-reduce | `e83a7913a` | bit-exact *here*, and guarded by a one-time runtime probe that verifies every element of the first exchange is f16-representable before any copy is compressed |
+> | pipelined delta-net reduction | `e83a7913a` | bit-exact -- `warp_reduce_sum(float2)` applies the same per-component offsets in the same order as the scalar form |
+> | delta-net addressing walked | `ed42ad15d` | bit-exact, addressing only |
+>
+> Verification used for these: `test-backend-ops` per-op, a 2-chunk perplexity
+> signature check (chunk [1] must read 4.9738), and the full 30-chunk gate.
+> Each bit-exact change was confirmed to reproduce the *preceding build*
+> digit-for-digit, which is a stronger test than the gate band alone.
+>
+> The same caution the paper makes below still applies: a matching perplexity
+> does **not** prove bit-exactness. Where "bit-exact" is claimed above it rests
+> on a structural argument (same expression, same accumulation order, only the
+> thread->work assignment or the addressing changes), plus digit-for-digit
+> reproduction of the prior build -- not on the gate.
+
 ## Conclusion
 
 **The patch set is not byte-identical to stock — confirmed empirically, not
