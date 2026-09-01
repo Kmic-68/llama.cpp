@@ -139,7 +139,25 @@ That sits right at the 53-55 t/s structural ceiling estimated for the current
 kernel shape, and the curve is flat-to-falling past n-max 4 (accept rate decays
 faster than the extra tokens pay).
 
-**Best remaining MTP idea, measured and costed:** the weight block's load and
+### MTP is host-sync bound -- start here, not with the kernels
+
+Steady-state MTP decode is **24% idle**, and **14.5% of wall is the host round
+trip** (95 DtoH events with 1.46 ms of GPU idle after each, plus 817 HtoD):
+logits to the CPU, speculative accept/reject there, tokens back. Removing it
+gives 54.5/(1-0.145) = **63.7 t/s, past the 60 target**. So 60 is reachable, but
+through the decode *pipeline*, not kernel tuning:
+
+1. GPU-side sampling -- llama.cpp has it and disables it for our split mode
+   (`llama-context.cpp`: "backend sampling not supported with
+   SPLIT_MODE_TENSOR"). Same root cause as the meta backend not servicing eval
+   callbacks. Needs the meta backend taught to run the sampling graph.
+2. Overlap host verification with GPU work in the speculative loop.
+
+**Caveat: nvprof costs MTP ~11% (48.65 profiled vs 54.5 not), and host-sync gaps
+are exactly where that overhead lands.** Re-measure with CUDA events inside the
+decode loop before building on 14.5%; true headroom is probably 5-10%.
+
+**Second MTP idea, measured and costed:** the weight block's load and
 6-bit unpack are redone once per column, five times over at ncols_dst=5. Priced
 with the `P100_NOUNPACK` probe: `mul_mat_vec_q<ncols=5>` 95.717 -> 87.629 us
 (-8.5%), tg256 32.12 -> 33.79 (+5.2%). Hoisting it recovers 4/5 of that,
