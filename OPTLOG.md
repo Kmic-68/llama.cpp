@@ -1745,3 +1745,33 @@ Hypotheses tested and **eliminated**, each with a standalone reproduction:
 **The 3.2% remains unexplained.** Untested candidates: activation (B) locality,
 cuBLAS handle/workspace state, or residual concurrency from the peer-copy
 stream. Worth ~2.3 points if anyone cracks it -- do not dismiss it as thermal.
+
+## 84b — the GEMM gap, resolved as far as it can be
+
+Two more hypotheses eliminated:
+
+| hypothesis | result |
+|---|---|
+| concurrency from the peer-copy stream stealing HBM | **0 of 256** gate/up GEMMs overlap with any other activity |
+| cuBLAS handle state (ggml sets TF32_TENSOR_OP_MATH + a 4 MB workspace) | 10.863-10.865 ms in all four combinations |
+
+Then the key observation, from a clean trace (442.74 t/s under nvprof, matching
+the un-profiled number):
+
+| device | n | min | median | mean | max |
+|---|---|---|---|---|---|
+| 0 | 256 | **10.869** | 11.072 (+1.9%) | 11.103 | 11.397 |
+| 1 | 256 | **10.863** | 11.201 (+3.1%) | 11.232 | 12.475 |
+
+**The minimum equals the standalone 10.864 ms exactly, on both devices.** The
+kernel does reach full speed in-model; what differs is the *median*, with a
+spread of 10.86-12.5 ms. So this is not a systematic property of the in-model
+environment that could be removed -- it is call-to-call variation in memory/clock
+state, and the nine software causes tested all came back negative.
+
+Ceiling if every call ran at the observed minimum: ~2 points, i.e. ~450. But
+there is no identified mechanism to make that happen, and it is not a code
+defect. Closing this line of investigation.
+
+Note GPU0 is consistently *faster* than GPU1 (median 11.07 vs 11.20) despite
+GPU0 also hosting Sunshine's display allocation. Unexplained, not actionable.
