@@ -1632,3 +1632,64 @@ Kept anyway: bit-identical (pure addressing), never slower in any measurement,
 costs 5 registers (47 -> 52) without changing resident blocks, and is a large
 win for small-head-count configurations. Recorded honestly as *not* a measurable
 gain for the Qwen3.5 27B workload.
+
+## 81 — CUDA graphs on Pascal (TESTED, no gain — upstream's exclusion is correct)
+
+llama.cpp disables CUDA graphs for cc < VOLTA unconditionally. sm_60 hardware
+supports them, and MTP decode launches a great many tiny kernels (rms_norm
+6.8us x 20198 calls, quantize_q8_1 2.8us x 37076, cpy 2.3us x 34426,
+bin_bcast 2.3us x 36328), so this looked like a large launch-overhead win.
+
+Added a `GGML_CUDA_GRAPHS_PRE_VOLTA=1` opt-in and measured. Graphs **do** engage
+("CUDA graph warmup complete", "CUDA Graph id reused"), and give nothing:
+
+| | graphs off | graphs on |
+|---|---|---|
+| MTP (n-max 4, p-min 0.2) | 54.478 | 54.028 |
+| tg256 | 32.12 | 31.25 |
+
+The workload is not launch-bound -- it is streaming weights. `mul_mat_vec_q`
+with ncols=5 is 52% of MTP GPU time at 95.7us per call (~383 GB/s of Q6_K
+weights, i.e. ~75% of achievable HBM bandwidth), and the tiny kernels overlap
+with that. Reverted; upstream's exclusion is justified for this workload.
+
+## 82 — MMVQ rows-per-block for the MTP path (no effect)
+
+`P100_MMVQ_ROWS_N` 16 -> 8 (doubling block count, since the down-projection at
+m=5120 yields only 320 blocks over 56 SMs and looked under-subscribed):
+MTP 54.040 -> 54.053. No effect -- the multi-column path is not
+parallelism-limited. Reverted.
+
+## 83 — `-sm layer` for decode (much worse)
+
+tg256 **20.37** vs 32.12 with `-sm tensor`. Decode is HBM-bandwidth-bound per
+GPU, so tensor split's two-way bandwidth is worth far more than the all-reduce
+costs. Same conclusion as prefill (attempt in 78's table: 226.9 vs 438.5).
+`-sm tensor` is correct for both phases.
+
+## Goal status, honestly
+
+Targets were 450 t/s prefill and 60 t/s MTP.
+
+| | start | achieved | target | |
+|---|---|---|---|---|
+| prefill pp2048 | 372.5 | **442.6** | 450 | 98.4% |
+| MTP | 48.8 | **54.5** | 60 | 90.8% |
+| single-token tg256 | 29.8 | **32.1** | — | +7.7% |
+
+Neither target met. What stands between here and them:
+
+**Prefill (+1.7% needed).** GEMM is 71% of wall at 15.7 TFLOPS in-model against
+16.8 standalone; the 6.6% gap is sustained-clock throttling and nvidia-smi is
+off limits. The one identified remaining item is fusing the all-reduce widen
+into the ADD (~+0.8%), which needs an accumulating-copy path in
+ggml-backend-meta.cpp so the ADD node can be dropped -- graph-construction
+surgery in generic code, which is more risk than the instruction to avoid
+"overly risky" changes allows this late. A second ~1.9% would come from
+overlapping each weight dequant with the *previous* matmul's GEMM on a second
+stream, which needs graph lookahead ggml does not currently expose.
+
+**MTP (+10% needed).** 52% of the time is `mul_mat_vec_q<ncols=5>` already at
+~75% of achievable HBM bandwidth. Closing the gap means attacking the sm_60
+dp4a emulation, which is already down to 8 instructions and bit-exact, or
+changing the kernel shape. Not a tuning problem.
