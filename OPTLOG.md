@@ -1813,3 +1813,50 @@ accumulation order is unchanged) if anyone picks it up.
 
 **All three probe switches in vecdotq.cuh were returned to 0** and correctness
 re-verified (chunk [1] 4.9738, [2] 3.9640) after this measurement.
+
+## 86 — MTP is host-sync bound, not kernel bound (the actual route to 60)
+
+Measured the idle fraction of MTP decode, which had never been done (this is the
+same measurement that produced the +12.2% prefill win in attempt 72).
+
+Steady-state decode (last 25% of the timeline, device 1), `--spec-draft-n-max 4`:
+
+**wall 1.603s, busy 76.0%, IDLE 24.0%**
+
+| gap follows | share of wall | n | avg |
+|---|---|---|---|
+| `[CUDA memcpy DtoH]` | **8.7%** | 95 | 1460.7 us |
+| `[CUDA memcpy HtoD]` | **5.8%** | 817 | 112.9 us |
+| `rms_norm_f32<1024>` | 4.3% | 1262 | 54.8 us |
+| `[CUDA memcpy PtoP]` | 1.3% | 2624 | 8.0 us |
+| bin_bcast / mmvq / quantize | ~2% | many | 2.6-28.6 us |
+
+**14.5% of wall is the host round trip** -- logits copied to the CPU, the
+speculative accept/reject decided there, tokens copied back. At ~4.3 DtoH per
+pass with 1.46 ms of GPU idle after each, the GPU spends a seventh of decode
+waiting on the host. Removing it entirely would give 54.5/(1-0.145) = **63.7
+t/s, past the 60 target**.
+
+So the route to 60 is **not** kernel optimisation. It is the decode pipeline.
+The two ways to get it:
+
+1. GPU-side sampling. llama.cpp has it, and it is explicitly disabled for our
+   split mode -- `llama-context.cpp`: "backend sampling not supported with
+   SPLIT_MODE_TENSOR; using CPU". Same root cause as the meta backend being
+   unable to service eval callbacks. Enabling it means teaching the meta backend
+   to run the sampling graph.
+2. Overlapping host verification with GPU work in the speculative loop
+   (application-level restructuring of llama-speculative-simple / the server).
+
+Both are backend/application architecture, not CUDA kernels, and well outside
+what should be attempted unattended.
+
+**Caveat, stated because it matters:** nvprof itself costs MTP ~11% (48.65 t/s
+profiled vs 54.5 unprofiled), and host-sync gaps are precisely where profiler
+overhead lands. Some fraction of the 14.5% is therefore artifact, and the true
+headroom is likely smaller -- call it 5-10% rather than 14.5%. It should be
+re-measured with CUDA events inside the decode loop rather than under a
+profiler before anyone builds on this number.
+
+This supersedes attempt 85's framing: the unpack redundancy (~3.5%) is real but
+it is the *second* item, not the first. Fix the host stalls first.
