@@ -1860,3 +1860,26 @@ profiler before anyone builds on this number.
 
 This supersedes attempt 85's framing: the unpack redundancy (~3.5%) is real but
 it is the *second* item, not the first. Fix the host stalls first.
+
+## 87 — remaining MTP flags swept (nothing left in flag space)
+
+`--spec-draft-backend-sampling` is **inert under `-sm tensor`**: 54.12 vs 53.59
+t/s, and the "backend sampling not supported with SPLIT_MODE_TENSOR" warning
+fires either way. This is the flag that would have addressed the 14.5% host
+round trip from attempt 86, and it is gated off for our split mode -- confirming
+that fix requires backend work, not configuration.
+
+`--spec-draft-n-min` (never previously swept, default 0): no effect.
+
+| n-max | p-min | n-min | t/s | accept |
+|---|---|---|---|---|
+| 4 | 0.2 | 0 | 54.48 | 78.2% |
+| 4 | 0.2 | 1 | 54.27 | 78.2% |
+| 4 | 0.2 | 4 | 54.38 | 78.2% |
+| 5 | 0.2 | 2 | 54.00 | 71.9% |
+| 6 | 0.2 | 3 | 50.32 | 67.8% |
+
+**The MTP flag space is now exhausted** (n-max, p-min, n-min, backend-sampling,
+split mode, cache types). 54.5 t/s stands, and the remaining 10% to the 60
+target is the host-sync work in attempt 86 plus the kernel work in 85 -- neither
+of which is reachable by configuration.
