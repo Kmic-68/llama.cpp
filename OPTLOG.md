@@ -1775,3 +1775,41 @@ defect. Closing this line of investigation.
 
 Note GPU0 is consistently *faster* than GPU1 (median 11.07 vs 11.20) despite
 GPU0 also hosting Sunshine's display allocation. Unexplained, not actionable.
+
+## 85 — the redundant weight unpack in mmvq, priced (not captured)
+
+`mul_mat_vec_q`'s inner nest is `for j in ncols_dst { for i in rows { tmp[j][i]
++= vec_dot(xs_i, ys_j) } }`. `xs` depends only on `i`, so for ncols_dst=5 the
+weight block's load **and its 6-bit unpack are redone five times**. MTP runs at
+ncols_dst=5, and that kernel is 52% of MTP GPU time -- so this looked like the
+route to 60 t/s.
+
+Priced it with the `P100_NOUNPACK` probe the previous session left in
+vecdotq.cuh (drops the shift/mask unpack, keeping both loads and the dp4a;
+results are wrong, timing only):
+
+| | unpack present | unpack removed |
+|---|---|---|
+| `mul_mat_vec_q<ncols=5>` per call | 95.717 us | **87.629 us** (-8.5%) |
+| tg256 (ncols=1) | 32.12 | **33.79** (+5.2%) |
+
+So the unpack is 8.5% of the ncols=5 kernel. Hoisting it (once instead of five
+times) recovers 4/5 of that, ~6.8% of the kernel = **~3.5% of MTP** -> ~56.4 t/s.
+Real, but **not enough for the 60 t/s target**, and nothing for single-token
+decode where there is only one column and so no redundancy to remove.
+
+Tried to get it for free by swapping the loop nest to `for i { for j { ... } }`,
+making the weight work loop-invariant in j. **No gain** (MTP 53.86 vs 54.48,
+tg256 31.77 vs 32.12; correctness held at chunk [1] 4.9738). Both loops carry
+`#pragma unroll` over compile-time bounds, so nvcc fully unrolls them and the
+order is irrelevant to CSE -- it simply is not hoisting the unpack in either
+form. Reverted.
+
+Capturing it needs a hand-written multi-column `vec_dot_q6_K_q8_1` that unpacks
+once and runs ncols dp4a chains, plus a dispatch for it in mmvq. That is a
+rewrite of the hottest kernel in the build for ~3.5% on one metric, so it was
+not attempted unattended. It is bit-exact by construction (per-column
+accumulation order is unchanged) if anyone picks it up.
+
+**All three probe switches in vecdotq.cuh were returned to 0** and correctness
+re-verified (chunk [1] 4.9738, [2] 3.9640) after this measurement.
