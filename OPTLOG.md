@@ -1424,3 +1424,62 @@ Also measured and rejected:
 - chunking the GEMM along m: strictly worse (15.25 -> 14.96 -> 12.89).
 - f32 GEMM output (would remove the f16->f32 convert): 7.65 TFLOPS, ~half
   speed. Dead.
+
+## 75 — f16 tensor-parallel all-reduce (KEPT, +2.4%)
+
+PtoP was 11.9% of prefill and already at hardware peak (attempt 72), so the only
+remaining lever was sending fewer bytes.
+
+On this backend every MUL_MAT output is *already* an f16 value widened to f32:
+with cc < VOLTA the cuBLAS epilogue writes f16 into a pool buffer and a separate
+`convert_unary` widens it (1984 converts per pass, exactly one per GEMM). So the
+f32 partials the all-reduce ships hold only f16-representable values, and
+narrowing them for transport is **exactly lossless** -- here.
+
+That is a property of this path, not a general truth (mul_mat_vec_q produces
+genuine f32), so it is not assumed. Guards:
+- `src->op == GGML_OP_MUL_MAT && src->ne[1] >= 512` -- the condition under which
+  the f16 cuBLAS path is taken; narrow batches keep f32.
+- `cc < VOLTA && fast_fp16_available(cc)`.
+- A **one-time runtime probe** on the first eligible exchange checks every
+  element for f16-exactness and latches the result. The probe exchange itself
+  still goes uncompressed, so a model whose partials are not f16-exact never
+  sees a single lossy copy. It reports: "tensor-parallel partials are f16-exact;
+  peer copies will be sent as f16".
+
+Two bugs found and fixed on the way, both worth recording:
+1. **One staging buffer per context is wrong.** In a butterfly all-reduce a
+   device is sender and receiver in the same step, so GPU1's buffer was both the
+   landing zone for copy 0->1 and the narrow output for copy 1->0. Each GPU
+   ended up adding its own partial twice. Perplexity chunk [1] 4.97 -> 27.28.
+   Fixed with separate OUT/IN buffers.
+2. **record_work() after the widen re-serialised the directions.** It advanced
+   the dst's work marker past a wait on the peer's copy, so the other direction's
+   copy stream queued behind it -- reinstating exactly the stall attempt 72
+   removed. 396.63 -> 439.16 once dropped. A `peer_stage_free` event guards
+   refill instead.
+
+pp2048 428.69 -> **439.16 +/- 0.98**. +2.4%.
+
+## 76 — pipelined gated_delta_net reduction (KEPT, +0.8%)
+
+The token loop's critical path is load -> reduce -> update -> reduce, serial
+over 2048 tokens, and a 5-step warp butterfly is ~150 cycles. But attn[col] for
+token t and kv[col] for token t+1 both read only the state *after* token t, so
+they are independent: token t+1's k is pulled forward and the two partials are
+reduced together with `warp_reduce_sum(float2)`, which interleaves the two
+shuffle chains and pays one chain's latency instead of two.
+
+Bit-identical: the float2 overload applies the same per-component offsets in the
+same order as the scalar one, and every partial is still accumulated over r in
+the same order.
+
+Bug found via `test-backend-ops -o GATED_DELTA_NET` (ERR 6.1e-4 vs 1e-7 tol,
+which compounded to NaN over 2048 tokens): the first attempt stored the
+*reduced* kv back into the accumulator and then reduced it again at the top of
+the next iteration. The carried value is already reduced.
+
+pp2048 439.16 -> **442.59 +/- 1.44**. +0.8%.
+
+Perplexity for 75+76 together: **2.6214 +/- 0.01995**, chunk [1] 4.9738 --
+identical to every digit to the ALGO3 build, confirming both are lossless.

@@ -67,56 +67,128 @@ gated_delta_net_cuda(const float * q,
         s_shard[r]  = curr_state[i];
     }
 
-    for (int t = 0; t < n_tokens; t++) {
-        const float * q_t = q + iq3 * sq3 + t * sq2 + iq1 * sq1;
-        const float * k_t = k + iq3 * sq3 + t * sq2 + iq1 * sq1;
-        const float * v_t = v + sequence * sv3 + t * sv2 + h_idx * sv1;
+    // Snapshot of the running state into the caller's rolling slots, shared by both variants.
+    auto snapshot = [&](const int t) {
+        if constexpr (keep_rs_t) {
+            // snapshot slot mapping: slot 0 = most recent state, slot s = s tokens back.
+            // When n_tokens < K only slots 0..n_tokens-1 are written; older slots are caller-owned.
+            const int target_slot = (int) n_tokens - 1 - t;
+            if (target_slot >= 0 && target_slot < K) {
+                float * slot = state + target_slot * state_slot_stride;
+#pragma unroll
+                for (int r = 0; r < rows_per_lane; r++) {
+                    const int i = r * warp_size + lane;
+                    slot[col * S_v + i] = s_shard[r];
+                }
+            }
+        }
+    };
 
-        const int64_t gb_offset = sequence * sb3 + t * sb2 + h_idx * sb1;
-        const float * beta_t = beta + gb_offset;
-        const float * g_t    = g    + gb_offset * (KDA ? S_v : 1);
-
-        const float beta_val = *beta_t;
-
-        // Cache k and q in registers
+    if constexpr (!KDA) {
+        // Software-pipelined. attn[col] for token t and kv[col] for token t+1 both read only the
+        // state *after* token t, so they are independent and can share one butterfly: the float2
+        // reduction runs the two shuffle chains interleaved, paying one chain's latency instead of
+        // two. That latency is the loop's critical path -- n_tokens iterations of
+        // load -> reduce -> update -> reduce -- so collapsing two chains into one is the win.
+        //
+        // Bit-identical to the unpipelined form: warp_reduce_sum(float2) applies exactly the same
+        // per-component offsets in the same order as the scalar version, every partial sum is
+        // still accumulated over r in the same order, and no term changes which value it uses.
         float k_reg[rows_per_lane];
         float q_reg[rows_per_lane];
-#pragma unroll
-        for (int r = 0; r < rows_per_lane; r++) {
-            const int i = r * warp_size + lane;
-            k_reg[r] = k_t[i];
-            q_reg[r] = q_t[i];
-        }
+        float g_val    = 0.0f;
+        float beta_val = 0.0f;
+        float v_val    = 0.0f;
+        float kv_shard = 0.0f;
 
-        if constexpr (!KDA) {
-            const float g_val = expf(*g_t);
+        // load token t's inputs and fold them into the pending kv partial
+        auto load_token = [&](const int t) {
+            const float * q_t = q + iq3 * sq3 + t * sq2 + iq1 * sq1;
+            const float * k_t = k + iq3 * sq3 + t * sq2 + iq1 * sq1;
+            const float * v_t = v + sequence * sv3 + t * sv2 + h_idx * sv1;
 
-            // kv[col] = (S^T @ k)[col] = sum_i S[i][col] * k[i]
-            float kv_shard = 0.0f;
+            const int64_t gb_offset = sequence * sb3 + t * sb2 + h_idx * sb1;
+
 #pragma unroll
             for (int r = 0; r < rows_per_lane; r++) {
-                kv_shard += s_shard[r] * k_reg[r];
+                const int i = r * warp_size + lane;
+                k_reg[r] = k_t[i];
+                q_reg[r] = q_t[i];
             }
-            float kv_col = warp_reduce_sum<warp_size>(kv_shard);
+
+            g_val    = expf(*(g + gb_offset));
+            beta_val = *(beta + gb_offset);
+            v_val    = v_t[col];
+        };
+
+        load_token(0);
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; r++) {
+            kv_shard += s_shard[r] * k_reg[r];
+        }
+        // carried across iterations already reduced -- do not reduce it a second time
+        float kv_col = warp_reduce_sum<warp_size>(kv_shard);
+
+        for (int t = 0; t < n_tokens; t++) {
 
             // delta[col] = (v[col] - g * kv[col]) * beta
-            float delta_col = (v_t[col] - g_val * kv_col) * beta_val;
+            const float delta_col = (v_val - g_val * kv_col) * beta_val;
 
             // fused: S[i][col] = g * S[i][col] + k[i] * delta[col]
             // attn[col] = (S^T @ q)[col] = sum_i S[i][col] * q[i]
             float attn_partial = 0.0f;
 #pragma unroll
             for (int r = 0; r < rows_per_lane; r++) {
-                s_shard[r]  = g_val * s_shard[r] + k_reg[r] * delta_col;
+                s_shard[r]    = g_val * s_shard[r] + k_reg[r] * delta_col;
                 attn_partial += s_shard[r] * q_reg[r];
             }
 
-            float attn_col = warp_reduce_sum<warp_size>(attn_partial);
+            // Pull token t+1's kv partial forward: it reads only the state after token t, so it
+            // is independent of attn[col] for token t and the two can share one butterfly. The
+            // float2 reduction interleaves the two shuffle chains, paying one chain's latency
+            // instead of two -- and that latency is this loop's critical path.
+            float kv_next = 0.0f;
+            if (t + 1 < n_tokens) {
+                load_token(t + 1);
+#pragma unroll
+                for (int r = 0; r < rows_per_lane; r++) {
+                    kv_next += s_shard[r] * k_reg[r];
+                }
+            }
+
+            const float2 red = warp_reduce_sum<warp_size>(make_float2(attn_partial, kv_next));
+            kv_col = red.y;
 
             if (lane == 0) {
-                attn_data[col] = attn_col * scale;
+                attn_data[col] = red.x * scale;
             }
-        } else {
+
+            attn_data += S_v * H;
+
+            snapshot(t);
+        }
+    } else {
+        for (int t = 0; t < n_tokens; t++) {
+            const float * q_t = q + iq3 * sq3 + t * sq2 + iq1 * sq1;
+            const float * k_t = k + iq3 * sq3 + t * sq2 + iq1 * sq1;
+            const float * v_t = v + sequence * sv3 + t * sv2 + h_idx * sv1;
+
+            const int64_t gb_offset = sequence * sb3 + t * sb2 + h_idx * sb1;
+            const float * beta_t = beta + gb_offset;
+            const float * g_t    = g    + gb_offset * S_v;
+
+            const float beta_val = *beta_t;
+
+            // Cache k and q in registers
+            float k_reg[rows_per_lane];
+            float q_reg[rows_per_lane];
+#pragma unroll
+            for (int r = 0; r < rows_per_lane; r++) {
+                const int i = r * warp_size + lane;
+                k_reg[r] = k_t[i];
+                q_reg[r] = q_t[i];
+            }
+
             // kv[col] = sum_i g[i] * S[i][col] * k[i]
             float kv_shard = 0.0f;
 #pragma unroll
@@ -145,22 +217,10 @@ gated_delta_net_cuda(const float * q,
             if (lane == 0) {
                 attn_data[col] = attn_col * scale;
             }
-        }
 
-        attn_data += S_v * H;
+            attn_data += S_v * H;
 
-        if constexpr (keep_rs_t) {
-            // snapshot slot mapping: slot 0 = most recent state, slot s = s tokens back.
-            // When n_tokens < K only slots 0..n_tokens-1 are written; older slots are caller-owned.
-            const int target_slot = (int) n_tokens - 1 - t;
-            if (target_slot >= 0 && target_slot < K) {
-                float * curr_state = state + target_slot * state_slot_stride;
-#pragma unroll
-                for (int r = 0; r < rows_per_lane; r++) {
-                    const int i = r * warp_size + lane;
-                    curr_state[col * S_v + i] = s_shard[r];
-                }
-            }
+            snapshot(t);
         }
     }
 

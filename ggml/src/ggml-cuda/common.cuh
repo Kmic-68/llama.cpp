@@ -1468,6 +1468,33 @@ struct ggml_backend_cuda_context {
         CUDA_CHECK(cudaEventRecord(work_event, stream()));
     }
 
+    // Staging buffers for compressed peer copies (see ggml_backend_cuda_cpy_tensor_async).
+    // Two of them, and they must stay distinct: in a butterfly all-reduce a device is both a
+    // sender and a receiver in the same step, so one shared buffer would have the outgoing
+    // narrow overwrite the partial that just landed from the peer.
+    // Allocated once and grown on demand -- sizes are stable across a run, so no cudaMalloc
+    // ends up on the hot path.
+    enum peer_stage_dir { PEER_STAGE_OUT = 0, PEER_STAGE_IN = 1 };
+    void * peer_stage[2]     = { nullptr, nullptr };
+    size_t peer_stage_cap[2] = { 0, 0 };
+    // Signals that the landing buffer has been widened and may be refilled. A sender waits on the
+    // receiver's copy of this before overwriting it.
+    cudaEvent_t peer_stage_free = nullptr;
+    // -1 = not yet probed, 0 = partials are not f16-exact (never compress), 1 = safe to compress
+    int    peer_f16_ok       = -1;
+
+    void * peer_stage_get(peer_stage_dir dir, size_t size) {
+        if (peer_stage_cap[dir] < size) {
+            ggml_cuda_set_device(device);
+            if (peer_stage[dir] != nullptr) {
+                CUDA_CHECK(cudaFree(peer_stage[dir]));
+            }
+            CUDA_CHECK(cudaMalloc(&peer_stage[dir], size));
+            peer_stage_cap[dir] = size;
+        }
+        return peer_stage[dir];
+    }
+
     cudaStream_t peer_copy_stream() {
         if (copy_stream == nullptr) {
             ggml_cuda_set_device(device);
