@@ -59,7 +59,9 @@ bench. Swept: 512 is catastrophic (cuBLAS takes the same time for n=512 as
 n=1024 -- wave quantisation), 3072 is bad (non-power-of-2), 4096 is slightly
 worse than 2048.
 
-**Re-baseline from cold.** The same build, same command, three readings:
+**Re-baseline from cold.** Note this is *model-level* drift (many kernels, PtoP,
+barriers) -- the GEMM kernel itself does not throttle at all. Same build, same
+command, three readings:
 442.59 at 39 C, 438.49 at 55 C, 434.10 starting at 52 C and ending at 66 C.
 That is a 2% spread from temperature alone. Anything under ~2% is not a code
 delta -- always compare at the same starting temperature.
@@ -90,8 +92,14 @@ Ranked by what is actually still available:
    by node, so this needs graph lookahead the backend does not expose today.
 4. Per-shape cuBLAS algo: ~+0.3%, measured, judged not worth the risk.
 
-The GEMM itself is done: 15.7 TFLOPS in-model against 16.8 standalone, and that
-6.6% gap is sustained-clock throttling (nvidia-smi is off limits per CLAUDE.md).
+The GEMM runs at ~15.9 TFLOPS in-model against 16.80 standalone -- a uniform
+**3.2%** gap worth ~2.3 points. An earlier draft of this file blamed thermal
+throttling; **that was wrong and is retracted**. A 170 s pure-GEMM run holds
+1328 MHz and 16.81 TFLOPS all the way to 73 C, hotter than the model ever gets.
+Seven causes have been tested and eliminated with standalone reproductions
+(throttling, dual-GPU load, nvprof overhead, preceding write traffic, pointer
+alignment, cold buffers, VMM mapping) -- see OPTLOG attempt 84. The cause is
+still unknown; it is real and it is not thermal.
 
 **Dead ends, measured -- do not re-litigate:**
 - MMQ on Pascal (no DP4A, ~4x ALU disadvantage).

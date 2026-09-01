@@ -1699,3 +1699,49 @@ changing the kernel shape. Not a tuning problem.
 `ed42ad15d` + docs: perplexity **2.6214 +/- 0.01995**, chunk [1] 4.9738 --
 identical to the previous gate, so attempt 80 (GDN addressing) is confirmed
 bit-exact end to end. Inside the CLAUDE.md band by 0.03 sigma.
+
+## 84 — RETRACTION: the in-model GEMM gap is NOT thermal throttling
+
+Earlier entries (and the first version of RESUME-HERE.md) attributed the gap
+between the in-model GEMM and the same GEMM standalone to "sustained-clock
+throttling". **That is wrong and is retracted.**
+
+Sustained pure-GEMM run, 170 s, ALGO3, m=8704 n=2048 k=5120:
+
+| elapsed | temp | clock | power | TFLOPS |
+|---|---|---|---|---|
+| 0 s | 41 C | 1328 MHz | 39 W | 16.79 |
+| 50 s | 57 C | 1328 MHz | 137 W | 16.81 |
+| 100 s | 65 C | 1328 MHz | 148 W | 16.81 |
+| 170 s | 73 C | 1328 MHz | 154 W | 16.81 |
+
+Clocks never leave 1328 MHz, past the 63-66 C the model reaches, and throughput
+is flat to three digits. There is no throttling.
+
+The real gap is also smaller than first reported. Duration *distribution* of the
+in-model gate/up GEMM (grid=(34,16), i.e. m=8704 k=5120), 118 calls per device:
+
+| | min | p25 | median | p75 | p90 | max | mean |
+|---|---|---|---|---|---|---|---|
+| dev 0 | 11.038 | 11.111 | 11.179 | 11.295 | 11.373 | 11.646 | 11.213 |
+| dev 1 | 11.001 | 11.046 | 11.196 | 11.390 | 11.508 | 12.175 | 11.239 |
+
+Tight, no outlier tail. Standalone is 10.864 ms. So the gap is a **uniform
+3.2%**, worth ~2.3 points of prefill wall time -- not the 6.9% an earlier noisy
+window suggested.
+
+Hypotheses tested and **eliminated**, each with a standalone reproduction:
+
+| hypothesis | result |
+|---|---|
+| clock/thermal throttling | 16.81 TFLOPS flat to 73 C, 1328 MHz |
+| both GPUs loaded (shared envelope) | 10.863 ms each, simultaneous |
+| nvprof inflates durations | nvprof 10.864 vs untimed 10.863 |
+| preceding dequant write traffic | writer+gemm: gemm still 10.866 |
+| pointer alignment (pool vs cudaMalloc) | only ~1%, and only below 16 B |
+| cold weight buffer (TLB/L2) | rotating 6x89 MB buffers: 10.864 |
+| VMM mapping vs cudaMalloc | 10.866 vs 10.868, granularity 2048 KB |
+
+**The 3.2% remains unexplained.** Untested candidates: activation (B) locality,
+cuBLAS handle/workspace state, or residual concurrency from the peer-copy
+stream. Worth ~2.3 points if anyone cracks it -- do not dismiss it as thermal.
