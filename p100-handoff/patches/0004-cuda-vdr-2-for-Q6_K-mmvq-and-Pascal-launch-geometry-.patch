@@ -1,0 +1,196 @@
+From f07b913a7f59f7bf386b5aab16a1f46f1f6f239f Mon Sep 17 00:00:00 2001
+From: Kaden <kaden@localhost>
+Date: Sat, 29 Aug 2026 19:23:10 -0500
+Subject: [PATCH 04/16] cuda: vdr=2 for Q6_K mmvq and Pascal launch geometry in
+ source (sm_60)
+
+Raise VDR_Q6_K_Q8_1_MMVQ from 1 to 2 so each thread handles two consecutive
+int32 of the quant data. For even iqs, bq8_offset, scale_offset and vh_shift are
+identical for iqs and iqs+1 -- all three are floor-divisions with an even
+modulus, so an even index and its odd successor land in the same bucket. The two
+halves therefore share one scales pointer, one bq6_K->d and one pair of q8_1 .ds
+scales, all of which were previously fetched twice by two separate warp lanes.
+That is 57.5 LSU operations per block against 81, 29% fewer. It does not widen
+the ql/qh loads: block_q6_K's 210-byte stride keeps those 2-byte aligned however
+vdr is set.
+
+Halving the threads per block-group moves the launch-geometry optimum, so retune
+it: nwarps 8 -> 2 for ncols_dst == 1. Measured on the full model rather than on a
+single isolated shape, which was misleading here -- the isolated kernel showed
+vdr=2 as a 1.12x win while the model showed nothing until the geometry followed.
+tg256: 8x4 20.35, 4x4 22.97, 2x4 23.31, 2x2 22.67, 1x4 22.22.
+
+Move the tuning out of the -DP100_* build flags and into the source, gated on
+__CUDA_ARCH_LIST__ == 600 so MMVQ_PARAMETERS_GENERIC -- which Ampere and later
+also fall through to -- is untouched. __CUDA_ARCH_LIST__ is the right test
+because it is visible to both the host and device passes, and calc_nwarps feeds
+both __launch_bounds__ and the host-side launch configuration, which must agree.
+A flagless build now reproduces the tuned result, removing the silent
+17% cliff that came from forgetting the flags.
+
+test-backend-ops -o MUL_MAT passes 1193/1193.
+
+qwen3.8-27B-Q6_K, 2x Tesla P100, -sm tensor -fa 1 -ctk/-ctv q4_0, tg256:
+20.35 -> 23.28 t/s (17.45 baseline, +33%).
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+---
+ ggml/src/ggml-cuda/mmvq.cu     | 29 +++++++++++-------
+ ggml/src/ggml-cuda/vecdotq.cuh | 55 ++++++++++++++++++++++++++++------
+ 2 files changed, 64 insertions(+), 20 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 15f9a016b..413d12a40 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -95,6 +95,19 @@ static constexpr __host__ __device__ int get_block_byte_size(ggml_type type) {
+     }
+ }
+ 
++// Launch geometry for mul_mat_vec_q on Pascal, measured on 2x Tesla P100 (sm_60).
++//
++// Pascal falls through to MMVQ_PARAMETERS_GENERIC, which Ampere and later also use, so these
++// values are applied only when the build targets sm_60 exclusively. __CUDA_ARCH_LIST__ is the
++// right test because it is visible to both the host and the device pass: calc_nwarps feeds both
++// __launch_bounds__ and the host-side launch configuration, and the two must agree.
++//
++// These supersede the older -DP100_NWARPS/-DP100_ROWS build flags, which are no longer read --
++// carrying the tuning in the source means a plain build cannot silently miss it.
++#if defined(__CUDA_ARCH_LIST__) && __CUDA_ARCH_LIST__ == 600
++#define GGML_CUDA_MMVQ_PASCAL 1
++#endif
++
+ enum mmvq_parameter_table_id {
+     MMVQ_PARAMETERS_GENERIC = 0,
+     MMVQ_PARAMETERS_TURING,
+@@ -426,16 +439,14 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
+ }
+ 
+ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool small_k = false, bool halve_iters = false) {
+-#ifdef P100_NWARPS
++#ifdef GGML_CUDA_MMVQ_PASCAL
+     if (table_id == MMVQ_PARAMETERS_GENERIC) {
+         if (ncols_dst == 1) {
+-            return P100_NWARPS;
++            return 2;
+         }
+-#ifdef P100_MC_NWARPS
+         if (ncols_dst <= 8) {
+-            return P100_MC_NWARPS;
++            return 4;
+         }
+-#endif
+     }
+ #endif
+     if (table_id == MMVQ_PARAMETERS_GENERIC) {
+@@ -568,8 +579,8 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int
+     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
+         switch (ncols_dst) {
+             case 1:
+-#ifdef P100_ROWS
+-                return P100_ROWS;
++#ifdef GGML_CUDA_MMVQ_PASCAL
++                return 4;
+ #else
+                 return small_k ? nwarps : 1;
+ #endif
+@@ -580,11 +591,7 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int
+             case 6:
+             case 7:
+             case 8:
+-#ifdef P100_MC_ROWS
+-                return P100_MC_ROWS;
+-#else
+                 return 2;
+-#endif
+             default:
+                 return 1;
+         }
+diff --git a/ggml/src/ggml-cuda/vecdotq.cuh b/ggml/src/ggml-cuda/vecdotq.cuh
+index c60647b3a..fbd9f8d84 100644
+--- a/ggml/src/ggml-cuda/vecdotq.cuh
++++ b/ggml/src/ggml-cuda/vecdotq.cuh
+@@ -624,7 +624,13 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1_impl_mmq(
+     return dm4f.x*sumf_d - dm4f.y*sumf_m;
+ }
+ 
+-#define VDR_Q6_K_Q8_1_MMVQ 1
++// P100 (sm_60): raised from 1 to 2. See vdr2_analysis.md for the derivation. This does NOT
++// widen the ql/qh global loads (block_q6_K's 210-byte stride keeps their alignment at 2 bytes
++// for ~half of all row-blocks, so a uniform, branch-free path must stay on get_int_b2 for both
++// values regardless of vdr). The win is eliminating the *redundant* re-fetch of bq6_K->d, the
++// two `scales` bytes, and the two q8_1 `.ds` scales, all four of which are IDENTICAL between
++// iqs and iqs+1 but were previously re-read from scratch by two separate warp lanes.
++#define VDR_Q6_K_Q8_1_MMVQ 2
+ #define VDR_Q6_K_Q8_1_MMQ  8
+ 
+ // contiguous v/x values
+@@ -1016,25 +1022,56 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
+ 
+     const block_q6_K * bq6_K = (const block_q6_K *) vbq + kbx;
+ 
+-    const int bq8_offset = 2 * QR6_K * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/4);
++    // iqs is even here (VDR_Q6_K_Q8_1_MMVQ == 2, mmvq.cu drives kqs = vdr * (tid % (qi/vdr))).
++    // bq8_offset, scale_offset and vh_shift are all floor-divisions with an even modulus
++    // (QI6_K/4 == 8, QI6_K/8 == 4), so they take the SAME value for iqs and iqs+1: an even
++    // iqs and its odd successor always land in the same divisor bucket. That means this
++    // thread's two "lanes" (formerly two separate warp threads under vdr=1) share one
++    // scale_offset/bq8_offset/vh_shift, one `scales` pointer, one pair of q8_1 block pointers,
++    // and therefore one pair of d8[] values and one bq6_K->d read -- all of which used to be
++    // fetched twice (once per lane) and are now fetched once.
++    const int bq8_offset   = 2 * QR6_K * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/4);
+     const int scale_offset = (QI6_K/4) * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/8);
+-    const int vh_shift = 2 * ((iqs % (QI6_K/2)) / (QI6_K/4));
++    const int vh_shift     = 2 * ((iqs % (QI6_K/2)) / (QI6_K/4));
++    const int qh_idx       = (QI6_K/4) * (iqs / (QI6_K/2)) + iqs % (QI6_K/4);
+ 
+-    const int vl = get_int_b2(bq6_K->ql, iqs);
+-    const int vh = get_int_b2(bq6_K->qh, (QI6_K/4) * (iqs / (QI6_K/2)) + iqs % (QI6_K/4)) >> vh_shift;
++    // ql/qh remain get_int_b2 (2x LDG.U16 each): block_q6_K is 210 bytes, so its ql/qh fields
++    // are only 4-byte aligned for even-index row-blocks and 2-byte aligned for odd-index ones.
++    // A width upgrade here would have to branch on kbx parity, which is exactly the kind of
++    // branchy duplication that previously blew register usage 71 -> 104 and cost 18%. Left
++    // alone on purpose; see vdr2_analysis.md.
++    const int vl0 = get_int_b2(bq6_K->ql, iqs);
++    const int vl1 = get_int_b2(bq6_K->ql, iqs + 1);
++
++    const int vh0 = get_int_b2(bq6_K->qh, qh_idx)     >> vh_shift;
++    const int vh1 = get_int_b2(bq6_K->qh, qh_idx + 1) >> vh_shift;
+ 
+     const int8_t * scales = bq6_K->scales + scale_offset;
+ 
+-    int    u[QR6_K];
++    // u depends on iqs % QI8_1, which DOES differ between iqs and iqs+1 (they select
++    // adjacent int32 lanes out of the same 32-byte q8_1 block), so u needs two full arrays.
++    // d8 depends only on the block (bq8_offset + 2*i), which is shared -> one array, read once.
++    int    u0[QR6_K];
++    int    u1[QR6_K];
+     float d8[QR6_K];
+ 
+ #pragma unroll
+     for (int i = 0; i < QR6_K; ++i) {
+-        u[i]  = get_int_b4(bq8_1[bq8_offset + 2*i].qs, iqs % QI8_1);
+-        d8[i] = __low2float(bq8_1[bq8_offset + 2*i].ds);
++        const block_q8_1 * bq8 = bq8_1 + bq8_offset + 2*i;
++        d8[i] = __low2float(bq8->ds);
++        u0[i] = get_int_b4(bq8->qs,  iqs      % QI8_1);
++        u1[i] = get_int_b4(bq8->qs, (iqs + 1) % QI8_1);
+     }
+ 
+-    return vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scales, bq6_K->d, d8);
++    // vec_dot_q6_K_q8_1_impl_mmvq (with its d*0.25f compensation for the vil4/vih4 scaling
++    // trick) is reused verbatim and unmodified for both lanes -- this patch does not touch
++    // that function at all, so its bit-exactness is untouched. The two per-lane results are
++    // added here instead of being combined via the warp-level reduction as two separate
++    // threads' contributions; this reassociates the final sum by one addition and can move
++    // the last ULP or two, which is expected to stay well inside the perplexity tolerance.
++    const float d = bq6_K->d;
++    return vec_dot_q6_K_q8_1_impl_mmvq(vl0, vh0, u0, scales, d, d8)
++         + vec_dot_q6_K_q8_1_impl_mmvq(vl1, vh1, u1, scales, d, d8);
+ }
+ 
+ #define VDR_IQ2_XXS_Q8_1_MMVQ 2
+-- 
+2.43.0
+

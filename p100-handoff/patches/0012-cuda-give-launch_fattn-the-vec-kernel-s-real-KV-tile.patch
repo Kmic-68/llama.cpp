@@ -1,0 +1,43 @@
+From da56cb516c362a39ee117880876b0c2d66b20483 Mon Sep 17 00:00:00 2001
+From: Kaden <kaden@localhost>
+Date: Sun, 30 Aug 2026 12:56:24 -0500
+Subject: [PATCH 12/16] cuda: give launch_fattn the vec kernel's real KV tile
+ size
+
+ggml_cuda_flash_attn_ext_vec_case_impl passed D as nbatch_fa, but the vec
+kernel steps its KV loop by nthreads. launch_fattn uses nbatch_fa only to
+work out ntiles_KV, which caps how many blocks may split the KV range, so
+wherever nthreads < D the available parallelism is understated -- Pascal
+runs 128 threads against D = 256, so it was halved. With a 256-long KV
+that left ntiles_KV = 1, pinning parallel_blocks at 1 and running the
+whole attention on 12 blocks of a 56-SM GPU.
+
+29.9 -> 30.11 t/s on 2x Tesla P100 with Qwen3 27B Q6_K.
+Perplexity unchanged at 2.7565; test-backend-ops FLASH_ATTN_EXT 3949/3949.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+---
+ ggml/src/ggml-cuda/fattn-vec.cuh | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/fattn-vec.cuh b/ggml/src/ggml-cuda/fattn-vec.cuh
+index 69dd93686..bcd340262 100644
+--- a/ggml/src/ggml-cuda/fattn-vec.cuh
++++ b/ggml/src/ggml-cuda/fattn-vec.cuh
+@@ -540,7 +540,11 @@ void ggml_cuda_flash_attn_ext_vec_case_impl(ggml_backend_cuda_context & ctx, ggm
+     const bool need_f16_K = type_K == GGML_TYPE_F16;
+     const bool need_f16_V = type_V == GGML_TYPE_F16;
+     constexpr size_t nbytes_shared = 0;
+-    launch_fattn<D, cols_per_block, 1>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, D, need_f16_K, need_f16_V, false);
++    // The KV tile this kernel actually steps by is nthreads, not D. Passing D understates the
++    // number of KV tiles wherever nthreads < D -- Pascal runs 128 threads against D = 256 -- and
++    // launch_fattn caps the KV-parallel block count at that number, so a short context ends up on
++    // a twelfth of the SMs.
++    launch_fattn<D, cols_per_block, 1>(ctx, dst, fattn_kernel, nwarps, nbytes_shared, nthreads, need_f16_K, need_f16_V, false);
+ }
+ 
+ template <int D, ggml_type type_K, ggml_type type_V>
+-- 
+2.43.0
+

@@ -1,0 +1,505 @@
+From 1ee4ffe85d18337b5412b094c973639b93fd01ec Mon Sep 17 00:00:00 2001
+From: Kaden <kaden@localhost>
+Date: Sun, 30 Aug 2026 12:38:13 -0500
+Subject: [PATCH 11/16] cuda: stop dividing in the elementwise and norm kernels
+ on Pascal
+
+sm_60 has no integer divider, so the 64-bit divisions several small
+kernels did per element cost dozens of instructions each and dominated
+them. Four changes, all general:
+
+- binbcast: a flat fast path for when every operand has the
+  destination's shape and is contiguous, skipping the broadcast index
+  math entirely (3.07 -> 2.09 us)
+- cpy_scalar: eight 64-bit divisions per element replaced with the
+  existing 32-bit multiply-shift helpers (4.85 -> 2.54 us)
+- the gated unary kernels and concat_cont: same, two per element
+- the norm kernels: load the row four floats at a time. A single block
+  owns the row, so what limits it is the SM's requests in flight rather
+  than bandwidth, and one float4 request carries four times the payload
+
+29.32 -> ~29.9 t/s on 2x Tesla P100 with Qwen3 27B Q6_K.
+
+Perplexity 2.7565 +/- 0.02153 against 2.7554 +/- 0.02151 for stock: the
+norm reductions now sum in a different order, so the result is no longer
+bit-identical, but the shift is 5% of the error bar. The index-math
+changes are bit-exact. test-backend-ops passes RMS_NORM 51/51,
+RMS_NORM_MUL_ADD 30/30, L2_NORM 20/20, NORM 50/50, ADD 99/99, MUL 91/91,
+CPY 246/246, CONCAT 177/177, SWIGLU 24/24, SET_ROWS 159/159.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+---
+ ggml/src/ggml-cuda/binbcast.cu |  54 +++++++++++++
+ ggml/src/ggml-cuda/concat.cu   |  21 ++++--
+ ggml/src/ggml-cuda/cpy.cu      |  50 +++++++++++++
+ ggml/src/ggml-cuda/norm.cu     | 133 ++++++++++++++++++++++++++++++++-
+ ggml/src/ggml-cuda/unary.cu    |  23 ++++--
+ 5 files changed, 263 insertions(+), 18 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/binbcast.cu b/ggml/src/ggml-cuda/binbcast.cu
+index 2e38077bf..d2bc6e76d 100644
+--- a/ggml/src/ggml-cuda/binbcast.cu
++++ b/ggml/src/ggml-cuda/binbcast.cu
+@@ -98,6 +98,37 @@ static __global__ void k_bin_bcast(const src0_t *         src0,
+     }
+ }
+ 
++// Every operand has the destination's shape and is contiguous: no broadcasting, no strides, no
++// index arithmetic. This is the shape of a residual add or an elementwise gate, and those launches
++// are small enough that the general kernel's per-element fastmodulo and its two-elements-per-thread
++// stride loop cost more than the memory traffic does.
++template <float (*bin_op)(const float, const float),
++          typename src0_t,
++          typename src1_t,
++          typename dst_t,
++          typename... src1_ptrs>
++static __global__ void k_bin_bcast_flat(const src0_t * src0,
++                                        const src1_t * src1,
++                                        dst_t *        dst,
++                                        const uint32_t ne,
++                                        src1_ptrs...   src1s) {
++    ggml_cuda_pdl_lc();
++    const uint32_t i = blockDim.x*blockIdx.x + threadIdx.x;
++
++    ggml_cuda_pdl_sync();
++    if (i >= ne) {
++        return;
++    }
++
++    float result = (float) src0[i];
++    if constexpr (sizeof...(src1_ptrs) > 0) {
++        result = (..., (result = bin_op(result, (float) src1s[i])));
++    } else {
++        result = bin_op(result, (float) src1[i]);
++    }
++    dst[i] = (dst_t) result;
++}
++
+ template <float (*bin_op)(const float, const float),
+           typename src0_t,
+           typename src1_t,
+@@ -170,6 +201,29 @@ static void launch_bin_bcast_pack(const ggml_tensor * src0, const ggml_tensor *
+                                   cudaStream_t stream, std::index_sequence<I...>) {
+     GGML_TENSOR_BINARY_OP_LOCALS
+ 
++    {
++        const bool extras_flat[] = { true,
++            (ggml_is_contiguous(dst->src[I + 1]) && ggml_are_same_shape(dst->src[I + 1], dst))... };
++        bool flat = src0_dd != nullptr && src1_dd != nullptr &&
++                    ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst) &&
++                    ggml_are_same_shape(src0, dst) && ggml_are_same_shape(src1, dst);
++        for (size_t k = 0; k < sizeof(extras_flat)/sizeof(bool); ++k) {
++            flat = flat && extras_flat[k];
++        }
++
++        const int64_t ne_flat = ggml_nelements(dst);
++        if (flat && ne_flat <= int64_t(std::numeric_limits<uint32_t>::max())) {
++            const int     block_size = 256;
++            const int64_t block_num  = (ne_flat + block_size - 1) / block_size;
++            const ggml_cuda_kernel_launch_params launch_params =
++                ggml_cuda_kernel_launch_params((dim3) block_num, block_size, 0, stream);
++            ggml_cuda_kernel_launch(k_bin_bcast_flat<bin_op, src0_t, src1_t, dst_t, type_for_index<const src1_t *, I>...>,
++                launch_params, src0_dd, src1_dd, dst_dd, (uint32_t) ne_flat,
++                (const src1_t *) dst->src[I + 1]->data...);
++            return;
++        }
++    }
++
+     int nr0 = ne10 / ne0;
+     int nr1 = ne11 / ne1;
+     int nr2 = ne12 / ne2;
+diff --git a/ggml/src/ggml-cuda/concat.cu b/ggml/src/ggml-cuda/concat.cu
+index 6df89013c..82ffd1a99 100644
+--- a/ggml/src/ggml-cuda/concat.cu
++++ b/ggml/src/ggml-cuda/concat.cu
+@@ -1,6 +1,7 @@
+ #include "concat.cuh"
+ 
+ #include <stdint.h>
++#include <limits>
+ 
+ // contiguous kernels
+ template <typename T, int dim>
+@@ -12,15 +13,18 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE) concat_cont(con
+                                                                              int64_t   ne02,
+                                                                              int64_t   ne0,
+                                                                              int64_t   ne1,
+-                                                                             int64_t   ne2) {
++                                                                             int64_t   ne2,
++                                                                             uint3     split_fd) {
+     static_assert(dim >= 0 && dim <= 2, "dim must be in [0, 2]");
+ 
+     const int64_t n = ne0 * ne1 * ne2;
+ 
++    // split_fd divides by ne0 (dim 0) or by the destination plane (dim 1) with a multiply-shift:
++    // sm_60 has no integer divider, so the 64-bit division this used to do per element dominated.
+     ggml_cuda_pdl_sync();
+     for (int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (int64_t) blockDim.x * gridDim.x) {
+         if constexpr (dim == 0) {
+-            const int64_t row = i / ne0;
++            const int64_t row = fastdiv((uint32_t) i, split_fd);
+             const int64_t i0  = i - row * ne0;
+ 
+             if (i0 < ne00) {
+@@ -32,7 +36,7 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE) concat_cont(con
+             const int64_t dst_plane  = ne0 * ne1;
+             const int64_t src0_plane = ne0 * ne01;
+             const int64_t src1_plane = dst_plane - src0_plane;
+-            const int64_t i2         = i / dst_plane;
++            const int64_t i2         = fastdiv((uint32_t) i, split_fd);
+             const int64_t i01        = i - i2 * dst_plane;
+ 
+             if (i01 < src0_plane) {
+@@ -67,16 +71,21 @@ static void concat_cont_cuda(const T * x,
+     const int64_t n          = ne0 * ne1 * ne2;
+     const int     num_blocks = (n + CUDA_CONCAT_BLOCK_SIZE - 1) / CUDA_CONCAT_BLOCK_SIZE;
+ 
++    GGML_ASSERT(n <= int64_t(std::numeric_limits<uint32_t>::max()));
++
+     if (dim == 0) {
+         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, CUDA_CONCAT_BLOCK_SIZE, 0, stream);
+-        ggml_cuda_kernel_launch(concat_cont<T, 0>, launch_params, x, y, dst, ne00, ne01, ne02, ne0, ne1, ne2);
++        ggml_cuda_kernel_launch(concat_cont<T, 0>, launch_params, x, y, dst, ne00, ne01, ne02, ne0, ne1, ne2,
++            init_fastdiv_values((uint32_t) ne0));
+         return;
+     }
+     if (dim == 1) {
+-        concat_cont<T, 1><<<num_blocks, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(x, y, dst, ne00, ne01, ne02, ne0, ne1, ne2);
++        concat_cont<T, 1><<<num_blocks, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(x, y, dst, ne00, ne01, ne02, ne0, ne1, ne2,
++            init_fastdiv_values((uint32_t) (ne0*ne1)));
+         return;
+     }
+-    concat_cont<T, 2><<<num_blocks, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(x, y, dst, ne00, ne01, ne02, ne0, ne1, ne2);
++    concat_cont<T, 2><<<num_blocks, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(x, y, dst, ne00, ne01, ne02, ne0, ne1, ne2,
++        init_fastdiv_values(1u));
+ }
+ 
+ // non-contiguous kernel (slow)
+diff --git a/ggml/src/ggml-cuda/cpy.cu b/ggml/src/ggml-cuda/cpy.cu
+index fd7ffc0bc..c6b2fd2a1 100644
+--- a/ggml/src/ggml-cuda/cpy.cu
++++ b/ggml/src/ggml-cuda/cpy.cu
+@@ -1,4 +1,5 @@
+ #include "cpy.cuh"
++#include <limits>
+ #include "dequantize.cuh"
+ #include "cpy-utils.cuh"
+ #if defined(GGML_USE_MUSA) && defined(GGML_MUSA_MUDNN_COPY)
+@@ -41,6 +42,42 @@ static __global__ void cpy_scalar(const char * cx, char * cdst, const int64_t ne
+     cpy_1(cx + x_offset, cdst + dst_offset);
+ }
+ 
++// Same as cpy_scalar, but every index comes from a 32-bit multiply-shift instead of a 64-bit
++// division. sm_60 has no integer divider at all, so the eight 64-bit divisions the generic kernel
++// does per element dominate it completely on small copies.
++template <cpy_kernel_t cpy_1>
++static __global__ void cpy_scalar_fastdiv(const char * cx, char * cdst, const uint32_t ne,
++                                          const uint3 ne00_ne01_ne02, const uint3 ne00_ne01, const uint3 ne00,
++                                          const int64_t nb00, const int64_t nb01, const int64_t nb02, const int64_t nb03,
++                                          const uint3 ne10_ne11_ne12, const uint3 ne10_ne11, const uint3 ne10,
++                                          const int64_t nb10, const int64_t nb11, const int64_t nb12, const int64_t nb13) {
++    ggml_cuda_pdl_lc();
++    const uint32_t i = blockDim.x*blockIdx.x + threadIdx.x;
++
++    if (i >= ne) {
++        return;
++    }
++
++    const uint32_t i03 = fastdiv(i, ne00_ne01_ne02);
++    const uint32_t r3  = i - i03*ne00_ne01_ne02.z;
++    const uint32_t i02 = fastdiv(r3, ne00_ne01);
++    const uint32_t r2  = r3 - i02*ne00_ne01.z;
++    const uint32_t i01 = fastdiv(r2, ne00);
++    const uint32_t i00 = r2 - i01*ne00.z;
++    const int64_t x_offset = i00*nb00 + i01*nb01 + i02*nb02 + i03*nb03;
++
++    const uint32_t i13 = fastdiv(i, ne10_ne11_ne12);
++    const uint32_t s3  = i - i13*ne10_ne11_ne12.z;
++    const uint32_t i12 = fastdiv(s3, ne10_ne11);
++    const uint32_t s2  = s3 - i12*ne10_ne11.z;
++    const uint32_t i11 = fastdiv(s2, ne10);
++    const uint32_t i10 = s2 - i11*ne10.z;
++    const int64_t dst_offset = i10*nb10 + i11*nb11 + i12*nb12 + i13*nb13;
++
++    ggml_cuda_pdl_sync();
++    cpy_1(cx + x_offset, cdst + dst_offset);
++}
++
+ template <typename T>
+ static __global__ void cpy_scalar_transpose(const char * cx, char * cdst, const int64_t ne,
+                                const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t nb00, const int64_t nb01, const int64_t nb02,
+@@ -212,6 +249,19 @@ static void ggml_cpy_scalar_cuda(
+         const int64_t num_blocks = (ne + CUDA_CPY_BLOCK_SIZE - 1) / CUDA_CPY_BLOCK_SIZE;
+         GGML_ASSERT(num_blocks <= INT_MAX);
+         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_CPY_BLOCK_SIZE, 0, stream);
++
++        if (ne <= int64_t(std::numeric_limits<uint32_t>::max()) &&
++            ne00*ne01*ne02 <= int64_t(std::numeric_limits<uint32_t>::max()) &&
++            ne10*ne11*ne12 <= int64_t(std::numeric_limits<uint32_t>::max())) {
++            ggml_cuda_kernel_launch(cpy_scalar_fastdiv<cpy_1_scalar<src_t, dst_t>>, launch_params,
++                cx, cdst, (uint32_t) ne,
++                init_fastdiv_values((uint32_t) (ne00*ne01*ne02)), init_fastdiv_values((uint32_t) (ne00*ne01)),
++                init_fastdiv_values((uint32_t) ne00), nb00, nb01, nb02, nb03,
++                init_fastdiv_values((uint32_t) (ne10*ne11*ne12)), init_fastdiv_values((uint32_t) (ne10*ne11)),
++                init_fastdiv_values((uint32_t) ne10), nb10, nb11, nb12, nb13);
++            return;
++        }
++
+         ggml_cuda_kernel_launch(cpy_scalar<cpy_1_scalar<src_t, dst_t>>, launch_params,
+             cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
+     };
+diff --git a/ggml/src/ggml-cuda/norm.cu b/ggml/src/ggml-cuda/norm.cu
+index 3dbeae10f..cd362a997 100644
+--- a/ggml/src/ggml-cuda/norm.cu
++++ b/ggml/src/ggml-cuda/norm.cu
+@@ -16,9 +16,50 @@ static __global__ void norm_f32(
+     x   += sample*stride_sample + channel*stride_channel + row*stride_row;
+     dst += ((sample*nchannels + channel)*nrows + row)*ncols;
+ 
+-    float2 mean_var = make_float2(0.0f, 0.0f);
++    // See rms_norm_f32: one block owns the row, so hold it in registers and load it four floats
++    // at a time instead of reading it twice a float at a time.
++    constexpr int max_regs = 8;
++
++    extern __shared__ float2 s_sum2[];
+ 
+     ggml_cuda_pdl_sync();
++
++    if (ncols % 4 == 0 && ncols <= block_size*max_regs && (uintptr_t(x) | uintptr_t(dst)) % 16 == 0) {
++        const float4 * x4   = (const float4 *) x;
++        float4 *       dst4 = (float4 *)       dst;
++        const int      nv4  = ncols/4;
++
++        float4 xv[max_regs/4];
++        float2 mv = make_float2(0.0f, 0.0f);
++#pragma unroll
++        for (int u = 0; u < max_regs/4; ++u) {
++            const int col = tid + u*block_size;
++            xv[u] = col < nv4 ? x4[col] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
++            mv.x += xv[u].x + xv[u].y + xv[u].z + xv[u].w;
++            mv.y += xv[u].x*xv[u].x + xv[u].y*xv[u].y + xv[u].z*xv[u].z + xv[u].w*xv[u].w;
++        }
++
++        mv = block_reduce<block_reduce_method::SUM, block_size>(mv, s_sum2);
++
++        const float mean    = mv.x / ncols;
++        const float var     = mv.y / ncols - mean * mean;
++        const float inv_std = rsqrtf(var + eps);
++
++#pragma unroll
++        for (int u = 0; u < max_regs/4; ++u) {
++            const int col = tid + u*block_size;
++            if (col < nv4) {
++                float4 r = xv[u];
++                r.x = (r.x - mean)*inv_std; r.y = (r.y - mean)*inv_std;
++                r.z = (r.z - mean)*inv_std; r.w = (r.w - mean)*inv_std;
++                dst4[col] = r;
++            }
++        }
++        return;
++    }
++
++    float2 mean_var = make_float2(0.0f, 0.0f);
++
+     for (int col = tid; col < ncols; col += block_size) {
+         const float xi = x[col];
+         mean_var.x += xi;
+@@ -26,7 +67,6 @@ static __global__ void norm_f32(
+     }
+ 
+     // sum up partial sums
+-    extern __shared__ float2 s_sum2[];
+     mean_var = block_reduce<block_reduce_method::SUM, block_size>(mean_var, s_sum2);
+ 
+     const float mean = mean_var.x / ncols;
+@@ -135,6 +175,54 @@ static __global__ void rms_norm_f32(const float * x,
+ 
+     ggml_cuda_pdl_sync();
+ 
++    // Four floats per load instruction. A single block owns the row, so nothing else is issuing
++    // memory traffic on that SM and what limits it is the number of requests in flight, not
++    // bandwidth -- one float4 request carries four times the payload of a float one.
++    constexpr int max_regs_v4 = max_regs/4;
++    const bool vec4_ok = ncols % 4 == 0 && ncols <= block_size*max_regs &&
++                         (uintptr_t(x) | uintptr_t(dst)) % 16 == 0 &&
++                         (!do_multiply || (uintptr_t(mul) % 16 == 0 && mul_ncols_packed.z == (uint32_t) ncols)) &&
++                         (!do_add      || (uintptr_t(add) % 16 == 0 && add_ncols_packed.z == (uint32_t) ncols));
++
++    if (vec4_ok) {
++        const float4 * x4   = (const float4 *) x;
++        float4 *       dst4 = (float4 *)       dst;
++        const int      nv4  = ncols/4;
++
++        float4 xv[max_regs_v4];
++        float  tmp = 0.0f;
++#pragma unroll
++        for (int u = 0; u < max_regs_v4; ++u) {
++            const int col = tid + u*block_size;
++            xv[u] = col < nv4 ? x4[col] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
++            tmp += xv[u].x*xv[u].x + xv[u].y*xv[u].y + xv[u].z*xv[u].z + xv[u].w*xv[u].w;
++        }
++
++        tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
++
++        const float mean  = tmp / ncols;
++        const float scale = rsqrtf(mean + eps);
++
++#pragma unroll
++        for (int u = 0; u < max_regs_v4; ++u) {
++            const int col = tid + u*block_size;
++            if (col < nv4) {
++                float4 r = xv[u];
++                r.x *= scale; r.y *= scale; r.z *= scale; r.w *= scale;
++                if constexpr (do_multiply) {
++                    const float4 m = ((const float4 *) mul)[col];
++                    r.x *= m.x; r.y *= m.y; r.z *= m.z; r.w *= m.w;
++                }
++                if constexpr (do_add) {
++                    const float4 a = ((const float4 *) add)[col];
++                    r.x += a.x; r.y += a.y; r.z += a.z; r.w += a.w;
++                }
++                dst4[col] = r;
++            }
++        }
++        return;
++    }
++
+     if (ncols <= block_size*max_regs) {
+         float xv[max_regs];
+         float tmp = 0.0f;
+@@ -295,16 +383,53 @@ static __global__ void l2_norm_f32(
+     x   += sample*stride_sample + channel*stride_channel + row*stride_row;
+     dst += ((sample*nchannels + channel)*nrows + row)*ncols;
+ 
+-    float tmp = 0.0f; // partial sum for thread in warp
++    // See rms_norm_f32: one block owns the row, so hold it in registers and load it four floats
++    // at a time instead of reading it twice a float at a time.
++    constexpr int max_regs = 8;
++
++    extern __shared__ float s_sum[];
+ 
+     ggml_cuda_pdl_sync();
++
++    if (ncols % 4 == 0 && ncols <= block_size*max_regs && (uintptr_t(x) | uintptr_t(dst)) % 16 == 0) {
++        const float4 * x4   = (const float4 *) x;
++        float4 *       dst4 = (float4 *)       dst;
++        const int      nv4  = ncols/4;
++
++        float4 xv[max_regs/4];
++        float  acc = 0.0f;
++#pragma unroll
++        for (int u = 0; u < max_regs/4; ++u) {
++            const int col = tid + u*block_size;
++            xv[u] = col < nv4 ? x4[col] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
++            acc += xv[u].x*xv[u].x + xv[u].y*xv[u].y + xv[u].z*xv[u].z + xv[u].w*xv[u].w;
++        }
++
++        acc = block_reduce<block_reduce_method::SUM, block_size>(acc, s_sum);
++        ggml_cuda_pdl_lc();
++
++        const float scale = rsqrtf(fmaxf(acc, eps * eps));
++
++#pragma unroll
++        for (int u = 0; u < max_regs/4; ++u) {
++            const int col = tid + u*block_size;
++            if (col < nv4) {
++                float4 r = xv[u];
++                r.x *= scale; r.y *= scale; r.z *= scale; r.w *= scale;
++                dst4[col] = r;
++            }
++        }
++        return;
++    }
++
++    float tmp = 0.0f; // partial sum for thread in warp
++
+     for (int col = tid; col < ncols; col += block_size) {
+         const float xi = x[col];
+         tmp += xi * xi;
+     }
+ 
+     // sum up partial sums
+-    extern __shared__ float s_sum[];
+     tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+     ggml_cuda_pdl_lc();
+ 
+diff --git a/ggml/src/ggml-cuda/unary.cu b/ggml/src/ggml-cuda/unary.cu
+index 4cb805fa6..77e93186d 100644
+--- a/ggml/src/ggml-cuda/unary.cu
++++ b/ggml/src/ggml-cuda/unary.cu
+@@ -1,4 +1,5 @@
+ #include "unary.cuh"
++#include <limits>
+ #include "convert.cuh"
+ 
+ static __device__ __forceinline__ float op_abs(float x) {
+@@ -259,8 +260,10 @@ void ggml_cuda_op_softplus(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+ }
+ /* gated ops */
+ 
++// The row/column split is a multiply-shift rather than a division: sm_60 has no integer divider,
++// so the two 64-bit divisions the straightforward form needs dominate this kernel.
+ template <float (*op)(float), typename T>
+-static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1) {
++static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst, const int64_t k, const uint3 n, const int64_t o0, const int64_t o1) {
+     ggml_cuda_pdl_lc();
+     const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+ 
+@@ -269,8 +272,9 @@ static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst,
+     }
+ 
+     // perform base op and multiply with gate (either offset in same tensor or a separate one)
+-    const int64_t j0 = (i / n) * o0 + (i % n);
+-    const int64_t j1 = o0 == o1 ? j0 : (i / n) * o1 + (i % n);
++    const uint2   rc = fast_div_modulo((uint32_t) i, n);
++    const int64_t j0 = int64_t(rc.x)*o0 + rc.y;
++    const int64_t j1 = o0 == o1 ? j0 : int64_t(rc.x)*o1 + rc.y;
+ 
+     ggml_cuda_pdl_sync();
+     dst[i] = (T)(op((float)x[j0]) * (float)g[j1]);
+@@ -279,8 +283,9 @@ static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst,
+ template <float (*op)(float), typename T>
+ static void unary_gated_cuda(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1, cudaStream_t stream) {
+     const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
++    GGML_ASSERT(k <= int64_t(std::numeric_limits<uint32_t>::max()));
+     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream);
+-    ggml_cuda_kernel_launch(unary_gated_op_kernel<op, T>, launch_params, x, g, dst, k, n, o0, o1);
++    ggml_cuda_kernel_launch(unary_gated_op_kernel<op, T>, launch_params, x, g, dst, k, init_fastdiv_values((uint32_t) n), o0, o1);
+ }
+ 
+ template <float (*op)(float)>
+@@ -360,7 +365,7 @@ void ggml_cuda_op_geglu_quick(ggml_backend_cuda_context & ctx, ggml_tensor * dst
+ // swiglu_oai
+ 
+ template <typename T>
+-static __global__ void swiglu_oai_kernel(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1, float alpha, float limit) {
++static __global__ void swiglu_oai_kernel(const T * x, const T * g, T * dst, const int64_t k, const uint3 n, const int64_t o0, const int64_t o1, float alpha, float limit) {
+     const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+ 
+     if (i >= k) {
+@@ -368,8 +373,9 @@ static __global__ void swiglu_oai_kernel(const T * x, const T * g, T * dst, cons
+     }
+ 
+     // perform base op and multiply with gate (either offset in same tensor or a separate one)
+-    const int64_t j0 = (i / n) * o0 + (i % n);
+-    const int64_t j1 = o0 == o1 ? j0 : (i / n) * o1 + (i % n);
++    const uint2   rc = fast_div_modulo((uint32_t) i, n);
++    const int64_t j0 = int64_t(rc.x)*o0 + rc.y;
++    const int64_t j1 = o0 == o1 ? j0 : int64_t(rc.x)*o1 + rc.y;
+ 
+     float xi = x[j0];
+     float gi = g[j1];
+@@ -380,7 +386,8 @@ static __global__ void swiglu_oai_kernel(const T * x, const T * g, T * dst, cons
+ template <typename T>
+ static void swiglu_oai_cuda(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1, const float alpha, const float limit, cudaStream_t stream) {
+     const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
+-    swiglu_oai_kernel<<<num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream>>>(x, g, dst, k, n, o0, o1, alpha, limit);
++    GGML_ASSERT(k <= int64_t(std::numeric_limits<uint32_t>::max()));
++    swiglu_oai_kernel<<<num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream>>>(x, g, dst, k, init_fastdiv_values((uint32_t) n), o0, o1, alpha, limit);
+ }
+ 
+ void ggml_cuda_op_swiglu_oai(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+-- 
+2.43.0
+
