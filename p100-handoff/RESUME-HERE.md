@@ -139,6 +139,17 @@ That sits right at the 53-55 t/s structural ceiling estimated for the current
 kernel shape, and the curve is flat-to-falling past n-max 4 (accept rate decays
 faster than the extra tokens pay).
 
+**Best remaining MTP idea, measured and costed:** the weight block's load and
+6-bit unpack are redone once per column, five times over at ncols_dst=5. Priced
+with the `P100_NOUNPACK` probe: `mul_mat_vec_q<ncols=5>` 95.717 -> 87.629 us
+(-8.5%), tg256 32.12 -> 33.79 (+5.2%). Hoisting it recovers 4/5 of that,
+**~+3.5% MTP -> ~56.4 t/s** -- real, but still short of 60, and nothing for
+single-token decode where there is only one column. Swapping the loop nest to
+make the weight work loop-invariant does *not* let nvcc capture it (both loops
+are fully unrolled, so order is irrelevant to CSE; measured, reverted).
+Capturing it needs a hand-written multi-column `vec_dot_q6_K_q8_1` plus dispatch
+-- bit-exact by construction, but a rewrite of the hottest kernel in the build.
+
 Profiled: **52% of MTP GPU time is `mul_mat_vec_q<ncols=5>`**, 95.7us per call,
 moving Q6_K weights at ~383 GB/s -- roughly 75% of achievable HBM bandwidth on
 this card. The remaining 25% is the sm_60 dp4a emulation (8 instructions, already
