@@ -14,7 +14,9 @@ untracked `ppl.txt` / `p100-handoff/`.
 
 Against CLAUDE.md's original 17.51 t/s decode baseline that is **1.81x**.
 
-Prefill goal was 450; landed at 442.6, i.e. 98.4% of it.
+Goals were 450 t/s prefill and 60 t/s MTP. **Neither was met**: prefill landed
+at 442.6 (98.4%), MTP at 54.5 (90.8%). See "What is left" below for exactly what
+stands in the way of each -- both are now structural, not tuning.
 
 ## Committed this session
 
@@ -82,7 +84,14 @@ Ranked by what is actually still available:
    occupancy. Nsight Compute would answer this; it does not support Pascal.
    nvprof metrics (`--metrics stall_memory_dependency,stall_exec_dependency`)
    is the next tool to reach for.
-3. Per-shape cuBLAS algo: ~+0.3%, measured, judged not worth the risk.
+3. **Overlap each weight dequant with the previous matmul's GEMM** (~+1.9%).
+   dequant is memory-bound and the GEMM is compute-bound, and dequant(W2) does
+   not depend on GEMM(W1) -- but they are on one stream and ggml executes node
+   by node, so this needs graph lookahead the backend does not expose today.
+4. Per-shape cuBLAS algo: ~+0.3%, measured, judged not worth the risk.
+
+The GEMM itself is done: 15.7 TFLOPS in-model against 16.8 standalone, and that
+6.6% gap is sustained-clock throttling (nvidia-smi is off limits per CLAUDE.md).
 
 **Dead ends, measured -- do not re-litigate:**
 - MMQ on Pascal (no DP4A, ~4x ALU disadvantage).
@@ -94,6 +103,11 @@ Ranked by what is actually still available:
 - `-sm layer` for prefill: 226.9 vs 438.5.
 - Reduce-scatter/all-gather instead of full-exchange all-reduce: identical
   traffic for 2 GPUs.
+- **CUDA graphs on Pascal**: they do engage if you lift the `cc < VOLTA` guard,
+  and give nothing (MTP 54.48 -> 54.03, tg256 32.12 -> 31.25). The workload
+  streams weights; it is not launch-bound. Upstream's exclusion is correct.
+- MMVQ rows-per-block 16 -> 8 for the multi-column path: no effect.
+- `-sm layer` for decode: 20.37 vs 32.12. Tensor split wins both phases.
 
 ## Decode (60 t/s goal still open)
 
@@ -115,9 +129,14 @@ n-max 3 leaves ~2% on the table. 48.8 -> 54.0 is +10.7%, and the peer-copy fix
 
 That sits right at the 53-55 t/s structural ceiling estimated for the current
 kernel shape, and the curve is flat-to-falling past n-max 4 (accept rate decays
-faster than the extra tokens pay). **60 t/s needs a shape change, not tuning** --
-the draft head itself, or a batched-decode kernel that does not re-read the
-weights per speculated token.
+faster than the extra tokens pay).
+
+Profiled: **52% of MTP GPU time is `mul_mat_vec_q<ncols=5>`**, 95.7us per call,
+moving Q6_K weights at ~383 GB/s -- roughly 75% of achievable HBM bandwidth on
+this card. The remaining 25% is the sm_60 dp4a emulation (8 instructions, already
+bit-exact and heavily optimised by earlier sessions). So **60 t/s needs a shape
+change, not tuning**: the draft head itself, or a decode kernel that does not
+re-read the weights per speculated token.
 
 ## Still open from the earlier audit (unchanged, none fixed)
 

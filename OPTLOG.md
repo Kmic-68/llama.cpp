@@ -1693,3 +1693,9 @@ stream, which needs graph lookahead ggml does not currently expose.
 ~75% of achievable HBM bandwidth. Closing the gap means attacking the sm_60
 dp4a emulation, which is already down to 8 instructions and bit-exact, or
 changing the kernel shape. Not a tuning problem.
+
+## Final gate on HEAD
+
+`ed42ad15d` + docs: perplexity **2.6214 +/- 0.01995**, chunk [1] 4.9738 --
+identical to the previous gate, so attempt 80 (GDN addressing) is confirmed
+bit-exact end to end. Inside the CLAUDE.md band by 0.03 sigma.
