@@ -1,1 +1,10 @@
-836e9fdc4a7b7434bebd241f404fa9116a7cc47f
+Last CODE commit (kernel changes):  ed42ad15d  cuda: walk gated_delta_net addresses instead of recomputing them
+Session-3 code range:               5d1fafb01..ed42ad15d   (see session3.diff)
+Upstream base:                      f280b2698              (see full-kernel.diff)
+Session-1 end:                      b44f8fe6f
+Session-2 end:                      134a4f4a5              (the range VERIFICATION.md audits)
+
+Commits after ed42ad15d are documentation only, so this file does not chase them.
+Regenerate the diffs with:
+    git diff f280b2698 HEAD -- ggml/src/ggml-cuda/ > p100-handoff/full-kernel.diff
+    git diff 5d1fafb01 HEAD -- ggml/src/ggml-cuda/ > p100-handoff/session3.diff
