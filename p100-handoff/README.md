@@ -1,6 +1,23 @@
 # llama.cpp CUDA kernel optimisations for Tesla P100 (sm_60)
 
-2x Tesla P100-PCIE-16GB, tensor-split, Qwen3.5 27B Q6_K, q4_0 KV cache, 175 W power cap.
+2x Tesla P100-PCIE-16GB, tensor-split, Qwen3.5 27B Q6_K, q4_0 KV cache.
+
+**Current numbers (2026-09-01, HEAD `836e9fdc4`)** -- these supersede everything
+else in this file, which describes the state at the end of session 2:
+
+| workload | CLAUDE.md baseline | now |
+|---|---|---|
+| plain decode `tg256` (the CLAUDE.md metric command) | 17.51 t/s | **32.1** best / ~31.8 typical (**1.83x**) |
+| speculative decode (MTP, `-n-max 4 -p-min 0.2`) | 32.94 | **54.5** |
+| prefill `pp2048 -b 2048 -ub 2048` | 222.6 (at `-ub 512`) | **442.6** cold / ~437 hot |
+| perplexity (`ppl-orig.txt`, q4_0/q4_0) | 2.6209 | **2.6214 +/- 0.01995** |
+
+Read `RESUME-HERE.md` first. The full attempt log is `../OPTLOG.md` -- start
+from its CLOSING SUMMARY. `full-kernel.diff` is the whole kernel delta against
+upstream `f280b2698`; `session3.diff` is just the 2026-08-31/09-01 work.
+
+<details>
+<summary>Historical: state at the end of session 2 (kept for reference)</summary>
 
 | workload | before | after |
 |----------|-------|-------|
@@ -9,6 +26,9 @@
 | **speculative decode (MTP)** | **32.94** | **50.1** (+52%) |
 | MTP speedup over plain decode | 1.11x | **1.68x** |
 | prompt processing at batch 7 (`pp512 -b 7 -ub 7`) | 61.08 | 88.87 (+45%) |
+
+</details>
+
 
 Everything here is general CUDA kernel work — nothing keys off this model or quant. Verified
 quant-agnostic across q6_K, q3_K, q4_K, q5_K, q4_0, q5_0, q8_0, q2_K and iq4_nl. The norm,
@@ -21,6 +41,10 @@ GPUs that, like Pascal, lack an integer divider and DP4A.
 |------|------|
 | `full-kernel.diff` | every kernel change against upstream `f280b2698` |
 | `session2.diff` | the second session's changes alone (on top of `b44f8fe6f`) |
+| `session3.diff` | the 2026-08-31/09-01 changes alone (on top of `5d1fafb01`) |
+| `RESUME-HERE.md` | **start here** -- current state and ranked next steps |
+| `VERIFICATION.md` | numerical audit (covers up to `134a4f4a5`; later changes noted at the top) |
+| `CORPUS.md` | why the perplexity gate corpus drifted, and which target goes with which file |
 | `patches/` | the same as `git am`-able commits, in order |
 | `commit-log.txt` | commit messages with per-file stats |
 | `OPTLOG.md` | **every attempt, kept and reverted, with numbers** — the real record |

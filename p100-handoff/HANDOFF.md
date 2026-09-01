@@ -1,5 +1,10 @@
 # P100 (sm_60) CUDA kernel optimization — handoff
 
+> **Historical (session 1/2). Superseded by `RESUME-HERE.md`.**
+> Current numbers as of 2026-09-01: decode **32.1** t/s, MTP **54.5**, prefill
+> **442.6**, perplexity **2.6214 +/- 0.01995**. Note this file quotes the
+> perplexity gate as 2.7554 -- that is the *other* corpus; see `CORPUS.md`.
+
 **Result: 17.45 → 27.03 t/s (+55%)** on the CLAUDE.md metric
 (`qwen3.8-27B-Q6_K`, 2× Tesla P100, `-sm tensor -fa 1 -ctk/-ctv q4_0`, tg256).
 

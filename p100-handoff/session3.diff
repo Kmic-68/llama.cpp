@@ -1,0 +1,628 @@
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index f700a3859..ca8d646f8 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1444,6 +1444,65 @@ struct ggml_backend_cuda_context {
+     std::string name;
+     cudaEvent_t copy_event = nullptr;
+ 
++    // Peer copies are issued on a dedicated stream instead of the compute stream.
++    //
++    // The tensor-parallel all-reduce exchanges partial sums in both directions at once. When the
++    // copies sat on the compute streams they serialised: copy 0->1 was issued on stream 0 and
++    // stream 1 was then made to wait on it, so copy 1->0 -- issued on stream 1 -- could not start
++    // until copy 0->1 had finished. PCIe here is full duplex (measured 9.74 GB/s *each way*
++    // simultaneously), so that wasted a full copy duration per exchange.
++    //
++    // work_event marks everything already enqueued on the compute stream. The copy stream waits on
++    // it rather than on the compute stream itself, so a wait installed on the compute stream by
++    // some *other* device's exchange does not push this device's copy behind it.
++    cudaStream_t copy_stream = nullptr;
++    cudaEvent_t  work_event  = nullptr;
++
++    // Record "everything enqueued on the compute stream so far". Must be called after anything
++    // that enqueues work which a later peer copy might read.
++    void record_work() {
++        if (work_event == nullptr) {
++            ggml_cuda_set_device(device);
++            CUDA_CHECK(cudaEventCreateWithFlags(&work_event, cudaEventDisableTiming));
++        }
++        CUDA_CHECK(cudaEventRecord(work_event, stream()));
++    }
++
++    // Staging buffers for compressed peer copies (see ggml_backend_cuda_cpy_tensor_async).
++    // Two of them, and they must stay distinct: in a butterfly all-reduce a device is both a
++    // sender and a receiver in the same step, so one shared buffer would have the outgoing
++    // narrow overwrite the partial that just landed from the peer.
++    // Allocated once and grown on demand -- sizes are stable across a run, so no cudaMalloc
++    // ends up on the hot path.
++    enum peer_stage_dir { PEER_STAGE_OUT = 0, PEER_STAGE_IN = 1 };
++    void * peer_stage[2]     = { nullptr, nullptr };
++    size_t peer_stage_cap[2] = { 0, 0 };
++    // Signals that the landing buffer has been widened and may be refilled. A sender waits on the
++    // receiver's copy of this before overwriting it.
++    cudaEvent_t peer_stage_free = nullptr;
++    // -1 = not yet probed, 0 = partials are not f16-exact (never compress), 1 = safe to compress
++    int    peer_f16_ok       = -1;
++
++    void * peer_stage_get(peer_stage_dir dir, size_t size) {
++        if (peer_stage_cap[dir] < size) {
++            ggml_cuda_set_device(device);
++            if (peer_stage[dir] != nullptr) {
++                CUDA_CHECK(cudaFree(peer_stage[dir]));
++            }
++            CUDA_CHECK(cudaMalloc(&peer_stage[dir], size));
++            peer_stage_cap[dir] = size;
++        }
++        return peer_stage[dir];
++    }
++
++    cudaStream_t peer_copy_stream() {
++        if (copy_stream == nullptr) {
++            ggml_cuda_set_device(device);
++            CUDA_CHECK(cudaStreamCreateWithFlags(&copy_stream, cudaStreamNonBlocking));
++        }
++        return copy_stream;
++    }
++
+     cudaStream_t streams[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = { { nullptr } };
+     cublasHandle_t cublas_handles[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
+     void * cublas_workspaces[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS] = {nullptr};
+diff --git a/ggml/src/ggml-cuda/convert.cu b/ggml/src/ggml-cuda/convert.cu
+index c42e0e350..0dc4c2c99 100644
+--- a/ggml/src/ggml-cuda/convert.cu
++++ b/ggml/src/ggml-cuda/convert.cu
+@@ -5,6 +5,11 @@
+ 
+ #define CUDA_Q8_0_NE_ALIGN 2048
+ 
++template <typename T> struct convert_vec4;
++template <> struct convert_vec4<float>       { using type = float4; };
++template <> struct convert_vec4<half>        { using type = uint2;  };
++template <> struct convert_vec4<nv_bfloat16> { using type = uint2;  };
++
+ template <int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
+ static __global__ void dequantize_block(const void * __restrict__ vx, dst_t * __restrict__ y,
+         const int64_t ne00, const int64_t ne01,
+@@ -173,6 +178,57 @@ static __global__ void dequantize_block_q6_K(const void * __restrict__ vx, dst_t
+     dequantize_q6_K(vx, i, yy + i*QK_K, threadIdx.x);
+ }
+ 
++// Same 256 outputs as dequantize_block_q6_K, same 64 threads, same arithmetic
++// per output -- only the thread->output assignment changes, so the result is
++// bit-identical (each output is an independent expression; there is no
++// reduction whose grouping could shift).
++//
++// The scalar kernel gives each thread four outputs 32 apart, which costs 7
++// single-byte loads and 4 scalar stores. Here each thread takes four
++// *consecutive* outputs instead: they share ip, j and the scale, so the low
++// and high quant bytes become 16-bit loads and the store becomes one vector
++// write. 11 memory instructions per thread -> 6, and a warp now stores 128
++// contiguous elements. sm_60 is issue-bound here, so the instruction count is
++// what matters.
++//
++// block_q6_K is 210 bytes, i.e. only 2-byte aligned, so the quant loads are
++// uint16 rather than uint32.
++template<typename dst_t>
++static __global__ void dequantize_block_q6_K_vec4(const void * __restrict__ vx, dst_t * __restrict__ yy) {
++    const block_q6_K * x = (const block_q6_K *) vx;
++
++    const int64_t ib  = blockIdx.x;
++    const int     t   = threadIdx.x;      // 0..63, four outputs each
++
++    const int     ip  = t >> 5;           // 0 or 1   (output halves)
++    const int     j   = (t >> 3) & 3;     // 0..3     (which of the four groups of 32)
++    const int     il0 = (4*t) & 31;       // 0,4,..,28, so il0/16 is constant over the four
++
++    const float   d   = x[ib].d;
++    const int8_t  sc  = x[ib].scales[8*ip + il0/16 + 2*j];
++
++    // 2-byte aligned: ql is at struct offset 0 and every offset below is even
++    const uint16_t * ql16 = (const uint16_t *) (x[ib].ql + 64*ip + il0 + 32*(j & 1));
++    const uint16_t * qh16 = (const uint16_t *) (x[ib].qh + 32*ip + il0);
++
++    const uint32_t qlp = (uint32_t) ql16[0] | ((uint32_t) ql16[1] << 16);
++    const uint32_t qhp = (uint32_t) qh16[0] | ((uint32_t) qh16[1] << 16);
++
++    typename convert_vec4<dst_t>::type yv;
++    dst_t * ys = (dst_t *) &yv;
++
++#pragma unroll
++    for (int k = 0; k < 4; ++k) {
++        const uint32_t qlb = (qlp >> (8*k)) & 0xFF;
++        const uint32_t qhb = (qhp >> (8*k)) & 0xFF;
++        const uint32_t nib = j < 2 ? (qlb & 0xF) : (qlb >> 4);
++        const int      q   = (int8_t) (nib | (((qhb >> (2*j)) & 3) << 4));
++        ys[k] = ggml_cuda_cast<dst_t>(d * sc * (q - 32));
++    }
++
++    *((typename convert_vec4<dst_t>::type *) (yy + ib*QK_K + 4*t)) = yv;
++}
++
+ template<typename dst_t>
+ static __global__ void dequantize_block_iq2_xxs(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+     const int64_t i = blockIdx.x;
+@@ -311,6 +367,12 @@ static void dequantize_row_q5_K_cuda(const void * vx, dst_t * y, const int64_t k
+ template<typename dst_t>
+ static void dequantize_row_q6_K_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
+     const int nb = k / QK_K;
++    // the vector store needs sizeof(dst_t)*4 alignment; QK_K*sizeof(dst_t) is a
++    // multiple of that, so checking the base pointer is enough
++    if (((uintptr_t) y % (4*sizeof(dst_t))) == 0) {
++        dequantize_block_q6_K_vec4<dst_t><<<nb, 64, 0, stream>>>(vx, y);
++        return;
++    }
+     dequantize_block_q6_K<<<nb, 64, 0, stream>>>(vx, y);
+ }
+ 
+@@ -455,11 +517,6 @@ static void convert_unary_cuda(const void * vx, dst_t * y,
+ // a 2-byte store per thread cannot saturate the memory pipe. This handles 4
+ // elements per thread with one aligned vector load and one aligned vector store.
+ // The per-element cast is unchanged, so the result is bit-identical.
+-template <typename T> struct convert_vec4;
+-template <> struct convert_vec4<float>       { using type = float4; };
+-template <> struct convert_vec4<half>        { using type = uint2;  };
+-template <> struct convert_vec4<nv_bfloat16> { using type = uint2;  };
+-
+ template <typename src_t, typename dst_t>
+ static __global__ void convert_unary_vec4(
+         const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t k4) {
+diff --git a/ggml/src/ggml-cuda/gated_delta_net.cu b/ggml/src/ggml-cuda/gated_delta_net.cu
+index 1b431a724..765e88cd8 100644
+--- a/ggml/src/ggml-cuda/gated_delta_net.cu
++++ b/ggml/src/ggml-cuda/gated_delta_net.cu
+@@ -1,8 +1,15 @@
+ #include "gated_delta_net.cuh"
+ #include "ggml-cuda/common.cuh"
+ 
++// Columns handled per block. Each block re-reads the whole k and q vector for the token, so with
++// the original 4 warps a 128-wide state was read by 32 separate blocks. Widening the block cuts
++// that redundancy (and the L1 traffic behind it) without changing any column's arithmetic.
++#ifndef P100_GDN_NWARPS
++#define P100_GDN_NWARPS 4
++#endif
++
+ template <int S_v, bool KDA, bool keep_rs_t>
+-__global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
++__global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * P100_GDN_NWARPS, 2)
+ gated_delta_net_cuda(const float * q,
+                                      const float * k,
+                                      const float * v,
+@@ -60,56 +67,138 @@ gated_delta_net_cuda(const float * q,
+         s_shard[r]  = curr_state[i];
+     }
+ 
+-    for (int t = 0; t < n_tokens; t++) {
+-        const float * q_t = q + iq3 * sq3 + t * sq2 + iq1 * sq1;
+-        const float * k_t = k + iq3 * sq3 + t * sq2 + iq1 * sq1;
+-        const float * v_t = v + sequence * sv3 + t * sv2 + h_idx * sv1;
++    // Snapshot of the running state into the caller's rolling slots, shared by both variants.
++    auto snapshot = [&](const int t) {
++        if constexpr (keep_rs_t) {
++            // snapshot slot mapping: slot 0 = most recent state, slot s = s tokens back.
++            // When n_tokens < K only slots 0..n_tokens-1 are written; older slots are caller-owned.
++            const int target_slot = (int) n_tokens - 1 - t;
++            if (target_slot >= 0 && target_slot < K) {
++                float * slot = state + target_slot * state_slot_stride;
++#pragma unroll
++                for (int r = 0; r < rows_per_lane; r++) {
++                    const int i = r * warp_size + lane;
++                    slot[col * S_v + i] = s_shard[r];
++                }
++            }
++        }
++    };
++
++    if constexpr (!KDA) {
++        // Software-pipelined. attn[col] for token t and kv[col] for token t+1 both read only the
++        // state *after* token t, so they are independent and can share one butterfly: the float2
++        // reduction runs the two shuffle chains interleaved, paying one chain's latency instead of
++        // two. That latency is the loop's critical path -- n_tokens iterations of
++        // load -> reduce -> update -> reduce -- so collapsing two chains into one is the win.
++        //
++        // Bit-identical to the unpipelined form: warp_reduce_sum(float2) applies exactly the same
++        // per-component offsets in the same order as the scalar version, every partial sum is
++        // still accumulated over r in the same order, and no term changes which value it uses.
++        float k_reg[rows_per_lane];
++        float q_reg[rows_per_lane];
++        float g_val    = 0.0f;
++        float beta_val = 0.0f;
++        float v_val    = 0.0f;
++        float kv_shard = 0.0f;
++
++        // Tokens are visited strictly in order, so the per-token addresses are an arithmetic
++        // progression: walk them instead of recomputing. The recomputed form cost twelve 64-bit
++        // multiplies per token (q/k/v/g/beta, three terms each), and sm_60 has no native 64-bit
++        // multiply -- each one expands to an IMAD sequence. That was far more instructions than
++        // the 16 FMAs of actual work in the loop body. Pure addressing, so bit-identical.
++        const float * q_t = q    + iq3 * sq3      + iq1   * sq1 + lane;
++        const float * k_t = k    + iq3 * sq3      + iq1   * sq1 + lane;
++        const float * v_t = v    + sequence * sv3 + h_idx * sv1 + col;
++        const float * g_t = g    + sequence * sb3 + h_idx * sb1;
++        const float * b_t = beta + sequence * sb3 + h_idx * sb1;
++
++        // load the token the pointers currently address, then step to the next one
++        auto load_token = [&]() {
++#pragma unroll
++            for (int r = 0; r < rows_per_lane; r++) {
++                k_reg[r] = k_t[r * warp_size];
++                q_reg[r] = q_t[r * warp_size];
++            }
+ 
+-        const int64_t gb_offset = sequence * sb3 + t * sb2 + h_idx * sb1;
+-        const float * beta_t = beta + gb_offset;
+-        const float * g_t    = g    + gb_offset * (KDA ? S_v : 1);
++            g_val    = expf(*g_t);
++            beta_val = *b_t;
++            v_val    = *v_t;
+ 
+-        const float beta_val = *beta_t;
++            q_t += sq2;
++            k_t += sq2;
++            v_t += sv2;
++            g_t += sb2;
++            b_t += sb2;
++        };
+ 
+-        // Cache k and q in registers
+-        float k_reg[rows_per_lane];
+-        float q_reg[rows_per_lane];
++        load_token();
+ #pragma unroll
+         for (int r = 0; r < rows_per_lane; r++) {
+-            const int i = r * warp_size + lane;
+-            k_reg[r] = k_t[i];
+-            q_reg[r] = q_t[i];
++            kv_shard += s_shard[r] * k_reg[r];
+         }
++        // carried across iterations already reduced -- do not reduce it a second time
++        float kv_col = warp_reduce_sum<warp_size>(kv_shard);
+ 
+-        if constexpr (!KDA) {
+-            const float g_val = expf(*g_t);
+-
+-            // kv[col] = (S^T @ k)[col] = sum_i S[i][col] * k[i]
+-            float kv_shard = 0.0f;
+-#pragma unroll
+-            for (int r = 0; r < rows_per_lane; r++) {
+-                kv_shard += s_shard[r] * k_reg[r];
+-            }
+-            float kv_col = warp_reduce_sum<warp_size>(kv_shard);
++        for (int t = 0; t < n_tokens; t++) {
+ 
+             // delta[col] = (v[col] - g * kv[col]) * beta
+-            float delta_col = (v_t[col] - g_val * kv_col) * beta_val;
++            const float delta_col = (v_val - g_val * kv_col) * beta_val;
+ 
+             // fused: S[i][col] = g * S[i][col] + k[i] * delta[col]
+             // attn[col] = (S^T @ q)[col] = sum_i S[i][col] * q[i]
+             float attn_partial = 0.0f;
+ #pragma unroll
+             for (int r = 0; r < rows_per_lane; r++) {
+-                s_shard[r]  = g_val * s_shard[r] + k_reg[r] * delta_col;
++                s_shard[r]    = g_val * s_shard[r] + k_reg[r] * delta_col;
+                 attn_partial += s_shard[r] * q_reg[r];
+             }
+ 
+-            float attn_col = warp_reduce_sum<warp_size>(attn_partial);
++            // Pull token t+1's kv partial forward: it reads only the state after token t, so it
++            // is independent of attn[col] for token t and the two can share one butterfly. The
++            // float2 reduction interleaves the two shuffle chains, paying one chain's latency
++            // instead of two -- and that latency is this loop's critical path.
++            float kv_next = 0.0f;
++            if (t + 1 < n_tokens) {
++                load_token();
++#pragma unroll
++                for (int r = 0; r < rows_per_lane; r++) {
++                    kv_next += s_shard[r] * k_reg[r];
++                }
++            }
++
++            const float2 red = warp_reduce_sum<warp_size>(make_float2(attn_partial, kv_next));
++            kv_col = red.y;
+ 
+             if (lane == 0) {
+-                attn_data[col] = attn_col * scale;
++                attn_data[col] = red.x * scale;
+             }
+-        } else {
++
++            attn_data += S_v * H;
++
++            snapshot(t);
++        }
++    } else {
++        for (int t = 0; t < n_tokens; t++) {
++            const float * q_t = q + iq3 * sq3 + t * sq2 + iq1 * sq1;
++            const float * k_t = k + iq3 * sq3 + t * sq2 + iq1 * sq1;
++            const float * v_t = v + sequence * sv3 + t * sv2 + h_idx * sv1;
++
++            const int64_t gb_offset = sequence * sb3 + t * sb2 + h_idx * sb1;
++            const float * beta_t = beta + gb_offset;
++            const float * g_t    = g    + gb_offset * S_v;
++
++            const float beta_val = *beta_t;
++
++            // Cache k and q in registers
++            float k_reg[rows_per_lane];
++            float q_reg[rows_per_lane];
++#pragma unroll
++            for (int r = 0; r < rows_per_lane; r++) {
++                const int i = r * warp_size + lane;
++                k_reg[r] = k_t[i];
++                q_reg[r] = q_t[i];
++            }
++
+             // kv[col] = sum_i g[i] * S[i][col] * k[i]
+             float kv_shard = 0.0f;
+ #pragma unroll
+@@ -138,22 +227,10 @@ gated_delta_net_cuda(const float * q,
+             if (lane == 0) {
+                 attn_data[col] = attn_col * scale;
+             }
+-        }
+ 
+-        attn_data += S_v * H;
++            attn_data += S_v * H;
+ 
+-        if constexpr (keep_rs_t) {
+-            // snapshot slot mapping: slot 0 = most recent state, slot s = s tokens back.
+-            // When n_tokens < K only slots 0..n_tokens-1 are written; older slots are caller-owned.
+-            const int target_slot = (int) n_tokens - 1 - t;
+-            if (target_slot >= 0 && target_slot < K) {
+-                float * curr_state = state + target_slot * state_slot_stride;
+-#pragma unroll
+-                for (int r = 0; r < rows_per_lane; r++) {
+-                    const int i = r * warp_size + lane;
+-                    curr_state[col * S_v + i] = s_shard[r];
+-                }
+-            }
++            snapshot(t);
+         }
+     }
+ 
+@@ -179,7 +256,7 @@ static void launch_gated_delta_net(
+         float scale, int64_t state_slot_stride, int K, cudaStream_t stream) {
+     //TODO: Add chunked kernel for even faster pre-fill
+     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+-    const int num_warps = 4;
++    const int num_warps = P100_GDN_NWARPS < S_v ? P100_GDN_NWARPS : (int) S_v;  // col must stay < S_v
+     dim3      grid_dims(H, n_seqs, (S_v + num_warps - 1) / num_warps);
+     dim3      block_dims(warp_size <= S_v ? warp_size : S_v, num_warps, 1);
+ 
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 0e903d3d0..3d3f2db30 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -715,6 +715,21 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+     if (copy_event != nullptr) {
+         CUDA_CHECK(cudaEventDestroy(copy_event));
+     }
++    if (work_event != nullptr) {
++        CUDA_CHECK(cudaEventDestroy(work_event));
++    }
++    if (copy_stream != nullptr) {
++        CUDA_CHECK(cudaStreamDestroy(copy_stream));
++    }
++    for (int i = 0; i < 2; ++i) {
++        if (peer_stage[i] != nullptr) {
++            ggml_cuda_set_device(device);
++            CUDA_CHECK(cudaFree(peer_stage[i]));
++        }
++    }
++    if (peer_stage_free != nullptr) {
++        CUDA_CHECK(cudaEventDestroy(peer_stage_free));
++    }
+     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
+         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
+             if (streams[i][j] != nullptr) {
+@@ -1557,14 +1572,40 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
+                                            (const float *) src1_ptr, s11,
+                     (const float *) beta,  (float       *)  dst_ptr, ne0));
+     } else if (ne12 == 1 && ne13 == 1) {
+-        CUBLAS_CHECK(
++        // On pre-Volta hardware cuBLAS's default kernel choice for a tall-and-skinny TN f16 GEMM
++        // is not the fastest one it has. Measured on P100 (sm_60) at n=2048, ALGO3 vs the default:
++        // ffn gate/up (m=8704,k=5120) 15.31 -> 16.79 TFLOPS, ffn down (m=5120,k=8704) 15.99 ->
++        // 16.54, attn qkv 14.09 -> 15.50, gdn in 15.24 -> 15.91. The advantage disappears and then
++        // inverts as n shrinks (at n=64 ALGO3 is up to 2x *slower*), so it is only used for the
++        // wide batches that prefill produces -- decode and short tails keep the default.
++        // These legacy algo selectors are meaningful only on the pre-Volta path, hence the cc gate.
++        cublasGemmAlgo_t algo = CUBLAS_GEMM_DEFAULT_TENSOR_OP;
++        if (cc < GGML_CUDA_CC_VOLTA && cu_compute_type == CUBLAS_COMPUTE_16F && ne11 >= 512) {
++            algo = CUBLAS_GEMM_ALGO3;
++        }
++
++        cublasStatus_t gemm_status =
+             cublasGemmEx(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
+                     ne01, ne11, ne10,
+                     alpha, src0_ptr, cu_data_type_a, s01,
+                            src1_ptr, cu_data_type_b, s11,
+                     beta,   dst_ptr, cu_data_type,   ne0,
+                     cu_compute_type,
+-                    CUBLAS_GEMM_DEFAULT_TENSOR_OP));
++                    algo);
++
++        if (gemm_status != CUBLAS_STATUS_SUCCESS && algo != CUBLAS_GEMM_DEFAULT_TENSOR_OP) {
++            // the tuned algo is not available for this shape -- fall back
++            gemm_status =
++                cublasGemmEx(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
++                        ne01, ne11, ne10,
++                        alpha, src0_ptr, cu_data_type_a, s01,
++                               src1_ptr, cu_data_type_b, s11,
++                        beta,   dst_ptr, cu_data_type,   ne0,
++                        cu_compute_type,
++                        CUBLAS_GEMM_DEFAULT_TENSOR_OP);
++        }
++
++        CUBLAS_CHECK(gemm_status);
+     } else if (r2 == 1 && r3 == 1 && is_src0_cont_2 && is_src1_cont_2) {
+         // with a [0, 2, 1, 3] perm. and ne02==1 the matrix strides need to be determined from dim 3:
+         const int64_t sma = ne02 == 1 ? s03 : s02;
+@@ -2447,6 +2488,8 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
+     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
+ 
+     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
++
++    cuda_ctx->record_work();
+ }
+ 
+ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+@@ -2467,6 +2510,8 @@ static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct
+ 
+     CUDA_CHECK(cudaMemcpy2DAsync(
+         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cuda_ctx->stream()));
++
++    cuda_ctx->record_work();
+ }
+ 
+ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const struct ggml_tensor * tensor, void * data,
+@@ -2480,6 +2525,36 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const
+         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
+ }
+ 
++// Sets *flag if any element is not exactly representable in f16. Used once, at the first
++// tensor-parallel exchange, to decide whether the partial sums may be shipped as f16.
++static __global__ void k_probe_f16_exact(const float * __restrict__ x, const int64_t n, int * __restrict__ flag) {
++    const int64_t i = blockIdx.x*(int64_t)blockDim.x + threadIdx.x;
++    if (i >= n) {
++        return;
++    }
++    const float v = x[i];
++    // NaN also trips this (NaN != NaN), which is the conservative direction
++    if (__half2float(__float2half(v)) != v) {
++        *flag = 1;
++    }
++}
++
++// Is this copy a tensor-parallel partial sum that we know came out of the f16 cuBLAS path?
++// On pre-Volta the mul_mat epilogue writes f16 and widens it to f32, so such a tensor holds
++// exactly-f16 values and can be shipped over PCIe at half the bytes with no loss at all.
++// Narrow batches go through mul_mat_vec_q instead, which produces genuine f32, hence the
++// ne[1] threshold -- it matches the condition under which the cuBLAS f16 path is taken.
++static bool ggml_cuda_peer_copy_compressible(const ggml_tensor * src, const ggml_tensor * dst, int cc) {
++    return cc < GGML_CUDA_CC_VOLTA
++        && src->op   == GGML_OP_MUL_MAT
++        && src->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
++        && src->ne[1] >= 512
++        && ggml_is_contiguous(src) && ggml_is_contiguous(dst)
++        && ggml_nelements(src) == ggml_nelements(dst)
++        && ggml_nelements(src) % 2 == 0
++        && fast_fp16_available(cc);
++}
++
+ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
+     ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
+     ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
+@@ -2518,7 +2593,99 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
+ #ifdef GGML_CUDA_NO_PEER_COPY
+             return false;
+ #else
+-            CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, dst_physical, src->data, src_physical, ggml_nbytes(dst), cuda_ctx_src->stream()));
++            // Issue the peer copy on a dedicated stream rather than the compute stream, so that
++            // opposing copies of a tensor-parallel all-reduce overlap instead of serialising --
++            // see the comment on copy_stream in ggml_backend_cuda_context. The copy stream waits
++            // on work_event (everything already enqueued on the src compute stream) instead of on
++            // the compute stream itself, which is what keeps it independent of waits installed
++            // there by the other direction of the exchange.
++            ggml_cuda_set_device(cuda_ctx_src->device);
++
++            if (!cuda_ctx_src->copy_event) {
++                CUDA_CHECK(cudaEventCreateWithFlags(&cuda_ctx_src->copy_event, cudaEventDisableTiming));
++            }
++
++            cudaStream_t copy_stream = cuda_ctx_src->peer_copy_stream();
++
++            if (cuda_ctx_src->work_event) {
++                CUDA_CHECK(cudaStreamWaitEvent(copy_stream, cuda_ctx_src->work_event, 0));
++            } else {
++                // nothing has been recorded yet: fall back to ordering against the compute stream
++                cuda_ctx_src->record_work();
++                CUDA_CHECK(cudaStreamWaitEvent(copy_stream, cuda_ctx_src->work_event, 0));
++            }
++
++            const int  cc_src  = ggml_cuda_info().devices[cuda_ctx_src->device].cc;
++            const bool eligible = ggml_cuda_peer_copy_compressible(src, dst, cc_src);
++
++            // One-time probe, on the first eligible exchange. The probe copy itself still goes
++            // uncompressed, so a model whose partials are not f16-exact never sees a lossy copy.
++            if (eligible && cuda_ctx_src->peer_f16_ok < 0) {
++                const int64_t ne = ggml_nelements(src);
++                int * flag = (int *) cuda_ctx_src->peer_stage_get(
++                        ggml_backend_cuda_context::PEER_STAGE_OUT, sizeof(int));
++                CUDA_CHECK(cudaMemsetAsync(flag, 0, sizeof(int), copy_stream));
++                const int64_t nblocks = (ne + 255) / 256;
++                k_probe_f16_exact<<<nblocks, 256, 0, copy_stream>>>((const float *) src->data, ne, flag);
++                int host_flag = 1;
++                CUDA_CHECK(cudaMemcpyAsync(&host_flag, flag, sizeof(int), cudaMemcpyDeviceToHost, copy_stream));
++                CUDA_CHECK(cudaStreamSynchronize(copy_stream));
++                cuda_ctx_src->peer_f16_ok = host_flag == 0 ? 1 : 0;
++                cuda_ctx_src->peer_stage_cap[ggml_backend_cuda_context::PEER_STAGE_OUT] = 0;
++                GGML_LOG_INFO("%s: tensor-parallel partials are %sf16-exact; peer copies %s\n", __func__,
++                        cuda_ctx_src->peer_f16_ok ? "" : "not ",
++                        cuda_ctx_src->peer_f16_ok ? "will be sent as f16" : "stay f32");
++            }
++
++            if (eligible && cuda_ctx_src->peer_f16_ok == 1) {
++                // half the PCIe bytes; the local narrow/widen passes cost ~0.25ms against ~2.1ms
++                // of PCIe saved, and are exact in both directions for f16-valued data
++                const int64_t ne     = ggml_nelements(src);
++                const size_t  nb_f16 = ne * sizeof(half);
++
++                half * stage_src = (half *) cuda_ctx_src->peer_stage_get(
++                        ggml_backend_cuda_context::PEER_STAGE_OUT, nb_f16);
++                ggml_cuda_set_device(cuda_ctx_dst->device);
++                half * stage_dst = (half *) cuda_ctx_dst->peer_stage_get(
++                        ggml_backend_cuda_context::PEER_STAGE_IN, nb_f16);
++                if (cuda_ctx_dst->peer_stage_free == nullptr) {
++                    CUDA_CHECK(cudaEventCreateWithFlags(&cuda_ctx_dst->peer_stage_free, cudaEventDisableTiming));
++                }
++                ggml_cuda_set_device(cuda_ctx_src->device);
++
++                // do not refill the peer's landing buffer until it has widened the last delivery
++                CUDA_CHECK(cudaStreamWaitEvent(copy_stream, cuda_ctx_dst->peer_stage_free, 0));
++
++                ggml_get_to_fp16_cuda(GGML_TYPE_F32)(src->data, stage_src, ne, copy_stream);
++                CUDA_CHECK(cudaMemcpyPeerAsync(stage_dst, dst_physical, stage_src, src_physical, nb_f16, copy_stream));
++                CUDA_CHECK(cudaEventRecord(cuda_ctx_src->copy_event, copy_stream));
++
++                CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx_src->stream(), cuda_ctx_src->copy_event, 0));
++                CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx_dst->stream(), cuda_ctx_src->copy_event, 0));
++
++                ggml_cuda_set_device(cuda_ctx_dst->device);
++                // Deliberately no record_work() here: the widen is enqueued on the dst compute
++                // stream behind the wait on copy_event, so advancing dst's work marker would make
++                // the *other* direction's copy stream wait on this direction's copy -- reinstating
++                // exactly the serialisation that the dedicated copy stream exists to avoid. The
++                // widened buffer is consumed by the ADD on the same stream (so ordered), and the
++                // next graph compute records a marker that covers it.
++                ggml_get_to_fp32_cuda(GGML_TYPE_F16)(stage_dst, (float *) dst->data, ne, cuda_ctx_dst->stream());
++                CUDA_CHECK(cudaEventRecord(cuda_ctx_dst->peer_stage_free, cuda_ctx_dst->stream()));
++                return true;
++            }
++
++            CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, dst_physical, src->data, src_physical, ggml_nbytes(dst), copy_stream));
++            CUDA_CHECK(cudaEventRecord(cuda_ctx_src->copy_event, copy_stream));
++
++            // the src compute stream must not overwrite the source buffer while the copy is in
++            // flight -- with the copy on the compute stream this was implicit
++            CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx_src->stream(), cuda_ctx_src->copy_event, 0));
++
++            // wait on dst stream for the copy to complete
++            CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx_dst->stream(), cuda_ctx_src->copy_event, 0));
++
++            return true;
+ #endif // GGML_CUDA_NO_PEER_COPY
+         }
+ 
+@@ -4312,6 +4479,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+ 
+     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+ 
++    // Mark everything this graph enqueued, so a later peer copy can order itself against the
++    // results without having to wait on the compute stream (see copy_stream in the context).
++    cuda_ctx->record_work();
++
+     return GGML_STATUS_SUCCESS;
+ }
+ 
