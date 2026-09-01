@@ -5,6 +5,11 @@
 
 #define CUDA_Q8_0_NE_ALIGN 2048
 
+template <typename T> struct convert_vec4;
+template <> struct convert_vec4<float>       { using type = float4; };
+template <> struct convert_vec4<half>        { using type = uint2;  };
+template <> struct convert_vec4<nv_bfloat16> { using type = uint2;  };
+
 template <int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static __global__ void dequantize_block(const void * __restrict__ vx, dst_t * __restrict__ y,
         const int64_t ne00, const int64_t ne01,
@@ -173,6 +178,57 @@ static __global__ void dequantize_block_q6_K(const void * __restrict__ vx, dst_t
     dequantize_q6_K(vx, i, yy + i*QK_K, threadIdx.x);
 }
 
+// Same 256 outputs as dequantize_block_q6_K, same 64 threads, same arithmetic
+// per output -- only the thread->output assignment changes, so the result is
+// bit-identical (each output is an independent expression; there is no
+// reduction whose grouping could shift).
+//
+// The scalar kernel gives each thread four outputs 32 apart, which costs 7
+// single-byte loads and 4 scalar stores. Here each thread takes four
+// *consecutive* outputs instead: they share ip, j and the scale, so the low
+// and high quant bytes become 16-bit loads and the store becomes one vector
+// write. 11 memory instructions per thread -> 6, and a warp now stores 128
+// contiguous elements. sm_60 is issue-bound here, so the instruction count is
+// what matters.
+//
+// block_q6_K is 210 bytes, i.e. only 2-byte aligned, so the quant loads are
+// uint16 rather than uint32.
+template<typename dst_t>
+static __global__ void dequantize_block_q6_K_vec4(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+    const block_q6_K * x = (const block_q6_K *) vx;
+
+    const int64_t ib  = blockIdx.x;
+    const int     t   = threadIdx.x;      // 0..63, four outputs each
+
+    const int     ip  = t >> 5;           // 0 or 1   (output halves)
+    const int     j   = (t >> 3) & 3;     // 0..3     (which of the four groups of 32)
+    const int     il0 = (4*t) & 31;       // 0,4,..,28, so il0/16 is constant over the four
+
+    const float   d   = x[ib].d;
+    const int8_t  sc  = x[ib].scales[8*ip + il0/16 + 2*j];
+
+    // 2-byte aligned: ql is at struct offset 0 and every offset below is even
+    const uint16_t * ql16 = (const uint16_t *) (x[ib].ql + 64*ip + il0 + 32*(j & 1));
+    const uint16_t * qh16 = (const uint16_t *) (x[ib].qh + 32*ip + il0);
+
+    const uint32_t qlp = (uint32_t) ql16[0] | ((uint32_t) ql16[1] << 16);
+    const uint32_t qhp = (uint32_t) qh16[0] | ((uint32_t) qh16[1] << 16);
+
+    typename convert_vec4<dst_t>::type yv;
+    dst_t * ys = (dst_t *) &yv;
+
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        const uint32_t qlb = (qlp >> (8*k)) & 0xFF;
+        const uint32_t qhb = (qhp >> (8*k)) & 0xFF;
+        const uint32_t nib = j < 2 ? (qlb & 0xF) : (qlb >> 4);
+        const int      q   = (int8_t) (nib | (((qhb >> (2*j)) & 3) << 4));
+        ys[k] = ggml_cuda_cast<dst_t>(d * sc * (q - 32));
+    }
+
+    *((typename convert_vec4<dst_t>::type *) (yy + ib*QK_K + 4*t)) = yv;
+}
+
 template<typename dst_t>
 static __global__ void dequantize_block_iq2_xxs(const void * __restrict__ vx, dst_t * __restrict__ yy) {
     const int64_t i = blockIdx.x;
@@ -311,6 +367,12 @@ static void dequantize_row_q5_K_cuda(const void * vx, dst_t * y, const int64_t k
 template<typename dst_t>
 static void dequantize_row_q6_K_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
     const int nb = k / QK_K;
+    // the vector store needs sizeof(dst_t)*4 alignment; QK_K*sizeof(dst_t) is a
+    // multiple of that, so checking the base pointer is enough
+    if (((uintptr_t) y % (4*sizeof(dst_t))) == 0) {
+        dequantize_block_q6_K_vec4<dst_t><<<nb, 64, 0, stream>>>(vx, y);
+        return;
+    }
     dequantize_block_q6_K<<<nb, 64, 0, stream>>>(vx, y);
 }
 
@@ -455,11 +517,6 @@ static void convert_unary_cuda(const void * vx, dst_t * y,
 // a 2-byte store per thread cannot saturate the memory pipe. This handles 4
 // elements per thread with one aligned vector load and one aligned vector store.
 // The per-element cast is unchanged, so the result is bit-identical.
-template <typename T> struct convert_vec4;
-template <> struct convert_vec4<float>       { using type = float4; };
-template <> struct convert_vec4<half>        { using type = uint2;  };
-template <> struct convert_vec4<nv_bfloat16> { using type = uint2;  };
-
 template <typename src_t, typename dst_t>
 static __global__ void convert_unary_vec4(
         const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t k4) {
