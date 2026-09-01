@@ -1605,3 +1605,30 @@ Same build, same commands:
 
 **A 2% spread on prefill comes from temperature alone.** Compare only at equal
 starting temperature; anything under ~2% is not a code delta.
+
+## 80 — GDN addressing strength-reduced (KEPT, below noise on this model)
+
+The token loop recomputed `q + iq3*sq3 + t*sq2 + iq1*sq1` and three more like it
+every iteration -- twelve 64-bit multiplies per token. sm_60 has no native 64-bit
+multiply, so each expands to an IMAD sequence: far more instructions than the 16
+FMAs of actual work in the body. Tokens are visited strictly in order, so the
+addresses are an arithmetic progression; the pointers are now walked instead.
+
+Measured directly with `test-backend-ops perf -o GATED_DELTA_NET` (isolates the
+kernel, so no thermal confound):
+
+| shape | recomputed | walked | |
+|---|---|---|---|
+| head_count=32, head_size=128, 256 tok | 1125.30 us | 1113.44 us | -1.1% |
+| head_count=4, head_size=128, 256 tok | 171.40 us | **121.26 us** | **-29.3%** |
+
+The gain scales inversely with occupancy: at head_count=4 there are only ~2.3
+blocks/SM so per-thread instruction count is exposed, while at head_count=32 the
+addressing hides behind warp parallelism. This model runs 768 blocks/GPU, i.e.
+the hidden regime, so **the model-level effect is below measurement noise**
+(pp2048 438.44 vs 438.49, at different start temperatures).
+
+Kept anyway: bit-identical (pure addressing), never slower in any measurement,
+costs 5 registers (47 -> 52) without changing resident blocks, and is a large
+win for small-head-count configurations. Recorded honestly as *not* a measurable
+gain for the Qwen3.5 27B workload.

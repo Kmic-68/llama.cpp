@@ -101,27 +101,37 @@ gated_delta_net_cuda(const float * q,
         float v_val    = 0.0f;
         float kv_shard = 0.0f;
 
-        // load token t's inputs and fold them into the pending kv partial
-        auto load_token = [&](const int t) {
-            const float * q_t = q + iq3 * sq3 + t * sq2 + iq1 * sq1;
-            const float * k_t = k + iq3 * sq3 + t * sq2 + iq1 * sq1;
-            const float * v_t = v + sequence * sv3 + t * sv2 + h_idx * sv1;
+        // Tokens are visited strictly in order, so the per-token addresses are an arithmetic
+        // progression: walk them instead of recomputing. The recomputed form cost twelve 64-bit
+        // multiplies per token (q/k/v/g/beta, three terms each), and sm_60 has no native 64-bit
+        // multiply -- each one expands to an IMAD sequence. That was far more instructions than
+        // the 16 FMAs of actual work in the loop body. Pure addressing, so bit-identical.
+        const float * q_t = q    + iq3 * sq3      + iq1   * sq1 + lane;
+        const float * k_t = k    + iq3 * sq3      + iq1   * sq1 + lane;
+        const float * v_t = v    + sequence * sv3 + h_idx * sv1 + col;
+        const float * g_t = g    + sequence * sb3 + h_idx * sb1;
+        const float * b_t = beta + sequence * sb3 + h_idx * sb1;
 
-            const int64_t gb_offset = sequence * sb3 + t * sb2 + h_idx * sb1;
-
+        // load the token the pointers currently address, then step to the next one
+        auto load_token = [&]() {
 #pragma unroll
             for (int r = 0; r < rows_per_lane; r++) {
-                const int i = r * warp_size + lane;
-                k_reg[r] = k_t[i];
-                q_reg[r] = q_t[i];
+                k_reg[r] = k_t[r * warp_size];
+                q_reg[r] = q_t[r * warp_size];
             }
 
-            g_val    = expf(*(g + gb_offset));
-            beta_val = *(beta + gb_offset);
-            v_val    = v_t[col];
+            g_val    = expf(*g_t);
+            beta_val = *b_t;
+            v_val    = *v_t;
+
+            q_t += sq2;
+            k_t += sq2;
+            v_t += sv2;
+            g_t += sb2;
+            b_t += sb2;
         };
 
-        load_token(0);
+        load_token();
 #pragma unroll
         for (int r = 0; r < rows_per_lane; r++) {
             kv_shard += s_shard[r] * k_reg[r];
@@ -149,7 +159,7 @@ gated_delta_net_cuda(const float * q,
             // instead of two -- and that latency is this loop's critical path.
             float kv_next = 0.0f;
             if (t + 1 < n_tokens) {
-                load_token(t + 1);
+                load_token();
 #pragma unroll
                 for (int r = 0; r < rows_per_lane; r++) {
                     kv_next += s_shard[r] * k_reg[r];
