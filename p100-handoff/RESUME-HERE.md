@@ -7,7 +7,7 @@ untracked `ppl.txt` / `p100-handoff/`.
 
 | metric | start of session | now |
 |---|---|---|
-| pp2048 (`-b 2048 -ub 2048`) | 372.5 | **442.6** (cold) / ~438 (hot) |
+| pp2048 (`-b 2048 -ub 2048`) | 372.5 | **442.6** cold / 434.1 hot |
 | tg256 (CLAUDE.md metric cmd) | 29.8 | **31.7** |
 | MTP decode (best settings) | 48.8 | **54.0** |
 | perplexity (ppl-orig.txt) | 2.6209 | **2.6214 +/- 0.01995** |
@@ -57,8 +57,10 @@ bench. Swept: 512 is catastrophic (cuBLAS takes the same time for n=512 as
 n=1024 -- wave quantisation), 3072 is bad (non-power-of-2), 4096 is slightly
 worse than 2048.
 
-**Re-baseline from cold.** The same build reads 442.59 at 39 C and 438.49 at
-55 C. A 1% delta is thermal, not code.
+**Re-baseline from cold.** The same build, same command, three readings:
+442.59 at 39 C, 438.49 at 55 C, 434.10 starting at 52 C and ending at 66 C.
+That is a 2% spread from temperature alone. Anything under ~2% is not a code
+delta -- always compare at the same starting temperature.
 
 ## What is left, and what is not
 

@@ -1590,3 +1590,18 @@ speculated tokens pay for themselves. This is at the 53-55 t/s structural
 ceiling for the current kernel shape, so the 60 t/s goal needs a shape change
 (the draft head, or a batched-decode kernel that does not re-read weights per
 speculated token), not more tuning.
+
+## Final measurements (end of session)
+
+Same build, same commands:
+
+| metric | value | temp |
+|---|---|---|
+| pp2048 | 442.59 +/- 1.44 | 39 C start |
+| pp2048 | 438.49 +/- 0.25 | 55 C start |
+| pp2048 | 434.10 +/- 1.28 | 52 -> 66 C |
+| tg256 (CLAUDE.md metric) | 31.79 +/- 0.16 | 51 C |
+| MTP (n-max 4, p-min 0.2) | 54.04 | warm |
+
+**A 2% spread on prefill comes from temperature alone.** Compare only at equal
+starting temperature; anything under ~2% is not a code delta.
