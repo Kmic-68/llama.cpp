@@ -350,15 +350,15 @@ void ggml_cuda_flash_attn_ext_gemm(ggml_backend_cuda_context & ctx, ggml_tensor 
                     // attention into a uniform average of V.
                     const half alpha = __float2half(1.0f);
                     const half beta  = __float2half(0.0f);
-                    CUBLAS_CHECK(cublasGemmStridedBatchedEx(
+                    CUBLAS_CHECK(cublasGemmEx(
                         cublas, CUBLAS_OP_T, CUBLAS_OP_N,
-                        nkv_c, nt, D,
+                        nkv_c, nt*gqa, D,
                         &alpha,
-                        Kmat, CUDA_R_16F, ldK, 0,
-                        Qf16.ptr, CUDA_R_16F, D, D*nt,
+                        Kmat, CUDA_R_16F, ldK,
+                        Qf16.ptr, CUDA_R_16F, D,
                         &beta,
-                        S.ptr,    CUDA_R_16F, nkv_c, nkv_c*nt,
-                        gqa, CUBLAS_COMPUTE_16F, CUBLAS_GEMM_DEFAULT));
+                        S.ptr,    CUDA_R_16F, nkv_c,
+                        CUBLAS_COMPUTE_16F, CUBLAS_GEMM_DEFAULT));
                 }
 
                 {
@@ -384,15 +384,15 @@ void ggml_cuda_flash_attn_ext_gemm(ggml_backend_cuda_context & ctx, ggml_tensor 
                 {
                     const half alpha = __float2half(1.0f);
                     const half beta  = __float2half(0.0f);
-                    CUBLAS_CHECK(cublasGemmStridedBatchedEx(
+                    CUBLAS_CHECK(cublasGemmEx(
                         cublas, CUBLAS_OP_N, CUBLAS_OP_N,
-                        DV, nt, nkv_c,
+                        DV, nt*gqa, nkv_c,
                         &alpha,
-                        Vmat, CUDA_R_16F, ldV, 0,
-                        P_ptr,    CUDA_R_16F, nkv_c, nkv_c*nt,
+                        Vmat, CUDA_R_16F, ldV,
+                        P_ptr,    CUDA_R_16F, nkv_c,
                         &beta,
-                        Otmp.ptr, CUDA_R_16F, DV, DV*nt,
-                        gqa, CUBLAS_COMPUTE_16F, CUBLAS_GEMM_DEFAULT));
+                        Otmp.ptr, CUDA_R_16F, DV,
+                        CUBLAS_COMPUTE_16F, CUBLAS_GEMM_DEFAULT));
                 }
 
                 {
