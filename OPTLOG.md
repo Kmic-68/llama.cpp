@@ -2321,3 +2321,161 @@ Attention is currently at ~22-25% of peak on this path. Mapping efficiency to th
 4. **Measure at 262144** rather than extrapolating -- throughput, VRAM, and decode.
 5. **Decode at depth is unmeasured.** Decode takes the VEC kernel (`Q->ne[1] == 1`),
    which this path does not touch, so it is not covered by any number here.
+
+---
+
+## 91 — PV GEMM in f16 (KEPT, +21.7% at 262144)
+
+First measurement ever taken at the actual operating depth. Everything below
+d=262144 in this file was extrapolation; the extrapolation was wrong.
+
+**Baseline at d=262144, GEMM path on: 75.44 t/s.** (Predicted ~95 from a linear
+fit through d=65536/131072. Reality was 21% worse.)
+
+### The change
+
+PV was `CUBLAS_COMPUTE_32F`: 6.4-6.7 TFLOPS on Pascal against 11.0-14.6 for
+`COMPUTE_16F`, for ~half of attention's flops. Attempt 90 chose fp32 out of
+caution ("summing ~chunk positive terms in f16 is unsafe") and never tested it.
+
+That caution was misplaced, and the evidence was already in the tree:
+`fattn-tile.cuh:888` declares `half2 VKQ[...]` under `FAST_FP16_AVAILABLE`, so
+**upstream's own Pascal kernel accumulates VKQ in f16 across the entire KV
+cache** and passes the same 3949 tests. Anything f16-accumulating over a single
+chunk is strictly more conservative than the kernel being replaced.
+
+Implementation keeps it stricter still: the GEMM writes an f16 partial for one
+chunk (beta=0) and `fattn_gemm_accum_O` folds it into an f32 running O. So f16
+summation spans k <= 2048, and cross-chunk accumulation stays f32.
+
+Fusing the rescale into that accumulate *removes* traffic rather than adding it:
+the old `fattn_gemm_rescale_O` read+wrote O, then the beta=1 GEMM read+wrote O
+again (50 MB/chunk at nt=2048, gqa=6). Now O and Otmp are read and O written
+once: 38 MB.
+
+| depth | before | after | delta |
+|---|---|---|---|
+| 65536 | 188.99 | 220.60 | +16.7% |
+| **262144** | **75.44** | **91.79** | **+21.7%** |
+
+Gates: 3949/3949; ppl 2.6214 +/- 0.01995 (gate 2.6209 +/- 0.0199); same-corpus
+A/B against the path disabled 2.7561 vs 2.7570 = 0.04 sigma.
+
+### The perplexity gate corpus is not ./ppl.txt
+
+CLAUDE.md says `-f ./ppl.txt` and requires 2.6209. The `ppl.txt` in the tree
+gives **2.7570 on stock upstream** (path disabled) and 2.7561 with this change --
+i.e. the documented number is unreachable on that file for *any* build. The gate
+was calibrated on `p100-handoff/ppl-orig.txt` (420098 B), which reproduces
+2.6214. The two files differ. **Use ppl-orig.txt; ppl.txt fails the gate for
+reasons that have nothing to do with the kernel.**
+
+---
+
+## 92 — a fast harness: stop paying 30 minutes per data point
+
+`llama-bench -d 262144` rebuilds 262144 tokens of context (~30 min) to time one
+27-second batch: a 60:1 overhead ratio on the quantity of interest.
+
+`make_test_cases_perf()` in test-backend-ops now carries the per-GPU production
+shape -- `test_flash_attn_ext(256, 256, 2, {6,1}, kv, 2048, ...)` with q4_0 K/V,
+at kv 32768/65536/131072/262144. That is exactly what one GPU sees for qwen3.5
+under `-sm tensor -ctk q4_0 -ctv q4_0 -ub 2048`: 2 KV heads, GQA 6, D 256.
+Perf-only, so the 3949 correctness tests are untouched. **Seconds per point.**
+
+Verified against the profile: FA launch count at d=65536 was 35840 =
+561 batch-chunks x **16** layers x 2 KV heads x 2 GPUs, confirming
+`full_attention_interval 4` leaves exactly 16 of 65 layers with a growing cache.
+
+A prefill batch is 16 of these ops, so `t/s = 2048 / (16*t_op + const)`.
+
+---
+
+## 93 — where the time actually goes at 262144
+
+Three points, one build, and the model is linear to 0.2%:
+
+    t_batch = 4.94 s + depth * 6.63e-5 s
+
+| depth | measured | s/batch | predicted |
+|---|---|---|---|
+| 65536 | 220.60 | 9.283 | - |
+| 131072 | 150.66 | 13.593 | 13.626 |
+| 262144 | 91.79 | 22.312 | - |
+
+Intercept 4.94 s matches the independently profiled context-independent kernel
+total (5.4 s/batch/GPU) and the d=0 batch time (4.72 s).
+
+Budget per GPU for the 262144 batch (22.31 s):
+
+| component | time | how obtained |
+|---|---|---|
+| context-independent kernels | 5.4 s | profile, /33 batches |
+| FA kernels | ~13.1 s | profile, scaled by sum(n_kv) |
+| **unaccounted** | **~4 s** | remainder |
+
+### What the residual is NOT
+
+- **Not host-side.** Phase timers (re-enabling the commented-out ones in
+  `llama-context.cpp`) give, per batch at depth: graph build **1.1 ms**,
+  `set_inputs` **30-43 ms** (of which the KQ mask is 30-36 ms), everything else
+  inside `graph_compute`. The mask is O(n_kv*n_tokens) but has an incremental
+  fast path (PR 18842) and costs 25 ms at n_kv=34816, ~190 ms extrapolated to
+  264192.
+- **Not thermal throttling.** Clocks hold 1240-1290 of 1328 MHz (-6%) with SW
+  power cap at 210 W. The isolated op still reports 10.0-10.1 TFLOPS after four
+  consecutive runs at 73 C.
+- **Not any kernel.** Every kernel in the profile is accounted for as either
+  depth-scaling (the FA set) or per-batch constant.
+
+### Reading `utilization.gpu` cost me time
+
+Sampling showed both GPUs at 0-13% for ~2.4 s before each batch's compute, which
+looked like a host stall. It is not: `utilization.gpu` counts **kernel execution
+only**, so DMA copies read as 0%. The phase timers then showed host work is 35 ms.
+
+### The live hypothesis
+
+**CUDA graphs are disabled on Pascal** ("disabling CUDA graphs due to GPU
+architecture"), so every kernel is launched individually from the host. This path
+issues **6 launches per chunk** (dequant K, dequant V, QK, softmax, PV, accum_O).
+At d=262144: 129 chunks x 2 KV heads x 16 layers x 6 = **~24,800 launches per GPU
+per batch**, ~49,500 issued from a single host thread for both devices.
+
+Note this makes the op-level harness *unrepresentative for launch cost*: it runs
+one GPU with no contention. A chunk sweep there is flat (below), but that does
+not settle it in production -- to be tested end-to-end.
+
+---
+
+## 94 — chunk size sweep (op level): no change, chunk stays 2048
+
+`FA_CHUNK` env override, kv=262144, one GPU:
+
+| chunk | TFLOPS |
+|---|---|
+| 1024 | 9.78 |
+| **2048** | **10.42** |
+| 4096 | 10.18 |
+| 8192 | 10.31 |
+| 16384 | 10.30 |
+
+Larger chunks do not pay at op level despite better GEMM k -- the score matrix
+grows with chunk and the extra traffic cancels it. Reverted to the constant 2048.
+**Still to test end-to-end**, where halving the chunk count also halves host
+launch issue, which this measurement cannot see.
+
+### Softmax rewrite: rejected (+0.8%)
+
+One block per query token covering the whole GQA group, mask staged in shared
+memory once instead of re-read gqa=6 times, scores cached in registers so S is
+read once instead of twice. Traffic per chunk ~200 MB -> ~108 MB.
+Measured 642715 us vs 648017 (**+0.8%**), inside the 648-660 us run-to-run band.
+Below the 2% threshold; reverted rather than carry the complexity.
+
+### Merged GEMM: kept (+2.7%)
+
+K and V are shared across the GQA group and Q/S/P/Otmp are contiguous across
+heads, so the strided-batched call described exactly the same memory as one GEMM
+with n = nt*gqa. Issuing one GEMM: 648017 -> 630650 us, **10.18 -> 10.46 TFLOPS**.
+3949/3949; ppl 2.6222 +/- 0.01996.
