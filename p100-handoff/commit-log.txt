@@ -1,24 +1,1748 @@
-ed42ad15d cuda: walk gated_delta_net addresses instead of recomputing them
-e83a7913a cuda: ship tensor-parallel partials as f16, pipeline the delta-net reduction
-f8edbf816 cuda: use cuBLAS ALGO3 for wide f16 GEMMs on pre-Volta
-a4d1103c5 cuda: run peer copies on a dedicated stream so both directions overlap
-58c8a73ed cuda: vectorise q6_K dequant (sm_60)
-5d1fafb01 cuda: vectorise the contiguous f32<->f16 convert (sm_60)
-7d004be91 cuda: correct the fastdiv domain guards (2^31, not 2^32)
-2c0d39158 cuda: bound mmvq row guards by nrows_x, not stride_col_dst
-134a4f4a5 cuda: stage the activation block-wide on the multi-column mmvq path
-4ee099082 cuda: widen the multi-column mmvq block to 16 rows
-c9de43286 cuda: give each warp its own rows on the multi-column mmvq path
-f30fee9a8 cuda: restore bit-identical output in the norm kernels
-da56cb516 cuda: give launch_fattn the vec kernel's real KV tile size
-1ee4ffe85 cuda: stop dividing in the elementwise and norm kernels on Pascal
-0588f67d2 cuda: keep the rms_norm row in registers instead of reading it twice
-bbdac166e cuda: stage the q8_1 activation through shared memory in mul_mat_vec_q
-246515a32 cuda: cache the q8_1-quantized activation across mul_mat_vec_q calls
-560442c89 cuda: accumulate the whole vdr group in an integer before scaling (sm_60)
-9fc142d12 cuda: stage x in 16-byte units in mul_mat_vec_q (sm_60)
-0732c729e cuda: vdr=4 for Q6_K mmvq, retuned Pascal geometry to 2x2 (sm_60)
-f07b913a7 cuda: vdr=2 for Q6_K mmvq and Pascal launch geometry in source (sm_60)
-c7e7faf60 cuda: stage x through shared memory in mul_mat_vec_q (sm_60)
-d8984de00 cuda: remove __vsubss4 from Q6_K/Q3_K mmvq vec_dot (sm_60)
-b44f8fe6f cuda: Pascal (sm_60) optimizations
+commit 98de4588f253112a28e178c9f0b6ea922f3ff355
+Author: Kaden <kaden@localhost>
+Date:   Tue Sep 1 21:30:25 2026 -0500
+
+    cuda: alias P onto S in the GEMM attention path
+    
+    Saves 50 MB of pool scratch at ub=2048. In the softmax kernel's second pass each
+    thread reads S[j] then writes P[j] at the same index, and every first-pass load is
+    fenced by the reduction's __syncthreads, so one buffer serves both roles.
+    
+    Verified: test-backend-ops -o FLASH_ATTN_EXT 3949/3949, and pp2048 @ d131072
+    measured 131.08 (tile 111.22) after the change.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ ggml/src/ggml-cuda/fattn-gemm.cu | 10 +++++++---
+ 1 file changed, 7 insertions(+), 3 deletions(-)
+
+commit bdcb3f7bf817b5d813639e6986108d312cff995e
+Author: Kaden <kaden@localhost>
+Date:   Tue Sep 1 20:33:41 2026 -0500
+
+    cuda: cuBLAS-GEMM flash attention for pre-Volta long context
+    
+    On Pascal there are no tensor cores, so long-context prefill falls to
+    flash_attn_tile, which measures 3.55 TFLOPS of a 19.05 peak (18.6%) while the
+    cuBLAS hgemm beside it in the same model reaches 15.7. Attention is ~86% of
+    prefill at 262144 context on qwen3.5 (only ~16 of 65 blocks have a growing KV
+    cache), so that gap dominates real long-context use. Attempt 89 established
+    that no tile-kernel configuration closes it: 15 configs, stock wins all.
+    
+    This adds an alternative path that keeps the flash-attention structure (online
+    softmax over KV chunks) but issues the two matmuls as cuBLAS GEMMs:
+    
+        S = K^T Q          strided-batched over the GQA group, f16 compute
+        online softmax     mask, running max/sum, P in f16, rescale factor for O
+        O += V P           f32 compute -- summing thousands of positive terms in
+                           f16 carries several % error
+    
+    S is computed transposed ([n_kv_chunk x n_tokens], column-major) so one query's
+    scores are contiguous: the softmax kernel is then coalesced and PV needs no
+    transpose.
+    
+    Measured at equal thermal state, pp2048 @ d65536:
+    
+        tile   158.43        GEMM   188.99     (+19.3%)
+        tile   183.27        GEMM   200.60     (+9.5%)
+    
+    Run-to-run variance at depth is large on this machine; call it +10-19%.
+    Short context is unaffected -- the path is gated to KV >= 4096, and d=0
+    measures 427.05 (off) vs 425.19 (on), within noise.
+    
+    It also removes the tile path's f16 KV staging. fattn-common converts all of K
+    and V on every call; at 262144 that is 512 MiB per GPU, worth ~58k tokens of
+    q4_0 KV cache. This path dequantizes one 2048-key chunk at a time, and f16
+    caches are read in place via cuBLAS's lda with no copy at all.
+    get_alloc_size() gates on exactly the same predicate as the dispatch -- if the
+    two ever disagree the kernel writes past the allocation.
+    
+    Numerics:
+    - test-backend-ops -o FLASH_ATTN_EXT: 3949/3949
+    - CLAUDE.md gate (c=4096, ppl-orig.txt): 2.6219 +/- 0.01996, inside the
+      2.6209 +/- 0.0199 band
+    - long-context A/B at c=16384 with q4_0 KV, which is what actually exercises
+      the per-chunk dequant: tile 2.6035 +/- 0.02713 vs GEMM 2.6047 +/- 0.02719,
+      a 0.04 sigma difference
+    
+    On by default for cc < VOLTA; GGML_CUDA_FA_GEMM=0 restores upstream behaviour.
+    
+    Two bugs found during development worth recording, both of which produced
+    plausible-looking wrong answers rather than crashes:
+    - alpha/beta must match the cuBLAS COMPUTE type, not the data type. Passing
+      half* with COMPUTE_32F reinterprets 1.0h as float 2.15e-41, which silently
+      degenerates attention into a uniform average of V.
+    - the first version wrote f32 scores and read them twice, which at ub=2048 is
+      ~400 MB per chunk and made the whole path 16% SLOWER than the tile kernel.
+      Unfusing attention pays score-matrix traffic that a fused kernel never does;
+      f16 scores plus removing a per-head-group stream sync recovered it.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ ggml/src/ggml-cuda/fattn-gemm.cu  | 403 ++++++++++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/fattn-gemm.cuh |   9 +
+ ggml/src/ggml-cuda/fattn.cu       |  21 ++
+ 3 files changed, 433 insertions(+)
+
+commit 9183630c8314b3467e5039c17cc725b32b3ed98a
+Author: Kaden <kaden@localhost>
+Date:   Tue Sep 1 18:55:49 2026 -0500
+
+    docs: long-context flash attention is the prefill bottleneck (attempt 89)
+    
+    Every prior measurement in this project was taken at 2048 tokens, where
+    flash-attn is 2.1% of prefill. Measured with llama-bench -d:
+    
+      d=0      434.21 t/s
+      d=32768  278.43  (-36%)
+      d=65536  179.80  (-59%)
+    
+    At d=65536 flash_attn_tile is 37.1% of GPU time and one call does 1.65 TFLOP
+    in 465 ms = 3.55 TFLOPS, 18.6% of this card's 19.05 peak, next to a cuBLAS
+    GEMM doing 15.7. Only ~16 of 65 blocks have a growing KV cache
+    (full_attention_interval 4), so attention is the only context-scaling cost.
+    Projects to ~86% of prefill at 262144.
+    
+    Swept 15 tile configurations; stock wins all of them. Upstream's
+    "TODO optimize kernel parameters for FP16 NVIDIA (P100)" is stale.
+    
+    Falsified three of my own hypotheses. Occupancy is not the limit: cuobjdump
+    shows REG:233 -> 1 block/SM -> 12.5% occupancy, and cutting registers to raise
+    it makes things monotonically WORSE (233/179.80, 128/161.42, 80/152.36) because
+    the kernel wants registers for unrolling.
+    
+    The real lever is memory traffic: 768 blocks per call each re-read their KV
+    head's whole cache, ~51 GB/call, about half the runtime. Implemented 64
+    queries per block for NVIDIA DKQ=256 (upstream builds it only under
+    GGML_USE_HIP): +4.6% like-for-like, but Pascal's 48 kiB/block SRAM limit means
+    every way of affording it costs more than it returns. All reverted.
+    
+    What would fix it: routing attention through cuBLAS, which already hits
+    15.7 TFLOPS in this model. ~2x after accounting for fp32 accumulation. Days of
+    work in generic code. Would also eliminate the 512 MiB f16 KV scratch.
+    
+    Also documented that scratch: fattn.cu:551 forces f16 K/V for the tile kernel
+    and fattn-common.cuh converts the entire cache every call. At 262144 that is
+    512 MiB per GPU, worth ~58,000 tokens of context. Prefill only. Not yet fixed.
+    
+    No code changed.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ OPTLOG.md | 140 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 140 insertions(+)
+
+commit e4fdbb901dac4766e99496caeb9be49afd836e7d
+Author: Kaden <kaden@localhost>
+Date:   Tue Sep 1 16:28:27 2026 -0500
+
+    docs: price the MTP host round trip properly, drop backend sampling
+    
+    Attempt 88. Measured the host-side sampling cost at this model's real vocab
+    (248320) and then checked it end-to-end instead of trusting nvprof.
+    
+    Prediction: default sampling (top_k 40 / top_p 0.95 / min_p 0.05 / temp 0.8)
+    would cost ~11 ms of a ~60 ms MTP step versus ~2.6-5.1 ms for the greedy
+    benchmark config, making GPU-side sampling worth 3-5x more than measured.
+    
+    Wrong. Defaults measure within noise of --temp 0 --top-k 1 (52.07/52.32 vs
+    51.82/51.76 t/s, two runs each). The isolated 2.2 ms/row does not appear in
+    wall time. Priced properly the lever is 4-8%, tops out at 57-59, and needs
+    axis-1 split rules for ARGMAX/TOP_K/SOFT_MAX/GET_ROWS in ggml-backend-meta.cpp.
+    Dropped.
+    
+    Also recorded so nobody re-derives them:
+    - the llama-context.cpp:1216 gate is load-bearing, not conservative:
+      output.weight is SPLIT_AXIS_1 (vocab-sharded) while the backend samplers
+      reduce over the whole vocab.
+    - mirroring output.weight to sidestep it is a net loss: it doubles output-head
+      memory traffic (995 MiB read per GPU instead of 497) and costs +497 MiB/GPU.
+    - default sampling costing nothing means every greedy-measured MTP number in
+      these docs carries over to real-world use.
+    
+    Flagged flash-attention as the top open measurement: at 2048 it is 2.1% of
+    prefill, but only ~16 of 65 blocks have a growing KV cache, so it is the only
+    context-scaling cost on this model and this build has never been profiled near
+    the 262144 context it supports.
+    
+    No code changed.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ OPTLOG.md                   | 114 +++++++++++++++++++++++++++++++++++++++++---
+ p100-handoff/RESUME-HERE.md |  41 +++++++++++++---
+ 2 files changed, 142 insertions(+), 13 deletions(-)
+
+commit 747a6618d0b78c97f32148c2f960971ab9f01003
+Author: Kaden <kaden@localhost>
+Date:   Tue Sep 1 06:24:39 2026 -0500
+
+    docs: make HEAD-sha.txt record the last code commit, not HEAD
+    
+    A file recording HEAD goes stale the moment it is committed. It now names the
+    last commit that actually changed kernel code (ed42ad15d) plus the four
+    reference points the diffs and the verification paper are cut against, and says
+    explicitly that later documentation commits do not invalidate it. Includes the
+    commands to regenerate the diffs.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ p100-handoff/HEAD-sha.txt | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+commit a4beffd928c6598cb5011bdea7e7980d293c2878
+Author: Kaden <kaden@localhost>
+Date:   Tue Sep 1 06:24:15 2026 -0500
+
+    docs: refresh the p100-handoff snapshot artefacts
+    
+    The folder still held Aug-30 snapshots that predate this session: a duplicate
+    OPTLOG.md that had drifted, diffs and a HEAD sha covering only up to 134a4f4a5,
+    and a README whose headline table read 29.83 decode / 50.1 MTP.
+    
+    - HEAD-sha.txt, commit-log.txt, full-kernel.diff: regenerated against HEAD.
+    - session3.diff: new, the 2026-08-31/09-01 kernel work alone (5d1fafb01..HEAD).
+    - Removed the duplicate OPTLOG.md rather than keep two copies in sync; left a
+      pointer to the root one.
+    - README: current numbers at the top, session-2 table folded into a <details>
+      block, contents table extended.
+    - HANDOFF.md: banner marking it historical, and flagging that the 2.7554 gate it
+      quotes belongs to the other corpus.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ p100-handoff/HANDOFF.md       |    5 +
+ p100-handoff/HEAD-sha.txt     |    3 +-
+ p100-handoff/OPTLOG-README.md |    5 +
+ p100-handoff/OPTLOG.md        | 1253 -----------------------------------------
+ p100-handoff/README.md        |   26 +-
+ p100-handoff/commit-log.txt   |  531 +----------------
+ p100-handoff/full-kernel.diff |  940 +++++++++++++++++++++++++++++--
+ p100-handoff/session3.diff    |  628 +++++++++++++++++++++
+ 8 files changed, 1580 insertions(+), 1811 deletions(-)
+
+commit 836e9fdc4a7b7434bebd241f404fa9116a7cc47f
+Author: Kaden <kaden@localhost>
+Date:   Tue Sep 1 06:23:04 2026 -0500
+
+    docs: bring handoff, optlog and verification paper up to final numbers
+    
+    - RESUME-HERE: final figures (prefill 442.6 cold / ~437 hot, tg256 32.1 best,
+      MTP 54.5, PPL 2.6214), the missing sixth commit, a code-diff summary, and the
+      complete MTP flag sweep including n-min and backend-sampling.
+    - OPTLOG: the mid-session "Goal status" section contradicted attempts 84 and 86,
+      so its retracted thermal claim and superseded MTP framing are struck through
+      with pointers to them. Added a closing summary that supersedes every earlier
+      summary in the file: result table, the six code changes with per-change
+      bit-exactness status, the three corrections I made to my own claims, the
+      ranked remaining work, and the measured dead ends.
+    - VERIFICATION.md: scope note making clear the adversarial audit covers only up
+      to 134a4f4a5, with a table of the six later changes and their status.
+    - patches/README-note.md: those patches are already committed; the later work
+      exists only as commits, with the git commands to see it.
+    - tools/README: checked the existing warning that nvprof inflates gaps. Kernel
+      durations are accurate (10.864 vs 10.863 un-profiled), but gaps do inflate and
+      cost MTP ~11%, so decode utilisation figures are an upper bound and the 14.5%
+      host round trip needs re-measuring with in-loop CUDA events. Documented
+      mtp-bench.sh.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ OPTLOG.md                           |  93 +++++++++++++++++++++++++++++--
+ p100-handoff/RESUME-HERE.md         | 108 ++++++++++++++++++++++++------------
+ p100-handoff/VERIFICATION.md        |  27 +++++++++
+ p100-handoff/patches/README-note.md |  16 ++++++
+ p100-handoff/tools/README.md        |  19 +++++++
+ 5 files changed, 222 insertions(+), 41 deletions(-)
+
+commit f85e154ed91538db61d8f831eca3ed5192a41bfb
+Author: Kaden <kaden@localhost>
+Date:   Tue Sep 1 00:35:14 2026 -0500
+
+    optlog: exhaust the MTP flag space
+    
+    --spec-draft-backend-sampling is inert under -sm tensor (the 'not supported with
+    SPLIT_MODE_TENSOR' warning fires either way), which is notable because that is
+    precisely the flag that would have addressed the 14.5% host round trip. Also
+    swept --spec-draft-n-min, never tested before: no effect.
+    
+    MTP flag space is now exhausted; 54.5 t/s stands.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ OPTLOG.md | 23 +++++++++++++++++++++++
+ 1 file changed, 23 insertions(+)
+
+commit 2005f80fa3db4c17660bf01392c4da33cc5199c9
+Author: Kaden <kaden@localhost>
+Date:   Tue Sep 1 00:31:52 2026 -0500
+
+    handoff: lead with the MTP host-sync finding
+    
+    Steady-state MTP decode is 24% idle with 14.5% of wall in the host round trip,
+    so the route to 60 t/s is the decode pipeline (GPU-side sampling, which is
+    disabled for SPLIT_MODE_TENSOR, or overlapping host verification), not kernel
+    tuning. Demotes the mmvq unpack idea to second place and carries the nvprof
+    caveat.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ p100-handoff/RESUME-HERE.md | 20 +++++++++++++++++++-
+ 1 file changed, 19 insertions(+), 1 deletion(-)
+
+commit 14197de6ed13b4e79536ac346604b8fb04c28b73
+Author: Kaden <kaden@localhost>
+Date:   Tue Sep 1 00:31:35 2026 -0500
+
+    optlog: MTP is host-sync bound -- the real route to 60 t/s
+    
+    Measured MTP's idle fraction, which had never been done (the same measurement
+    that produced the +12.2% prefill win). Steady-state decode is 24% idle, and
+    14.5% of wall is the host round trip: logits to CPU, speculative accept/reject
+    on host, tokens back. 95 DtoH events with 1.46ms of GPU idle after each.
+    
+    Removing it would give ~63.7 t/s, past the target -- so the route to 60 is the
+    decode pipeline, not kernel work. Either GPU-side sampling (which llama.cpp has
+    but explicitly disables for SPLIT_MODE_TENSOR) or overlapping host verification
+    with GPU work. Both are backend/application architecture.
+    
+    Caveat recorded: nvprof costs MTP ~11% and host-sync gaps are where that
+    overhead lands, so part of the 14.5% is artifact; true headroom is likely 5-10%
+    and should be re-measured with in-loop CUDA events.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ OPTLOG.md | 47 +++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 47 insertions(+)
+
+commit 2a1f29afdbe26b609d1a7c05d5d2321e25c032a0
+Author: Kaden <kaden@localhost>
+Date:   Tue Sep 1 00:28:36 2026 -0500
+
+    handoff: record the mmvq unpack-redundancy finding and its measured ceiling
+    
+    The best remaining MTP idea, priced: the weight load and 6-bit unpack are redone
+    once per column at ncols_dst=5. Worth ~3.5% MTP (~56.4 t/s), still short of the
+    60 target, and nothing for single-token decode. Loop reordering does not let
+    nvcc capture it. Recorded with the numbers so the next session does not have to
+    re-derive them.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ p100-handoff/RESUME-HERE.md | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+commit 2a5e3524e8274e007440ed46ba7849c3a850bafc
+Author: Kaden <kaden@localhost>
+Date:   Tue Sep 1 00:26:12 2026 -0500
+
+    optlog: price the redundant weight unpack in mmvq (not capturable cheaply)
+    
+    For ncols_dst=5 the weight block's load and 6-bit unpack are redone once per
+    column. Priced with the existing P100_NOUNPACK probe: mul_mat_vec_q<ncols=5>
+    95.717 -> 87.629us (-8.5%), tg256 32.12 -> 33.79 (+5.2%). Hoisting it recovers
+    4/5 of that, ~3.5% of MTP -> ~56.4 t/s, short of the 60 target.
+    
+    Swapping the loop nest so the weight work is loop-invariant in j does not let
+    nvcc capture it (both loops are fully unrolled, so order is irrelevant to CSE):
+    MTP 53.86 vs 54.48, reverted. Capturing it needs a hand-written multi-column
+    vec_dot, which is a rewrite of the hottest kernel for 3.5% on one metric.
+    
+    Probe switches returned to 0 and correctness re-verified.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ OPTLOG.md | 38 ++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 38 insertions(+)
+
+commit 8ef141ee30a3285dd37df3ba6b14426379e801e8
+Author: Kaden <kaden@localhost>
+Date:   Tue Sep 1 00:09:05 2026 -0500
+
+    optlog: close out the GEMM-gap investigation
+    
+    Two more eliminations: no concurrent activity overlaps any of the 256 gate/up
+    GEMMs, and cuBLAS handle state (TF32 math mode, 4MB workspace) makes no
+    difference in any combination.
+    
+    The decisive observation is that the in-model minimum duration equals the
+    standalone 10.864ms exactly on both devices; it is the median that runs 1.9-3.1%
+    higher, with a 10.86-12.5ms spread. So the kernel does reach full speed
+    in-model and this is call-to-call variation, not a removable software cause.
+    Nine hypotheses tested, all negative. Closing the line.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ OPTLOG.md | 30 ++++++++++++++++++++++++++++++
+ 1 file changed, 30 insertions(+)
+
+commit c816521cb860ce155d5d10baad289a8a78e65673
+Author: Kaden <kaden@localhost>
+Date:   Tue Sep 1 00:06:20 2026 -0500
+
+    optlog: retract the thermal-throttling explanation for the GEMM gap
+    
+    An earlier entry attributed the difference between the in-model GEMM and the
+    same GEMM standalone to sustained-clock throttling. That is wrong. A 170s pure
+    GEMM run holds 1328 MHz and 16.81 TFLOPS from 41 C all the way to 73 C -- hotter
+    than the model ever reaches -- with no measurable decay.
+    
+    The gap is also smaller than first reported: the in-model duration distribution
+    is tight (median 11.18 ms, min 11.00, no outlier tail) against 10.864 standalone,
+    so a uniform 3.2%, worth ~2.3 points of prefill.
+    
+    Seven candidate causes were tested and eliminated, each with a standalone
+    reproduction: throttling, both-GPU load, nvprof overhead, preceding write
+    traffic, pointer alignment, cold weight buffers, and VMM vs cudaMalloc mapping.
+    The cause remains unknown. Recorded so it is not dismissed as thermal.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ OPTLOG.md                   | 46 +++++++++++++++++++++++++++++++++++++++++++++
+ p100-handoff/RESUME-HERE.md | 14 +++++++++++---
+ 2 files changed, 57 insertions(+), 3 deletions(-)
+
+commit 54e0b076e87f96f6fdb039522feb62fcfb37041c
+Author: Kaden <kaden@localhost>
+Date:   Mon Aug 31 23:21:47 2026 -0500
+
+    handoff: final gate, remaining levers, and the negative results
+    
+    Perplexity 2.6214 +/- 0.01995 on HEAD, chunk [1] 4.9738 -- identical to the
+    previous gate, confirming the gated_delta_net addressing change is bit-exact.
+    
+    Records the two remaining prefill levers with why they were not taken (fusing
+    the all-reduce widen into the ADD, and overlapping each weight dequant with the
+    previous GEMM -- both need graph-construction changes in generic code), the MTP
+    profile showing mul_mat_vec_q<ncols=5> at ~75% of achievable HBM bandwidth, and
+    the measured dead ends including CUDA graphs on Pascal.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ OPTLOG.md                   |  6 ++++++
+ p100-handoff/RESUME-HERE.md | 29 ++++++++++++++++++++++++-----
+ 2 files changed, 30 insertions(+), 5 deletions(-)
+
+commit 7fe832f4a4346c460b956ea06f97f541b66a7ec1
+Author: Kaden <kaden@localhost>
+Date:   Mon Aug 31 23:10:42 2026 -0500
+
+    optlog: CUDA graphs on Pascal, MMVQ rows, layer-split decode -- all negative
+    
+    Three measured negative results worth not repeating: CUDA graphs do engage on
+    sm_60 when the pre-Volta guard is lifted but give nothing (MTP 54.48 -> 54.03,
+    tg256 32.12 -> 31.25) because the workload streams weights rather than being
+    launch-bound; halving MMVQ rows-per-block does nothing; -sm layer decode is
+    20.37 vs 32.12 for -sm tensor.
+    
+    Also records goal status honestly: prefill 442.6 of 450, MTP 54.5 of 60, and
+    what specifically stands in the way of each.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ OPTLOG.md | 61 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 61 insertions(+)
+
+commit ed42ad15d6852851464e629d9fd8dd7ad4f21755
+Author: Kaden <kaden@localhost>
+Date:   Mon Aug 31 23:00:42 2026 -0500
+
+    cuda: walk gated_delta_net addresses instead of recomputing them
+    
+    The token loop recomputed q + iq3*sq3 + t*sq2 + iq1*sq1 and three more like it
+    every iteration -- twelve 64-bit multiplies per token, and sm_60 has no native
+    64-bit multiply, so each expands to an IMAD sequence. That was far more
+    instructions than the 16 FMAs of real work in the body. Tokens are visited
+    strictly in order, so the addresses form an arithmetic progression and the
+    pointers are simply walked. Bit-identical: addressing only.
+    
+    Measured with test-backend-ops perf, which isolates the kernel from thermal
+    drift: head_count=32 1125.30 -> 1113.44 us (-1.1%), head_count=4 171.40 ->
+    121.26 us (-29.3%). The gain scales inversely with occupancy -- at low head
+    counts per-thread instruction count is exposed, at high counts it hides behind
+    warp parallelism.
+    
+    This model runs in the hidden regime, so its model-level effect is below noise.
+    Kept because it is never slower, bit-exact, and a large win for small head
+    counts.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ OPTLOG.md                             | 27 ++++++++++++++++++++++
+ ggml/src/ggml-cuda/gated_delta_net.cu | 42 ++++++++++++++++++++++-------------
+ 2 files changed, 53 insertions(+), 16 deletions(-)
+
+commit 2869456373a998feb16e5251242a8f114d0fb54d
+Author: Kaden <kaden@localhost>
+Date:   Mon Aug 31 22:54:13 2026 -0500
+
+    handoff: final measurements and the thermal envelope
+    
+    Three readings of the same build differ by 2% purely from starting temperature
+    (442.59 at 39 C, 438.49 at 55 C, 434.10 at 52->66 C). Recorded explicitly so a
+    future comparison is not misread as a code regression.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ OPTLOG.md                   | 15 +++++++++++++++
+ p100-handoff/RESUME-HERE.md |  8 +++++---
+ 2 files changed, 20 insertions(+), 3 deletions(-)
+
+commit 8bd8f3e4c2f525b7b337ea6aed9bf74a6b28f80c
+Author: Kaden <kaden@localhost>
+Date:   Mon Aug 31 22:52:23 2026 -0500
+
+    handoff: MTP re-measured at 54.0 t/s, resume notes for the next session
+    
+    MTP had not been measured since the peer-copy fix. Re-swept: 48.8 -> 54.04 t/s
+    with --spec-draft-n-max 4 --spec-draft-p-min 0.2 (+10.7%), which is at the
+    53-55 t/s structural ceiling for the current kernel shape. The old n-max 3
+    default leaves ~2% on the table.
+    
+    RESUME-HERE.md records the state (prefill 442.6, decode 31.7, MTP 54.0,
+    perplexity 2.6214), which changes are bit-exact and which is not, the measured
+    dead ends so they are not re-litigated, and the ranked remaining work.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ OPTLOG.md                                          |   25 +
+ p100-handoff/CORPUS.md                             |   67 +
+ p100-handoff/HANDOFF.md                            |  208 +
+ p100-handoff/HEAD-sha.txt                          |    2 +
+ p100-handoff/OPTLOG.md                             | 1253 +++
+ p100-handoff/README.md                             |  245 +
+ p100-handoff/RESUME-HERE.md                        |  130 +
+ p100-handoff/VERIFICATION.md                       |  206 +
+ p100-handoff/bench/README.md                       |   21 +
+ p100-handoff/bench/mtp.sh                          |   10 +
+ p100-handoff/bench/mtpp.sh                         |    9 +
+ p100-handoff/bench/pp7.sh                          |    7 +
+ p100-handoff/bench/q4.sh                           |    4 +
+ p100-handoff/commit-log.txt                        |  507 ++
+ p100-handoff/full-kernel.diff                      | 1081 +++
+ .../0001-cuda-Pascal-sm_60-optimizations.patch     |  112 +
+ ...-__vsubss4-from-Q6_K-Q3_K-mmvq-vec_dot-sm.patch |   98 +
+ ...x-through-shared-memory-in-mul_mat_vec_q-.patch |  181 +
+ ...for-Q6_K-mmvq-and-Pascal-launch-geometry-.patch |  196 +
+ ...for-Q6_K-mmvq-retuned-Pascal-geometry-to-.patch |  152 +
+ ...x-in-16-byte-units-in-mul_mat_vec_q-sm_60.patch |   85 +
+ ...late-the-whole-vdr-group-in-an-integer-be.patch |  117 +
+ ...the-q8_1-quantized-activation-across-mul_.patch |  150 +
+ ...the-q8_1-activation-through-shared-memory.patch |  103 +
+ ...he-rms_norm-row-in-registers-instead-of-r.patch |   87 +
+ ...ividing-in-the-elementwise-and-norm-kerne.patch |  505 ++
+ ...aunch_fattn-the-vec-kernel-s-real-KV-tile.patch |   43 +
+ ...e-bit-identical-output-in-the-norm-kernel.patch |  189 +
+ ...ach-warp-its-own-rows-on-the-multi-column.patch |  250 +
+ ...en-the-multi-column-mmvq-block-to-16-rows.patch |   49 +
+ ...the-activation-block-wide-on-the-multi-co.patch |  162 +
+ .../patches/PENDING-oob-and-fastdiv-fixes.patch    |  305 +
+ p100-handoff/ppl-orig.txt                          | 8894 ++++++++++++++++++++
+ p100-handoff/session2.diff                         | 1042 +++
+ p100-handoff/tools/README.md                       |   31 +
+ p100-handoff/tools/cpu-sampler.c                   |   96 +
+ p100-handoff/tools/mtp-bench.sh                    |   10 +
+ p100-handoff/tools/opt-mc.txt                      | 3847 +++++++++
+ p100-handoff/tools/opt-tok1-run1.txt               | 3847 +++++++++
+ p100-handoff/tools/proofs-fastdiv-dp4a/cpy.c       |   55 +
+ p100-handoff/tools/proofs-fastdiv-dp4a/cpy2        |  Bin 0 -> 15968 bytes
+ p100-handoff/tools/proofs-fastdiv-dp4a/cpy2.c      |   23 +
+ p100-handoff/tools/proofs-fastdiv-dp4a/cpyt        |  Bin 0 -> 16840 bytes
+ p100-handoff/tools/proofs-fastdiv-dp4a/dp4a        |  Bin 0 -> 16088 bytes
+ p100-handoff/tools/proofs-fastdiv-dp4a/dp4a.c      |   55 +
+ p100-handoff/tools/proofs-fastdiv-dp4a/fd          |  Bin 0 -> 16792 bytes
+ p100-handoff/tools/proofs-fastdiv-dp4a/fd.c        |   48 +
+ p100-handoff/tools/proofs-fastdiv-dp4a/fd2         |  Bin 0 -> 16504 bytes
+ p100-handoff/tools/proofs-fastdiv-dp4a/fd2.c       |   32 +
+ p100-handoff/tools/proofs-fastdiv-dp4a/fd3         |  Bin 0 -> 16544 bytes
+ p100-handoff/tools/proofs-fastdiv-dp4a/fd3.c       |   20 +
+ p100-handoff/tools/proofs-norm-binbcast/bb         |  Bin 0 -> 21000 bytes
+ p100-handoff/tools/proofs-norm-binbcast/bb.cpp     |   77 +
+ p100-handoff/tools/proofs-norm-binbcast/pb         |  Bin 0 -> 16072 bytes
+ p100-handoff/tools/proofs-norm-binbcast/pb.cpp     |   29 +
+ p100-handoff/tools/tensor-hash-harness.patch       |   58 +
+ 56 files changed, 24723 insertions(+)
+
+commit 21aef9810685eb8ffc38cff2a3e335f30112fcbb
+Author: Kaden <kaden@localhost>
+Date:   Mon Aug 31 22:49:02 2026 -0500
+
+    optlog: per-shape algo sweep, GDN load-ahead experiment, session summary
+    
+    Records two rejected attempts (per-shape cuBLAS algo, worth only ~0.3%; GDN
+    loads issued an iteration ahead, which costs more in occupancy than it wins in
+    latency cover) and the end-of-session accounting: prefill 372.5 -> 442.6 t/s,
+    decode 29.8 -> 31.7 t/s, perplexity 2.6214 inside the gate.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ OPTLOG.md | 82 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 82 insertions(+)
+
+commit e83a7913af45b87a3911af1260841edc58aa7abd
+Author: Kaden <kaden@localhost>
+Date:   Mon Aug 31 22:41:13 2026 -0500
+
+    cuda: ship tensor-parallel partials as f16, pipeline the delta-net reduction
+    
+    Two prefill optimisations.
+    
+    1. f16 all-reduce. PtoP was 11.9% of prefill and already at hardware peak, so
+       the only lever left was fewer bytes. On cc < VOLTA every MUL_MAT output is
+       already an f16 value widened to f32 -- cuBLAS writes f16 and convert_unary
+       widens it -- so the f32 partials hold only f16-representable values and
+       narrowing them for transport is exactly lossless.
+    
+       That is a property of this path, not a general truth, so it is guarded:
+       src->op == MUL_MAT with ne[1] >= 512 (the condition under which the f16
+       cuBLAS path is taken), cc < VOLTA, and a one-time runtime probe that checks
+       every element for f16-exactness and latches the result. The probe exchange
+       itself goes uncompressed, so a model whose partials are not f16-exact never
+       sees a lossy copy.
+    
+       Needs separate OUT/IN staging buffers: in a butterfly a device is sender and
+       receiver in the same step, and one shared buffer had the outgoing narrow
+       overwrite the partial that had just landed. A peer_stage_free event keeps a
+       sender from refilling a landing buffer before it has been widened.
+    
+    2. Pipelined delta-net reduction. attn[col] for token t and kv[col] for token
+       t+1 both read only the state after token t, so token t+1's k is pulled
+       forward and the two partials reduce together as a float2 -- one interleaved
+       shuffle chain instead of two on the loop's critical path. Bit-identical: same
+       per-component offsets, same order, same accumulation over r.
+    
+    pp2048 428.69 -> 442.59 t/s on 2x P100 (+3.2%).
+    Perplexity 2.6214 +/- 0.01995, chunk [1] 4.9738 -- identical to every digit to
+    the previous build, so both changes are lossless.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ OPTLOG.md                             |  59 ++++++++++++++
+ ggml/src/ggml-cuda/common.cuh         |  27 +++++++
+ ggml/src/ggml-cuda/gated_delta_net.cu | 146 ++++++++++++++++++++++++----------
+ ggml/src/ggml-cuda/ggml-cuda.cu       |  99 +++++++++++++++++++++++
+ 4 files changed, 288 insertions(+), 43 deletions(-)
+
+commit f8edbf8160b32ed8f8d20488258839c6943d4b8e
+Author: Kaden <kaden@localhost>
+Date:   Mon Aug 31 21:59:11 2026 -0500
+
+    cuda: use cuBLAS ALGO3 for wide f16 GEMMs on pre-Volta
+    
+    cuBLAS's default kernel choice for a tall-and-skinny TN f16 GEMM is not the
+    fastest one it has on sm_60. Measured on P100 at n=2048: ffn gate/up 15.31 ->
+    16.79 TFLOPS, ffn down 15.99 -> 16.54, attn qkv 14.09 -> 15.50, gdn in 15.24 ->
+    15.91, gdn misc 11.83 -> 13.98.
+    
+    The advantage inverts as n shrinks -- at n=64 ALGO3 is up to 2x slower -- so it
+    is used only for ne11 >= 512, which is the wide batch prefill produces; decode
+    and short tails keep the default. Gated on cc < VOLTA because these legacy algo
+    selectors are only meaningful on the pre-Volta path, and it falls back to the
+    default if cuBLAS rejects the algo for a given shape.
+    
+    Also makes the gated_delta_net warp count a compile-time knob (default 4 =
+    unchanged upstream behaviour) after sweeping 2/4/8/16 found 4 already optimal.
+    
+    pp2048 421.04 -> 428.69 t/s on 2x P100 (+1.8%).
+    
+    This one is not bit-exact: a different kernel means a different f16
+    k-accumulation order. Perplexity 2.6214 +/- 0.01995 against the 2.6209
+    reference -- 0.03 sigma, well inside the required band, with mixed per-chunk
+    direction.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ OPTLOG.md                             | 55 +++++++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/gated_delta_net.cu | 11 +++++--
+ ggml/src/ggml-cuda/ggml-cuda.cu       | 30 +++++++++++++++++--
+ 3 files changed, 92 insertions(+), 4 deletions(-)
+
+commit a4d1103c52e4d85f25e93671e8a9e73b22e9e5fd
+Author: Kaden <kaden@localhost>
+Date:   Mon Aug 31 21:36:24 2026 -0500
+
+    cuda: run peer copies on a dedicated stream so both directions overlap
+    
+    The tensor-parallel all-reduce exchanges partial sums in both directions at
+    once, but the two copies were serialising. Copy 0->1 was issued on GPU0's
+    compute stream and GPU1's compute stream was then made to wait on it, so copy
+    1->0 -- issued on GPU1's compute stream -- could not start until copy 0->1 had
+    completed. nvprof shows this directly: 86% of all GPU idle time was a 4358us
+    gap immediately after every PtoP copy, exactly one copy duration, 156 times.
+    
+    PCIe here is full duplex: 9.74 GB/s each way simultaneously, 19.5 GB/s
+    aggregate, so the opposing copy was free.
+    
+    Peer copies now go on a dedicated per-context copy_stream. It waits on
+    work_event -- recorded at the end of every graph compute and set_tensor_async
+    -- rather than on the compute stream itself, so a wait installed there by the
+    other direction cannot push this device's copy behind it. The src compute
+    stream then waits on the copy event, preserving the write-after-read ordering
+    that was implicit while the copy lived on the compute stream.
+    
+    pp2048 375.19 -> 421.04 t/s on 2x P100 (+12.2%).
+    Perplexity 2.6209 +/- 0.01994, exact match per chunk -- scheduling only.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ OPTLOG.md                       | 50 +++++++++++++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/common.cuh   | 32 ++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/ggml-cuda.cu | 48 ++++++++++++++++++++++++++++++++++++++-
+ 3 files changed, 129 insertions(+), 1 deletion(-)
+
+commit 58c8a73edbf25e041ff9e1f9c813b84611e21205
+Author: Kaden <kaden@localhost>
+Date:   Mon Aug 31 21:36:14 2026 -0500
+
+    cuda: vectorise q6_K dequant (sm_60)
+    
+    Reassign each of the 64 threads four consecutive outputs instead of four
+    outputs 32 apart. They then share ip, j and the scale, so the quant reads
+    become 16-bit loads and the store becomes a single vector write: 11 memory
+    instructions per thread down to 6, and a warp stores 128 contiguous elements.
+    block_q6_K is 210 bytes so the loads are uint16, not uint32.
+    
+    Only the thread->output assignment changes -- each output is an independent
+    expression, no reduction grouping shifts -- so the result is bit-identical.
+    Verified by replaying both index mappings over 4096 random superblocks:
+    1048576 elements, 0 bit mismatches, 0 unwritten.
+    
+    pp2048 372.5 -> 375.19 t/s on 2x P100.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ ggml/src/ggml-cuda/convert.cu | 67 +++++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 62 insertions(+), 5 deletions(-)
+
+commit 5d1fafb0114debea57500b608ae76e01c16dae6d
+Author: Kaden <kaden@localhost>
+Date:   Mon Aug 31 18:38:24 2026 -0500
+
+    cuda: vectorise the contiguous f32<->f16 convert (sm_60)
+    
+    convert_unary moves one element per thread. For the cuBLAS prefill path that is
+    1984 f32->f16 casts of the activations plus 1984 f16->f32 casts of the results
+    per forward pass, and a 2-byte store per thread cannot saturate the memory pipe:
+    measured ~145 GB/s against a ~600 GB/s ceiling, roughly 4x off memory-bound.
+    
+    Add a contiguous fast path handling 4 elements per thread with one aligned
+    vector load and one aligned vector store (float4 / uint2). Taken only when the
+    length is a multiple of 4 and both pointers are 16-byte aligned; otherwise the
+    scalar kernel still runs.
+    
+    The per-element cast is untouched and an elementwise cast has no arithmetic to
+    reorder, so the result is bit-identical -- only the access pattern changes.
+    
+    pp2048 (-b 2048 -ub 2048)  353.68 -> 372.51 t/s  (+5.3%)
+    perplexity 2.6209 +/- 0.01994 on the original 420,098-byte corpus (unchanged)
+    test-backend-ops -o CPY, -o MUL_MAT: 3/3 backends passed
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ ggml/src/ggml-cuda/convert.cu | 48 +++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 48 insertions(+)
+
+commit a769cda6d623bbe5d4d96a123aa63e28965b0463
+Author: Kaden <kaden@localhost>
+Date:   Mon Aug 31 18:14:20 2026 -0500
+
+    optlog: numerical audit findings and the corpus-drift resolution
+    
+    Records attempt 69 (three-way adversarial bit-exactness audit, the magnitude
+    measurements, and the two defects fixed) and attempt 70 (why the perplexity
+    gate read 2.7554 instead of 2.6209 -- the docs corpus changed in the Aug 24
+    upstream pull, not any code change).
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ OPTLOG.md | 68 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 68 insertions(+)
+
+commit 7d004be9180d8bc1ea955656e0a98eda2c1f732a
+Author: Kaden <kaden@localhost>
+Date:   Mon Aug 31 18:13:43 2026 -0500
+
+    cuda: correct the fastdiv domain guards (2^31, not 2^32)
+    
+    fastdiv evaluates (mulhi(n, mp) + n) >> L entirely in 32 bits, but the
+    Granlund-Montgomery round-up scheme needs a 33rd bit: the `hi + n` add can carry
+    out and is silently truncated. Verified exhaustively over all n in [0, 2^32) for
+    53 representative divisors, plus an analytic first-failure sweep over all 2^32
+    divisors: exact for every numerator n <= 2^31, first failure at n = 2^31 + 1
+    (worst case d = 2^30 + 1). Divisors above 2^31 yield L = 32 and are wrong for
+    every n >= d.
+    
+    The guards here admitted n <= UINT32_MAX, i.e. off by a factor of two. A tensor
+    with more than 2^31 elements would silently misdirect multi-gigabyte reads and
+    writes rather than fail. Needs ~4 GB in one tensor so it is unreachable on the
+    27B-Q6_K benchmark, but none of these files are gated on __CUDA_ARCH__ == 600.
+    
+    Document the bound as GGML_CUDA_FASTDIV_MAX next to fastdiv and apply it at all
+    four sites. (The UINT32_MAX idiom is upstream's, at binbcast.cu:215; this only
+    corrects the sites this branch added.)
+    
+    unary_gated and swiglu_oai had made fastdiv unconditional where upstream used
+    int64 division and handled any size, so merely tightening the assert would have
+    turned "silently wrong above 2^31" into "aborts above 2^31" -- still a
+    regression against upstream. Both now fall back to an int64 kernel instead.
+    concat's guard is scoped to the dims that actually use fastdiv; dim 2 does not,
+    so its assert was spurious.
+    
+    perplexity 2.6209 +/- 0.01994 (unchanged), tg256 29.81 +/- 0.07 t/s
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ ggml/src/ggml-cuda/common.cuh |  9 ++++++++
+ ggml/src/ggml-cuda/concat.cu  |  8 ++++++-
+ ggml/src/ggml-cuda/cpy.cu     |  6 +++---
+ ggml/src/ggml-cuda/unary.cu   | 49 +++++++++++++++++++++++++++++++++++++++----
+ 4 files changed, 64 insertions(+), 8 deletions(-)
+
+commit 2c0d391589804b6e172ca759af606b101867c1a0
+Author: Kaden <kaden@localhost>
+Date:   Mon Aug 31 18:13:30 2026 -0500
+
+    cuda: bound mmvq row guards by nrows_x, not stride_col_dst
+    
+    The kernel never received nrows_x, so it used stride_col_dst as a stand-in for
+    the row count. For MUL_MAT that is correct (stride_col_dst == ne0 == nrows_x),
+    but for MUL_MAT_ID stride_col_dst is ne0*ne1, far larger than the row count, so
+    the guard never fires.
+    
+    Upstream was immune because rows_per_cuda_block == 1 for ncols_dst == 1
+    short-circuits the guard entirely. This branch forces 2 rows, which makes the
+    bug reachable: with an odd nrows_x the surplus lane reads x out of bounds and
+    writes into the next expert's dst slot.
+    
+    Thread nrows_x through mul_mat_vec_q_switch_ncols_dst -> switch_fusion -> the
+    kernel and bound all three sites by it: the staging clamp and both write guards.
+    
+    Also fixes the fused-gate read, which indexed with the unclamped row while the
+    weight staging used the clamped one; the clamped row is now recorded in irows[]
+    and reused, so the two agree.
+    
+    Latent on dense models (Qwen3 has even nrows_x) but live on any MoE model with
+    an odd row count.
+    
+    test-backend-ops -o MUL_MAT     3/3 backends passed
+    test-backend-ops -o MUL_MAT_ID  3/3 backends passed
+    perplexity 2.6209 +/- 0.01994 (unchanged), tg256 29.81 +/- 0.07 t/s
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ ggml/src/ggml-cuda/mmvq.cu | 40 ++++++++++++++++++++++------------------
+ 1 file changed, 22 insertions(+), 18 deletions(-)
+
+commit 134a4f4a5e20ae52791da48a889f332cfb9d6732
+Author: Kaden <kaden@localhost>
+Date:   Sun Aug 30 20:38:05 2026 -0500
+
+    cuda: stage the activation block-wide on the multi-column mmvq path
+    
+    With split_rows every warp walks the same K, so a single staged copy of
+    the activation serves the whole block -- 4736 bytes at four columns, and
+    free here because occupancy is capped by registers rather than shared
+    memory.
+    
+    pp512 (b=4 ub=4) 70.55 -> 71.44, REG 168 -> 144.
+    MTP decode 48.6-49.3 -> 50.1 t/s. Single-token decode unchanged at 29.83.
+    
+    Probes recorded alongside: the activation is 44% of this kernel and its
+    main register consumer (deleting it takes REG to 71), while deleting the
+    weight unpack entirely is worth only 5.7% -- so the unpack-once refactor
+    across quant types would return ~1.4% end to end and is not worth doing.
+    Staging recovers 1.3% of the activation's 44%, confirming again that past
+    one column the cost is volume, not access pattern.
+    
+    MUL_MAT 1193/1193. PPL 2.7554 +/- 0.02151 on the standard gate; through
+    the changed path 3.6199 +/- 0.08383 against 3.6237 for stock geometry.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ OPTLOG.md                      | 47 ++++++++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/mmvq.cu     | 55 +++++++++++++++++++++++++++++++++---------
+ ggml/src/ggml-cuda/vecdotq.cuh |  8 ++++++
+ 3 files changed, 98 insertions(+), 12 deletions(-)
+
+commit 5e50a5d3b9fdbb3783a6358f229b3241a2c6941e
+Author: Kaden <kaden@localhost>
+Date:   Sun Aug 30 19:47:54 2026 -0500
+
+    optlog: MMQ is 4x slower than mvq on Pascal; map the road to 60 t/s
+    
+    Upstream tunes the mvq->MMQ crossover per architecture and its comment
+    names the exact problem the multi-column path has: k-quants are expensive
+    to decode and mvq redoes that per column. MMQ decodes once into shared and
+    reuses across a tile, so it looked like the answer. On Pascal it is 4x
+    slower (17.11 against 70.57) -- its tiles are arithmetic-dense and assume
+    real DP4A, which sm_60 emulates. Upstream's default is right here.
+    
+    Also records that dropping the weight staging and trading rows-per-warp
+    for warps both lose, and the round-time budget showing 60 t/s needs both
+    the activation cost largely removed from the verify kernel and the launch
+    overhead halved.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ OPTLOG.md | 57 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 57 insertions(+)
+
+commit e4c5f4d10761989e96203dd814c5a98c39bf5ff6
+Author: Kaden <kaden@localhost>
+Date:   Sun Aug 30 19:07:55 2026 -0500
+
+    optlog: retune the MTP flags against the faster verification step
+    
+    n-max 6 / p-min 0.75 was tuned against a verification step this session
+    made 45% faster, so the optimum moved to shorter, more aggressive drafts.
+    p-min matters more than draft length: a high floor stops drafting early,
+    so most rounds verify one or two tokens and waste the batched forward.
+    
+    n-max 3 / p-min 0.05 gives 48.90 t/s against 38.15 for the old defaults on
+    the standard benchmark prompt.
+    
+    Speed is content-dependent and should be quoted as a range: 48.84 on code,
+    40.36 on an explanation, 37.68 on prose (against 38.15 / 26.86 / 22.05 for
+    the old flags -- the tuning helps everywhere, by up to 71%). Prose prefers
+    n-max 2 (39.38).
+    
+    Re-tuning the geometry for the now-dominant 4-column kernel found nothing;
+    4 rows per warp is optimal there too, so the committed 4x16 stands.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ OPTLOG.md | 57 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 57 insertions(+)
+
+commit 4ee0990827f790f97a90ef86f2bf2ae59bf78969
+Author: Kaden <kaden@localhost>
+Date:   Sun Aug 30 18:39:19 2026 -0500
+
+    cuda: widen the multi-column mmvq block to 16 rows
+    
+    The previous sweep varied rows at fixed warp count, which also varied
+    rows per warp -- and rows per warp is what sets register pressure, so it
+    looked like rows could not go past 8. Holding rows per warp at 4 and
+    scaling warps and rows together keeps REG at 182 while letting a block
+    cover four times the rows, and the activation traffic that dominates this
+    kernel falls as 1/rows.
+    
+    pp512 (b=7 ub=7) 82.12 -> 88.87, so 61.08 -> 88.87 (+45%) against stock.
+    MTP decode 37.9 -> 38.69 t/s, a 1.30x speculative speedup against 1.11x
+    before any of this work. Single-token decode untouched at 29.83.
+    
+    8x32 measures marginally faster still (89.20) but needs 32 rows before a
+    block is worth launching; 4x16 is within noise and degrades better on
+    narrower matrices.
+    
+    test-backend-ops MUL_MAT 1193/1193. Perplexity through this path
+    (-b 7 -ub 7): 3.6199 +/- 0.084 against 3.6237 +/- 0.084 for stock geometry.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ OPTLOG.md                  | 34 ++++++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/mmvq.cu |  4 ++--
+ 2 files changed, 36 insertions(+), 2 deletions(-)
+
+commit c9de43286d76f538c26b3de9e706cc97239263af
+Author: Kaden <kaden@localhost>
+Date:   Sun Aug 30 18:10:20 2026 -0500
+
+    cuda: give each warp its own rows on the multi-column mmvq path
+    
+    Speculative decoding verifies several draft tokens in one batched
+    forward, which lands on mul_mat_vec_q with ncols_dst > 1 -- 37% of GPU
+    time in an MTP run, at 196us a call against 99us for the one-column
+    kernel that streams the same weights. Everything done for decode so far
+    was gated to ncols_dst == 1, so this path was untouched.
+    
+    The activation is re-read by every block of the grid, and past one column
+    its traffic dominates: ~102 MB per matmul against 21 MB of weights. That
+    is volume, not access pattern -- staging it in shared memory the way the
+    one-column path does gains ~1% and costs the shared memory the real fix
+    needs. The fix is reuse: more output rows per block.
+    
+    Registers rather than shared memory limit how many rows fit (REG:200,
+    28 inlined dot products live at once), so give each warp its own rows and
+    have every warp walk the whole of K instead of the warps splitting K and
+    sharing every row. Per-thread accumulators are unchanged, a block covers
+    four times the rows, and the cross-warp reduction disappears.
+    
+    Also clamps the row used for addressing: a block covers its full row
+    count whether the tensor has that many left or not, and the staging was
+    reading off the end of the weights. Two rows got away with it, eight
+    would not.
+    
+    pp512 (b=7 ub=7) 61.08 -> 82.12 t/s; kernel 188 -> 129 us.
+    MTP decode 32.94 -> 37.9 t/s, a 1.27x speculative speedup against 1.11x.
+    Single-token decode is untouched at ~29.9.
+    
+    test-backend-ops MUL_MAT 1193/1193. Perplexity through this path (-b 7
+    -ub 7): 3.6199 +/- 0.084 against 3.6237 +/- 0.084 for the stock geometry.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ OPTLOG.md                      | 80 ++++++++++++++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/mmvq.cu     | 70 ++++++++++++++++++++++++++++--------
+ ggml/src/ggml-cuda/vecdotq.cuh | 17 +++++++++
+ 3 files changed, 153 insertions(+), 14 deletions(-)
+
+commit 8eb9b75293d6bca0b6b4ce27207818f10d82fb43
+Author: Kaden <kaden@localhost>
+Date:   Sun Aug 30 14:10:08 2026 -0500
+
+    optlog: sustained throughput, and correct the noise diagnosis
+    
+    The earlier caveat blamed desktop contention and said 'contention, not
+    thermal'. That was inferred from a sample taken at 67 C, before the cards
+    had saturated, and it is wrong. Sampling the throttle reasons during a
+    sustained load shows both cards hitting the 175 W power cap and GPU1 then
+    hitting sw_thermal_slowdown at 79 C, falling to ~949 MHz against a 1328
+    MHz boost.
+    
+    Same binary, same command: 29.59 +/- 0.20 cold, 24.77 +/- 2.36 once hot,
+    22.74 +/- 1.23 for tg2048 from steady state. The honest headline is two
+    numbers -- ~29.6 burst, ~23-25 sustained -- and the gap is power and
+    cooling, not software.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ OPTLOG.md | 41 +++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 41 insertions(+)
+
+commit f30fee9a8d1cd7399dc1b27ec694a63ef5d8a193
+Author: Kaden <kaden@localhost>
+Date:   Sun Aug 30 13:44:38 2026 -0500
+
+    cuda: restore bit-identical output in the norm kernels
+    
+    The float4 reductions changed the summation order -- thread t took a
+    contiguous quad instead of the reference's strided columns t, t+B, ... --
+    so the per-thread partials and the reduction tree differed and perplexity
+    moved 2.7554 -> 2.7565. Floating point addition does not associate.
+    
+    Revert just those three reduction paths and keep the register caching,
+    which used the reference's ownership and was always bit-exact. Perplexity
+    returns to exactly 2.7554 +/- 0.02151, so the whole optimisation series is
+    now bit-identical to stock. That also confirms by measurement, rather than
+    by argument, that the fastdiv index maths, the contiguous elementwise fast
+    path and the flash-attn tile-size fix change no results.
+    
+    Three ways to keep the wider accesses without touching the arithmetic were
+    tried and none was faster.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ OPTLOG.md                  |  31 +++++++++++
+ ggml/src/ggml-cuda/norm.cu | 127 +--------------------------------------------
+ 2 files changed, 33 insertions(+), 125 deletions(-)
+
+commit 58f9fe5ce753429300c5b1274cf95394681d3c5f
+Author: Kaden <kaden@localhost>
+Date:   Sun Aug 30 13:11:40 2026 -0500
+
+    optlog: vdr sweep for q6_K, and what 40 t/s would actually require
+    
+    Lowering vdr to buy back occupancy loses badly (27.00 at vdr=2, 21.34 at
+    vdr=1 against 30.11 at vdr=4), so the shared-memory/occupancy tradeoff in
+    mul_mat_vec_q has no slack left in that direction.
+    
+    Also records the time budget at 30.11 t/s and why 40 t/s needs the matmul
+    itself near its streaming floor rather than one more tail kernel.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ OPTLOG.md | 21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+
+commit da56cb516c362a39ee117880876b0c2d66b20483
+Author: Kaden <kaden@localhost>
+Date:   Sun Aug 30 12:56:24 2026 -0500
+
+    cuda: give launch_fattn the vec kernel's real KV tile size
+    
+    ggml_cuda_flash_attn_ext_vec_case_impl passed D as nbatch_fa, but the vec
+    kernel steps its KV loop by nthreads. launch_fattn uses nbatch_fa only to
+    work out ntiles_KV, which caps how many blocks may split the KV range, so
+    wherever nthreads < D the available parallelism is understated -- Pascal
+    runs 128 threads against D = 256, so it was halved. With a 256-long KV
+    that left ntiles_KV = 1, pinning parallel_blocks at 1 and running the
+    whole attention on 12 blocks of a 56-SM GPU.
+    
+    29.9 -> 30.11 t/s on 2x Tesla P100 with Qwen3 27B Q6_K.
+    Perplexity unchanged at 2.7565; test-backend-ops FLASH_ATTN_EXT 3949/3949.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ OPTLOG.md                        | 16 ++++++++++++++++
+ ggml/src/ggml-cuda/fattn-vec.cuh |  6 +++++-
+ 2 files changed, 21 insertions(+), 1 deletion(-)
+
+commit 1ee4ffe85d18337b5412b094c973639b93fd01ec
+Author: Kaden <kaden@localhost>
+Date:   Sun Aug 30 12:38:13 2026 -0500
+
+    cuda: stop dividing in the elementwise and norm kernels on Pascal
+    
+    sm_60 has no integer divider, so the 64-bit divisions several small
+    kernels did per element cost dozens of instructions each and dominated
+    them. Four changes, all general:
+    
+    - binbcast: a flat fast path for when every operand has the
+      destination's shape and is contiguous, skipping the broadcast index
+      math entirely (3.07 -> 2.09 us)
+    - cpy_scalar: eight 64-bit divisions per element replaced with the
+      existing 32-bit multiply-shift helpers (4.85 -> 2.54 us)
+    - the gated unary kernels and concat_cont: same, two per element
+    - the norm kernels: load the row four floats at a time. A single block
+      owns the row, so what limits it is the SM's requests in flight rather
+      than bandwidth, and one float4 request carries four times the payload
+    
+    29.32 -> ~29.9 t/s on 2x Tesla P100 with Qwen3 27B Q6_K.
+    
+    Perplexity 2.7565 +/- 0.02153 against 2.7554 +/- 0.02151 for stock: the
+    norm reductions now sum in a different order, so the result is no longer
+    bit-identical, but the shift is 5% of the error bar. The index-math
+    changes are bit-exact. test-backend-ops passes RMS_NORM 51/51,
+    RMS_NORM_MUL_ADD 30/30, L2_NORM 20/20, NORM 50/50, ADD 99/99, MUL 91/91,
+    CPY 246/246, CONCAT 177/177, SWIGLU 24/24, SET_ROWS 159/159.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ OPTLOG.md                      |  55 +++++++++++++++++
+ ggml/src/ggml-cuda/binbcast.cu |  54 +++++++++++++++++
+ ggml/src/ggml-cuda/concat.cu   |  21 +++++--
+ ggml/src/ggml-cuda/cpy.cu      |  50 ++++++++++++++++
+ ggml/src/ggml-cuda/norm.cu     | 133 +++++++++++++++++++++++++++++++++++++++--
+ ggml/src/ggml-cuda/unary.cu    |  23 ++++---
+ 6 files changed, 318 insertions(+), 18 deletions(-)
+
+commit 0588f67d2e63eb903913e14fca0f3a3076157f6f
+Author: Kaden <kaden@localhost>
+Date:   Sun Aug 30 11:26:01 2026 -0500
+
+    cuda: keep the rms_norm row in registers instead of reading it twice
+    
+    rms_norm_f32<1024> is launched with grid (1,1,1) on a 5120-wide row, so a
+    single block owns the row and nothing else covers its memory latency --
+    and it read the row once to accumulate the sum of squares and again to
+    scale it. When the row fits in a fixed number of registers per thread,
+    hold it there and skip the second read; longer rows keep the strided
+    loops.
+    
+    28.98 -> 29.27 t/s on 2x Tesla P100 with Qwen3 27B Q6_K.
+    Perplexity unchanged (2.7554); RMS_NORM 51/51, RMS_NORM_MUL_ADD 30/30.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ OPTLOG.md                  | 28 ++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/norm.cu | 43 +++++++++++++++++++++++++++++++++++++++++--
+ 2 files changed, 69 insertions(+), 2 deletions(-)
+
+commit bbdac166e18e648d751971117710df378c02c05f
+Author: Kaden <kaden@localhost>
+Date:   Sun Aug 30 10:52:36 2026 -0500
+
+    cuda: stage the q8_1 activation through shared memory in mul_mat_vec_q
+    
+    Within a warp the activation reads are 32-bit words 16 bytes apart inside
+    a 36-byte block_q8_1 that then jump to the next block, so each of the
+    eight loads per iteration fans out into many transactions. Every block of
+    the grid reads the same activation, so it is L2-resident and this costs
+    request throughput rather than bandwidth: replacing the activation with a
+    constant makes the kernel 13.5% faster, while deleting the entire dot
+    product is worth under 1%.
+    
+    Pull the warp's contiguous run of q8_1 blocks in with coalesced uint4
+    loads, the same way the weights are already staged, and read it back from
+    shared memory. Gated to ncols_dst == 1 on Pascal.
+    
+    27.49 -> 28.98 t/s on 2x Tesla P100 with Qwen3 27B Q6_K.
+    Perplexity unchanged (2.7554), test-backend-ops MUL_MAT 1193/1193.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ OPTLOG.md                  | 27 ++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/mmvq.cu | 48 ++++++++++++++++++++++++++++++++++++++++++++--
+ 2 files changed, 73 insertions(+), 2 deletions(-)
+
+commit 9f1f4d68bb1157fb68020b99e074585618276d77
+Author: Kaden <kaden@localhost>
+Date:   Sun Aug 30 08:18:57 2026 -0500
+
+    optlog: mmvq is DRAM-bound, not issue-bound; record the remaining pools
+    
+    Two probes settle the direction: deleting every dp4a from the q6_K inner
+    loop is worth +0.8%, and halving the shared-memory loads is worth
+    nothing. Instruction-count work on mul_mat_vec_q is finished.
+    
+    Also records the re-swept geometry (2x2 still optimal), the per-token
+    time budget (24.8 ms mmvq, 7.5 ms tail, 4.1 ms GPU idle) and the tail
+    breakdown, so the next session starts from the 11% idle.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ OPTLOG.md | 67 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 67 insertions(+)
+
+commit 246515a32c52f02a569284dbd4e14be9d46727ee
+Author: Kaden <kaden@localhost>
+Date:   Sun Aug 30 07:22:41 2026 -0500
+
+    cuda: cache the q8_1-quantized activation across mul_mat_vec_q calls
+    
+    quantize_q8_1 ran once per mul_mat_vec_q, but within a transformer block
+    q/k/v share one normed activation and gate/up share another, so roughly
+    two fifths of those launches re-quantized an identical buffer.
+    
+    Cache the result per device on the backend context, keyed on the src1
+    node pointer, its data pointer, the src0 type and the required size, and
+    invalidate it at the start of every graph evaluation.
+    
+    27.03 -> 27.49 t/s on 2x Tesla P100 with Qwen3 27B Q6_K.
+    Perplexity unchanged (2.7554), test-backend-ops MUL_MAT 1193/1193.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ OPTLOG.md                       | 11 +++++++++++
+ ggml/src/ggml-cuda/common.cuh   | 24 ++++++++++++++++++++++++
+ ggml/src/ggml-cuda/ggml-cuda.cu | 12 ++++++++++++
+ ggml/src/ggml-cuda/mmvq.cu      | 35 ++++++++++++++++++++++++++++++++---
+ 4 files changed, 79 insertions(+), 3 deletions(-)
+
+commit 3bc4e1718d668204896bf06d148ae7788fcc3124
+Author: Kaden <kaden@localhost>
+Date:   Sat Aug 29 23:57:19 2026 -0500
+
+    handoff: mmvq GLU fusion on Pascal re-measured and still a loss
+    
+    Lifted the upstream 'fusion is not universally faster on Pascal' exclusion to
+    re-test it against the reworked kernel. Fusion fires (unary_gated_op_kernel
+    calls drop) but measures 25.49 against 27.03: the fused kernel reads the gate
+    matrix unstaged from global, and staging it too would double shared memory to
+    7424 bytes, making smem the occupancy limiter at 9 blocks/SM against 14. The
+    upstream decision stands.
+    
+    Also recorded that the dequantize-and-FMA alternative (which would exploit
+    P100's fast FP16) no longer exists in the tree and would need new numerics work.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ HANDOFF.md | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+commit 42ad11197a3d4e262fc47a9c38c464276a0f8c10
+Author: Kaden <kaden@localhost>
+Date:   Sat Aug 29 23:50:36 2026 -0500
+
+    handoff: record that occupancy is not the limiter in either direction
+    
+    Forcing fewer registers via __launch_bounds__ hurts monotonically with zero
+    spill (67 regs 27.01, 64 26.63, 61 26.68, 56 26.34) -- ptxas rematerialises
+    rather than spills, and the extra instructions cost more than the occupancy
+    gains. Double-buffering the shared stage to remove the WAR barrier also loses
+    (26.38): smem 3712 -> 7168 bytes turns shared memory into the occupancy limiter,
+    14 -> 9 blocks/SM.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ HANDOFF.md | 10 +++++++++-
+ 1 file changed, 9 insertions(+), 1 deletion(-)
+
+commit 5cd1e62aea780ef1c6683a674b59932a685fb1af
+Author: Kaden <kaden@localhost>
+Date:   Sat Aug 29 23:31:25 2026 -0500
+
+    docs: add HANDOFF.md distilling the session
+    
+    Forward-looking summary: what is committed and why, the measured model of what
+    binds the kernel (global load count, not bandwidth/ALU/occupancy), the ceiling
+    arithmetic, every failed attempt with its reason, the alignment wall, and the
+    process notes (build times, which gates are actually sensitive, the CLAUDE.md
+    perplexity discrepancy).
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ HANDOFF.md | 194 +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 194 insertions(+)
+
+commit 80e7aebc8380dc8629fc42550a769b6a210e2f5c
+Author: Kaden <kaden@localhost>
+Date:   Sat Aug 29 23:25:32 2026 -0500
+
+    optlog: wide shared reads reverted; note the uintptr_t address-space pitfall
+    
+    Reading the vdr contiguous quant words as vdr+1 aligned 32-bit shared loads plus
+    funnel shifts cuts LDS 34 -> 26 but costs 11 registers for the staged arrays,
+    netting 26.86 against 27.03.
+    
+    Worth recording: the first attempt cast the shared pointer through uintptr_t and
+    back, which loses the address space and made ptxas emit generic loads (25.61).
+    Deriving the aligned pointer with char* arithmetic from the original keeps LDS.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ OPTLOG.md | 23 +++++++++++++++++++++++
+ 1 file changed, 23 insertions(+)
+
+commit 066b558b133f737a669908be1853a2b5df2fbcd0
+Author: Kaden <kaden@localhost>
+Date:   Sat Aug 29 23:08:25 2026 -0500
+
+    optlog: alignment rotation reverted for the third time; LDG != LDS in cost
+    
+    Implemented per-block 16-byte-aligned slots with funnel-shift rotation and a
+    compile-time aligned reader (get_int_b2 templated on alignment). Mechanically
+    correct -- LDS.U.U16 34 -> 2 -- and still slower: 26.50-26.85 against 27.03.
+    
+    The corrective finding is that the clamped-index variant has FEWER total LSU
+    operations than the kept version (40 vs 46) and is still 5% slower, because
+    per-block staging turns one contiguous run into four base addresses and global
+    loads cost far more than shared ones. The binding resource is the global load
+    count, not LSU slots in aggregate.
+    
+    Also reverted a compile-time staging bound: fewer instructions (421 -> 383) but
+    ~3% more bytes staged per iteration, 26.65.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ OPTLOG.md | 36 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 36 insertions(+)
+
+commit 560442c8961f745578b169368a52a0eb36cd70ca
+Author: Kaden <kaden@localhost>
+Date:   Sat Aug 29 22:33:10 2026 -0500
+
+    cuda: accumulate the whole vdr group in an integer before scaling (sm_60)
+    
+    With vdr=4 the inner body was "sumf += d8[i] * (dp4a(...) * sc)" once per (l, i)
+    pair. But scales[4*i] and the q8_1 scale are constant across the vdr group --
+    the same sharing property that motivated raising vdr in the first place -- so
+    the integer accumulator can absorb all four l values before any float work.
+    dp4a already takes an accumulator, so chaining the group is free.
+    
+    That collapses the integer multiply by the scale, three XMADs each on Pascal
+    which has no IMAD, from 8 per vec_dot to 2, and the int->float conversion
+    likewise from 8 to 2.
+    
+    Peak |acc| is vdr*4*128*128 = 262144, well inside float's exactly representable
+    integer range, so folding the group before converting loses nothing. It rounds
+    twice per i rather than four times, so it is marginally more accurate;
+    perplexity is unchanged at 2.7554 +/- 0.02151.
+    
+    mul_mat_vec_q<q6_K, ncols_dst=1>: 678 -> 624 instructions, XMAD 197 -> 161,
+    I2F 16 -> 8, registers 78 -> 66. Isolated kernel 116.4 -> 108.3 us.
+    
+    Geometry re-swept after the register drop; 2x2 remains optimal.
+    
+    test-backend-ops -o MUL_MAT passes 1193/1193.
+    
+    qwen3.8-27B-Q6_K, 2x Tesla P100, -sm tensor -fa 1 -ctk/-ctv q4_0, tg256:
+    26.24 -> 27.03 t/s (17.45 baseline, +55%).
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ OPTLOG.md                      | 28 +++++++++++++++++++++++++
+ ggml/src/ggml-cuda/vecdotq.cuh | 47 ++++++++++++++++++++++++------------------
+ 2 files changed, 55 insertions(+), 20 deletions(-)
+
+commit 2e29db95c5d7df3d0c83c6e6cae4c5a168baceb7
+Author: Kaden <kaden@localhost>
+Date:   Sat Aug 29 21:51:56 2026 -0500
+
+    optlog: MC (MTP) path is compute-bound and geometry-insensitive
+    
+    Re-swept the ncols_dst 2-8 launch geometry, which still carried pre-staging
+    values. Byte-identical timings across all six configurations. nvprof confirms
+    these shapes do run mul_mat_vec_q<ncols_dst=4>. n=4 costs 2.3x n=1 for 4x the
+    output because weights are read once regardless of column count, so the path is
+    compute bound and the geometry -- which only shapes memory access -- cannot
+    move it. Left unchanged.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ OPTLOG.md | 23 +++++++++++++++++++++++
+ 1 file changed, 23 insertions(+)
+
+commit 0dc12423e4eb01906a55b7415d4a6497817baf57
+Author: Kaden <kaden@localhost>
+Date:   Sat Aug 29 21:38:04 2026 -0500
+
+    optlog: price the q8_1 activation loads (2% ceiling), close out the lever list
+    
+    Collapsing the four per-l u loads to one -- an upper bound on what padding the
+    mmvq-private q8_1 buffer to 16-byte alignment could achieve -- gains 2%
+    (116.61 -> 114.28 us). The activation is L1/L2-resident so those loads are
+    already nearly free. Every remaining lever is now measured rather than
+    estimated; only the global weight repack remains material.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ OPTLOG.md | 33 +++++++++++++++++++++++++++++++++
+ 1 file changed, 33 insertions(+)
+
+commit 9aff03f2519a3b0a0c779e8471ae5cfd8d9a3d45
+Author: Kaden <kaden@localhost>
+Date:   Sat Aug 29 21:29:07 2026 -0500
+
+    optlog: verify the model is dense, closing the impossibility proof
+    
+    The ceiling derivation assumes all weights are read per token. GGUF metadata
+    confirms it: qwen35 hybrid attention/SSM, 65 blocks, no expert_count key, so
+    dense. Corroborated by mmvq's 29.1 ms/token moving ~24 GB at the measured
+    414 GB/s per GPU.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ OPTLOG.md | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+commit c30af141520ed2c81f9098b6c0fa80c5a2ee4f3e
+Author: Kaden <kaden@localhost>
+Date:   Sat Aug 29 21:25:55 2026 -0500
+
+    optlog: prove 40 t/s is unreachable from measured bandwidth
+    
+    40 t/s leaves 16.0 ms/token for mmvq after the measured 9.0 ms of non-mmvq work,
+    which would need 702 GB/s per GPU against a measured 605 GB/s streaming ceiling.
+    Absolute ceiling with a perfect mmvq is 36.3 t/s; the practical one, given the
+    measured memory floor, is 30.5 t/s.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ OPTLOG.md | 35 +++++++++++++++++++++++++++++++++++
+ 1 file changed, 35 insertions(+)
+
+commit 314f2be109e2914325576ec06c061c45c4995fdd
+Author: Kaden <kaden@localhost>
+Date:   Sat Aug 29 21:22:09 2026 -0500
+
+    optlog: record attempts 13-15 (CUDA graphs, rms_norm block, q8_1 indexing)
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ OPTLOG.md | 44 ++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 44 insertions(+)
+
+commit d0a41002a1314d7688a192d50760ae831301ac35
+Author: Kaden <kaden@localhost>
+Date:   Sat Aug 29 21:12:34 2026 -0500
+
+    optlog: final state 26.26 t/s, per-type effects, and the alignment wall
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ OPTLOG.md | 60 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 60 insertions(+)
+
+commit 9fc142d12f8d14ac35698e986a35469946b64c6e
+Author: Kaden <kaden@localhost>
+Date:   Sat Aug 29 20:42:41 2026 -0500
+
+    cuda: stage x in 16-byte units in mul_mat_vec_q (sm_60)
+    
+    The staging loop moved 32 bits per lane, 128 bytes per warp per instruction,
+    which at vdr=4 is seven load and seven store instructions per row per iteration.
+    A warp's run of blocks is contiguous and shared memory already tolerates an
+    arbitrary byte offset -- that is what mis[] carries -- so the run can be fetched
+    from the 16-byte-aligned address below it and the offset passed through to the
+    extraction unchanged. One uint4 instruction moves 512 bytes per warp.
+    
+    Global load and shared store counts each drop about 4x (seven rounds to two) on
+    a kernel that is bound by the number of memory instructions it issues. Registers
+    fall 87 -> 78 as a side effect, since far fewer staging addresses are live.
+    
+    Geometry re-swept afterwards and 2x2 remains optimal: 2x4 24.69, 4x2 24.76,
+    1x2 26.00, 4x4 23.49.
+    
+    test-backend-ops -o MUL_MAT passes 1193/1193.
+    
+    qwen3.8-27B-Q6_K, 2x Tesla P100, -sm tensor -fa 1 -ctk/-ctv q4_0, tg256:
+    24.33 -> 26.21 t/s (17.45 baseline, +50%).
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ OPTLOG.md                  | 21 +++++++++++++++++++++
+ ggml/src/ggml-cuda/mmvq.cu | 27 +++++++++++++++++----------
+ 2 files changed, 38 insertions(+), 10 deletions(-)
+
+commit 0732c729e59b2b52cdf594c087f913c659801844
+Author: Kaden <kaden@localhost>
+Date:   Sat Aug 29 20:10:40 2026 -0500
+
+    cuda: vdr=4 for Q6_K mmvq, retuned Pascal geometry to 2x2 (sm_60)
+    
+    Extends the vdr=2 sharing to groups of four. For every iqs that is a multiple of
+    4, all four consecutive indices share bq8_offset, scale_offset and vh_shift --
+    those are floor-divisions whose moduli (8 and 4) are multiples of 4 -- and the
+    ql index, qh index and q8_1 lane index are each consecutive without wrapping,
+    since iqs % 8 is 0 or 4. So the scales, the block scale and the q8_1 .ds values
+    are fetched once per four lanes instead of once each. vec_dot_q6_K_q8_1 now
+    loops over vdr so the factor is a single constant.
+    
+    vdr=8 was rejected on analysis: scale_offset changes at iqs % 16 == 4, so a group
+    of eight needs two scale reads, leaving only ~8% for a much larger register cost.
+    
+    Raising vdr raises register pressure and moves the launch-geometry optimum, so
+    nwarps/rows are retuned again, to 2x2. The sweep has to be done against the real
+    model: vdr=4 is better than vdr=2 on an isolated shape (139.2 vs 143.7 us) but
+    worse on the model at the old geometry (21.60 vs 23.28), because registers went
+    77 -> 103 and cost occupancy. At 2x2 registers are 87 and it wins.
+    
+    test-backend-ops -o MUL_MAT passes 1193/1193.
+    
+    qwen3.8-27B-Q6_K, 2x Tesla P100, -sm tensor -fa 1 -ctk/-ctv q4_0, tg256:
+    23.28 -> 24.33 t/s (17.45 baseline, +39%).
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ OPTLOG.md                      | 38 ++++++++++++++++++++++
+ ggml/src/ggml-cuda/mmvq.cu     |  2 +-
+ ggml/src/ggml-cuda/vecdotq.cuh | 71 +++++++++++++++++++-----------------------
+ 3 files changed, 71 insertions(+), 40 deletions(-)
+
+commit f07b913a7f59f7bf386b5aab16a1f46f1f6f239f
+Author: Kaden <kaden@localhost>
+Date:   Sat Aug 29 19:23:10 2026 -0500
+
+    cuda: vdr=2 for Q6_K mmvq and Pascal launch geometry in source (sm_60)
+    
+    Raise VDR_Q6_K_Q8_1_MMVQ from 1 to 2 so each thread handles two consecutive
+    int32 of the quant data. For even iqs, bq8_offset, scale_offset and vh_shift are
+    identical for iqs and iqs+1 -- all three are floor-divisions with an even
+    modulus, so an even index and its odd successor land in the same bucket. The two
+    halves therefore share one scales pointer, one bq6_K->d and one pair of q8_1 .ds
+    scales, all of which were previously fetched twice by two separate warp lanes.
+    That is 57.5 LSU operations per block against 81, 29% fewer. It does not widen
+    the ql/qh loads: block_q6_K's 210-byte stride keeps those 2-byte aligned however
+    vdr is set.
+    
+    Halving the threads per block-group moves the launch-geometry optimum, so retune
+    it: nwarps 8 -> 2 for ncols_dst == 1. Measured on the full model rather than on a
+    single isolated shape, which was misleading here -- the isolated kernel showed
+    vdr=2 as a 1.12x win while the model showed nothing until the geometry followed.
+    tg256: 8x4 20.35, 4x4 22.97, 2x4 23.31, 2x2 22.67, 1x4 22.22.
+    
+    Move the tuning out of the -DP100_* build flags and into the source, gated on
+    __CUDA_ARCH_LIST__ == 600 so MMVQ_PARAMETERS_GENERIC -- which Ampere and later
+    also fall through to -- is untouched. __CUDA_ARCH_LIST__ is the right test
+    because it is visible to both the host and device passes, and calc_nwarps feeds
+    both __launch_bounds__ and the host-side launch configuration, which must agree.
+    A flagless build now reproduces the tuned result, removing the silent
+    17% cliff that came from forgetting the flags.
+    
+    test-backend-ops -o MUL_MAT passes 1193/1193.
+    
+    qwen3.8-27B-Q6_K, 2x Tesla P100, -sm tensor -fa 1 -ctk/-ctv q4_0, tg256:
+    20.35 -> 23.28 t/s (17.45 baseline, +33%).
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ OPTLOG.md                      | 56 ++++++++++++++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/mmvq.cu     | 29 +++++++++++++---------
+ ggml/src/ggml-cuda/vecdotq.cuh | 55 ++++++++++++++++++++++++++++++++++-------
+ 3 files changed, 120 insertions(+), 20 deletions(-)
+
+commit b74bca274a02452a010885da586c699452a38522
+Author: Kaden <kaden@localhost>
+Date:   Sat Aug 29 18:24:29 2026 -0500
+
+    optlog: prefetch pipeline reverted; kernel is LSU-issue bound, not latency bound
+    
+    Register-prefetch software pipelining is a wash (q6_K 164.7 -> 163.8) with
+    registers 62 -> 75. At 32 resident warps the load latency is already hidden, so
+    the limit is the number of LSU instructions issued, not their latency: per
+    iteration LDG 13 + LDS 56 + STS 12 = 81, dominated by the 56 shared loads that
+    exist only because the staged image keeps the source misalignment.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ OPTLOG.md | 35 +++++++++++++++++++++++++++++++++++
+ 1 file changed, 35 insertions(+)
+
+commit 85b201e5f087f6f6b4154c941dcf1db9b43175fb
+Author: Kaden <kaden@localhost>
+Date:   Sat Aug 29 18:09:11 2026 -0500
+
+    optlog: ceiling analysis - memory floor is 114.5us, 40 t/s unreachable
+    
+    Stubbing the dp4a/float math while keeping all staging and extraction shows
+    mul_mat_vec_q is 114.5us memory + 50us arithmetic. Even with free arithmetic the
+    kernel caps at 29.4 t/s, and 40 t/s would need 84us, below the memory-only floor.
+    The memory side already runs at 421 GB/s against a measured 605 GB/s streaming
+    ceiling, and cooperative staging already matches the 16-byte-load ceiling, so a
+    weight repack would buy nothing.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ OPTLOG.md | 45 +++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 45 insertions(+)
+
+commit b7c7b8329f196af3066963ff5694acc273c2ee91
+Author: Kaden <kaden@localhost>
+Date:   Sat Aug 29 17:52:57 2026 -0500
+
+    optlog: record perplexity gate and post-staging analysis
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ OPTLOG.md | 20 +++++++++++++++++++-
+ 1 file changed, 19 insertions(+), 1 deletion(-)
+
+commit c7e7faf6090f8350a86d92e291c743a510acf128
+Author: Kaden <kaden@localhost>
+Date:   Sat Aug 29 17:22:29 2026 -0500
+
+    cuda: stage x through shared memory in mul_mat_vec_q (sm_60)
+    
+    mul_mat_vec_q on Pascal is load-ISSUE bound, not bandwidth bound: measured
+    throughput tracks bytes fetched per load instruction, and the card streams
+    605 GB/s while this kernel managed 236.
+    
+    Every ggml block size is 2 mod 4 -- block_q6_K is 210 bytes, block_q8_0 34,
+    block_q4_0 18 -- because each block carries a 2-byte ggml_half next to a
+    multiple-of-4 payload. Consecutive blocks therefore alternate 4-byte alignment,
+    so get_int_b2 must issue two 16-bit loads for every quant word, and the scales
+    and block scale cost a load apiece: roughly 7 load instructions and only ~26
+    bytes fetched per block.
+    
+    Have the warp pull its whole contiguous run of blocks in with a few fully
+    coalesced 32-bit loads issued from the 4-byte-aligned base below the data, and
+    do the per-thread field extraction out of shared memory, where the odd alignment
+    costs nothing. The misalignment is preserved in shared memory rather than
+    removed, which is what keeps the global side aligned without padding or
+    repacking the weights -- a padded block stride was investigated and rejected
+    because mmvq and mmq must share a tensor's physical layout.
+    
+    The staging loop needs a compile-time trip count and an explicit __ldg: with a
+    runtime bound ptxas emits predicated generic loads (LD.E) for the staging reads
+    instead of LDG, which throws away the entire benefit and measured slower than
+    the original. Final SASS has LD.E 0, LDG 13, LDS 56, STS 12, and registers drop
+    from 71 to 62 so occupancy improves too.
+    
+    Isolated kernel (m=4096, n=1, k=14336), us/run:
+      q6_K 204 -> 165, q3_K 286 -> 151, q8_0 188 -> 152, q2_K 153 -> 143,
+      q4_K ~141 -> 131, q5_K 145 -> 144, q4_0 94 -> 96
+    
+    test-backend-ops -o MUL_MAT passes 1193/1193 on repeated runs.
+    
+    qwen3.8-27B-Q6_K, 2x Tesla P100, -sm tensor -fa 1 -ctk/-ctv q4_0, tg256:
+    17.72 -> 20.43 t/s.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ OPTLOG.md                  |  67 +++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/mmvq.cu | 110 ++++++++++++++++++++++++++++++++++++++++-----
+ 2 files changed, 165 insertions(+), 12 deletions(-)
+
+commit d8984de003177150644196eb2afe680f7926be1f
+Author: Kaden <kaden@localhost>
+Date:   Sat Aug 29 16:04:41 2026 -0500
+
+    cuda: remove __vsubss4 from Q6_K/Q3_K mmvq vec_dot (sm_60)
+    
+    NVIDIA GPUs have had no SIMD-video hardware since Kepler, so __vsubss4 is emulated
+    by ptxas: 9 SASS instructions on sm_60 where a plain subtract is 1. Both mmvq
+    K-quant call sites subtract a power-of-two bias from packed sub-byte values whose
+    high bits are known zero, which makes the saturation the intrinsic provides
+    unnecessary and lets the bias be folded into the extract shifts instead.
+    
+    For Q6_K, b - 32 is the sign-extension of the 6-bit quant b from bit 5: flipping
+    bit 5 and shifting left by 2 puts that sign in bit 7, yielding a packed int8 equal
+    to 4*(b - 32) that dp4a consumes directly. Q3_K is the same idea from bit 2 with a
+    shift of 5. Both shifts fold into the extract shifts that were needed anyway and
+    the bit flip fuses into an adjacent LOP3, so the bias becomes free. The resulting
+    power-of-two factor is undone once in the float scale, exactly.
+    
+    Inner loop of mul_mat_vec_q<Q6_K, ncols_dst=1>: 412 -> 368 instructions,
+    PRMT 36 -> 20, LOP3 32 -> 8.
+    
+    Bit-exact: 0 mismatches over 4.2M random argument tuples for both types, and
+    test-backend-ops -o MUL_MAT passes 1193/1193. Perplexity is unchanged to all 30
+    printed chunk values.
+    
+    qwen3.8-27B-Q6_K, 2x Tesla P100, -sm tensor -fa 1 -ctk/-ctv q4_0, tg256:
+    17.45 -> 17.71 t/s.
+    
+    Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+    Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
+
+ OPTLOG.md                      | 106 +++++++++++++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/vecdotq.cuh |  32 +++++++++----
+ 2 files changed, 128 insertions(+), 10 deletions(-)
+
+commit b44f8fe6f81134d2e54a9fdf999033b88270777b
+Author: Kaden <kaden@localhost>
+Date:   Sat Aug 29 14:04:29 2026 -0500
+
+    cuda: Pascal (sm_60) optimizations
+    
+    - fix null data ptr in quantized KV padding memset (unblocks -sm tensor + quant KV)
+    - 8-instruction dp4a emulation via PRMT + XMAD.H1 (was 12), bit-exact
+    - mmvq nwarps/rows tuning for Pascal: +17% single-col, +20% multi-col
+
+ ggml/src/ggml-cuda/common.cuh   | 24 +++++++++++++++++++++---
+ ggml/src/ggml-cuda/ggml-cuda.cu |  2 +-
+ ggml/src/ggml-cuda/mmvq.cu      | 20 ++++++++++++++++++++
+ 3 files changed, 42 insertions(+), 4 deletions(-)

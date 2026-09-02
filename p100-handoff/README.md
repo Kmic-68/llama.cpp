@@ -30,6 +30,30 @@ upstream `f280b2698`; `session3.diff` is just the 2026-08-31/09-01 work.
 </details>
 
 
+## Long context (added later; read this before the numbers below)
+
+Everything below this section is measured at **2048 tokens of context**. The
+machine's actual workload is **262144**, where prefill is a completely different
+number because attention work is O(batch x depth).
+
+| depth | tile kernel | cuBLAS-GEMM path (`bdcb3f7bf`) |
+|---|---|---|
+| 0 | 427 hot | 425 (gated off below KV 4096) |
+| 65536 | 158.43 | **188.99** |
+| 131072 | 111.22 | **131.08** |
+| 262144 | ~61 (extrapolated) | ~77 (extrapolated, **never measured**) |
+
+Cause: on Pascal there are no tensor cores, so long context falls to
+`flash_attn_tile` at **3.55 TFLOPS of a 19.05 peak (18.6%)** beside a cuBLAS GEMM
+doing 15.7. Only ~16 of 65 blocks have a growing KV cache
+(`full_attention_interval 4`), so attention is the only context-scaling cost.
+
+**Hard ceiling at 262144 is ~202 t/s** (105.6 TFLOP of attention per GPU per
+2048-token batch = 5.54 s at full peak, plus ~4.6 s of context-independent work).
+Target is 175, needing attention at ~70% of peak against ~25% today. Route and
+arithmetic: OPTLOG attempt 90. Decode at depth is **unmeasured** -- it uses the
+VEC kernel, which this path does not touch.
+
 Everything here is general CUDA kernel work — nothing keys off this model or quant. Verified
 quant-agnostic across q6_K, q3_K, q4_K, q5_K, q4_0, q5_0, q8_0, q2_K and iq4_nl. The norm,
 elementwise, copy and flash-attention changes are architecture-general; the largest effects land on
@@ -42,6 +66,7 @@ GPUs that, like Pascal, lack an integer divider and DP4A.
 | `full-kernel.diff` | every kernel change against upstream `f280b2698` |
 | `session2.diff` | the second session's changes alone (on top of `b44f8fe6f`) |
 | `session3.diff` | the 2026-08-31/09-01 changes alone (on top of `5d1fafb01`) |
+| `session4-longcontext.diff` | the cuBLAS-GEMM attention path alone (on top of `9183630c8`) |
 | `RESUME-HERE.md` | **start here** -- current state and ranked next steps |
 | `VERIFICATION.md` | numerical audit (covers up to `134a4f4a5`; later changes noted at the top) |
 | `CORPUS.md` | why the perplexity gate corpus drifted, and which target goes with which file |

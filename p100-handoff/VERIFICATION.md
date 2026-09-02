@@ -231,3 +231,36 @@ Exhaustive proofs: `tools/proofs-fastdiv-dp4a/`, `tools/proofs-norm-binbcast/`
 (CPU-only, `gcc`, no GPU). Hash harness: apply
 `tools/tensor-hash-harness.patch`, rebuild `llama-eval-callback`, run with
 `LLAMA_TENSOR_HASH=1 ... -sm layer`, and diff the `HASH` lines.
+
+---
+
+## Long-context work (attempts 89-90) — verification status
+
+**Scope note:** the audit above covers up to `134a4f4a5`. This section covers
+`bdcb3f7bf` (cuBLAS-GEMM flash attention) and `98de4588f` (P/S aliasing).
+
+| claim | evidence | status |
+|---|---|---|
+| correctness of the new attention path | `test-backend-ops -o FLASH_ATTN_EXT`: **3949/3949**, re-run after every change including the aliasing | **verified** |
+| does not perturb short context | d=0, same thermal state: 427.05 +/- 0.44 (off) vs 425.19 +/- 2.19 (on) | **verified** — gated to KV >= 4096 |
+| perplexity in band | CLAUDE.md gate, c=4096, ppl-orig.txt: **2.6219 +/- 0.01996** (band 2.6010-2.6408) | **verified** |
+| q4_0 KV at depth is sound | A/B at c=16384: tile 2.6035 +/- 0.02713 vs GEMM 2.6047 +/- 0.02719 = **0.04 sigma** | **verified** — this is the only test that exercises the per-chunk dequant |
+| +17.9% / +19.3% at depth | d=131072 and d=65536, both arms back to back in one thermal state | **verified**, though run-to-run variance at depth is large (an earlier pair read +9.5%) |
+| removes the 512 MiB f16 KV staging | `get_alloc_size` no longer requests it | **request removed; SAVING NOT DEMONSTRATED** |
+| 262144 behaviour (throughput, VRAM, decode) | — | **NEVER MEASURED.** Every 262144 figure in these docs is extrapolation |
+
+### On the 512 MiB specifically
+
+Peak VRAM measured **identical** with the path on and off at d=65536
+(13493/13237 MiB) and d=131072 (14071/13813 MiB). The unconfirmed explanation is
+that ggml sizes one compute buffer by peak *concurrently live* allocations, and at
+ub=2048 the FFN intermediates (~142 MB each) exceed the FA staging until it grows
+past them near 262144. Do not repeat the 512 MiB claim as fact without measuring
+at `-c 262144`.
+
+### Numerical caveat carried by this path
+
+QK^T uses `CUBLAS_COMPUTE_16F` (k=256; the tile kernel likewise keeps KQ in half).
+PV uses `CUBLAS_COMPUTE_32F` because it sums thousands of positive terms. **The
+f16-PV variant has never been tested** — fp32 was chosen from caution, not
+measurement, and it is the single biggest remaining performance lever.

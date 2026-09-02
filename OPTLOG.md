@@ -2206,3 +2206,118 @@ scratch is worth **~58,000 tokens of context**.
 Prefill only -- decode has `Q->ne[1] == 1` and takes the VEC kernel, which reads
 quantized KV directly. The conversion traffic (~22 GB/batch) is only ~1% of time;
 this is a **VRAM** problem, not a speed one.
+
+---
+
+## 90 — cuBLAS-GEMM flash attention: long context fixed (KEPT, default-on pre-Volta)
+
+Attempt 89 showed the tile kernel cannot be tuned out of 18.6% of peak. This
+replaces it at long context instead. Commits `bdcb3f7bf`, `98de4588f`.
+
+### The path
+
+Keeps flash attention's structure (online softmax over KV chunks), issues the two
+matmuls as cuBLAS GEMMs:
+
+    S = K^T Q      strided-batched over the GQA group, f16 compute
+    softmax        mask, running max/sum, P in f16, rescale factor for O
+    O += V P       f32 compute
+
+S is computed **transposed** (`[n_kv_chunk x n_tokens]`, column-major) so one
+query's scores are contiguous -- that makes the softmax kernel coalesced and turns
+PV into a plain `V*P` with no transpose. P aliases S (same index, read-then-write
+per thread, first-pass loads fenced by the reduction's `__syncthreads`).
+
+Gated to `Q->ne[1] >= 128 && K->ne[1] >= 4096`, mask required, no ALiBi/softcap/
+sinks, `cc < VOLTA`. On by default; `GGML_CUDA_FA_GEMM=0` restores upstream.
+
+### Results (equal thermal state, path off vs on)
+
+| depth | tile | GEMM | delta |
+|---|---|---|---|
+| d=0 | 427.05 +/- 0.44 | 425.19 +/- 2.19 | **within noise -- gate works** |
+| d=65536 | 158.43 | **188.99** | **+19.3%** |
+| d=131072 | 111.22 | **131.08** | **+17.9%** |
+
+Earlier same-day pair at d=65536 read 183.27 vs 200.60 (+9.5%); run-to-run
+variance at depth is large, so call it **+10-19%**.
+
+### Numerics
+
+- `test-backend-ops -o FLASH_ATTN_EXT`: **3949/3949**
+- CLAUDE.md gate (c=4096, ppl-orig.txt): **2.6219 +/- 0.01996**, inside the band
+- long-context A/B at c=16384 with **q4_0 KV** -- the only test that exercises the
+  per-chunk dequant: tile 2.6035 +/- 0.02713 vs GEMM 2.6047 +/- 0.02719, **0.04 sigma**
+
+### Two bugs, both of which produced plausible wrong answers rather than crashes
+
+1. **alpha/beta must match the cuBLAS COMPUTE type, not the data type.** Passing
+   `half*` with `COMPUTE_32F` reinterprets 1.0h (0x3C00) as float 2.15e-41, i.e.
+   zero -- S becomes uniform and attention degenerates into a plain average of V.
+   It still normalizes and stays in range, so it looks healthy. ERR was 0.056 at
+   kv=4096 and 0.326 at kv=16384.
+2. **The first working version was 16% SLOWER than the tile kernel** (154.57 vs
+   183.27). Unfusing attention pays score-matrix traffic that a fused kernel never
+   does: at ub=2048, S is 100 MB per chunk and was touched four times (GEMM writes,
+   softmax reads twice, writes P, PV reads P) = ~400 MB/chunk, ~410 GB/batch.
+   f16 scores + removing a per-head-group `cudaStreamSynchronize` recovered it.
+   **I costed this only after writing the code; it should have been costed first.**
+
+Then the profile showed the QK^T GEMM running `maxwell_fp16_sgemm` at 6.2 TFLOPS
+because it was still `COMPUTE_32F`; only PV needs fp32 (it sums thousands of
+positive terms, QK^T sums k=256). Switching QK^T to `COMPUTE_16F`: 187.97 -> 200.60.
+
+### The 512 MiB staging: request removed, saving NOT demonstrated
+
+`get_alloc_size` no longer reserves the whole-cache f16 staging on this path (it
+gates on exactly the same predicate as the dispatch -- if those ever disagree the
+kernel writes past the allocation). But **peak VRAM measured identical with the
+path on and off at both d=65536 (13493/13237 MiB) and d=131072 (14071/13813)**.
+
+Hypothesis, unconfirmed: ggml sizes one compute buffer by the peak of concurrently
+*live* allocations, and at ub=2048 the FFN intermediates (17408 x 2048 x 4 = 142 MB
+each) exceed the FA staging until the staging passes them -- which would only
+happen near 262144, where it is 512 MiB. Verification at -c 262144 failed on
+tooling, not on results (llama-perplexity aborts because ppl-orig.txt is only
+123310 tokens; a llama-cli attempt used an invalid flag). **Treat the VRAM saving
+as unproven.** Per-chunk scratch is ~70 MB after the P/S aliasing, and it is
+*constant* in context length while the staging is proportional -- that is the
+whole argument, and it is still just an argument.
+
+### Ceiling arithmetic for long context (this is what caps the target)
+
+Per GPU per 2048-token batch, attention is
+`12 heads x 2048 queries x n_kv x 256 dim x 2 (QK,PV) x 16 layers`:
+
+| depth | attention TFLOP | floor at 19.05 TFLOPS | + 4.6 s non-attention | ceiling t/s |
+|---|---|---|---|---|
+| 65536 | 26.4 | 1.39 s | 6.0 s | ~342 |
+| 131072 | 52.8 | 2.77 s | 7.4 s | ~277 |
+| **262144** | **105.6** | **5.54 s** | **10.14 s** | **~202** |
+
+Non-attention (~4.6 s) is context-independent and already near its own ceiling
+(GEMM at 82% of peak). **So >202 t/s at 262144 is not reachable on this hardware**,
+and prefill necessarily degrades with depth -- it starts at ~434 empty.
+
+Attention is currently at ~22-25% of peak on this path. Mapping efficiency to the
+262144 number:
+
+| attention efficiency | t/s at 262144 |
+|---|---|
+| 25% (now, extrapolated) | ~77 |
+| 50% | ~130 |
+| 65% | ~155 |
+| **70% (the 175 t/s target)** | **~165-175** |
+| 80% | ~178 |
+
+### Next, in order (none started)
+
+1. **PV GEMM in f16.** It is ~70% of attention compute and runs `COMPUTE_32F` at
+   6.5 TFLOPS vs 13.1 in f16. Untested against the perplexity gate -- fp32 was
+   chosen out of caution, not measurement. Biggest single lever.
+2. **Single-pass softmax** -- removes one full read of S.
+3. **Larger chunks** -- QK^T is 12.29 TFLOPS at chunk 2048 vs 14.87 at 16384;
+   chunk was sized for scratch, and P/S aliasing has freed room.
+4. **Measure at 262144** rather than extrapolating -- throughput, VRAM, and decode.
+5. **Decode at depth is unmeasured.** Decode takes the VEC kernel (`Q->ne[1] == 1`),
+   which this path does not touch, so it is not covered by any number here.

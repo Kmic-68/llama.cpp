@@ -1,9 +1,34 @@
-# Resume point — prefill 442.6 t/s, decode 32.1 t/s, MTP 54.5 t/s
+# Resume point — long context is the live problem; short context is done
 
 All work is committed. Tree is clean apart from your own `CLAUDE.md` edit and
 untracked `ppl.txt` / `p100-handoff/`.
 
-## Where things stand
+## READ THIS FIRST: prefill is a curve, and the target is 175 t/s at 262144
+
+Every number in this file below this section is measured at **2048 tokens of
+context**, where flash attention is 2.1% of prefill. **That is not the regime this
+model is used in.** The user runs 262144. Prefill degrades with depth because
+attention work is O(batch x depth) -- this is physics, not a defect:
+
+| depth | before (tile kernel) | now (GEMM path) |
+|---|---|---|
+| 0 | 434 / 427 hot | 425 (unchanged -- path is gated off below KV 4096) |
+| 32768 | 278 | not re-measured |
+| 65536 | 158.43 | **188.99** (+19.3%) |
+| 131072 | 111.22 | **131.08** (+17.9%) |
+| 262144 | ~61 (extrapolated) | **~77 (extrapolated, NEVER MEASURED)** |
+
+**Hard ceiling at 262144 is ~202 t/s** -- attention there is 105.6 TFLOP per GPU
+per 2048-token batch, which is 5.54 s even at this card's full 19.05 TFLOPS, plus
+~4.6 s of context-independent work. See OPTLOG attempt 90 for the table.
+
+**Current target: 175 t/s at 262144**, which needs attention at ~70% of peak; it
+is at ~22-25% now. Route is OPTLOG attempt 90's "Next, in order" list, starting
+with the PV GEMM in f16 (~70% of attention compute, currently fp32 at 6.5 TFLOPS
+against 13.1 available). Also open: **decode at 262144 has never been measured**,
+and it takes the VEC kernel, which the new path does not touch.
+
+## Where things stand at SHORT context (2048)
 
 | metric | start of session | now |
 |---|---|---|
@@ -30,6 +55,18 @@ Six code commits (+ eleven docs/log commits), `5d1fafb01..f85e154ed`:
 | `f8edbf816` | cuBLAS ALGO3 for wide f16 GEMMs | +1.8% pp |
 | `e83a7913a` | **f16 all-reduce** + pipelined delta-net reduction | +3.2% pp |
 | `ed42ad15d` | delta-net addressing walked, not recomputed | below noise here* |
+
+Later session (long context), `9183630c8..98de4588f`:
+
+| commit | what | gain |
+|---|---|---|
+| `bdcb3f7bf` | **cuBLAS-GEMM flash attention for pre-Volta** | **+17.9% @ d=131072, +19.3% @ d=65536**, 0 at short context |
+| `98de4588f` | alias P onto S in that path | -50 MB scratch |
+
+`bdcb3f7bf` adds `ggml/src/ggml-cuda/fattn-gemm.{cu,cuh}` and touches
+`fattn.cu` (dispatch + `get_alloc_size`). On by default for `cc < VOLTA`;
+`GGML_CUDA_FA_GEMM=0` restores upstream behaviour. Gated to KV >= 4096 so short
+context is provably unaffected (425.19 on vs 427.05 off, within noise).
 
 \* -29% on the kernel at head_count=4, -1.1% at head_count=32; this model runs
 in the regime where it hides behind warp parallelism. Kept because it is
@@ -104,10 +141,11 @@ are gated delta net with constant state. So flash-attn is the **only** cost on
 this model that scales with context length — everything else in that profile is
 context-independent. At 2048 it is 2.1% and not worth touching; at 262k it should
 dominate, and the 2.1% figure is actively misleading if quoted at long context.
-**This build has never been profiled at long context. That is the top open
-measurement** -- `llama-bench -d <depth>` sweeping depth 0 / 32k / 131k / 262k,
-which also answers whether 262k even fits alongside the ~22 GB of weights
-(KV at 262k is roughly 4.8 GB: 16 layers, head_count_kv 4, k/v length 256, q4_0).
+**DONE -- see OPTLOG attempts 89 and 90 and the section at the top of this file.**
+Profiled at d=65536: flash_attn_tile was 37.1% of GPU time, one call doing
+1.65 TFLOP in 465 ms = **3.55 TFLOPS, 18.6% of the 19.05 peak**, beside a cuBLAS
+GEMM doing 15.7. Fixed by replacing the path (attempt 90), not by tuning it
+(attempt 89: 15 configs, stock wins all).
 
 Ranked by what is actually still available (all context-independent, so the
 above outranks them at 262k):
