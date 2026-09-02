@@ -2446,6 +2446,17 @@ Note this makes the op-level harness *unrepresentative for launch cost*: it runs
 one GPU with no contention. A chunk sweep there is flat (below), but that does
 not settle it in production -- to be tested end-to-end.
 
+**Correction, on arithmetic done after writing the above:** launch issue is not
+big enough to be the main term. 49,536 launches per batch across both devices at
+~10-20 us of host issue is 0.5-1.0 s, not 4 s. A second measurable term is the
+**KQ mask upload**: 264192 x 2048 x 2 B = 1.08 GB per GPU per batch, re-sent
+every batch, and the profile's HtoD rate is 2.47 GB/s -> ~0.9 s for both GPUs at
+d=262144 (0.22 s at d=65536, matching the depth scaling). Almost all of that
+upload is unchanged between batches -- only the newest 2048 columns differ -- but
+it is a graph input and is re-sent whole. Together these cover perhaps half the
+residual; the rest is still unattributed, and the end-to-end chunk sweep that
+would separate them was not run.
+
 ---
 
 ## 94 — chunk size sweep (op level): no change, chunk stays 2048
