@@ -253,8 +253,12 @@ void ggml_cuda_flash_attn_ext_gemm(ggml_backend_cuda_context & ctx, ggml_tensor 
     ggml_cuda_pool_alloc<half>  Qf16(pool, D*nt*gqa);
     ggml_cuda_pool_alloc<half>  Kf16(pool, D*chunk);
     ggml_cuda_pool_alloc<half>  Vf16(pool, DV*chunk);
+    // P aliases S: in the second pass each thread reads S[j] then writes P[j] at the same
+    // index, and every first-pass load is fenced by the reduction's __syncthreads, so one
+    // buffer serves both. Worth 50 MB at ub=2048, which lowers the context length at which
+    // this path's fixed scratch undercuts the tile path's context-proportional staging.
     ggml_cuda_pool_alloc<half>  S(pool, chunk*nt*gqa);
-    ggml_cuda_pool_alloc<half>  P(pool, chunk*nt*gqa);
+    half * const P_ptr = S.ptr;
     ggml_cuda_pool_alloc<float> O(pool, DV*nt*gqa);
     ggml_cuda_pool_alloc<float> m_state(pool, nt*gqa);
     ggml_cuda_pool_alloc<float> l_state(pool, nt*gqa);
@@ -349,7 +353,7 @@ void ggml_cuda_flash_attn_ext_gemm(ggml_backend_cuda_context & ctx, ggml_tensor 
                 {
                     dim3 grid(nt, gqa, 1);
                     fattn_gemm_softmax<256><<<grid, 256, 0, stream>>>(
-                        S.ptr, mask ? (const half *) mask->data : nullptr, P.ptr,
+                        S.ptr, mask ? (const half *) mask->data : nullptr, P_ptr,
                         m_state.ptr, l_state.ptr, corr.ptr,
                         scale, nkv_c, c, nt,
                         mask ? mask->nb[1]/sizeof(half) : 0,
@@ -372,7 +376,7 @@ void ggml_cuda_flash_attn_ext_gemm(ggml_backend_cuda_context & ctx, ggml_tensor 
                         DV, nt, nkv_c,
                         &alpha,
                         Vmat, CUDA_R_16F, ldV, 0,
-                        P.ptr,    CUDA_R_16F, nkv_c, nkv_c*nt,
+                        P_ptr,    CUDA_R_16F, nkv_c, nkv_c*nt,
                         &beta,
                         O.ptr,    CUDA_R_32F, DV, DV*nt,
                         gqa, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
