@@ -3,30 +3,79 @@
 All work is committed. Tree is clean apart from your own `CLAUDE.md` edit and
 untracked `ppl.txt` / `p100-handoff/`.
 
-## READ THIS FIRST: prefill is a curve, and the target is 175 t/s at 262144
+## READ THIS FIRST: long context is measured now, and 175 t/s is not reachable
 
-Every number in this file below this section is measured at **2048 tokens of
-context**, where flash attention is 2.1% of prefill. **That is not the regime this
-model is used in.** The user runs 262144. Prefill degrades with depth because
-attention work is O(batch x depth) -- this is physics, not a defect:
+Every number further down this file is measured at **2048 tokens of context**,
+where flash attention is 2.1% of prefill. **That is not the regime this model is
+used in.** The user runs 262144.
 
-| depth | before (tile kernel) | now (GEMM path) |
+**Prefill, all measured (no extrapolation):**
+
+| depth | tile kernel | GEMM path, session 4 end |
 |---|---|---|
-| 0 | 434 / 427 hot | 425 (unchanged -- path is gated off below KV 4096) |
-| 32768 | 278 | not re-measured |
-| 65536 | 158.43 | **188.99** (+19.3%) |
-| 131072 | 111.22 | **131.08** (+17.9%) |
-| 262144 | ~61 (extrapolated) | **~77 (extrapolated, NEVER MEASURED)** |
+| 0 | 427 hot | 425 (unchanged -- gated off below KV 4096) |
+| 65536 | 158.43 | **220.60** |
+| 131072 | 111.22 | **150.66** |
+| **262144** | not measured | **95.14** |
 
-**Hard ceiling at 262144 is ~202 t/s** -- attention there is 105.6 TFLOP per GPU
-per 2048-token batch, which is 5.54 s even at this card's full 19.05 TFLOPS, plus
-~4.6 s of context-independent work. See OPTLOG attempt 90 for the table.
+At 262144 the session went **75.44 -> 95.14 t/s, +26.1%**, via the PV GEMM in f16
+(attempt 91) and merging the gqa-batched GEMMs into single calls (attempt 94).
 
-**Current target: 175 t/s at 262144**, which needs attention at ~70% of peak; it
-is at ~22-25% now. Route is OPTLOG attempt 90's "Next, in order" list, starting
-with the PV GEMM in f16 (~70% of attention compute, currently fp32 at 6.5 TFLOPS
-against 13.1 available). Also open: **decode at 262144 has never been measured**,
-and it takes the VEC kernel, which the new path does not touch.
+**Decode, measured for the first time (tg128, r=2):**
+
+| depth | t/s |
+|---|---|
+| 0 | 31.51 +/- 0.23 |
+| 65536 | 15.55 +/- 1.35 |
+| 262144 | **7.32 +/- 0.56** |
+
+Decode is untouched by any of this work -- the GEMM path is gated at
+`Q->ne[1] >= 128` and decode takes the VEC kernel.
+
+### 175 t/s at 262144 is not reachable on this hardware
+
+Measured terms: context-independent work is **4.94 s/batch** (linear-fit
+intercept, confirmed by the profile's constant kernels at 5.4 s and by the d=0
+batch time of 4.72 s); attention at 262144 is **105.6 TFLOP per GPU per batch**.
+
+175 t/s means the batch in 11.70 s, leaving 6.76 s for attention =
+**15.6 TFLOPS sustained**, including softmax, mask traffic and per-chunk dequant.
+The fastest pure cuBLAS hgemm anywhere in this model (FFN, k=5120, no softmax) is
+**15.7 TFLOPS**. Attention is at 10.46 now. Realistic ceiling **~150**; likely
+landing zone **110-130**.
+
+### The two biggest remaining wins, both unattempted
+
+1. **Decode GQA redundancy (worth ~+57% decode at 262144).** The vec kernel reads
+   the KV cache once per Q head, re-reading each KV head gqa=6 times: 906 MB per
+   op instead of 151 MB. Measured 4.15 ms/layer at kv=262144 = 66.5 ms of the
+   136 ms token time. Both cheap explanations were tested and rejected (forcing
+   any parallel_blocks is worse; forcing TILE is 6036 us vs 4153). Needs a
+   GQA-aware decode kernel. See OPTLOG attempt 95.
+2. **The ~4 s prefill residual at 262144** (18% of the batch). Not host-side
+   (phase timers: 35 ms/batch), not throttling (-6%), not in any profiled kernel.
+   Partly the KQ mask upload (1.08 GB per GPU per batch, ~0.9 s) and host launch
+   issue (~0.5-1.0 s, CUDA graphs are unavailable on Pascal). Remainder
+   unattributed.
+
+### Measure with the op harness, not llama-bench
+
+`llama-bench -d 262144` spends ~30 minutes rebuilding context to time one
+27-second batch. `test-backend-ops perf -o FLASH_ATTN_EXT -b CUDA0` now carries
+the exact per-GPU production shape at kv 32768/65536/131072/262144, for both
+nb=2048 (prefill) and nb=1 (decode). **Seconds per data point.** A prefill batch
+is 16 of the nb=2048 op; `t/s = 2048 / (16*t_op + 4.94)`.
+
+Caveat: the harness runs one GPU with no host contention, so it cannot see launch
+issue or PtoP. Chunk-size results from it did not need end-to-end confirmation
+(all variants were flat or worse), but a change that trades launches for work does.
+
+### The perplexity gate corpus is p100-handoff/ppl-orig.txt, NOT ./ppl.txt
+
+CLAUDE.md says `-f ./ppl.txt` and requires 2.6209 +/- 0.0199. The `ppl.txt` in the
+tree gives **2.7570 on stock upstream** -- the documented number is unreachable on
+that file for any build, including unmodified llama.cpp. `ppl-orig.txt` reproduces
+2.6214. Use it, or every gate run looks like a failure.
 
 ## Where things stand at SHORT context (2048)
 
