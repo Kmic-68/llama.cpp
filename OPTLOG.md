@@ -2808,3 +2808,75 @@ worst case, so a fallback that can still materialise the mask saves no VRAM.
 Any implementation therefore has to decide at context creation (n_seq_max == 1,
 causal, no SWA) and then **verify per batch with a hard failure**, not a silent
 fallback. That is the shape of the work; it was not started.
+
+---
+
+## 99 — decode at depth: the measurement, the budget, and the ceiling
+
+Taken before attacking the vec kernel, so the payoff is predicted rather than
+discovered afterwards.
+
+### The op, at the production decode shape
+
+`test-backend-ops perf -o FLASH_ATTN_EXT -b CUDA0`, the case added last session
+(D 256, 2 KV heads, GQA 6, q4_0 K and V, nb=1) -- one layer, one token, one GPU:
+
+| kv | us/op | ratio to previous |
+|---|---|---|
+| 32768 | 524.78 | -- |
+| 65536 | 1027.83 | 1.96 |
+| 131072 | 2083.30 | 2.03 |
+| 262144 | 4267.27 | 2.05 |
+
+Exactly linear in kv, so this is KV traffic and nothing else.
+
+### The 6x is confirmed by the bandwidth, not just by reading the code
+
+The cache actually needed is `2 heads x 256 dim x kv x 0.5625 B/value` for each of
+K and V = **151 MB** at kv=262144. Against 4.267 ms that is **35 GB/s**, which this
+card never does. At gqa=6 redundancy it is 906 MB = **212 GB/s**, which is squarely
+what it does achieve. The kernel is not slow; it is reading six times what it needs,
+once per Q head.
+
+### Decode time budget, end to end
+
+| depth | t/s | ms/token |
+|---|---|---|
+| 0 | 30.71 +/- 0.15 (warm; 32.1 best) | ~32 |
+| 76662 | 15.0 | 66.7 |
+| 262144 | 7.32 | 136.6 |
+
+Linear fit: **ms/token = 37.8 + 3.77e-4 * kv**.
+
+The harness slope is `16 layers * 16.28 ns/kv` = **2.61e-4 ms/kv**, so pure flash
+attention is **69% of everything that scales with context**. At 262144:
+
+| term | ms/token | share |
+|---|---|---|
+| context-independent | 37.8 | 28% |
+| flash attention (op) | 68.3 | 50% |
+| other kv-scaling (mask build/upload, launch, P2P contention) | ~30.5 | 22% |
+
+The 1.45x between the in-model attention slope and the harness slope is expected:
+the harness runs one GPU with no host contention (see attempt 96's caveat).
+
+### What the GQA fix is worth, and what it is not
+
+At 6x less traffic the op should land near 0.71 ms ideal, ~1.2 ms realistically
+(less parallelism to hide latency). Holding the other terms fixed:
+
+| depth | now | predicted | with MTP (x1.51 measured) |
+|---|---|---|---|
+| 76662 | 15.0 | **~19** | ~29 |
+| 262144 | 7.32 | **~11.4** | ~17 |
+
++56% at 262144, which independently reproduces the +57% estimated in attempt 95.
+
+**Ceilings, so we know when to stop.** With attention free entirely, 262144 decode
+is still `37.8 + 30.5 = 68.3` ms = **14.6 t/s**. With the kv-scaling overhead gone
+too it is 37.8 ms = **26.4 t/s**. So the GQA fix is worth roughly 60% of the
+available headroom, and the next item after it is that ~30 ms/token of mask and
+launch overhead -- the same KQ mask that also costs 1024 MiB of VRAM per GPU.
+
+MTP multiplies whatever decode does by ~1.51x at depth (22.60 vs 15.0 t/s measured
+at 76.7k, 80.9% accept), so it cannot substitute for fixing decode.
