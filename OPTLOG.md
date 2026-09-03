@@ -2652,3 +2652,91 @@ require the effect to exceed ~4%.** A single before/after pair at either level
 cannot resolve less than that. The only deltas in this session large enough to be
 safe on a single pair are PV-in-f16 (+21.7% end-to-end at 262144) and the
 session total (75.44 -> 95.14, +26.1%).
+
+---
+
+## 97 — MTP at 262144 with ub=2048: the draft context was reserving the target's ubatch (KEPT)
+
+### The problem, as posed
+
+The goal is all three at once: full 262144 context, prefill fast enough to stay near
+442 t/s at short context (which requires `-ub 2048` -- see the ubatch sweep), and MTP.
+That combination **did not run**: it aborts during startup with
+
+    ggml_backend_cuda_buffer_type_alloc_buffer: allocating 1296.06 MiB on device 0:
+    cudaMalloc failed: out of memory
+
+### Where the VRAM goes (measured, per GPU, `-c 262144 -b 2048 -ub 2048`, MTP n-max 4)
+
+| buffer | MiB | scales with |
+|---|---|---|
+| model | 10215 | fixed (+187 vs non-MTP, the nextn block) |
+| target KV, q4_0 | 2304 | context |
+| recurrent state | 374 | **draft lanes** (4 rs_seq; 75 MiB at 1) |
+| target compute | 1512 | ubatch x n_kv (~1074 of it is the KQ mask) |
+| draft KV, f16 | 512 | context |
+| **draft compute** | **1296** | **ubatch x n_kv -- its own copy of the mask** |
+
+Total wanted 16213 MiB against ~15.6 GB usable (16276 on the card, less Sunshine's
+392 on GPU0). **Short by ~600 MiB.**
+
+The recurrent state is the term the user noticed: it is `n_max` x 75 MiB, so lanes do
+cost VRAM directly. But it is not what breaks the build -- the draft's *compute buffer*
+is, and that one is not intrinsic at all.
+
+### The cause
+
+`common_base_params_to_speculative` copies the target's `common_params` wholesale, so
+the draft context inherits `n_ubatch = 2048`. Its compute buffer is then reserved for a
+2048-wide ubatch against the full 262144-cell cache, and at that shape the KQ mask alone
+is `262144 * 2048 * 2 = 1074 MiB`. The draft is **one layer**, and both draft prefill
+loops already chunk by `llama_n_ubatch(ctx_dft)` (`speculative.cpp:1103`, `:625`) -- a
+narrower draft ubatch just means more iterations of a single-layer graph. The wide
+ubatch buys prefill throughput on the *target*; the draft was paying for it for nothing.
+
+### The change
+
+New `--spec-draft-ubatch-size` / `-ubd` (default 0 = inherit, so nothing changes unless
+asked), applied in `common_base_params_to_speculative` where every caller -- server and
+`common.cpp:1304` -- already routes.
+
+### Results
+
+`-ubd 256`, per GPU: draft compute **1296 -> 162 MiB**, saving **1134 MiB**. The full
+config now runs.
+
+Speed cost at short context, alternating A/B/A/B from the same thermal state, MTP
+n-max 4 / p-min 0.2, 260 tokens greedy:
+
+| config | t/s | t/s |
+|---|---|---|
+| baseline | 52.256 | 52.145 |
+| `-ubd 256` | 52.121 | 52.140 |
+| `-ctkd/-ctvd q4_0` | 50.965 | 51.012 |
+
+`-ubd` is **free** (within noise, and every run produced 197 accepts of 252 drafted --
+byte-identical output). Quantizing the draft KV cache also works and saves a further
+368 MiB (512 -> 144), but it costs **2.2%**, so it is a margin lever to reach for only
+if needed, not a default.
+
+### Where that leaves the budget
+
+With `-ubd 256` alone at 262144 + ub 2048 + MTP, peak measured with nvidia-smi:
+
+| GPU | peak | free |
+|---|---|---|
+| 0 | 15977 MiB | ~300 (Sunshine holds 392 here) |
+| 1 | 15585 MiB | ~690 |
+
+It fits, but ~300 MiB on GPU0 is not comfortable margin. The next lever is the
+**target's** 1074 MiB KQ mask, which is also uploaded from a 1104 MiB pinned host buffer
+every batch -- device VRAM, host RAM and prefill time in one item. See the next attempt.
+
+Unrelated but worth recording: the `backend offload failed for seq_id=0; using CPU
+sampler` warning at MTP startup is **pre-existing** and appears in every run including
+the baseline. It is the `SPLIT_MODE_TENSOR` backend-sampling limitation from attempt 88,
+not a fault of this change.
+
+Also: the server's context checkpoints (`created context checkpoint N of 32, size =
+149.626 MiB`) are host-side `std::vector<uint8_t>` state copies, not VRAM. At the default
+32 they are ~4.8 GB of **host** RAM at this context length; `-ctxcp` tunes them.

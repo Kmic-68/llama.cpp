@@ -340,6 +340,8 @@ struct common_params_speculative_draft {
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
 
+    int32_t n_ubatch = 0; // physical batch size for the draft context (0 - inherit the target's)
+
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;
 

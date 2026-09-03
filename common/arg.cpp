@@ -4039,6 +4039,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--spec-draft-ubatch-size", "-ubd", "--ubatch-size-draft"}, "N",
+        string_format(
+            "physical batch size for the draft context (default: %d, 0 = same as the target)\n"
+            "at long context the draft's compute buffer is dominated by its KQ mask\n"
+            "(n_kv x n_ubatch x 2 bytes), so a narrow draft ubatch frees VRAM without\n"
+            "affecting target prefill throughput",
+            params.speculative.draft.n_ubatch
+        ),
+        [](common_params & params, int value) {
+            params.speculative.draft.n_ubatch = value;
+        }
+    ).set_env("LLAMA_ARG_SPEC_DRAFT_UBATCH_SIZE").set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
         {"--spec-draft-type-k", "-ctkd", "--cache-type-k-draft"}, "TYPE",
         string_format(
             "KV cache data type for K for the draft model\n"
