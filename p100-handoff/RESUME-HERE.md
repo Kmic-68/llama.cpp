@@ -18,7 +18,7 @@ Before this session that combination did not start at all — it aborted with
 
 **`-ubd 256` is the new flag and the whole fix** (commit `0d1ea109c`). The MTP
 draft context was inheriting the target's `n_ubatch = 2048` and reserving its own
-1296 MiB compute buffer, ~1074 MiB of which was a *second copy of the KQ mask*
+1296 MiB compute buffer, ~1024 MiB of which was a *second copy of the KQ mask*
 (262144 x 2048 x f16) — for a draft that is one layer and whose prefill loops
 already chunk by `llama_n_ubatch(ctx_dft)`. `-ubd 256` cuts it to 162 MiB/GPU.
 Default is 0 = inherit, so nothing changes for anyone who does not pass it.

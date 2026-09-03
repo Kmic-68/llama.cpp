@@ -2673,7 +2673,7 @@ That combination **did not run**: it aborts during startup with
 | model | 10215 | fixed (+187 vs non-MTP, the nextn block) |
 | target KV, q4_0 | 2304 | context |
 | recurrent state | 374 | **draft lanes** (4 rs_seq; 75 MiB at 1) |
-| target compute | 1512 | ubatch x n_kv (~1074 of it is the KQ mask) |
+| target compute | 1512 | ubatch x n_kv (1024 of it is the KQ mask) |
 | draft KV, f16 | 512 | context |
 | **draft compute** | **1296** | **ubatch x n_kv -- its own copy of the mask** |
 
@@ -2689,7 +2689,7 @@ is, and that one is not intrinsic at all.
 `common_base_params_to_speculative` copies the target's `common_params` wholesale, so
 the draft context inherits `n_ubatch = 2048`. Its compute buffer is then reserved for a
 2048-wide ubatch against the full 262144-cell cache, and at that shape the KQ mask alone
-is `262144 * 2048 * 2 = 1074 MiB`. The draft is **one layer**, and both draft prefill
+is `262144 * 2048 * 2 = 1024 MiB`. The draft is **one layer**, and both draft prefill
 loops already chunk by `llama_n_ubatch(ctx_dft)` (`speculative.cpp:1103`, `:625`) -- a
 narrower draft ubatch just means more iterations of a single-layer graph. The wide
 ubatch buys prefill throughput on the *target*; the draft was paying for it for nothing.
@@ -2729,7 +2729,7 @@ With `-ubd 256` alone at 262144 + ub 2048 + MTP, peak measured with nvidia-smi:
 | 1 | 15585 MiB | ~690 |
 
 It fits, but ~300 MiB on GPU0 is not comfortable margin. The next lever is the
-**target's** 1074 MiB KQ mask, which is also uploaded from a 1104 MiB pinned host buffer
+**target's** 1024 MiB KQ mask, which is also uploaded from a 1104 MiB pinned host buffer
 every batch -- device VRAM, host RAM and prefill time in one item. See the next attempt.
 
 Unrelated but worth recording: the `backend offload failed for seq_id=0; using CPU
@@ -2791,7 +2791,7 @@ here. Do not re-litigate.
 
 ### The durable fix is the target's KQ mask
 
-Per GPU: **1074 MiB of device VRAM** (262144 x 2048 x f16, inside the 1512 MiB
+Per GPU: **1024 MiB of device VRAM** (262144 x 2048 x f16, inside the 1512 MiB
 compute buffer) plus a **1104 MiB pinned host buffer** it is uploaded from every
 batch. That single item is device VRAM, host RAM and prefill time at once, and it
 is ~4x the margin problem.

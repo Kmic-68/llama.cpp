@@ -2341,7 +2341,7 @@ common_params common_base_params_to_speculative(const common_params & params) {
     result.cache_type_v  = params_spec.cache_type_v;
 
     // The draft context reserves a compute buffer of its own, and at long context that buffer is
-    // dominated by the KQ mask: n_kv * n_ubatch * sizeof(f16) is 1074 MiB at 262144 x 2048. The
+    // dominated by the KQ mask: n_kv * n_ubatch * sizeof(f16) is 1024 MiB at 262144 x 2048. The
     // target needs a wide ubatch because that is what buys prefill throughput, but the draft is a
     // single layer that just loops over more chunks, so it can be capped independently.
     if (params_spec.n_ubatch > 0) {
