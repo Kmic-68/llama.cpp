@@ -1,0 +1,157 @@
+diff --git a/ggml/src/ggml-cuda/fattn-gemm.cu b/ggml/src/ggml-cuda/fattn-gemm.cu
+index c08768048..7375f6b37 100644
+--- a/ggml/src/ggml-cuda/fattn-gemm.cu
++++ b/ggml/src/ggml-cuda/fattn-gemm.cu
+@@ -15,9 +15,8 @@
+ //       m_new = max(m, rowmax(S+mask))
+ //       corr  = exp(m - m_new);  P = exp(S + mask - m_new)
+ //       l     = l*corr + rowsum(P)
+-//       O     = O*corr                 (rescale kernel)
+-//       O    += V P                    (GEMM, f32 accumulate -- summing ~chunk positive
+-//                                       terms in f16 carries several % error)
++//       Otmp  = V P                    (GEMM, f16 accumulate over one chunk)
++//       O     = O*corr + Otmp          (fused rescale + f32 accumulate across chunks)
+ //   dst = O / l
+ //
+ // S is computed TRANSPOSED ([n_kv_chunk x n_tokens], column-major) so that one query's
+@@ -132,19 +131,29 @@ static __global__ void fattn_gemm_fill(float * __restrict__ p, const float v, co
+     }
+ }
+ 
+-// O *= corr, applied between the softmax update and the accumulating PV GEMM.
+-static __global__ void fattn_gemm_rescale_O(
+-        float * __restrict__ O, const float * __restrict__ corr,
++// O = O*corr + Otmp, applied after the PV GEMM.
++//
++// The PV GEMM runs f16-accumulate (2:1 rate on Pascal) into a per-chunk f16 partial Otmp,
++// and this kernel folds it into the f32 running output. So f16 summation spans only one
++// chunk (k <= chunk) while accumulation ACROSS chunks stays f32 -- strictly better than
++// upstream's tile kernel, which keeps VKQ in half2 over the whole cache
++// (fattn-tile.cuh, FAST_FP16_AVAILABLE).
++//
++// Fusing the rescale into the accumulate is also cheaper than the rescale-only kernel it
++// replaces: that one read+wrote O and then the beta=1 GEMM read+wrote O again (50 MB per
++// chunk at nt=2048, gqa=6); this reads O+Otmp and writes O once (38 MB).
++static __global__ void fattn_gemm_accum_O(
++        float * __restrict__ O, const half * __restrict__ Otmp,
++        const float * __restrict__ corr,
+         const int DV, const int nt) {
+     const int t = blockIdx.x;
+     const int h = blockIdx.y;
+     const float c = corr[h*nt + t];
+-    if (c == 1.0f) {
+-        return;
+-    }
+-    float * Oh = O + ((int64_t) h*nt + t)*DV;
++    const int64_t off = ((int64_t) h*nt + t)*DV;
++    float      * Oh = O    + off;
++    const half * Th = Otmp + off;
+     for (int d = threadIdx.x; d < DV; d += blockDim.x) {
+-        Oh[d] *= c;
++        Oh[d] = Oh[d]*c + __half2float(Th[d]);
+     }
+ }
+ 
+@@ -260,6 +269,8 @@ void ggml_cuda_flash_attn_ext_gemm(ggml_backend_cuda_context & ctx, ggml_tensor
+     ggml_cuda_pool_alloc<half>  S(pool, chunk*nt*gqa);
+     half * const P_ptr = S.ptr;
+     ggml_cuda_pool_alloc<float> O(pool, DV*nt*gqa);
++    // f16 destination of the PV GEMM for one chunk; folded into O by fattn_gemm_accum_O.
++    ggml_cuda_pool_alloc<half>  Otmp(pool, DV*nt*gqa);
+     ggml_cuda_pool_alloc<float> m_state(pool, nt*gqa);
+     ggml_cuda_pool_alloc<float> l_state(pool, nt*gqa);
+     ggml_cuda_pool_alloc<float> corr(pool, nt*gqa);
+@@ -339,15 +350,15 @@ void ggml_cuda_flash_attn_ext_gemm(ggml_backend_cuda_context & ctx, ggml_tensor
+                     // attention into a uniform average of V.
+                     const half alpha = __float2half(1.0f);
+                     const half beta  = __float2half(0.0f);
+-                    CUBLAS_CHECK(cublasGemmStridedBatchedEx(
++                    CUBLAS_CHECK(cublasGemmEx(
+                         cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+-                        nkv_c, nt, D,
++                        nkv_c, nt*gqa, D,
+                         &alpha,
+-                        Kmat, CUDA_R_16F, ldK, 0,
+-                        Qf16.ptr, CUDA_R_16F, D, D*nt,
++                        Kmat, CUDA_R_16F, ldK,
++                        Qf16.ptr, CUDA_R_16F, D,
+                         &beta,
+-                        S.ptr,    CUDA_R_16F, nkv_c, nkv_c*nt,
+-                        gqa, CUBLAS_COMPUTE_16F, CUBLAS_GEMM_DEFAULT));
++                        S.ptr,    CUDA_R_16F, nkv_c,
++                        CUBLAS_COMPUTE_16F, CUBLAS_GEMM_DEFAULT));
+                 }
+ 
+                 {
+@@ -361,25 +372,33 @@ void ggml_cuda_flash_attn_ext_gemm(ggml_backend_cuda_context & ctx, ggml_tensor
+                     CUDA_CHECK(cudaGetLastError());
+                 }
+ 
++                // Otmp = V P, then O = O*corr + Otmp.
++                //
++                // f16 compute: COMPUTE_32F with f16 inputs runs 6.4-6.7 TFLOPS on Pascal
++                // against 11.0-14.6 for COMPUTE_16F, and PV is ~half of attention's flops.
++                // The f16 sum here spans one chunk; cross-chunk accumulation is f32 in
++                // fattn_gemm_accum_O. Upstream's Pascal tile kernel accumulates VKQ in
++                // half2 over the ENTIRE cache and passes the same tests, so this is the
++                // more conservative of the two.
++                // alpha/beta must match the COMPUTE type, not the data type.
+                 {
+-                    dim3 grid(nt, gqa, 1);
+-                    fattn_gemm_rescale_O<<<grid, 256, 0, stream>>>(O.ptr, corr.ptr, DV, nt);
+-                    CUDA_CHECK(cudaGetLastError());
+-                }
+-
+-                // O += V P   (f32 accumulate: summing ~chunk positive terms in f16 is unsafe)
+-                {
+-                    const float alpha = 1.0f;
+-                    const float beta  = 1.0f;
+-                    CUBLAS_CHECK(cublasGemmStridedBatchedEx(
++                    const half alpha = __float2half(1.0f);
++                    const half beta  = __float2half(0.0f);
++                    CUBLAS_CHECK(cublasGemmEx(
+                         cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+-                        DV, nt, nkv_c,
++                        DV, nt*gqa, nkv_c,
+                         &alpha,
+-                        Vmat, CUDA_R_16F, ldV, 0,
+-                        P_ptr,    CUDA_R_16F, nkv_c, nkv_c*nt,
++                        Vmat, CUDA_R_16F, ldV,
++                        P_ptr,    CUDA_R_16F, nkv_c,
+                         &beta,
+-                        O.ptr,    CUDA_R_32F, DV, DV*nt,
+-                        gqa, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
++                        Otmp.ptr, CUDA_R_16F, DV,
++                        CUBLAS_COMPUTE_16F, CUBLAS_GEMM_DEFAULT));
++                }
++
++                {
++                    dim3 grid(nt, gqa, 1);
++                    fattn_gemm_accum_O<<<grid, 256, 0, stream>>>(O.ptr, Otmp.ptr, corr.ptr, DV, nt);
++                    CUDA_CHECK(cudaGetLastError());
+                 }
+             }
+ 
+diff --git a/tests/test-backend-ops.cpp b/tests/test-backend-ops.cpp
+index 99014df09..cbe8e6db6 100644
+--- a/tests/test-backend-ops.cpp
++++ b/tests/test-backend-ops.cpp
+@@ -10348,6 +10348,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
+     // Qwen3-VL-8B https://github.com/ggml-org/llama.cpp/issues/17012
+     test_cases.emplace_back(new test_flash_attn_ext(72, 72, 16, {1, 1}, 5776, 5776, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+ 
++    // Long-context prefill attention, exactly as one GPU sees it for qwen3.5-27B under
++    // -sm tensor -ctk q4_0 -ctv q4_0 -ub 2048: 2 KV heads, GQA 6 (12 Q heads), D 256.
++    // 16 of the 65 layers carry a growing KV cache (full_attention_interval 4), so a
++    // prefill batch costs 16x one of these. Benchmarking the op directly avoids the ~30
++    // minutes llama-bench spends rebuilding 262144 tokens of context to time one batch.
++    // nb=2048 is a prefill batch; nb=1 is decode, which takes the VEC kernel instead.
++    for (int kv : {32768, 65536, 131072, 262144}) {
++        for (int nb : {2048, 1}) {
++            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
++        }
++    }
++
+     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680,   1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
