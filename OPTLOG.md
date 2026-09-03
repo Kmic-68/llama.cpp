@@ -2490,3 +2490,75 @@ K and V are shared across the GQA group and Q/S/P/Otmp are contiguous across
 heads, so the strided-batched call described exactly the same memory as one GEMM
 with n = nt*gqa. Issuing one GEMM: 648017 -> 630650 us, **10.18 -> 10.46 TFLOPS**.
 3949/3949; ppl 2.6222 +/- 0.01996.
+
+---
+
+## 95 — final state at 262144, and the decode curve
+
+### Prefill (the metric)
+
+| build | pp2048 @ d262144 |
+|---|---|
+| session start (attempt 90 kernel) | 75.44 |
+| + PV in f16 (91) | 91.79 |
+| + merged GEMM (94) | **95.14** |
+
+**+26.1% at the operating depth.** Full curve on the final build:
+
+| depth | pp2048 |
+|---|---|
+| 0 | ~427 |
+| 65536 | 220.60 |
+| 131072 | 150.66 |
+| 262144 | **95.14** |
+
+### Decode (tg128, r=2)
+
+| depth | t/s | vs empty |
+|---|---|---|
+| 0 | 31.51 +/- 0.23 | - |
+| 65536 | 15.55 +/- 1.35 | -51% |
+| 262144 | **7.32 +/- 0.56** | **-77%** |
+
+Decode takes the VEC kernel (`Q->ne[1] == 1`), which the GEMM path does not
+touch -- gated at `Q->ne[1] >= 128`. So this curve is upstream behaviour and is
+unchanged by attempts 90-94, but it had never been measured.
+
+**Decode at depth is ~2x off its memory-bound floor.** Per token per GPU:
+
+| term | bytes | at d=0 | at d=262144 |
+|---|---|---|---|
+| weights | 10.4 GB | 10.4 GB | 10.4 GB |
+| KV cache (q4_0, 16 layers, 2 KV heads) | 2.4 GB | - | 2.4 GB |
+| measured time | | 31.7 ms | 136 ms |
+| **implied bandwidth** | | **328 GB/s** | **94 GB/s** |
+
+P100 HBM2 peak is 732 GB/s. Reading weights alone sustains 328; adding the KV
+cache read drops the effective rate to 94. At the 328 GB/s the same card already
+demonstrates, 12.8 GB/token would be 39 ms -> **~26 t/s**; even at a conservative
+196 GB/s it is 65 ms -> **~15 t/s**, against 7.32 measured.
+
+**This is the largest unexploited win identified in this project and it was never
+attempted.** It is a decode-side FA/KV-read problem, entirely separate from the
+prefill work above.
+
+### Why 175 t/s prefill at 262144 is not reachable on this hardware
+
+Every term below is measured, not extrapolated:
+
+- context-independent work: **4.94 s/batch** (linear-fit intercept; independently
+  confirmed by the profile's per-batch constant kernels at 5.4 s and by the d=0
+  batch time of 4.72 s)
+- attention flops at 262144, per GPU per batch: **105.6 TFLOP**
+
+175 t/s means a 2048-token batch in 2048/175 = **11.70 s**, leaving
+11.70 - 4.94 = **6.76 s** for attention, i.e. **15.6 TFLOPS sustained** including
+softmax, mask traffic, per-chunk dequant and the score matrix.
+
+The fastest pure cuBLAS hgemm anywhere in this model -- the FFN GEMM at k=5120,
+no softmax, no mask, no score traffic -- is **15.7 TFLOPS**. So 175 requires
+attention-with-softmax to run at the speed of the fastest bare matmul on the card.
+
+Current attention: 10.46 TFLOPS (55% of the 19.05 fp16 peak). Realistic ceiling
+with the residual eliminated and attention at ~13 TFLOPS is **~150 t/s**; the
+likely landing zone is **110-130**.
