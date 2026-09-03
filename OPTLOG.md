@@ -2562,3 +2562,37 @@ attention-with-softmax to run at the speed of the fastest bare matmul on the car
 Current attention: 10.46 TFLOPS (55% of the 19.05 fp16 peak). Realistic ceiling
 with the residual eliminated and attention at ~13 TFLOPS is **~150 t/s**; the
 likely landing zone is **110-130**.
+
+### Decode: two hypotheses tested and rejected
+
+Using the new nb=1 perf cases (4 ms per measurement):
+
+| experiment | kv=262144, nb=1 |
+|---|---|
+| **default (VEC)** | **4153 us** |
+| forced parallel_blocks=2 | 14876 us |
+| forced parallel_blocks=4 | 7335 us |
+| forced parallel_blocks=8 | 4938 us |
+| forced parallel_blocks=16 | 4548 us |
+| forced parallel_blocks=32 | 4847 us |
+| forced TILE kernel | 6036 us |
+
+So the KV dimension is **already** well split by `launch_fattn`'s efficiency
+search, and VEC is already the better of the two kernels. Neither is the problem.
+
+The remaining explanation is **GQA redundancy**: the vec kernel reads the KV
+cache once per Q head, so each KV head is re-read gqa=6 times. That is 906 MB per
+op rather than 151 MB, which puts the kernel at a respectable **~218 GB/s**, not
+the 36 GB/s a naive byte count suggests. The kernel is not slow; it is doing 6x
+more reads than necessary.
+
+Note the selection logic already prefers TILE over VEC when GQA applies -- but
+only for *unquantized* KV (`fattn.cu`: the `!ggml_is_quantized` branch requires
+`!gqa_opt_applies`, the quantized branch does not). For q4_0 it takes VEC
+regardless. Measured here, that choice is correct (VEC 4153 < TILE 6036); both
+leave the 6x on the table.
+
+**Fixing this needs a GQA-aware decode kernel that loads a KV head once and dots
+it against all gqa Q heads.** Estimated payoff if KV traffic drops 6x: op ~4.15
+-> ~1.2 ms, decode 136 -> ~89 ms/token, i.e. **7.32 -> ~11.5 t/s at 262144
+(+57%)**. Not attempted -- it is a new kernel, not a parameter change.
