@@ -1,7 +1,65 @@
-# Resume point — long context is the live problem; short context is done
+# Resume point — the full-context + MTP config runs; decode at depth is the problem
 
 All work is committed. Tree is clean apart from your own `CLAUDE.md` edit and
 untracked `ppl.txt` / `p100-handoff/`.
+
+## SESSION 6 FIRST: the working configuration
+
+The goal was full 262144 context **and** fast prefill **and** MTP, all at once.
+Before this session that combination did not start at all — it aborted with
+`cudaMalloc failed: out of memory` reserving 1296 MiB on device 0. It runs now.
+
+    GGML_CUDA_P2P=1 ./build-opt/bin/llama-server \
+      -m /mnt/fast/models/Qwen3.8-27B-Q6_K.gguf \
+      -ngl 99 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 \
+      -c 262144 -b 262144 -ub 2048 \
+      --spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min 0.2 \
+      -ngld 99 -ubd 256
+
+**`-ubd 256` is the new flag and the whole fix** (commit `0d1ea109c`). The MTP
+draft context was inheriting the target's `n_ubatch = 2048` and reserving its own
+1296 MiB compute buffer, ~1074 MiB of which was a *second copy of the KQ mask*
+(262144 x 2048 x f16) — for a draft that is one layer and whose prefill loops
+already chunk by `llama_n_ubatch(ctx_dft)`. `-ubd 256` cuts it to 162 MiB/GPU.
+Default is 0 = inherit, so nothing changes for anyone who does not pass it.
+
+**`-b` must exceed the prompt**, separately from `-ub`. The speculative tools
+reject a prompt larger than the *logical* batch (`the prompt exceeds the batch
+size (76662 tokens, batch 2048)`). `-ub 2048` is what sets the compute shape and
+prefill speed; `-b` is just an admission limit. This is why the command above
+carries `-b 262144 -ub 2048` rather than the `-b 2048 -ub 2048` used at short
+context.
+
+MTP is driven **by flags against the main model** — there is no separate draft
+model. `/mnt/fast/models/Qwen3.8-27B-MTP-ONLY-Q6_K.gguf` exists and is *not* used;
+the log line to look for is `creating MTP draft context against the target model`.
+
+### Measured at the operating point
+
+| metric | value |
+|---|---|
+| prefill, 0 -> 76662 | **264.75 t/s** average over the ramp (292 s) |
+| MTP decode at ~76.7k | **22.60 t/s**, 80.9% accept |
+| plain decode at ~76.7k | 15.0 t/s (so MTP is worth **1.51x** at depth) |
+| pp2048, short context | **431.8 +/- 1.0** at 48 C — unchanged, see the thermal note below |
+| perplexity gate | 2.6222 +/- 0.01996, in band |
+| peak VRAM GPU0 | 16133 MiB of 16276 — **143 MiB free** |
+| peak VRAM GPU1 | 15741 MiB — 535 MiB free |
+
+### Two things to know before touching this
+
+1. **The VRAM margin is 143 MiB on GPU0** and the asymmetry is exactly Sunshine's
+   392 MiB, which grows while actually streaming. The only working margin lever
+   today is `-ctkd q4_0 -ctvd q4_0` (the *draft's* KV cache, not the context's):
+   +368 MiB, **-2.2% decode**. Leave it off unless you need the room.
+   Asymmetric `-ts` does **not** work — see OPTLOG 98, it is quantised ~2.1 GB
+   per step and every non-equal ratio OOMs the other card.
+2. **Decode at depth is now the binding constraint**, not VRAM and not prefill.
+   32.1 t/s at d=0 -> 15.0 at 76k -> 7.32 at 262144. MTP multiplies whatever that
+   is by ~1.5x, so it cannot rescue it. The known cause is the flash-attention vec
+   kernel's **GQA redundancy** (each KV head re-read gqa=6 times, 906 MB/op instead
+   of 151 MB) — see the section below and OPTLOG 95. Still unattempted, still the
+   largest identified win in the project.
 
 ## READ THIS FIRST: long context is measured now, and 175 t/s is not reachable
 
