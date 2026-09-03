@@ -2740,3 +2740,71 @@ not a fault of this change.
 Also: the server's context checkpoints (`created context checkpoint N of 32, size =
 149.626 MiB`) are host-side `std::vector<uint8_t>` state copies, not VRAM. At the default
 32 they are ~4.8 GB of **host** RAM at this context length; `-ctxcp` tunes them.
+
+---
+
+## 98 — the full-context + fast-prefill + MTP config, measured end to end
+
+Validation of attempt 97 at the operating point, plus one dead end.
+
+### It runs, and here is what it does
+
+`-c 262144 -b 262144 -ub 2048 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0`, MTP n-max 4 /
+p-min 0.2, `-ubd 256`, 76662-token prompt (`-b` must exceed the prompt: the
+speculative tools reject a prompt larger than the *logical* batch, which is why
+`-b 2048` fails there while `-ub 2048` is what actually sets the compute shape):
+
+| metric | value |
+|---|---|
+| prefill, 0 -> 76662 | 76662 tokens in 292.464 s = **262.12 t/s** average over the ramp |
+| MTP decode at ~76.7k | **13.38 t/s**, 81.25% accept |
+| peak VRAM GPU0 | **16133 MiB of 16276 -- 143 MiB free** |
+| peak VRAM GPU1 | 15741 MiB -- 535 MiB free |
+
+Short-context prefill is unaffected, as it must be -- attempt 97 touches only the
+draft context's params: **pp2048 = 430.61 +/- 0.72** starting at 53 C, inside the
+documented thermal band (442.59 at 39 C, 438.49 at 55 C, 434.10 starting at 52 C).
+
+**143 MiB of margin on GPU0 is not enough to rely on.** The asymmetry is exactly
+Sunshine's 392 MiB, and Sunshine's footprint is not constant -- it grows while
+actually streaming. The only margin lever that works today is `-ctkd q4_0 -ctvd
+q4_0` (+368 MiB, -2.2% decode), which would put GPU0 at ~511 MiB free.
+
+### Dead end: asymmetric tensor split does not rebalance this
+
+The obvious idea is to offset Sunshine's 392 MiB by giving GPU0 a smaller share.
+`-ts` is far too coarse for that. Measured (short-prompt probe, so absolute
+numbers are ~364 MiB below the at-depth peaks above):
+
+| `-ts` | GPU0 free | GPU1 free | result |
+|---|---|---|---|
+| (none, 50/50) | 507 | 899 | runs |
+| 199,201 (49.75/50.25) | 2111 | 391 | **OOM** |
+| 399,401 (49.875/50.125) | 2111 | 393 | **OOM** |
+| 48,52 | 2329 | 175 | **OOM** |
+| 46,54 | 2835 | 1499 | **OOM** |
+
+A 0.125% nudge and a 4% shift produce the *same* ~2.1 GB migration, so the split
+is quantised at a granularity far larger than the ~200 MiB being asked for, and
+every non-equal ratio lands worse than balanced. There is no fine-grained setting
+here. Do not re-litigate.
+
+### The durable fix is the target's KQ mask
+
+Per GPU: **1074 MiB of device VRAM** (262144 x 2048 x f16, inside the 1512 MiB
+compute buffer) plus a **1104 MiB pinned host buffer** it is uploaded from every
+batch. That single item is device VRAM, host RAM and prefill time at once, and it
+is ~4x the margin problem.
+
+The CUDA side is easy: the GEMM path's softmax kernel already takes `mask` and
+already handles `nullptr` (`fattn-gemm.cu:42, :60, :198`), so an implicit-causal
+branch there is a few lines. The risk is entirely in llama.cpp. Causal-by-
+arithmetic (`mask[i][j] = 0 iff j <= n_past + i`) is only valid when KV cell index
+equals position, which holds for a single sequence on a freshly filled unified
+cache and is broken by context shift, defrag, multi-sequence and SWA. It is also
+not enough to fall back dynamically: the compute buffer is *reserved* for the
+worst case, so a fallback that can still materialise the mask saves no VRAM.
+
+Any implementation therefore has to decide at context creation (n_seq_max == 1,
+causal, no SWA) and then **verify per batch with a hard failure**, not a silent
+fallback. That is the shape of the work; it was not started.
