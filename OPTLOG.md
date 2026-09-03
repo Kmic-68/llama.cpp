@@ -2596,3 +2596,59 @@ leave the 6x on the table.
 it against all gqa Q heads.** Estimated payoff if KV traffic drops 6x: op ~4.15
 -> ~1.2 ms, decode 136 -> ~89 ms/token, i.e. **7.32 -> ~11.5 t/s at 262144
 (+57%)**. Not attempted -- it is a new kernel, not a parameter change.
+
+---
+
+## 96 — two-stream pipeline: REJECTED, and a correction to how the op harness was read
+
+### The change (reverted)
+
+Software-pipelined the chunk loop across two streams: chunk c+1's dequant and QK on
+a producer stream, chunk c's softmax/PV/accum on the main stream, S/K/V double
+buffered, joined with events. The consumer chain stays strictly ordered, which the
+online-softmax state requires. Passed 3949/3949.
+
+Rationale was that softmax (~19% of the op, memory-bound) should hide inside the
+next chunk's compute-bound QK. **It does not.** Both chains contend for the same
+SMs and the GEMMs already saturate compute, so there is little idle capacity for
+the softmax to occupy. Moving the V dequant to the producer as well changed
+nothing (611313 vs 610639).
+
+### The correction
+
+The pipelined build measured 610639 us against a 630650 us baseline, which I
+reported as +3.2%. **That was noise.** Reverting the change and re-measuring gave
+**612441 us** -- indistinguishable from the pipelined number. The pipeline was
+worth nothing.
+
+Repeating the identical binary from cold shows why:
+
+| run | us/run | GPU temp |
+|---|---|---|
+| 1 | 612441 | ~63 C |
+| 2 | 613866 | 65 C |
+| 3 | 618801 | 68 C |
+| 4 | 622617 | 69 C |
+| 5 | 623410 | 70 C |
+
+**The op harness drifts ~1.8% monotonically with die temperature**, and across a
+longer session the spread reaches 3%. Earlier in this session the same code went
+648017 -> 660627 over five runs while heating. That is the same magnitude as most
+of the deltas being chased.
+
+**Consequences for what is recorded above:**
+
+- The merged-GEMM result in attempt 94 (+2.7%, 648017 -> 630650) compared a cold
+  baseline against a warm candidate, so the direction is right but the magnitude
+  is not trustworthy. Cold-to-cold it looks more like 5%, but that pairing is not
+  controlled either.
+- The softmax rewrite (+0.8%) is comfortably inside the noise band and its
+  rejection stands for a better reason than the one given.
+- **End-to-end `llama-bench -d` is also noisy at depth**: the same build measured
+  150.66 and 157.39 t/s at d=131072 (4.5% apart, the second under nvprof).
+
+**Method for anyone continuing: alternate A/B/A/B from the same thermal state, or
+require the effect to exceed ~4%.** A single before/after pair at either level
+cannot resolve less than that. The only deltas in this session large enough to be
+safe on a single pair are PV-in-f16 (+21.7% end-to-end at 262144) and the
+session total (75.44 -> 95.14, +26.1%).
