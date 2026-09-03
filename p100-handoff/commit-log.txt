@@ -1,3 +1,5 @@
+428c483ae docs: reject the two-stream pipeline and correct the harness noise floor
+5e8615334 docs: regenerate handoff artifacts for session 5
 ffca91955 docs: rewrite the handoff head around measured 262144 numbers
 ab3e03480 docs: log the decode hypotheses tested and the GQA-redundancy finding
 f7fb6fca3 tests: add decode-shaped (nb=1) long-context FA perf cases
