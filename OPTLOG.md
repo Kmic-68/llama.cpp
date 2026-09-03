@@ -2919,3 +2919,65 @@ which would end the margin problem from attempt 98 outright). Post-GQA-fix that 
 another ~9 ms/token: **18-24 t/s plain, 27-36 with MTP** at full context. It is a
 quality tradeoff rather than a free win, so it needs its own perplexity number
 against the Q6_K baseline -- but it is cheap to test and the file is already there.
+
+---
+
+## 100 — prefill profiled at depth: the mask is not a speed problem, and prefill has less headroom than hoped
+
+`nvprof --print-gpu-summary` over a 22k-token prefill (avg depth ~11k), both GPUs,
+125 s of GPU time total.
+
+| kernel | share | s |
+|---|---|---|
+| `maxwell_hgemm_*`, all shapes | **71.5%** | 89.3 |
+| `[CUDA memcpy PtoP]` | 7.06% | 8.82 |
+| `gated_delta_net` | 6.66% | 8.31 |
+| `[CUDA memcpy HtoD]` | 2.32% | 2.89 |
+| `fattn_gemm_softmax` | 2.08% | 2.60 |
+| `convert_unary_vec4` f32->f16 + f16->f32 | 2.79% | 3.48 |
+| `dequantize_block_q6_K_vec4` | 1.90% | 2.37 |
+| `rms_norm` (both sizes) | 1.67% | 2.08 |
+| `fattn_gemm_accum_O` | 0.29% | 0.37 |
+
+### The KQ mask upload is NOT the prefill residual — hypothesis rejected
+
+Attempt 93 attributed roughly 0.9 s/batch of the unexplained prefill time to the
+1024 MiB KQ mask upload. **That is wrong.** Total HtoD for the entire run is 2.89 s,
+and the model itself is 20.9 GB: `20.9 GB / 2.89 s = 7.2 GB/s`, i.e. HtoD is
+essentially *just the one-time weight load at full PCIe rate*. Per-batch mask
+traffic does not register. The 65.3 ms max HtoD is a large weight tensor, not a mask.
+
+**Consequence: removing the mask is worth 1024 MiB of VRAM per GPU and nothing in
+speed.** That reprices the work from "VRAM and time in one item" (attempt 98) to a
+pure VRAM play, and it should be judged as such.
+
+### Attention's overhead is small, so its 10.56 TFLOPS *is* the GEMM's efficiency
+
+Everything in the attention op that is not a cuBLAS GEMM -- softmax, accum_O,
+q_to_f16, finalize, q4_0 dequant -- totals ~3.25 s of 125 s, about **4% of
+attention**. So the path is not losing time around the GEMMs; the GEMMs themselves
+run at ~12.3 TFLOPS at chunk 2048 (attempt 90's own measurement) against 15.7 for
+the best hgemm shape in the model, and attempt 96 already found chunk-size
+variants flat or worse.
+
+**Realistic prefill headroom is therefore ~15-20%, not the ~80% that the
+"attention at 15.7 TFLOPS" arithmetic suggests.** An earlier note in this session
+speculated 175 t/s at 262144 from removing the residual; that speculation is
+withdrawn pending an actual profile at 262144, which this one cannot substitute
+for -- at 11k depth attention is not yet dominant, so the residual is structurally
+invisible here.
+
+### What this profile does hand us
+
+Small, real cleanups totalling ~5%: the f32<->f16 conversion pairs around the
+GEMMs (2.79%) and the q6_K dequant (1.90%). The conversion pair is the same item
+as "fuse the all-reduce widen into the ADD" in the handoff's remaining-work list.
+
+### Ranking after this profile
+
+1. **Decode GQA dedup** -- ~2x, well-founded on byte counting, unaffected by any
+   of the above. Clearly first.
+2. Prefill conversion/dequant cleanups -- ~5%, low risk.
+3. KQ mask removal -- 1024 MiB/GPU, **no speed**, high risk. Only if VRAM margin
+   matters more than the risk.
+4. Deep profile at 262144 -- ~45 min, the only way to price the prefill residual.
