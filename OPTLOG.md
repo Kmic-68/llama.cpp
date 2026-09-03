@@ -2880,3 +2880,42 @@ launch overhead -- the same KQ mask that also costs 1024 MiB of VRAM per GPU.
 
 MTP multiplies whatever decode does by ~1.51x at depth (22.60 vs 15.0 t/s measured
 at 76.7k, 80.9% accept), so it cannot substitute for fixing decode.
+
+### Correction to the ceiling above: the byte model, and 11.4 was too pessimistic
+
+The prediction of "~11.4 t/s at 262144" held the non-attention terms fixed and
+assumed the deduped op would only reach 1.2 ms. Recast as bytes -- decode on this
+card is bandwidth-bound, so bytes per token per GPU is the honest unit:
+
+| term | bytes/token/GPU | achieved rate | ms |
+|---|---|---|---|
+| weights, Q6_K tensor-split | 11.21 GB | ~344 GB/s | 32.6 |
+| KV as read today (6x redundant) | 14.5 GB | 212 GB/s | 68.4 |
+| **KV as actually needed** | **2.42 GB** | 212 GB/s | **11.4** |
+
+Two independent checks: 11.21 GB / 32.6 ms = 344 GB/s matches the ~383 GB/s
+measured for `mul_mat_vec_q`, and d=0 decode (32.6 ms) *is* exactly the weight
+stream -- so the context-independent term is weight traffic and essentially
+nothing else. **The 37.8 ms intercept fitted above is noise from three points; the
+real intercept is ~32.6 ms.**
+
+Measured 136.6 ms at 262144 against 32.6 + 68.4 = 101 predicted leaves **~35 ms**
+of in-model overhead (P2P contention, 16 extra launches, mask). Whether that
+scales with the attention work is the open question and it sets the range:
+
+| assumption | ms/token | t/s |
+|---|---|---|
+| overhead fixed | 32.6 + 11.4 + 35 = 79 | **12.7** |
+| overhead proportional to attention | 32.6 + 17.2 = 50 | **20** |
+
+Landing zone **~15-16 t/s plain, ~23-24 with MTP** -- about **2x**, not the 1.56x
+predicted above. The earlier number stands corrected.
+
+### The second lever: weight bytes
+
+Weights are the other half of the budget and `/mnt/fast/models/Qwen3.8-27B-Q4_0.gguf`
+already exists (16.06 GB vs 22.43 GB = 0.72x the traffic, and ~3 GB/GPU of VRAM back,
+which would end the margin problem from attempt 98 outright). Post-GQA-fix that is
+another ~9 ms/token: **18-24 t/s plain, 27-36 with MTP** at full context. It is a
+quality tradeoff rather than a free win, so it needs its own perplexity number
+against the Q6_K baseline -- but it is cheap to test and the file is already there.
