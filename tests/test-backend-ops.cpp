@@ -10353,8 +10353,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // 16 of the 65 layers carry a growing KV cache (full_attention_interval 4), so a
     // prefill batch costs 16x one of these. Benchmarking the op directly avoids the ~30
     // minutes llama-bench spends rebuilding 262144 tokens of context to time one batch.
+    // nb=2048 is a prefill batch; nb=1 is decode, which takes the VEC kernel instead.
     for (int kv : {32768, 65536, 131072, 262144}) {
-        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, kv, 2048, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
+        for (int nb : {2048, 1}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
+        }
     }
 
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
