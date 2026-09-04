@@ -3089,3 +3089,60 @@ That is a restructuring of upstream's tile dispatch, not a patch, which is why i
 scoped rather than attempted here. Expected value: MTP currently reads each KV head
 ~6x per forward pass; `ncols2=6` with `ncols1=4` would make it 2x, i.e. ~3x less
 attention traffic on the path that matters most.
+
+---
+
+## 102 — GQA folding in the *tile* kernel for MTP decode — REVERTED
+
+Attempt 101 fixed single-token decode but not MTP, which presents `ne[1] == 5` and so
+routes to the tile kernel. This tried to give the tile kernel the same fix.
+
+### What it took to build (all four are real traps in this code)
+
+1. **Config entries must go in both NVIDIA tables.** `get_config_nvidia_fp16` and
+   `..._fp32` are separate tables with different tuning (`(256,256,2)` is
+   `64,2,64,64` in one and `128,3,64,64` in the other).
+2. **`if constexpr` still instantiates the untaken arm.** The generic ladder computes
+   `cols_per_block/ncols2`; at `ncols2 == 6` that is `32/6 == 5`, i.e. an `ncols` of 30
+   with no config entry, and it fails to compile even though it is unreachable. The
+   power-of-two rungs need explicit `&& ncols2 != 6` guards.
+3. **`nwarps` must divide `ncols`** (from `cpw`/`np` in the kernel). 192 threads == 6
+   warps works for `ncols in {6,12,24}` (cpw 1/2/4); 384 and 256 do not, and fail as
+   `ggml_cuda_memcpy_1`'s "bad nbytes" rather than anything legible.
+4. `launch_fattn_tile_switch_ncols1` needs a `cols_per_block in {24,12,6}` ladder,
+   since none of `{64,32,16,8,4,2}` is divisible by 6.
+
+It does compile and it is correct: **3949/3949**.
+
+### It does not pay, and the accept rate is why the raw number looks like it does
+
+MTP at 76662, alternating, `GGML_CUDA_FA_TILE_NO_GQA6` as the kill switch:
+
+| | run 1 | run 2 | mean | accept |
+|---|---|---|---|---|
+| off (upstream, folds 2 of 6) | 19.079 | 18.685 | 18.88 | 82.258% |
+| on (folds 6) | 19.366 | 19.140 | **19.25** | 85.833% |
+
++2.0% at face value. But folding changes the reduction order, which changes which
+drafts get accepted: 82.258% -> 85.833% is `1 + 4*0.8226 = 4.29` -> `4.43` accepted
+tokens per forward pass, **+3.3% of throughput on its own**. A +2.0% measurement
+against a +3.3% tailwind means the kernel itself got **~1% slower**.
+
+**Reverted** under the "revert anything that does not improve the metric" rule. The
+lesson generalises: with MTP, decode throughput is not a clean kernel benchmark --
+accept rate rides on the numerics and must be reported beside every t/s figure.
+
+### Why the byte count over-promised, in both attempts
+
+`ncols1=4, ncols2=6` is 24 columns per block. Per-thread state in both the tile and vec
+kernels scales with the number of columns, so folding trades memory traffic for
+occupancy at a fixed exchange rate, and on this card occupancy is already the binding
+constraint (attempt 101: forcing registers 255 -> 128 made the vec kernel *faster*
+despite 368 B/thread of spill). Single-token decode wins because it starts at
+`ncols == 1` and has room to spend; MTP starts at 5 columns and does not.
+
+**So the remaining decode headroom is not reachable by folding more.** It needs the
+per-thread state to stop scaling with columns at all -- splitting the output dimension
+across all threads of the block instead of replicating it per warp, so `VKQ` is one
+half2 per column per thread rather than four. That is the rewrite sketched at the end
+of attempt 101 and it is still the honest next step.

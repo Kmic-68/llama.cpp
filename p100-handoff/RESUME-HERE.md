@@ -54,12 +54,9 @@ the log line to look for is `creating MTP draft context against the target model
    +368 MiB, **-2.2% decode**. Leave it off unless you need the room.
    Asymmetric `-ts` does **not** work — see OPTLOG 98, it is quantised ~2.1 GB
    per step and every non-equal ratio OOMs the other card.
-2. **Decode at depth is now the binding constraint**, not VRAM and not prefill.
-   32.1 t/s at d=0 -> 15.0 at 76k -> 7.32 at 262144. MTP multiplies whatever that
-   is by ~1.5x, so it cannot rescue it. The known cause is the flash-attention vec
-   kernel's **GQA redundancy** (each KV head re-read gqa=6 times, 906 MB/op instead
-   of 151 MB) — see the section below and OPTLOG 95. Still unattempted, still the
-   largest identified win in the project.
+2. **Decode at depth is the binding constraint**, not VRAM and not prefill.
+   The GQA redundancy named here has now been **half fixed** — see OPTLOG 101/102 and
+   the block below.
 
 ## READ THIS FIRST: long context is measured now, and 175 t/s is not reachable
 
@@ -134,6 +131,50 @@ CLAUDE.md says `-f ./ppl.txt` and requires 2.6209 +/- 0.0199. The `ppl.txt` in t
 tree gives **2.7570 on stock upstream** -- the documented number is unreachable on
 that file for any build, including unmodified llama.cpp. `ppl-orig.txt` reproduces
 2.6214. Use it, or every gate run looks like a failure.
+
+## Decode: what session 6 changed
+
+`ggml/src/ggml-cuda/fattn-vec.cuh` now folds the whole GQA group into one block
+(commit `9c7a8865b`). Upstream only ever folds **powers of two** — the tile dispatch
+tries `%8/%4/%2`, its config table stops at `{2,4,8,16,32}`, and `cols_per_block` is
+`{64,32,16,8}` — and this model is **gqa_ratio 6**, so it folded nothing in vec and
+2 of 6 in tile. Nothing in either kernel's arithmetic needs a power of two.
+
+| metric | before | after |
+|---|---|---|
+| FA decode op, kv=262144, nb=1 | 4271.72 us | **2096.60 us (2.04x)** |
+| plain decode at 76662 (A/B/A/B, same binary) | 14.3 t/s | **18.1 t/s (+26.6%)** |
+| `test-backend-ops -o FLASH_ATTN_EXT` | 3949/3949 | 3949/3949 |
+| perplexity gate | 2.6222 | 2.6222 (per-chunk identical) |
+
+`GGML_CUDA_FA_VEC_GQA=1` restores upstream behaviour exactly; that is how every A/B
+above was taken. Not bit-exact for decode (different grid -> different
+`parallel_blocks` -> different combine order), same tier as ALGO3.
+
+**MTP decode is NOT improved.** It presents `ne[1] == 5` and routes to the tile
+kernel. Two attempts failed, both measured, both reverted (OPTLOG 102):
+routing MTP to the folded vec kernel was **3% slower** (18.02 vs 18.62), and teaching
+the tile kernel to fold 6 was **~1% slower** once the accept-rate tailwind is removed
+(19.25 vs 18.88 t/s looks like +2.0%, but accept went 82.26% -> 85.83%, worth +3.3%
+by itself).
+
+**Watch the accept rate whenever you benchmark MTP.** It rides on the numerics, so any
+kernel change moves it, and a t/s figure quoted without it is not a kernel measurement.
+
+### Why folding stops paying, and what the real fix is
+
+Per-thread state scales with the column count in both kernels, so folding trades
+memory traffic for occupancy — and occupancy is already the binding constraint. Proof:
+forcing the vec kernel from 255 registers to 128 (4 blocks/SM instead of 2) made it
+**10% faster despite raising spill to 368 B/thread**. That only happens to a
+warp-starved kernel. Neither the bandwidth floor (~0.7 ms) nor the compute floor
+(~0.68 ms) is near the 2.1 ms observed; the rest is stall.
+
+Single-token decode wins because it starts at `ncols == 1` and has occupancy to spend.
+MTP starts at 5 columns and does not. **More folding cannot get the rest.** The next
+step is to stop per-thread state scaling with columns: split the output dimension
+across all threads of the block instead of replicating it per warp, so `VKQ` holds one
+half2 per column per thread rather than four.
 
 ## Where things stand at SHORT context (2048)
 
