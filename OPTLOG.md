@@ -3506,3 +3506,50 @@ needs 49152 B against a 48 KiB limit, so gqa-6 folding caps at ncols=12 — exac
 Reaching nb=6 needs ncols=36, i.e. ~1365 B/column. The thread-mapping inversion deletes the
 combine buffers and would also allow half-precision KQ, which is what makes that budget
 reachable. It remains blocked on its out-of-bounds write.
+
+## Attempt 109 — tile occupancy tuning for the GQA-6 configs (ALL REVERTED)
+
+The tile kernel at nb=6 runs 192 threads at occupancy 2 = 12 warps/SM of 64. Tried to
+buy warps three ways. `cpw = ncols/nwarps` feeds `KQ_cs = min(cpw, 2*cpy_ne)` and then a
+`memcpy_1<KQ_cs*sizeof(half)>`, so **cpw must be a power of two** — that, not nwarps
+dividing ncols, is what made 256/384 threads fail with "bad nbytes" in earlier sessions.
+
+| config for nb=6 | nb=6 op | verdict |
+|---|---|---|
+| 192 thr, occ 2, ncols 48 (shipped) | **9162 us** | best |
+| 384 thr, occ 2, ncols 48 (cpw 4) | 9617 us | reverted, ~85 regs/thread |
+| 192 thr, occ 3, ncols 24 (2 KV passes) | 9494 us | reverted |
+
+All three knobs are at a local optimum. Reverted to the committed state and re-measured
+to confirm (9162 us).
+
+## The ceiling, quantified
+
+Budget per forward pass per GPU at 262144, validated against measurement:
+
+    pass_ms = 1.1 * (28 weights + 16 * FA_op_ms + 15 other)
+
+Decode: 1.1*(28 + 16*2.031 + 15) = 83.1 ms -> 12.0 t/s. **Measured 12.0 t/s.**
+
+The decisive measurement is that vec scales *linearly* with ncols at identical KV traffic
+(ncols 6 -> 2031 us, ncols 12 -> 4299 us). Attention here is bound by per-column issue,
+not by KV bandwidth. So a verify pass over k tokens costs ~k times the attention of one
+token: **MTP amortizes the 28 ms of weights and nothing else.**
+
+    verify nb=6: 1.1*(28 + 16*9.163 + 15) = 208 ms, at most 6 tokens -> 28.8 t/s
+
+That is the ceiling at *perfect* acceptance of all 5 drafts. At a realistic ~60% it is
+~18 t/s. **30 t/s at 262144 is above the ceiling of the current attention kernels**, and
+no amount of MTP tuning or GQA folding changes that.
+
+Where the remaining headroom actually is: FA is 147 of the 208 ms (71%) of a verify pass.
+Against a 0.77 ms/layer KV-bandwidth floor and a 0.13 ms/layer fp16 compute floor, the
+9.16 ms measured is 12x and 70x off respectively. The kernel is stalling, not working.
+Closing even half of that gap puts 30 t/s in reach:
+
+    FA_op 9.16 -> 4.0 ms: 1.1*(28 + 64 + 15) = 118 ms / 6 = 51 t/s perfect, ~30 t/s at 60%
+
+That requires a tile kernel restructured for sm_60's emulated dp4a, not a config change.
+Note also that the previously-blocking thread-mapping inversion is now known to be the
+**wrong fix for MTP**: it targets the vec kernel, which MTP never calls, and widening vec
+to ncols=36 would cost ~12 ms against tile's 9.16 ms.
