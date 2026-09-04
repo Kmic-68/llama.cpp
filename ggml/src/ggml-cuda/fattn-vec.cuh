@@ -28,8 +28,17 @@ static constexpr __device__ int ggml_cuda_fattn_vec_get_nthreads_device() {
 // gets 2 blocks/SM == 8 warps of a possible 64, which cannot cover HBM latency once each block
 // does ncols2 dot products per loaded K byte. Raising the minimum forces ptxas to spend fewer
 // registers per thread, trading spill for warps in flight.
+//
+// That trade only pays while the spill stays small, and the spill scales with ncols, not ncols2:
+// holding 128 registers costs 368 bytes of stack at ncols == 6 but 2432 at ncols == 12, which
+// made the 12-column kernel 5.5x slower per column than the 6-column one. Give the wide kernels
+// their registers back.
+static constexpr __device__ __host__ int ggml_cuda_fattn_vec_minblocks(const int ncols, const int ncols2) {
+    return ncols2 == 1 ? 1 : (ncols <= 8 ? P100_FA_VEC_MINBLOCKS : (ncols <= 16 ? 2 : 1));
+}
+
 template<int D, int ncols, int ncols2, ggml_type type_K, ggml_type type_V, bool use_logit_softcap> // D == head size
-__launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), ncols2 > 1 ? P100_FA_VEC_MINBLOCKS : 1)
+__launch_bounds__(ggml_cuda_fattn_vec_get_nthreads_device(), ggml_cuda_fattn_vec_minblocks(ncols, ncols2))
 static __global__ void flash_attn_ext_vec(
         const char * Q_ptr,
         const char * K_ptr,
@@ -665,10 +674,31 @@ void ggml_cuda_flash_attn_ext_vec_case(ggml_backend_cuda_context & ctx, ggml_ten
         return;
     }
 
+    // Two columns needs the fold just as much as one: without it this shape reads the KV cache
+    // once per Q head. At 262144 that is 8179 us against 2029 us for the folded single-column
+    // case -- 4x the cost for one extra token.
     constexpr int cols_per_block = 2;
     if (logit_softcap == 0.0f) {
         constexpr bool use_logit_softcap = false;
+
+        const int gqa_ratio = Q->ne[2] / K->ne[2];
+        float max_bias = 0.0f;
+        memcpy(&max_bias, (const float *) KQV->op_params + 1, sizeof(float));
+
+        const int ncols2 = ggml_cuda_fattn_vec_gqa_fold(gqa_ratio, int(Q->ne[2]), max_bias, D);
+
+        // Scoped to D == 256. With GGML_CUDA_FA_ALL_QUANTS the vec kernel is instantiated for
+        // every head size against every K/V type pair, so folding at every D adds 160 MB to
+        // libggml-cuda.so -- enough to push the 262144 context back into cudaMalloc failure.
+        if constexpr (D == 256) {
+            switch (ncols2) {
+                case 6: ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, 6, type_K, type_V, use_logit_softcap>(ctx, dst); return;
+                case 2: ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, 2, type_K, type_V, use_logit_softcap>(ctx, dst); return;
+                default: break;
+            }
+        }
         ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, 1, type_K, type_V, use_logit_softcap>(ctx, dst);
+        return;
     } else {
         constexpr bool use_logit_softcap = true;
         ggml_cuda_flash_attn_ext_vec_case_impl<D, cols_per_block, 1, type_K, type_V, use_logit_softcap>(ctx, dst);

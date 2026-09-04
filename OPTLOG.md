@@ -3444,3 +3444,65 @@ also cannot find its own injection library, which really lives in
 **Installing a compute-sanitizer matching the driver is the highest-leverage next
 step for this project** -- it would name the offending write in a single run, where
 three rounds of code inspection failed to find it.
+
+## Attempt 107 — GQA-6 folding in the tile kernel (KEPT, small)
+
+The MTP verify pass has `Q->ne[1] == n_draft+1`, which with quantized KV is `> 2` and so
+goes to the **tile** kernel, not the vec kernel. Every previous session's work on the vec
+kernel — including the thread-mapping inversion — was aimed at the wrong kernel for MTP.
+
+`launch_fattn_tile_switch_ncols2` folds only powers of two (`%8`, `%4`, `%2`). gqa_ratio 6
+falls through to `ncols2 == 2`, so a forward pass reads the KV cache 3x. Added ncols2 == 6
+with cols_per_block 48/24/12/6 at 192 threads (nwarps must divide ncols), scoped to
+DKQ == DV == 256 so the library grows 374 -> 375 MB rather than 530.
+
+Op time, D 256, GQA 6, q4_0, kv=262144:
+
+| nb | before | after |
+|---|---|---|
+| 2048 (prefill) | 618181 us | 606574 us |
+| 512 | 175146 us | 172706 us |
+| 6 (MTP verify) | 9526 us | 9162 us |
+
+Kept: every shape improved, none regressed. But only ~2-4%, which **falsifies the KV-traffic
+model**: at 262144 the KV cache is ~453 MB per pass at ncols2 == 2, i.e. ~2.3 ms of the
+measured 9.5 ms. The tile kernel is issue-bound, not bandwidth-bound, and folding heads
+cannot fix that. The 4.5x gap between vec (nb=1, 2031 us) and tile (nb=6, 9162 us) is the
+real target.
+
+## Attempt 108 — GQA fold + occupancy fix for the 2-column vec path (KEPT, 1.9x)
+
+`Q->ne[1] == 2` reached the vec kernel with `ncols2 == 1` — no folding at all, so it read
+the KV cache once per Q head: 8179 us against 2029 us for the folded 1-column case, 4x the
+cost for one extra token.
+
+Folding alone made it **worse** (11281 us). Cause, from `cuobjdump -res-usage`:
+
+| ncols | REG | spill | op time |
+|---|---|---|---|
+| 1 (unfolded) | 248 | 0 B | — |
+| 6 (shipped decode) | 128 | 368 B | 2029 us |
+| 12 (folded 2-col) | 128 | **2432 B** | 11281 us |
+
+`__launch_bounds__(..., ncols2 > 1 ? 4 : 1)` pins REG at 128 for *every* folded kernel. The
+spill scales with `ncols`, not `ncols2`, so the wide kernel had nowhere to put its
+accumulators. Made minblocks a function of ncols: `ncols <= 8 ? 4 : (ncols <= 16 ? 2 : 1)`.
+This preserves the measured optimum at ncols == 6 (attempt ~103: minblocks 4 = 2097 us beats
+1/2 = 2338 us) and only relaxes it where the evidence now says the opposite.
+
+Spill 2432 -> 480 B; **nb=2: 8179 -> 4299 us (1.9x)**. Fold scoped to D == 256: at every D
+with FA_ALL_QUANTS the library goes 374 -> 534 MB, which is enough to push the 262144
+context back into cudaMalloc failure. Scoped it is 394 MB.
+
+Gates: 3/3 backends, all ops pass. PPL 2.6186 +/- 0.0199 (band 2.6209 +/- 0.0199; prefill
+now takes the ncols2 == 6 tile path, so the reduction order and thus the last digits change).
+llama-bench tg256 26.05 +/- 1.88 t/s, unchanged.
+
+### Why nb=6 cannot follow nb=2 into the vec kernel
+
+Vec shared memory is exactly 2048 B per column: KQ scores `ncols*D` floats (1024) + q8_1 Q
+staging (768) + `KQ_max_shared`/`KQ_sum_shared` cross-warp combine buffers (256). ncols=24
+needs 49152 B against a 48 KiB limit, so gqa-6 folding caps at ncols=12 — exactly nb=2.
+Reaching nb=6 needs ncols=36, i.e. ~1365 B/column. The thread-mapping inversion deletes the
+combine buffers and would also allow half-precision KQ, which is what makes that budget
+reachable. It remains blocked on its out-of-bounds write.
