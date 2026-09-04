@@ -3251,3 +3251,80 @@ instead of 8 dimensions across its own KV slice. Identical work per thread
 **adds no instantiations**, so it costs no VRAM. That is what makes single-KV-read MTP
 reachable, and it is worth roughly the 1.70x that MTP delivers at short context but
 currently loses at depth.
+
+---
+
+## 104 — inverting the V thread mapping: 2.35x on the op, but NOT correct yet (REVERTED)
+
+### Why this is the change that matters
+
+Decode at 262144 is 7.3 t/s. Weights are 28 ms/token and irreducible, so **plain decode
+cannot exceed ~21 t/s** and the 30 t/s target requires MTP to work. MTP does not work
+at depth (attempt 103: 1.70x at short context, 1.06x at 76k) because the drafted tokens
+do not share a KV pass. Making them share one needs `ncols1 x ncols2` ~= 24-30 columns
+in a single block, and that is blocked by `VKQ[ncols][(D/2)/nthreads_V]` --
+per-thread accumulators scale with column count, so 24 columns is 96 registers of
+accumulators before anything else (measured in attempt 103: REG 128, **STACK 5312**).
+
+### The design
+
+Upstream gives each **warp** the whole output vector for its own slice of KV positions.
+Invert it: give each **thread** `D/nthreads` consecutive head dimensions for **all**
+columns, and let the whole block walk the KV tile together.
+
+- work per thread is identical: 32 positions x 8 dims becomes 128 positions x 2 dims
+- `VKQ` collapses from `[ncols][4]` to `[ncols][1]` -- **1 register per column, not 4**
+- the cross-warp combine disappears entirely: each thread's dimensions are unique in
+  the block, so it writes `dst` directly instead of staging partials through shared
+- it adds **no instantiations**, so unlike attempt 103's approach it costs no VRAM
+
+Implementation is small because setting `nthreads_V = nthreads` makes the rescale loops
+and `VKQ` indexing collapse on their own; only the KV walk, the per-thread head-dim
+offset, and the final write need branches.
+
+### It is fast
+
+| kv | baseline | folded (warp-wise) | **folded + inverted** |
+|---|---|---|---|
+| 65536 | 1029.99 | 639.81 | **511.5** |
+| 262144 | 4271.72 | 2094.36 | **1820.6** |
+
+**2.35x over baseline**, 13% over the committed kernel, reproducible across runs.
+Spill also fell 240 -> 112 B/thread.
+
+### It is not correct: 5 of 3949 shapes fail
+
+    hsk=256 hsv=256 nr23=[4,1]  kv=512   nb=1 mask=0 f16/f16   ERR 0.034-0.048
+    hsk=256 hsv=256 nr23=[16,1] kv=1024  nb=1 mask=1 q8_0/q8_0 ERR 0.071
+    hsk=256 hsv=256 nr23=[16,1] kv=16384 nb=1 mask=1 q8_0/q8_0 ERR 0.060
+
+`GGML_CUDA_FA_VEC_GQA=1` (folding off, so block-wide off) gives **3949/3949**, which
+isolates the fault to this path. All failures are `D == 256`, `nb == 1`, with a fold of
+4 or 8; the production fold of 6 passes, so the bug is *not* simply "block-wide is
+broken" -- it depends on the column count.
+
+**Two real bugs were found and fixed and were not sufficient:**
+1. The `if constexpr (!V_blockwide)` guard was placed on the final `kqmax_scale`
+   rescale instead of the shared-memory staging loop, skipping a rescale that must
+   always run.
+2. The warp-wise path only reads `KQ` entries its own warp wrote, so `__syncwarp()`
+   sufficed; the block-wide path has every thread read every warp's scores and needs
+   `__syncthreads()` both before the V loop and after it (before the next tile
+   overwrites `KQ`).
+
+A third fault remains. Things checked and eliminated by inspection: the tid -> KV
+position mapping in the KQ phase (it is `tid` for both `nthreads_KQ` 8 and 32), the
+`head0`/`sequence` decode, the shared-memory sizes, the `KQ_sum_shared` reduction and
+its barrier, and the `parallel_blocks > 1` partial-output indexing (which the failing
+`kv=512` shape does exercise).
+
+**Reverted** rather than shipped. The committed kernel (attempt 101) stays at
+3949/3949.
+
+### What it is worth if finished
+
+At 262144, using the measured 1820 us and the 1.35x in-model factor from attempt 103:
+attention falls from ~45 ms/token to ~39 ms, i.e. ~12.2 t/s plain. The real prize is
+that `VKQ[ncols][1]` makes the 24-30 column MTP configuration affordable, which is the
+step from ~12 to the 30 t/s target. **The design is sound and the speed is measured;
+only the remaining correctness fault stands between here and that.**
