@@ -3592,3 +3592,42 @@ Predicted nb=6: 5078 us (f16 compute) - ~2.7 ms of the f16 cache's extra read tr
 1.1*(28 + 16*3.2 + 15) = 104 ms per verify pass for up to 6 tokens: 58 t/s at perfect
 acceptance, **~34 t/s at 60%**, 29 t/s at 50%. This is the first identified path that
 reaches the 30 t/s target at 262144.
+
+## Attempt 111 — dequantize the KV tile into shared memory (KEPT, big)
+
+Acting on attempt 110: added `flash_attn_tile_load_tile_q4_0`, which reads q4_0 blocks and
+dequantizes into the shared tile the kernel already stages, and launched that path with
+`need_f16_K/V = false` so launch_fattn stops converting the whole cache.
+
+The awkward part of q4_0 is that byte `qs[m]` packs values m and m+16. But a tile copy
+covers 8 contiguous values at an 8-aligned offset, so a run is always entirely low nibbles
+or entirely high ones -- no straddling. `stride_K2 = nb11/sizeof(half2)` is already exactly
+36 half2 (144 B) for a q4_0 row, so the existing pointer arithmetic needed no change; only a
+`ggml_type` template parameter threaded through iter_KQ / iter / the kernel.
+
+Removing the fixed conversion moved the vec/tile crossover, so the dispatch now prefers tile
+for D=256 q4_0 with gqa_ratio % 6 == 0 (`GGML_CUDA_FA_TILE_Q4_0=0` restores the old split).
+
+Op time, kv=262144:
+
+| nb | before | after | |
+|---|---|---|---|
+| 1 (decode) | 2030 us (vec) | **1836 us** | 1.11x |
+| 2 | 4286 us (vec) | **3449 us** | 1.24x |
+| 3 / 4 | 6690 us | **4172 us** | 1.60x |
+| 6 / 8 (MTP verify) | 9242 us | **6213 us** | 1.49x |
+
+Gates: FA ops pass, **PPL 2.6186 +/- 0.0199 bit-identical to the previous run** -- expected,
+since the dequant computes (q-8)*d into half exactly as to_fp16 does, so shared memory holds
+the same values. **llama-bench tg256 26.05 -> 28.40 +/- 1.40 t/s.**
+
+Budget at 262144 after this change:
+
+    decode:     1.1*(28 + 16*1.836 + 15) = 79.6 ms  -> 12.6 t/s
+    verify nb=6: 1.1*(28 + 16*6.213 + 15) = 157 ms, up to 6 tokens
+                 -> 38 t/s perfect, ~22 t/s at 60% acceptance
+
+Still short of 30 at realistic acceptance, but 9242 -> 6213 is the first change that moves
+the MTP verify shape materially. Note `get_alloc_size` still reserves the 512 MiB per GPU of
+f16 staging that this path no longer uses -- reserving it is safe, not reserving it when
+some other path needs it would not be, so that saving is a separate follow-up.
