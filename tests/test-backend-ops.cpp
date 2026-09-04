@@ -10359,6 +10359,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
         }
     }
+    // Same shapes with an f16 cache. The tile kernel is launched with need_f16_K/V, so a
+    // quantized cache is dequantized in full by launch_fattn on every call; these isolate
+    // how much of the tile kernel's cost is that conversion rather than attention itself.
+    for (int nb : {8, 6, 4, 1}) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 262144, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    }
 
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));

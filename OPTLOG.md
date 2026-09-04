@@ -3553,3 +3553,42 @@ That requires a tile kernel restructured for sm_60's emulated dp4a, not a config
 Note also that the previously-blocking thread-mapping inversion is now known to be the
 **wrong fix for MTP**: it targets the vec kernel, which MTP never calls, and widening vec
 to ncols=36 would cost ~12 ms against tile's 9.16 ms.
+
+## Attempt 110 — the tile kernel dequantizes the entire KV cache on every call
+
+`launch_fattn` is called with `need_f16_K/V = true` for the tile kernel. When the cache is
+not f16 it runs `to_fp16(K_data, K_f16, ggml_nelements(K), stream)` — the **whole** tensor,
+every call, uncached. Same shapes with an f16 cache isolate it (kv=262144):
+
+| nb | q4_0 | f16 | delta |
+|---|---|---|---|
+| 4 | 6689 us | 2576 us | 4113 us |
+| 6 | 9242 us | 5078 us | 4164 us |
+| 8 | 9244 us | 5094 us | 4150 us |
+
+Constant ~4.15 ms independent of nb — a fixed conversion, not attention work. It is 45% of
+the nb=6 cost and 66 ms of every forward pass across the 16 full-attention layers, spent
+re-converting a cache that changed by 6 positions. Traffic is 151 MB read + 537 MB written
++ 537 MB read back per layer per GPU; at 4.15 ms that is 166 GB/s, i.e. already
+bandwidth-optimal. It cannot be made faster, only removed.
+
+This also explains why the shipped vec/tile split is already right:
+
+- vec reads q4_0 directly (no conversion) but costs ~338 us/column: emulated dp4a.
+- tile pays 4.15 ms fixed but only ~106 us/column: f16 FMA on the converted cache.
+
+Crossover at 4150/(338-106) = 18 columns, which is exactly where the dispatch boundary sits.
+
+A persistent f16 shadow is not an option: 537 MB per layer per GPU, 8.6 GB across 16 layers,
+against ~500 MB free at full context.
+
+**The fix is to dequantize each KV tile into the shared memory the tile kernel already
+stages** (`flash_attn_tile_load_tile` -> `KV_tmp`) rather than the whole cache into global
+memory, and launch with `need_f16_K/V = false`. That removes the 537 MB write and the
+537 MB read-back, leaving a 151 MB direct read, while keeping the cheap f16 inner loop.
+
+Predicted nb=6: 5078 us (f16 compute) - ~2.7 ms of the f16 cache's extra read traffic
++ 0.77 ms of q4_0 reads = **~3.2 ms**, against 9242 us now. That gives
+1.1*(28 + 16*3.2 + 15) = 104 ms per verify pass for up to 6 tokens: 58 t/s at perfect
+acceptance, **~34 t/s at 60%**, 29 t/s at 50%. This is the first identified path that
+reaches the 30 t/s target at 262144.
