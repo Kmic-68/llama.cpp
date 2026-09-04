@@ -2981,3 +2981,111 @@ as "fuse the all-reduce widen into the ADD" in the handoff's remaining-work list
 3. KQ mask removal -- 1024 MiB/GPU, **no speed**, high risk. Only if VRAM margin
    matters more than the risk.
 4. Deep profile at 262144 -- ~45 min, the only way to price the prefill residual.
+
+---
+
+## 101 — GQA head folding in the flash-attention vec kernel (KEPT, +26.6% decode at depth)
+
+### The defect
+
+With grouped-query attention the vec kernel launches one block per **Q** head, so each
+K/V head's cache is read `gqa_ratio` times per token. At 262144 that is 906 MB moved
+per op instead of 151 MB. The kernel was never slow -- 906 MB in 4.27 ms is **212 GB/s**,
+which is what this card does -- it was simply reading six times what it needed.
+
+`launch_fattn` has always taken an `ncols2` (heads folded per block) parameter and
+computes `ntiles_z_gqa = gqa_ratio/ncols2` for it. The vec kernel passed `1`.
+
+### Why upstream misses this model specifically
+
+Both the vec and tile paths only ever consider **powers of two**. The tile kernel's
+dispatch tries `gqa_ratio % 8`, `% 4`, `% 2`; its config table only has entries for
+`ncols in {2,4,8,16,32}`; and `launch_fattn_tile_switch_ncols1` derives
+`ncols1 = cols_per_block/ncols2` from `cols_per_block in {64,32,16,8}`.
+
+**This model has `gqa_ratio == 6`.** So the tile kernel folds 2 of 6 heads and the vec
+kernel folded none. Nothing in either kernel's arithmetic requires a power of two --
+`j/ncols2` and `j%ncols2` are generic -- it is purely the dispatch ladder and the
+config table.
+
+### The change
+
+`ncols2` added to `flash_attn_ext_vec`, following the tile kernel's existing pattern
+exactly (`head0 = blockIdx.z*ncols2 - sequence*ne02`, column `j` splits as
+`j/ncols2` == token and `j%ncols2` == head, dst at `head0 + j%ncols2`, mask shared
+across the group). Instantiated for `ncols2 in {1,2,3,4,6,8}` -- **not** restricted to
+powers of two. Gated on `max_bias == 0` (ALiBi gives each head its own slope) and on
+the fold dividing both `gqa_ratio` and `ne02`. `GGML_CUDA_FA_VEC_GQA` overrides the
+choice; `=1` restores upstream behaviour exactly and is how every A/B below was taken.
+
+Two supporting changes:
+- Staged `Q_i32`/`Q_ds` moved to shared memory for the folded case. They depend only on
+  `threadIdx.x`, so every warp held an identical private copy; at `ncols2 == 6` that
+  cost 608 B/thread of spill. Now 240 B. **This did not change runtime** (2301 -> 2340 us,
+  noise) and is kept only because less spill cannot hurt.
+- `__launch_bounds__` minimum blocks/SM raised to 4 for the folded kernel.
+
+### The wall is occupancy, and here is the proof
+
+At 255 registers the kernel gets exactly 2 blocks/SM = 8 warps of a possible 64.
+Forcing 4 blocks/SM caps registers at 128 and **increases** spill to 368 B/thread, yet:
+
+| minblocks | registers | spill | kv=262144 op |
+|---|---|---|---|
+| 1 | 255 | 240 | 2337.92 us |
+| 2 | 255 | 240 | 2337.92 us (no-op: 255*128 already fits 2 blocks/SM) |
+| **4** | **128** | **368** | **2096.60 us** |
+
+**Adding spill made it 10% faster.** That only happens when a kernel is starved of
+warps, not of registers. Neither the bandwidth floor (~0.7 ms) nor the compute floor
+(~0.68 ms) is near 2.1 ms; the remainder is stall.
+
+### Results
+
+Op, decode shape (D 256, 2 KV heads, GQA 6, q4_0, nb=1):
+
+| kv | fold=1 | fold=3 | fold=6 |
+|---|---|---|---|
+| 65536 | 1029.99 | 860.68 | 639.81 |
+| 131072 | 2083.30 | 1661.53 | 1191.83 |
+| 262144 | 4271.72 | 3309.91 | **2096.60** |
+
+**2.04x at 262144.** Note `fold=2` was worth *nothing* (4258 vs 4271): half the traffic
+but half the blocks, a wash -- which is the occupancy story again.
+
+End to end, plain decode at 76662 tokens, alternating A/B/A/B from the same thermal
+state, same binary via the env override:
+
+| fold | run 1 | run 2 | mean |
+|---|---|---|---|
+| 1 | 14.0 | 14.6 | 14.3 |
+| **6** | **17.6** | **18.6** | **18.1** |
+
+**+26.6%.**
+
+### Numerics
+
+- `test-backend-ops -o FLASH_ATTN_EXT`: **3949/3949**, re-run after every edit.
+- Perplexity gate: **2.6222 +/- 0.01996**, and every per-chunk value is identical to
+  the pre-change run -- expected, since prefill does not use this kernel.
+- **Not bit-exact for decode.** Folding changes the grid, so `parallel_blocks` differs,
+  so the online-softmax combine sums in a different order. Greedy generation shares a
+  prefix and then flips a token (short-context check: 822 vs 819 bytes, both coherent
+  and equivalent). This is the same tier as the ALGO3 change in attempt 84 -- accepted
+  on statistical grounds, not bit-parity.
+
+### What this does NOT fix: MTP decode
+
+MTP decodes `n_max+1 == 5` tokens at once, so `Q->ne[1] == 5`, and with quantized KV
+`ggml_cuda_get_best_fattn_kernel` routes `ne[1] > 2` to **TILE**, not vec. So the
+user's actual decode path is untouched by this attempt and still folds only 2 of 6
+heads. Fixing it needs `ncols2 == 6` support in the tile kernel, which needs:
+1. config entries at `ncols in {6,12,24}` with `nthreads in {192, 128 or 384, 256}`
+   (the constraint is that `nwarps` divide `ncols`, from `cpw`/`np` in the kernel), and
+2. `launch_fattn_tile_switch_ncols1` taught to use `cols_per_block in {24,12,6}`
+   instead of only `{64,32,16,8}`.
+
+That is a restructuring of upstream's tile dispatch, not a patch, which is why it was
+scoped rather than attempted here. Expected value: MTP currently reads each KV head
+~6x per forward pass; `ncols2=6` with `ncols1=4` would make it 2x, i.e. ~3x less
+attention traffic on the path that matters most.
