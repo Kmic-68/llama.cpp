@@ -3146,3 +3146,108 @@ per-thread state to stop scaling with columns at all -- splitting the output dim
 across all threads of the block instead of replicating it per warp, so `VKQ` is one
 half2 per column per thread rather than four. That is the rewrite sketched at the end
 of attempt 101 and it is still the honest next step.
+
+---
+
+## 103 — the first honest decode profile, and three hypotheses killed by it
+
+### Method note: diffing two profiles does not isolate decode
+
+Attempt 102 and an earlier pass here both tried to isolate decode by profiling
+`-n 1` and `-n 129` and subtracting. **That does not work at long context.** Prefill
+is ~290 s of GPU time and decode adds ~7 s, so a few percent of run-to-run variation
+on the prefill swamps the signal. It produced a table claiming `maxwell_hgemm` cost
+59 ms/token and `gated_delta_net` 24.8 ms/token; the call counts then showed
+`maxwell_hgemm` had **identical counts in both runs** (47360 vs 47360), i.e. zero
+decode calls and a pure-noise number.
+
+**Profile a decode-dominated run instead** (short prompt, 256 tokens). Kernels that
+only exist in decode -- `mul_mat_vec_q<ncols=1>`, `flash_attn_ext_vec` -- can then be
+read off directly, because prefill uses MMQ and the GEMM attention path.
+
+### Decode profile (256 tokens, short context, model load excluded)
+
+| kernel | share |
+|---|---|
+| **`mul_mat_vec_q` (weights)** | **67%** |
+| output head (hgemm + gemmSN + q6_K dequant) | 8.1% |
+| `flash_attn_ext_vec` | 6.4% |
+| `rms_norm` | 3.6% |
+| add + `quantize_q8_1` | 3.7% |
+| `gated_delta_net` | 1.4% |
+| PtoP | 1.2% |
+
+### Killed hypothesis 1: gated_delta_net is a decode problem
+
+Claimed at 19% from the bad diff. It is **1.4%**, 9.68 us per call, 52 registers, no
+spill. Per call it moves ~2 MB of recurrent state, which at 344 GB/s is ~6 us -- it is
+already at its bandwidth bound. Nothing to win here.
+
+### Killed hypothesis 2: the weight path has headroom
+
+`mul_mat_vec_q` moves **11.21 GB per GPU per token in 23.0 ms = 487 GB/s**, against
+the P100's 732 GB/s peak: **67% of hardware peak.** Decode at short context is at the
+memory wall and prior sessions already took it there. Earlier notes in this session
+estimating 344 GB/s were wrong.
+
+### Killed hypothesis 3: smaller weights are an easy win
+
+`Qwen3.8-27B-Q4_0.gguf` (14.94 GiB) vs Q6_K (20.88 GiB), same thermal state:
+
+| model | tg256 |
+|---|---|
+| Q6_K | 28.94 |
+| Q4_0 | **31.21 (+7.8%)** |
+
+Bytes fall 28.5% but speed rises 7.8%, because Q4_0's mmvq reaches only **373 GB/s**
+against Q6_K's 487. Every mmvq optimisation in this project -- vdr=4, uint4 staging,
+the integer accumulator, the `__vsubss4` removal -- was written **for Q6_K**. Paying a
+quality cost for +7.8% is not worth it. (Porting those optimisations to Q4_0 would be
+a real project and would then be worth ~+30%.)
+
+### The live finding: MTP's benefit inverts with depth
+
+| context | plain decode | MTP | ratio |
+|---|---|---|---|
+| short | 32.1 | 54.5 | **1.70x** |
+| 76662 | 18.1 | 19.25 | **1.06x** |
+
+Speculative decoding should improve *with* depth: it reads the weights once and emits
+~4.3 tokens. It does the opposite here because **the drafted tokens do not share a KV
+pass** -- both attention kernels tile tokens and the GQA group as separate grid
+dimensions, so a forward pass reads the K/V cache 5-6 times. Per pass at 76k per GPU
+that is ~4.2 GB of KV traffic against 11.21 GB of weights, and it grows with context
+until it cancels the weight amortisation entirely.
+
+This is a tiling decision, not a tuning constant, and it is the largest remaining
+decode defect.
+
+### Why the bounded fix failed, twice
+
+`ncols1=8 x ncols2=3` (24 columns, 2 KV reads instead of 6) compiles but ptxas gives
+**REG:128 with STACK:5312 B/thread** -- 22x the 240 B that was tolerable at 6 columns,
+because `VKQ[ncols][4]` puts 24 columns at 96 accumulator registers before anything
+else. It could not be measured because of the next finding.
+
+### New constraint: kernel instantiations cost VRAM
+
+Adding those variants grew `libggml-cuda.so` from **374 MB to 530 MB**, and the larger
+CUDA module consumes enough device memory that the 262144 + MTP configuration
+**stopped fitting** -- `cudaMalloc failed` on a 40 MiB pool allocation during prefill,
+with the new path *disabled*. Reverting restored it (GPU0 peak 15779 MiB, 497 free).
+
+**Every attention variant shipped is a withdrawal from the same VRAM budget as the KV
+cache.** This caps how many `(ncols1, ncols2)` shapes can ever exist on a 16 GB card
+at full context, and it makes any fix that *adds* kernels strictly worse than one that
+makes existing kernels cheaper.
+
+### What that leaves
+
+The thread-mapping inversion sketched in attempt 101 is now the only candidate that
+fits every constraint: each thread owns 2 head dimensions across **all** columns
+instead of 8 dimensions across its own KV slice. Identical work per thread
+(32 positions x 8 dims -> 128 x 2), `VKQ` drops from `[ncols][4]` to `[ncols][1]` --
+24 columns for 24 registers instead of 96 -- the cross-warp combine disappears, and it
+**adds no instantiations**, so it costs no VRAM. That is what makes single-KV-read MTP
+reachable, and it is worth roughly the 1.70x that MTP delivers at short context but
+currently loses at depth.
