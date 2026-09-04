@@ -3424,3 +3424,23 @@ operation. Every future attempt at this rewrite must run the perplexity gate bef
 being believed, not after being committed.
 
 **Reverted.** The committed kernel (attempt 101) remains at 3949/3949 and 2.6222.
+
+### Tooling note: compute-sanitizer is unusable on this machine
+
+The out-of-bounds write above is exactly what `compute-sanitizer --tool memcheck`
+exists to find, and it cannot run here:
+
+    ========= Error: Target application terminated before first instrumented API call
+
+It fails identically on a trivial op (`-o ADD`), so it is not specific to the
+attention tests, and it fails with `--target-processes all` and with an explicit
+`--injection-path`. Setting `CUDA_INJECTION64_PATH` by hand dumps core.
+
+**Root cause: driver 580.173.02 (CUDA 13-era) against compute-sanitizer 2022.4.1
+(CUDA 12.0)**, from `nvidia-cuda-toolkit`. The `/usr/bin/compute-sanitizer` wrapper
+also cannot find its own injection library, which really lives in
+`/usr/lib/nvidia-cuda-toolkit/compute-sanitizer/`.
+
+**Installing a compute-sanitizer matching the driver is the highest-leverage next
+step for this project** -- it would name the offending write in a single run, where
+three rounds of code inspection failed to find it.
