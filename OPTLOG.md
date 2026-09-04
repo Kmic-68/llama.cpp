@@ -3365,3 +3365,62 @@ delivers at short context, because the drafted tokens do not share a KV pass.
 
 So 30 t/s remains reachable in principle and requires, in order: the V thread-mapping
 inversion of attempt 104 made correct, then the 24-30 column configuration it enables.
+
+---
+
+## 106 — the inversion's real bug found and fixed; it still fails the gate (REVERTED again)
+
+### The actual defect in attempt 104
+
+Not the sinks block -- that one is safe, and checking it before rebuilding saved a
+cycle. The original strides columns across warps (`j = j0 + threadIdx.y`) and relies on
+the cross-warp max reduction afterwards, which works because `max` is idempotent and a
+sink only raises the maximum.
+
+The real defect: **`KQ_max_new[j]` is reduced only across the warp**
+(`for offset = nthreads_KQ; offset < WARP_SIZE`), so each warp normalises its scores by
+*its own* maximum and stores `exp(s - warp_max)`. The warp-wise V walk only ever reads
+back its own warp's scores, so that is consistent. **The block-wide walk has every
+thread sum scores from all four warps -- each normalised against a different maximum.**
+Summing incommensurable exponentials is wrong for any shape; it only surfaced in some
+tests because the error depends on how far apart the per-warp maxima happen to fall.
+
+Fix: promote the running max to block scope before anything is exponentiated -- two
+`__syncthreads()` and an `ncols*nwarps` float reduction per KV tile, amortised over 128
+positions.
+
+### With that fix it is correct on the op suite, and slower than it was
+
+**3949/3949**, up from 3945/3949.
+
+| kv | baseline | committed (warp-wise fold) | inverted + block-wide max |
+|---|---|---|---|
+| 65536 | 1029.99 | 639.81 | **553.9 (-13.5%)** |
+| 262144 | 4271.72 | 2094.36 | **2025.4 (-3.3%)** |
+
+The block-wide max costs most of what the inversion won at 262144 (1820 -> 2025 us), so
+its own benefit there is **+3.3%, inside the noise band**. Its value was never the
+speed: `VKQ[ncols][1]` is what makes the 24-30 column single-KV-read MTP configuration
+affordable.
+
+### And it still fails real inference
+
+    [24]2.6698,[25]nan,[26]nan,...,[30]nan
+    Unexpected negative standard deviation of log(prob)
+
+Chunks 1-24 reproduce the reference values exactly, then it breaks down. A control run
+of the identical gate on the committed build immediately afterwards gives
+**2.6222 +/- 0.01996 with zero NaN**, so this is the change and not the environment.
+
+The delayed onset points at an out-of-bounds write corrupting state that is only
+consumed later, rather than a wrong result computed in place -- and note perplexity is
+prefill, which does not even use this kernel, so the corruption crosses ops.
+
+### The lesson that matters more than the change
+
+**`test-backend-ops -o FLASH_ATTN_EXT` passing 3949/3949 is NOT sufficient validation
+for this kernel.** It cannot see out-of-bounds writes whose effects land in another
+operation. Every future attempt at this rewrite must run the perplexity gate before
+being believed, not after being committed.
+
+**Reverted.** The committed kernel (attempt 101) remains at 3949/3949 and 2.6222.
