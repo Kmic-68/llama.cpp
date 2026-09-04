@@ -3328,3 +3328,40 @@ attention falls from ~45 ms/token to ~39 ms, i.e. ~12.2 t/s plain. The real priz
 that `VKQ[ncols][1]` makes the 24-30 column MTP configuration affordable, which is the
 step from ~12 to the 30 t/s target. **The design is sound and the speed is measured;
 only the remaining correctness fault stands between here and that.**
+
+---
+
+## 105 — decode measured at true full context: 7.32 -> 12.0 t/s
+
+Every earlier decode figure at 262144 in this file came from `llama-bench -d` or from
+extrapolation. This is a real run: an 830000-byte prompt (~244k tokens, sized to fit
+under the 262144 limit -- a 1.26 MB prompt is rejected at 369930 tokens), `-c 262144
+-b 262144 -ub 2048`, the committed GQA-folding kernel.
+
+    Prompt: 150.9 t/s   Generation: 12.0 t/s
+
+| metric | before | after |
+|---|---|---|
+| decode at full context | 7.32 (documented baseline) | **12.0 t/s** |
+
+**+64%**, and it confirms the budget model built in attempts 103-104, which predicted
+~11.2 t/s from `weights 28 ms + folded attention ~45 ms + other ~15 ms`. The two
+figures agree to within the difference between 244k and 262144 tokens of depth.
+
+Prefill over the 0 -> 244k ramp is 150.9 t/s (an average over the ramp, not a
+steady-state depth figure; the session-5 number of 95.14 t/s is the steady-state
+value at 262144 and the two are not comparable).
+
+### Distance to 30 t/s
+
+Weights cost ~28 ms/token and are irreducible at Q6_K, so **plain decode cannot pass
+~21 t/s**; 12.0 is already 57% of that ceiling. The remaining path is entirely through
+MTP, which today is worth only 1.06x at depth (attempt 103) instead of the 1.70x it
+delivers at short context, because the drafted tokens do not share a KV pass.
+
+    12.0 plain  ->  ~12.7 with MTP as it behaves today
+    12.0 plain  ->  ~20 with MTP restored to 1.7x
+    plus the inverted mapping's own 13% and a single-KV-read pass  ->  ~30
+
+So 30 t/s remains reachable in principle and requires, in order: the V thread-mapping
+inversion of attempt 104 made correct, then the 24-30 column configuration it enables.
