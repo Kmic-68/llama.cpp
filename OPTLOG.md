@@ -4032,3 +4032,35 @@ matter: nbatch_K 32 vs 64 (6035 vs 6067), 384 vs 192 threads (pre-dequant this w
 
 **Config-level tuning of this kernel is exhausted.** Remaining gains need inner-loop
 restructuring (register blocking, fewer shared-memory round trips), not table entries.
+
+## Attempt 121 — exact-fit tile widths for the MTP verify shape (KEPT, 1.24x)
+
+The nb sweep at kv=262144 showed nb=5/6 costing the same as nb=8, and nb=3 the same as nb=4:
+the ncols2==6 ladder only offered cols_per_block 6/12/24/48, i.e. ncols1 of 1/2/4/8. A
+5-token MTP verify was padded into two 4-token tiles — **37% of the work was padding**.
+
+There was no ncols1 == 5 or 6 because cols_per_block must be a multiple of ncols2 == 6 *and*
+cpw == ncols/nwarps must be a power of two (it sizes a memcpy_1). 36 satisfies both: 9 warps
+(288 threads), cpw == 4.
+
+| nb | before | after | |
+|---|---|---|---|
+| 2 | 3191 us | **2166 us** | 1.47x |
+| 3 | 4115 | **3150** | 1.31x |
+| 4 | 4102 | **3154** | 1.30x |
+| **5 (MTP verify, n_draft=4)** | ~6070 | **4898** | **1.24x** |
+| 6 | 6072 | **4900** | 1.24x |
+| 7 / 8 | 6059 | 5614 | 1.08x |
+
+Also tried the *exact* 30-wide tile for 5 tokens (ncols1 == 5). To keep cpw a power of two it
+needs 15 warps = 480 threads, which starves it of registers: **5098 us against 4898** for the
+36-wide tile that wastes a column. Rejected; 5 tokens route to 36.
+
+Efficiency on the verify shape: 3.16 -> 3.29 TFLOPS at nb=5, and nb=6 3.18 -> 3.94.
+
+### Why this was invisible earlier
+
+Every previous measurement used nb=6 or nb=8, which land on the same tile count, so the
+padding never showed up as a difference. It only appeared once the sweep included nb=5 and 7
+and the pairs (3,4), (5,6), (7,8) turned out identical.
+Gates: PPL 2.6186 +/- 0.0199, 3/3 backends, all ops pass, tg256 25.39 +/- 3.34 (noisy state).

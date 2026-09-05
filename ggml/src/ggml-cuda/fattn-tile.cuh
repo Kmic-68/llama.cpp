@@ -81,6 +81,7 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_nv
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 12, 192, 2,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 24, 192, 2,  64,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 48, 192, 2,  32,  64)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 36, 288, 2,  32,  64)
 
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(320, 256, 16, 256, 2,  64,  64)
 
@@ -156,6 +157,7 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_nv
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 12, 192, 2,  32,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 24, 192, 2,  32,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 48, 192, 2,  32,  64)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 36, 288, 2,  32,  64)
 
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(320, 256, 16, 256, 2,  32,  64)
 
@@ -1404,9 +1406,18 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
             return;                                                                                    \
         }
 
+        // Pick the smallest cols_per_block whose ncols1 == cols_per_block/6 covers ne[1], so a
+        // 5- or 6-token MTP verify does not pad up to two 4-token tiles. cols_per_block must be
+        // a multiple of ncols2 == 6, and cpw == ncols/nwarps must be a power of two, which is
+        // what 30 (15 warps, cpw 2) and 36 (9 warps, cpw 4) satisfy.
         if (Q->ne[1] > 48/6) GGML_CUDA_LAUNCH_TILE_GQA6(48)
-        if (Q->ne[1] > 24/6) GGML_CUDA_LAUNCH_TILE_GQA6(24)
-        if (Q->ne[1] > 12/6) GGML_CUDA_LAUNCH_TILE_GQA6(12)
+        if (Q->ne[1] > 36/6) GGML_CUDA_LAUNCH_TILE_GQA6(48)
+        // 5 tokens also go to the 36-wide tile: the exact-fit 30-wide config needs 15 warps
+        // (480 threads) to keep cpw a power of two, which starves it of registers and measures
+        // 5098 us against 4912 for the 36-wide one, despite wasting a column.
+        if (Q->ne[1] > 24/6) GGML_CUDA_LAUNCH_TILE_GQA6(36)
+        if (Q->ne[1] > 12/6) GGML_CUDA_LAUNCH_TILE_GQA6(24)
+        if (Q->ne[1] >  6/6) GGML_CUDA_LAUNCH_TILE_GQA6(12)
         GGML_CUDA_LAUNCH_TILE_GQA6(6)
 #undef GGML_CUDA_LAUNCH_TILE_GQA6
     }
