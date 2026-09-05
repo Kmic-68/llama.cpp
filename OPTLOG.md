@@ -3782,3 +3782,61 @@ the per-column cost is real.
 
 Realistic ceiling on this hardware: **~26 t/s with an ideal draft path**, against 14.3 today.
 The draft path is therefore still worth ~1.8x and is the only remaining lever of that size.
+
+## Attempt 116 — the large-n_ctx MTP penalty: diagnosed, not fixed
+
+Decode is **2.2x slower purely from allocating a big context**, with a near-empty cache and
+identical work (same prompt, same 133 tokens, same 101 accepted -- deterministic):
+
+| | MTP decode |
+|---|---|
+| `-c 4096` | 50.5 t/s |
+| `-c 262144` | 22.6 t/s |
+
+Isolated, in order:
+
+- **Not the ubatch.** `-c 4096`: 50.26 (ub 512) / 50.78 (ub 2048). `-c 262144`: 22.91 / 23.02.
+- **Not the draft ubatch.** `-ubd` 64 vs 256: 23.03 vs 21.43, sys time identical.
+- **MTP-specific.** Plain `llama-cli` decode is **30.7 t/s at both** `-c 4096` and `-c 262144`.
+  The target context alone (a 10 GB KV cache) costs nothing; the penalty needs the draft context.
+- **Not GPU work.** nvprof `--print-gpu-summary` is *identical* between the two: HtoD 2.604 vs
+  2.666 s over the same 5190 calls, mul_mat_vec_q 1.650 vs 1.650 s over 17170, same kernels and
+  counts throughout. Decode wall was 1.469 s vs 4.687 s. The extra time is pure host-side gap.
+- **It is driver time.** strace: same **1959 ioctl calls**, but **252 us/call -> 2683 us/call**.
+  sys time 2.69 s -> 8.80 s while user time moves +1.0 s.
+
+Cost splits across both forward passes. Fitting `pass(k) = V + k*D` on an n_draft sweep:
+
+| | V (verify) | D (draft step) |
+|---|---|---|
+| `-c 4096` | 36.0 ms | 10.5 ms |
+| `-c 262144` | 66.4 ms | 28.8 ms |
+
+A plain decode step at `-c 262144` is 32.6 ms, but MTP's verify pass is 66.4 ms — 2x, for the
+same model work.
+
+### Why this matters for the goal
+
+Empty-cache overhead at `-c 262144` is V + 4D = **182 ms/pass**. The real 229k run measured
+281 ms/pass. So roughly **65% of the full-context MTP pass is allocation-driven host overhead,
+not attention work.** Removing it would give 281 - 182 + 78 = ~177 ms/pass = 44 ms/token =
+**~22.7 t/s**, from 14.3 today.
+
+### Rejected fixes (all measured, all reverted)
+
+- **Bounding the O(cells.size()) KV scans** to `[used_min, used_max_p1)` in seq_rm/seq_cp/
+  seq_add/seq_div. Exactly equivalent (unused cells hold pos == -1; p0 >= 0). Back-to-back,
+  3 runs each: 19.91/19.36/19.88 (mean 19.72) vs 18.74/19.42/19.45 (mean 19.20) = +2.7%,
+  inside the +/-2% band, and it cannot help at true full context where used ~= allocated.
+- **CUDA graphs at large context.** 23.40 vs 23.11 — the driver cost is not per-launch.
+- **Pinned host memory** (`GGML_CUDA_NO_PINNED=1`): 20.57 vs 19.23, i.e. pageable was if
+  anything *faster*. Not the HtoD staging.
+
+Mechanism still unidentified: the CUDA driver's per-ioctl cost grows ~10x when a second
+context with a large allocation exists, without any change in GPU work.
+
+### Measurement warning
+
+`-c 262144` runs vary **19.2-23.4 t/s across sessions** (thermal/state drift) though only
++/-2% back-to-back. Every A/B here must be run back-to-back; an earlier single-shot
+comparison wrongly dismissed the scan bounding.
