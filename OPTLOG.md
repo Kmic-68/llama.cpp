@@ -4408,3 +4408,44 @@ occupancy, nbatch_K, nbatch_fa, and ncols routing all measure neutral or worse.
 `test-backend-ops perf` silently **skips** the large-kv cases when VRAM is occupied — a
 running llama-server made every kv=131072/262144 case vanish from the output with a clean
 exit and "2/2 backends passed". Check for a live server before trusting a perf run.
+
+## Attempt 133 — nbatch_K 128 for the narrow gqa-6 tiles (KEPT, -10.3% at nb=1)
+
+Attempt 131 made plain decode the target: attention is 23.7 of every 46.6 ms/token, and it
+sits **4.8x off its own bandwidth floor** (16 layers x 151 MB at 490 GB/s = 4.9 ms). Occupancy
+had already been disproven three ways, so this targets **loop iterations per call** instead:
+`nbatch_K` sets the K-chunk width, and 128 halves the chunk loop from 4 to 2 for DKQ=256.
+
+Reproducible to 0.1% across interleaved reps:
+
+| nbatch_K | nb=1 |
+|---|---|
+| 64 | 1690.88 / 1690.55 us |
+| **128** | **1517.95 / 1517.75 us** |
+
+Applied across the gqa-6 configs, it is **config-specific**:
+
+| configs at K=128 | nb=1 | nb=4 | nb=6 |
+|---|---|---|---|
+| control (all K=64) | 1691.04 | 3154.60 | 4897.09 |
+| **ncols 6, 12, 24** | **1517.04** (-10.3%) | **3103.81** (-1.6%) | 4897.09 |
+| + ncols 36, 48 | 1518.19 | 3103.80 | **5739.58 (+17% worse)** |
+
+So K=128 is applied to the narrow tiles only; 36 and 48 stay at 64, with the reason in a
+source comment so it is not "fixed" later.
+
+**This is the first parameter to move the decode shape.** Everything before it targeted warps
+in flight (384 threads, occupancy 2->4, doubling warps) and measured neutral or worse. This
+one targets the shared-memory/loop-overhead axis the profiling actually pointed at.
+
+Gates: **PPL 2.6186 +/- 0.0199**, **3/3 backends**, tg256 **31.23 +/- 0.11**.
+
+Attention falls 27.1 -> 24.3 ms/token, so plain decode should move ~21.5 -> ~22.8 t/s.
+
+### Measurement infrastructure
+
+`test-backend-ops` takes **`-p <params regex>`**. Filtering to `kv=262144,nb=N,.*type_K=q4_0`
+runs one shape in ~7 s instead of ~7 min for the whole flash-attn suite — a 60x faster loop,
+which is why three sweeps fit in the time one used to take. Note the timing line and the case
+description are on **separate output lines**, so a grep requiring both on one line silently
+returns nothing.

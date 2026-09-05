@@ -77,9 +77,12 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_nv
     // nwarps must divide ncols, so these use 192 threads = 6 warps. Shared memory is
     // ncols*640 + nbatch_fa*144 bytes; ncols=48 drops to nbatch_fa=32 to stay under the
     // 32 kiB that keeps occupancy 2.
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  6, 192, 2,  64,  64)
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 12, 192, 2,  64,  64)
-    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 24, 192, 2,  64,  64)
+    // nbatch_K 128 halves the K-chunk loop and is worth -10.3% at ncols=6 and -1.6% at
+    // ncols=24, but it costs +17% at ncols=36 (nb=6: 4897 -> 5740 us), so it is applied
+    // only to the narrow tiles.
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  6, 192, 2, 64, 128)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 12, 192, 2,  64, 128)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 24, 192, 2,  64, 128)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 48, 192, 2,  32,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 36, 288, 2,  32,  64)
 
