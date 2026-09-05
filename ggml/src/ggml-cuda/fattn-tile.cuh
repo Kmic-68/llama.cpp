@@ -745,7 +745,8 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
         const int stride_mask,
         float * const KQ_max,
         float * const KQ_sum,
-        T_acc * const VKQ,
+        T_acc  * const VKQ,
+        float2 * const VKQ_f,
         const int k_VKQ_0,
         const int k_VKQ_max,
         const int col_Q_0) {
@@ -863,6 +864,8 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
 #pragma unroll
             for (int i0 = 0; i0 < DVp/2; i0 += warp_size) {
                 VKQ[jc*((DVp/2)/warp_size) + i0/warp_size] *= KQ_max_scale_h2;
+                VKQ_f[jc*((DVp/2)/warp_size) + i0/warp_size].x *= KQ_max_scale;
+                VKQ_f[jc*((DVp/2)/warp_size) + i0/warp_size].y *= KQ_max_scale;
             }
 #else
 #pragma unroll
@@ -965,6 +968,24 @@ static __device__ __forceinline__ void flash_attn_tile_iter(
 
         __syncthreads();
     }
+
+#ifdef FAST_FP16_AVAILABLE
+    // Fold the tile's half2 partial sums into the fp32 running accumulator and reset.
+    // VKQ otherwise accumulates over the entire KV cache in an 11-bit mantissa, and the
+    // error grows as sqrt(context): NMSE against the fp32 CPU reference measured 3.2e-6 at
+    // kv=512 and 2.8e-5 at kv=65536. Folding per tile bounds it to nbatch_fa terms while the
+    // inner loop keeps its single HMUL2 -- one conversion per nbatch_fa products.
+#pragma unroll
+    for (int jc = 0; jc < cpw; ++jc) {
+#pragma unroll
+        for (int i0 = 0; i0 < DVp/2; i0 += warp_size) {
+            const int i = jc*((DVp/2)/warp_size) + i0/warp_size;
+            VKQ_f[i].x += __low2float (VKQ[i]);
+            VKQ_f[i].y += __high2float(VKQ[i]);
+            VKQ[i] = make_half2(0.0f, 0.0f);
+        }
+    }
+#endif // FAST_FP16_AVAILABLE
 }
 
 template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap,
@@ -1065,12 +1086,14 @@ static __global__ void flash_attn_tile(
     __shared__ half2 Q_tmp[ncols * DKQ/2];
     __shared__ half2 KV_tmp[nbatch_fa * (nbatch_K/2 + cpy_ne) + DVp-DV];
     __shared__ half  KQ[ncols * nbatch_fa];
-    __align__(16) half2 VKQ[cpw * ((DVp/2)/warp_size)] = {{0.0f, 0.0f}};
+    __align__(16) half2  VKQ  [cpw * ((DVp/2)/warp_size)] = {{0.0f, 0.0f}}; // per-tile partial
+    __align__(16) float2 VKQ_f[cpw * ((DVp/2)/warp_size)] = {{0.0f, 0.0f}}; // fp32 running sum
 #else
     __shared__ float Q_tmp[ncols * DKQ];
     __shared__ float KV_tmp[nbatch_fa * (nbatch_K + cpy_ne) + DVp-DV];
     __shared__ float KQ[ncols * nbatch_fa];
     __align__(16) float2 VKQ[cpw * ((DVp/2)/warp_size)] = {{0.0f, 0.0f}};
+    float2 * const VKQ_f = VKQ;   // fp32 path already accumulates in fp32
 #endif // FAST_FP16_AVAILABLE
 
     float KQ_max[cpw];
@@ -1139,14 +1162,14 @@ static __global__ void flash_attn_tile(
             constexpr bool oob_check = false;
             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, type_K, type_V>
                 (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
-                stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
+                stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, VKQ_f, k_VKQ_0, k_VKQ_max, col_Q_0);
             k_VKQ_0 += gridDim.y*nbatch_fa;
         }
         if (k_VKQ_0 < k_VKQ_max) {
             constexpr bool oob_check = true;
             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, type_K, type_V>
                 (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
-                stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
+                stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, VKQ_f, k_VKQ_0, k_VKQ_max, col_Q_0);
         }
     } else {
         // Branch without out-of-bounds checks.
@@ -1154,7 +1177,7 @@ static __global__ void flash_attn_tile(
             constexpr bool oob_check = false;
             flash_attn_tile_iter<warp_size, nwarps, ncols1, ncols2, DKQ, DV, nbatch_fa, nbatch_K, use_logit_softcap, oob_check, type_K, type_V>
                 (Q_tmp, K_h2, V_h2, maskh, ne01, logit_softcap, slope, KQ, KV_tmp,
-                stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, k_VKQ_0, k_VKQ_max, col_Q_0);
+                stride_K2, stride_V2, stride_mask, KQ_max, KQ_sum, VKQ, VKQ_f, k_VKQ_0, k_VKQ_max, col_Q_0);
         }
     }
 
@@ -1167,11 +1190,7 @@ static __global__ void flash_attn_tile(
         static_assert(cpw == 1, "bad cpw");
         static_assert(nbatch_fa*nbatch_K >= nwarps*DVp, "KV_tmp too small");
 
-#ifdef FAST_FP16_AVAILABLE
-        half2 * VKQ_combine    = (half2 *) KV_tmp;
-#else
-        float * VKQ_combine    = (float *) KV_tmp;
-#endif // FAST_FP16_AVAILABLE
+        float * VKQ_combine    = (float *) KV_tmp;   // VKQ_f is fp32 on both paths
         float * KQ_sum_combine = (float *) Q_tmp;
 
         if (threadIdx.y % np != 0) {
@@ -1243,19 +1262,11 @@ static __global__ void flash_attn_tile(
             const float val = expf(sink - KQ_max[jc0]);
             KQ_sum[jc0] = KQ_sum[jc0]*KQ_max_scale + val;
 
-#ifdef FAST_FP16_AVAILABLE
-            const half2 KQ_max_scale_h2 = make_half2(KQ_max_scale, KQ_max_scale);
 #pragma unroll
             for (int i0 = 0; i0 < DVp/2; i0 += warp_size) {
-                VKQ[jc0*((DVp/2)/warp_size) + i0/warp_size] *= KQ_max_scale_h2;
+                VKQ_f[jc0*((DVp/2)/warp_size) + i0/warp_size].x *= KQ_max_scale;
+                VKQ_f[jc0*((DVp/2)/warp_size) + i0/warp_size].y *= KQ_max_scale;
             }
-#else
-#pragma unroll
-            for (int i0 = 0; i0 < DVp/2; i0 += warp_size) {
-                VKQ[jc0*((DVp/2)/warp_size) + i0/warp_size].x *= KQ_max_scale;
-                VKQ[jc0*((DVp/2)/warp_size) + i0/warp_size].y *= KQ_max_scale;
-            }
-#endif // FAST_FP16_AVAILABLE
         }
     }
 
@@ -1282,7 +1293,7 @@ static __global__ void flash_attn_tile(
             __align__(16) float2 tmp[cpy_ne_D];
 #pragma unroll
             for (int i1 = 0; i1 < cpy_ne_D; ++i1) {
-                tmp[i1] = __half22float2(VKQ[jc0*((DVp/2)/warp_size) + i0/warp_size + i1]);
+                tmp[i1] = VKQ_f[jc0*((DVp/2)/warp_size) + i0/warp_size + i1];
                 tmp[i1].x *= scale;
                 tmp[i1].y *= scale;
             }

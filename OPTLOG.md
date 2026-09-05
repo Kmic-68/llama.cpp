@@ -4501,3 +4501,51 @@ block indices. The eight scalar loads coalesce across threads and the compiler's
 wide load does not beat that. Reverted.
 
 So the ~1200 us is the dequant **arithmetic and shared-memory writes**, not the loads.
+
+## Attempt 136 — fp16 accumulation in VKQ is real; fixed with a per-tile fp32 fold (KEPT)
+
+Prompted by a report that llama.cpp's `FAST_FP16_AVAILABLE` gate does lossy math on sm_60,
+where sm_61 was exempted long ago. Checked it against this build rather than assuming.
+
+**The mechanism is the accumulator, not the multiply.** `VKQ` (the attention output) was a
+`half2` register accumulating over the *entire* KV cache — a quarter-million adds in an 11-bit
+mantissa at 262144 context.
+
+This shape (D=256, 2 KV heads, GQA 6, q4_0) had **no eval coverage at all**, so it had never
+been checked against the CPU reference. Added cases; the error grows as sqrt(context):
+
+| kv | half2 accum | **per-tile fold (kept)** | full fp32 accum |
+|---|---|---|---|
+| 512 | 3.185e-06 | 2.894e-06 | 1.435e-06 |
+| 4096 | 3.310e-06 | 3.170e-06 | 1.479e-06 |
+| 16384 | 8.357e-06 | 3.089e-06 | 1.687e-06 |
+| **65536** | **2.773e-05** | **3.205e-06** | 1.793e-06 |
+
+### Why not the upstream fix
+
+Extending the sm_61 exemption to sm_60 turns `Q_tmp`, `KQ` and `KV_tmp` to float as well. On
+these tuned configs the 36-wide tile then needs **50176 B of shared memory against a 48 KiB
+limit** — it does not build. Measured as an accuracy-equivalent change (fp32 accumulate, half2
+multiply) it costs **+17.5% at nb=1, +90% at nb=4, +44% at nb=6**.
+
+### The fix
+
+Accumulate in half2 *within* a KV tile, fold into an fp32 running accumulator once per tile,
+and rescale both on the online-softmax max update. The inner loop keeps its single HMUL2; the
+cost is one conversion per `nbatch_fa` products. Error is bounded to 64 terms instead of
+262144.
+
+| shape | half2 | per-tile fold | full fp32 |
+|---|---|---|---|
+| nb=1 | 1518 us | **1554 (+2.4%)** | 1784 (+17.5%) |
+| nb=4 | 3104 | **3241 (+4.4%)** | 5886 (+90%) |
+| nb=6 | 4900 | **5165 (+5.4%)** | 7059 (+44%) |
+
+**8.7x the accuracy at depth for 2.4% on the decode shape**, and the error is now *flat* with
+context (2.9e-6 -> 3.2e-6) rather than growing. The residual against full fp32 is fp16
+*product* rounding, which does not accumulate and stays constant with context — that is the
+part worth keeping fp16 for.
+
+Gates: **PPL 2.6199 +/- 0.0199** (moved from 2.6186 toward CLAUDE.md's stated 2.6209, as
+expected when the arithmetic gets more accurate), **3/3 backends**, tg256 **31.21 +/- 0.11**
+against 31.23 — unchanged.
