@@ -4384,3 +4384,27 @@ Plain 21.5-23.7 against MTP 23.2 (attempt 129). The server agrees: `speculative.
 measured **28.099** and `n_max=7` **28.040** in the same session — indistinguishable. At
 228958 context MTP is close to free of benefit, which reframes the whole strategy: the target
 is single-token decode, and within it, **flash-attn at 23.7 of 46.6 ms per token**.
+
+## Attempt 132 — occupancy on the nb=1 (plain decode) tile config (REJECTED)
+
+Now that plain decode is the target (attempt 131), checked the ncols=6 config, which was
+never tuned for this shape — I set its occupancy to 2 by analogy with the wider tiles.
+Shared memory is only 13056 B there, so **5 blocks/SM would fit** while occupancy 2 gives
+12 warps of a possible 64.
+
+Raising it to 4 (24 warps/SM): **nb=1 1687 -> 1707 us**, slightly worse. Other shapes
+unchanged to slightly worse (nb=2 2166->2177, nb=4 3154->3177, nb=6 4898->4946).
+
+Third independent confirmation that this kernel is **not latency-bound**: 384 threads at
+ncols=48 was exactly neutral (attempt 120), doubling occupancy there did nothing, and
+quadrupling it here is a mild regression. The limiter is shared-memory throughput or
+dependent-instruction chains, not warps in flight.
+
+**Config space for the tile kernel is exhausted** across every shape: thread count,
+occupancy, nbatch_K, nbatch_fa, and ncols routing all measure neutral or worse.
+
+### Measurement note
+
+`test-backend-ops perf` silently **skips** the large-kv cases when VRAM is occupied — a
+running llama-server made every kv=131072/262144 case vanish from the output with a clean
+exit and "2/2 backends passed". Check for a live server before trusting a perf run.
