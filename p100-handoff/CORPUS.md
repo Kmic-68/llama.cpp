@@ -65,3 +65,16 @@ not different arithmetic.
 against a fixed document. Use `ppl-orig.txt` (420,098 bytes) with the
 2.6209 target, or `./ppl.txt` (422,246) with the 2.7554 target — but never
 compare a number from one to a target from the other.
+
+
+## Session 7 confirmation (2026-09-05)
+
+Verified directly rather than inferred: `./ppl.txt` yields **2.7566 +/- 0.0215 on any
+build**, including one with the session's kernel path disabled at runtime
+(`GGML_CUDA_FA_TILE_Q4_0=0`), which reproduces the identical figure. So a run against
+`./ppl.txt` can never match CLAUDE.md's stated 2.6209 gate, on any build, stock or not.
+
+**Use `p100-handoff/ppl-orig.txt`** -> 2.6186 +/- 0.0199, inside the 2.6209 +/- 0.0199 gate.
+
+The root `HANDOFF.md`'s 2.7554 is the `./ppl.txt` figure from session 1 and is correct for
+that corpus.

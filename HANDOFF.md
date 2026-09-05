@@ -1,5 +1,19 @@
 # P100 (sm_60) CUDA kernel optimization — handoff
 
+> **STALE — this is the session-1 document (2026-08-29), kept because its analysis of
+> `mul_mat_vec_q` is still correct and still load-bearing.**
+>
+> For current state read **`p100-handoff/RESUME-HERE.md`**. Short version as of
+> 2026-09-05 (HEAD `606215cbf`): `tg256` is **32.11 t/s** and MTP decode at 262144
+> context is **23.2 t/s**. Most work since this document has been long-context and
+> speculative-decode, not `mul_mat_vec_q`.
+>
+> One correction: the **PPL 2.7554** below is the figure for `./ppl.txt`. That is *not*
+> the corpus CLAUDE.md's 2.6209 gate refers to — that one is
+> `p100-handoff/ppl-orig.txt`, which gives **2.6186**. `./ppl.txt` yields 2.7566 on any
+> build including stock, so a run against it can never match the documented gate. See
+> `p100-handoff/CORPUS.md`.
+
 **Result: 17.45 → 27.03 t/s (+55%)** on the CLAUDE.md metric
 (`qwen3.8-27B-Q6_K`, 2× Tesla P100, `-sm tensor -fa 1 -ctk/-ctv q4_0`, tg256).
 

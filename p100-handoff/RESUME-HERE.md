@@ -1,9 +1,132 @@
-# Resume point — the full-context + MTP config runs; decode at depth is the problem
+# Resume point — 262144 MTP decode is 23.2 t/s; the bottleneck is GPU idle, not the kernels
 
 All work is committed. Tree is clean apart from your own `CLAUDE.md` edit and
-untracked `ppl.txt` / `p100-handoff/`.
+untracked `ppl.txt`.
 
-## SESSION 6 FIRST: the working configuration
+## SESSION 7 FIRST (this is the current state)
+
+**Result: MTP decode at full context 17.4 -> 23.2 t/s.** Short-context `tg256` is 32.11
+(project baseline was 17.51). Gates held at every step: **PPL 2.6186 +/- 0.0199**,
+`test-backend-ops` **3/3 backends**.
+
+### The configuration to run
+
+    GGML_CUDA_P2P=1 GGML_CUDA_GRAPHS_PRE_VOLTA=1 ./build-opt/bin/llama-server \
+      -m /mnt/fast/models/Qwen3.8-27B-Q6_K.gguf \
+      -ngl 99 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 \
+      -c 262144 -b 262144 -ub 2048 \
+      --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.2 \
+      -ngld 99 -ubd 256
+
+Two changes from session 6's command, both worth real throughput:
+
+- **`--spec-draft-n-max 3`, not 4.** See the interaction below — this is +9.4%.
+- **`GGML_CUDA_GRAPHS_PRE_VOLTA=1`.** +6.7% on the MTP path. Left opt-in because it
+  *costs* 2% on single-token decode (`tg256` 31.23 -> 30.61), which is CLAUDE.md's metric.
+
+### Measured at the operating point (228958 tokens of real context)
+
+| config | t/s | accept |
+|---|---|---|
+| session 6 baseline | 17.396 | 79.0% |
+| + exact-fit tiles (`2c5405fef`) | 20.264 | 81.1% |
+| + CUDA graphs (`e339c6243`), k=4 | 21.221 | 81.1% |
+| **+ n_draft=3** | **23.216** | **85.9%** |
+
+Prefill at that context is ~150 t/s. Plain (non-MTP) decode is 12.2 t/s.
+
+### The one non-obvious result: n_draft=3 beats n_draft=4 by 9.4%
+
+Not because of acceptance. `n_draft=3` makes the verify pass carry `nb = 4` columns, which
+is exactly `get_mmvq_mmid_max_batch(Q6_K, Pascal) == 4`. At `nb <= 4`,
+`ggml_cuda_mul_mat_id_needs_sync()` returns false, so **CUDA graphs stay enabled for the
+verify pass**. At `nb = 5` (n_draft=4) they are disabled for it.
+
+Neither finding predicts this alone: the mmid threshold on its own measures +0.75%, and
+graphs on their own +6.7%. They are coupled. **If you change `n_draft`, re-check whether
+`n_draft + 1` still sits at or below the mmid limit.**
+
+### What was committed
+
+| commit | what |
+|---|---|
+| `2c5405fef` | exact-fit tile widths for the MTP verify shape |
+| `e339c6243` | CUDA graphs allowed on pre-Volta, opt-in |
+| `2786b05e2` `9082aad9f` `17c5e60b8` `f59c3f56f` `606215cbf` | measurements and rejections |
+
+**`2c5405fef` is the big one.** The `ncols2 == 6` ladder only offered `cols_per_block`
+6/12/24/48, i.e. `ncols1` of 1/2/4/8, so a 5-token verify pass was padded into two 4-token
+tiles — **37% of the attention work was padding**. There was no `ncols1` of 5 or 6 because
+`cols_per_block` must be a multiple of `ncols2 == 6` *and* `cpw == ncols/nwarps` must be a
+power of two (it sizes a `memcpy_1`). **36 satisfies both**: 9 warps, cpw 4. Kernel time at
+kv=262144 went 6070 -> 4898 us. The exact 30-wide tile for 5 tokens needs 15 warps (480
+threads) and measures *worse* (5098 us), so 5 tokens deliberately use the 36-wide tile.
+
+## THE THING TO KNOW BEFORE OPTIMISING ANYTHING ELSE
+
+**64% of every MTP verify pass is GPU idle.** Measured by profiling twice (`-n 384` and
+`-n 1`) and differencing the call counts, which are exact integers, so the prefill that
+swamps a single profile cancels out. At 81k context, per verify pass:
+
+| | ms/pass |
+|---|---|
+| `mul_mat_vec_q<Q6_K, ncols_dst=5>` (987 calls) | 105.2 |
+| `mul_mat_vec_q<..., ncols_dst=1>` (draft steps) | 12.1 |
+| **flash_attn_tile (both instances)** | **5.8** |
+| everything else (~2100 calls) | ~9.6 |
+| total GPU busy, 2 GPUs summed | 106.7 (~53 per GPU) |
+| **measured wall** | **148** |
+
+**Flash attention is 5.8 ms of a 148 ms pass.** Sessions 1-6 and most of session 7 were
+spent optimising it. The pass issues ~3000 kernel launches; the gap is scheduling, not
+compute.
+
+At 229k the same gap is ~68-77 ms of a ~200 ms pass. **Closing it entirely would give
+~32 t/s** — that is where the remaining 1.3x to the 30 t/s goal lives, and it is a
+llama.cpp host-path problem, not a CUDA kernel problem.
+
+Three attacks on it so far: CUDA graphs (+6.7% at 81k, +2.2% at depth), the mmid threshold
+(+0.75%), the internal AllReduce (**-17%**, rejected). What is left is cutting launch
+*count*: 987 matmuls per pass over 65 layers is ~15/layer.
+
+## Rejected this session — do not repeat without new information
+
+| attempt | result |
+|---|---|
+| internal AllReduce on Pascal | **-17%**. Gated off for `cc < Volta` because its poll uses `__nanosleep`; that poll is a `volatile` load so a `clock64()` spin works and it *runs* — but these are **P100-PCIe** cards and the chunked pipeline assumes NVLink. The generic butterfly wins. |
+| fused-MoE mmid limit 4 -> 8 | +0.75% across 3 interleaved pairs. Real but too small to diverge from upstream's heuristic. |
+| n_draft 4 -> 6 at depth | +1.9%, against ~10% projected: acceptance falls 81.1% -> 69.7%, cancelling the amortisation. |
+| `nbatch_fa` 32 -> 64 on the 36-wide tile | <1%, inside noise. |
+| 30-wide tile (exact fit for 5 tokens) | worse: 5098 vs 4898 us, needs 480 threads. |
+| doubling occupancy (384 threads, 24 warps/SM) | **exactly neutral** (6066 vs 6067 us) — rules out latency-boundness. |
+| bounding the O(cells.size()) KV scans | +2.7%, inside noise. |
+
+## Measurement pitfalls that cost real time this session
+
+1. **A negative result is only valid for the workload it was measured on.** CUDA graphs were
+   rejected *twice* in earlier sessions on single-token `llama-bench`, which issues few
+   kernels. On the MTP path they are worth +6.7%.
+2. **Cold-start skew is severe.** The same config measured **26.44 t/s as the first run of a
+   batch and 30.14 warm**. Always discard a warmup run and interleave A/B *within one
+   session*; cross-session comparison on this machine is worthless (6-13% swings).
+3. **`-n 128` is too short to measure long-context decode.** It amortises a ~2-3 s fixed
+   startup over ~30 passes and understates throughput by ~25% (14.3 vs 17.4 t/s for the same
+   build). Use `-n 512` or more.
+4. **A single nvprof profile at long context is prefill-dominated** (590 GPU-seconds of
+   prefill vs 13.5 s of decode). Difference two runs' call counts instead.
+5. **`./ppl.txt` is not the gate corpus.** It yields **2.7566 on any build**, including
+   stock — confirmed by re-running with the session's kernel path disabled. CLAUDE.md's
+   stated 2.6209 belongs to `p100-handoff/ppl-orig.txt`, which gives 2.6186. (The root
+   `HANDOFF.md`'s 2.7554 is the `./ppl.txt` figure from the early sessions — both are
+   correct for their own corpus.)
+6. **Background jobs need `setsid`.** The harness reaps plain background tasks; two
+   full-context runs were lost that way before detaching them properly.
+
+---
+
+## SESSION 6 (historical — superseded by the section above)
+
+### The working configuration as of session 6
 
 The goal was full 262144 context **and** fast prefill **and** MTP, all at once.
 Before this session that combination did not start at all — it aborted with
