@@ -3840,3 +3840,58 @@ context with a large allocation exists, without any change in GPU work.
 `-c 262144` runs vary **19.2-23.4 t/s across sessions** (thermal/state drift) though only
 +/-2% back-to-back. Every A/B here must be run back-to-back; an earlier single-shot
 comparison wrongly dismissed the scan bounding.
+
+## Attempt 117 — the draft step is host-bound, and 30 t/s is reachable after all
+
+### Correcting the ceiling
+
+Attempt 115 claimed a ~26 t/s ceiling. That was an arithmetic error: the allocation overhead
+was subtracted from the draft steps but left inside the verify pass. Done consistently:
+
+| | ms/pass | ms/token | t/s |
+|---|---|---|---|
+| measured at 229k | 281 | 69.7 | 14.3 |
+| minus allocation overhead (103.6) | 177 | 44.0 | 22.7 |
+| minus per-draft host overhead (~38) | ~139 | ~34.5 | **~29** |
+| both, with an ideal ~3 ms draft step | ~117-125 | ~29-31 | **~32-34** |
+
+**30 t/s with MTP is reachable.** It is not a hardware limit.
+
+### What a draft step actually costs
+
+nvprof per-kernel counts across n_draft = 1 / 2 / 4 (49/36/24 verify passes, 49/72/96 draft
+steps), short context:
+
+| kernel | k=1 | k=2 | k=4 | per draft step |
+|---|---|---|---|---|
+| `mul_mat_vec_q<Q6_K, ncols_dst=1>` | 888 | 1302 | 1734 | **18.0 exactly** |
+| `mul_mat_vec_q<ncols_dst=2/3/5>` | 51490 | 36360 | 23230 | 0 (verify only, ~1000/pass) |
+| `[CUDA memcpy HtoD]` | 5884 | 5816 | 5792 | 0 — constant, it is model load |
+
+(414/23 = 432/24 = 18.0.) So the draft really is one MTP block: **18 matmuls against ~1000
+for a verify pass** — it is not secretly running the trunk. At 158 us/call that is
+**~2.9 ms of GPU work inside a ~12.5 ms draft step**; ~9.6 ms is host-side.
+
+### Rejected: the CPU-sampler sync
+
+`set_sampler` refuses backend sampling whenever `split_mode == TENSOR`
+(llama-context.cpp:1216), so every draft step samples on the CPU — an obvious per-step sync
+suspect. Measured against `-sm layer`, where backend sampling is active:
+
+| | verify V | draft D | D/V |
+|---|---|---|---|
+| `-sm tensor` (CPU sampler) | 38.8 ms | 12.5 ms | 0.32 |
+| `-sm layer` (backend sampler) | 54.1 ms | 16.8 ms | 0.31 |
+
+The ratio is unchanged, so the sampler sync is not the cost. Rejected.
+
+### Where the remaining work is
+
+Both remaining components are **host-side per-forward-pass overhead, not GPU work**:
+
+1. allocation-driven overhead, ~104 ms/pass at `-c 262144` (attempt 116, mechanism open)
+2. per-draft-step overhead, ~9.6 ms x 4 = ~38 ms/pass
+
+Together ~142 ms of the 281 ms pass — **50% of a full-context MTP pass is host overhead**.
+Removing both lands at ~29 t/s; an ideal draft step takes it past 30. This is llama.cpp
+per-decode overhead, not a CUDA kernel problem, which is why kernel work has stopped paying.
