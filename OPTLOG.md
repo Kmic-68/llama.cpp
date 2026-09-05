@@ -3733,3 +3733,52 @@ context with these kernels.
 
 **30 t/s at 262144 needs 33.3 ms/token, i.e. a 2.1x cut from 69.9 ms.** The draft steps are
 now ~52% of the pass, so they -- not the verify attention -- are the largest remaining target.
+
+## Attempt 115 — plain vs MTP at depth, and where the draft cost lives
+
+Same 262144-token corpus, same build, both measured:
+
+| | short ctx | 228958 ctx |
+|---|---|---|
+| plain decode | 31.5 t/s (31.7 ms/step) | **12.2 t/s** (82 ms/step) |
+| MTP (n_draft=4) | **52.15 t/s**, 78.2% accept | **14.3 t/s**, 76.9% accept |
+| MTP multiplier | 1.66x | **1.17x** |
+
+### Decomposing the MTP pass
+
+Short: 260 predicted / 197 accepted = 63 passes in 4.985 s = 79.1 ms/pass, 4.13 tokens/pass.
+Long:  133 predicted / 100 accepted = 33 passes in 9.291 s = 281 ms/pass, 4.03 tokens/pass.
+
+Verify pass = plain step + the extra attention for 5 columns instead of 1:
+long = 82 + 16*(5.0 - 1.69) = 135 ms. Draft overhead is the remainder.
+
+| | draft overhead/pass | per draft step |
+|---|---|---|
+| short | 79.1 - 31.7 = 47.4 ms | **11.9 ms** |
+| long  | 281 - 135 = 146 ms | **36.5 ms** |
+
+So a draft step is **~11.9 ms constant + ~24.6 ms that scales with context**. The scaling part
+matches 16 full-attention layers x 1.69 ms = 27 ms almost exactly — the draft appears to run
+the whole attention stack rather than the single nextn layer. A draft step costs 44% of a full
+65-layer decode step at depth.
+
+### What this bounds
+
+30 t/s at 262144 needs 33.3 ms/token. Current 69.7.
+
+| scenario | pass ms | ms/token | t/s |
+|---|---|---|---|
+| now | 281 | 69.7 | 14.3 |
+| draft step cut to its short-ctx 11.9 ms | 183 | 45.4 | 22.0 |
+| draft step ~5 ms (near-ideal nextn layer) | 155 | 38.5 | 26.0 |
+| **drafting entirely free** | **135** | **33.5** | **29.9** |
+
+**30 t/s at 262144 requires the draft to cost nothing at all.** Even a perfect single-layer
+draft lands near 26 t/s. The verify pass alone (135 ms for 4.03 tokens) is 33.5 ms/token, and
+that floor is set by 82 ms of plain decode step (28 ms of it irreducible weight reads) plus
+53 ms of extra attention for verifying 5 columns — the tile kernel is bandwidth-bound at
+nb=1 (1104 us f16 vs a ~1.1 ms KV floor) but compute-bound above it, and without tensor cores
+the per-column cost is real.
+
+Realistic ceiling on this hardware: **~26 t/s with an ideal draft path**, against 14.3 today.
+The draft path is therefore still worth ~1.8x and is the only remaining lever of that size.
