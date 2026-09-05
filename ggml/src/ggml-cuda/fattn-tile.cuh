@@ -490,12 +490,15 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile_q4_0(
                         const int shift = iqs < QK4_0/2 ? 0 : 4;
 
                         const block_q4_0 * blk = (const block_q4_0 *) (KV + i*stride_KV) + a/QK4_0;
-                        const float d = __half2float(blk->d);
+                        // (q - 8)*d as one hfma2 per pair rather than a float sub and mul
+                        // per value, which halves the dequant ALU in the load.
+                        const half2 dh   = __half2half2(blk->d);
+                        const half2 offs = __hmul2(dh, __float2half2_rn(-8.0f));
 #pragma unroll
                         for (int l = 0; l < cpy_ne; ++l) {
                             const int q0 = (blk->qs[base + 2*l + 0] >> shift) & 0x0F;
                             const int q1 = (blk->qs[base + 2*l + 1] >> shift) & 0x0F;
-                            tmp[l] = make_half2((q0 - 8)*d, (q1 - 8)*d);
+                            tmp[l] = __hfma2(__halves2half2(__int2half_rn(q0), __int2half_rn(q1)), dh, offs);
                         }
                     } else {
 #pragma unroll

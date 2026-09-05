@@ -3648,3 +3648,44 @@ nb=6 6242 us). PPL 2.6186 +/- 0.0199, tg256 28.11 +/- 1.97, 3/3 backends, all op
 
 Note on measurement hygiene: the first perf run after a build reads ~8% slow (clock ramp) —
 nb=2048 gave 682208 us then 629067 us on the same binary. Discard the first run.
+
+## Attempt 112 — hfma2 dequant in the tile loader (KEPT)
+
+`(q - 8)*d` as one `__hfma2` per pair instead of a float sub + mul + convert per value.
+
+kv=262144, quiet machine, warmed: nb=1 1833 -> **1691 us** (-7.8%), nb=2 3471 -> 3200,
+nb=6 6237 -> **6080 us** (-2.5%). tg256 is insensitive to it (31.36 / 31.96 / 31.63 against
+31.76 baseline -- same distribution), so it is kept on the long-context op numbers, which
+are stable and reproduce exactly across runs.
+
+## Attempt 113 — CUDA graphs on Pascal (REVERTED)
+
+`ggml_cuda_graph_set_enabled` disables graphs for `cc < GGML_CUDA_CC_VOLTA` on architecture
+alone, though Pascal supports them (graphs need only compute 3.0). Earlier profiling put
+~4.1 ms/token of the decode budget in GPU idle across ~920 kernel launches, so this looked
+like the largest recoverable pool.
+
+It is not recoverable this way. Two independent A/B pairs:
+
+| | graphs off | graphs on |
+|---|---|---|
+| run A | 31.36 +/- 0.16 | 30.72 +/- 0.10 |
+| run B | 31.46 +/- 0.16 | 30.87 +/- 0.08 |
+
+Consistently ~0.6 t/s **worse**. Capture/replay and re-instantiation cost more than the
+launch overhead saved. Reverted.
+
+## Measurement hygiene: two traps hit this session
+
+1. **Machine load moves tg256 by ~10%.** The same commit measured 28.11-28.40 t/s while
+   stale background shells and a 262144 prefill were running, and 31.76 once quiet. The
+   flash-attn *op* numbers were unaffected (baseline reproduced 1833/6237 us exactly under
+   both). Never compare end-to-end t/s across different machine states -- re-measure the
+   baseline back-to-back, which is what caught this: a claimed "28.40 -> 31.36 from hfma2"
+   was really the machine going quiet.
+2. **`./ppl.txt` is not the gate corpus.** CLAUDE.md specifies `-f ./ppl.txt` with a required
+   2.6209 +/- 0.0199, but that file yields **2.7566 +/- 0.0215 on any build** -- confirmed by
+   re-running with `GGML_CUDA_FA_TILE_Q4_0=0`, which disables this session's kernel path
+   entirely and gives the identical 2.7566. The corpus behind 2.6209 is
+   `p100-handoff/ppl-orig.txt`, which gives 2.6186. Following CLAUDE.md literally makes every
+   build look like a correctness failure.
