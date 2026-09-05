@@ -4166,3 +4166,35 @@ gain is workload-specific and the default path is CLAUDE.md's tg256 metric, whic
 
 Lesson: a negative result is only valid for the workload it was measured on. This one was
 wrong twice for that reason.
+
+## Attempt 127 — the fused-MoE batch threshold (REJECTED, ~1%)
+
+`get_mmvq_mmid_max_batch_pascal_older` returns **4 for Q6_K**. The MTP verify pass carries
+n_draft+1 == 5 tokens, so `5 > 4` and `ggml_cuda_mul_mat_id` skips the fused path and takes
+the fallback that **stream-synchronises** (llama.cpp's own `[TAG_MUL_MAT_ID_CUDA_GRAPHS]`).
+With 65 layers that is a sync per layer per pass — the obvious candidate for the 64% GPU idle
+measured in attempt 125, and CLAUDE.md's listed untried idea (MMVQ_MAX_BATCH_SIZE).
+
+Made the limit env-overridable (`GGML_CUDA_MMID_MAX_BATCH`) so A/B needs no rebuild, and
+applied the override to **both** `ggml_cuda_mul_mat_id` and `ggml_cuda_mul_mat_id_needs_sync`
+— the first attempt wired only the dispatch, leaving graph-eligibility disagreeing with it.
+
+Interleaved, same session, graphs on, k=4, 81k:
+
+| pair | mmid=4 | mmid=8 | delta |
+|---|---|---|---|
+| warm pair (v2) | 30.136 | 30.281 | +0.5% |
+| rep1 (v3, warmup discarded) | 30.064 | 30.347 | +0.9% |
+
+**~1%, inside the noise band. Rejected.** The mechanism is real but removing the sync does not
+pay: the fused Q6_K kernel at batch 5 evidently costs about what the avoided sync saves.
+
+It does explain the n_draft curve at 81k, though: k=3 (nb=4, under the limit) measured fastest
+at 30.260 while k=4 (nb=5) did not — that was this threshold, not acceptance, and it is worth
+~1% rather than anything larger.
+
+### Measurement note
+
+Cold-start skew is severe at 81k: the same config measured **26.437 t/s as the first run of a
+batch and 30.136 warm**. Always discard a warmup run and interleave A/B within one session;
+cross-session comparison on this machine is worthless.
