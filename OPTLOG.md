@@ -4449,3 +4449,40 @@ runs one shape in ~7 s instead of ~7 min for the whole flash-attn suite — a 60
 which is why three sweeps fit in the time one used to take. Note the timing line and the case
 description are on **separate output lines**, so a grep requiring both on one line silently
 returns nothing.
+
+## Attempt 134 — cpw (Q-column reuse per thread) makes no difference; parameter space closed
+
+At ncols=6 with 192 threads, `cpw = ncols/nwarps = 1`: each thread owns one Q column, so every
+K element fetched from shared feeds exactly one MAC. That is a mechanical explanation for the
+kernel sitting 4.8x off its bandwidth floor, and 96 threads gives `cpw = 2` (it must be a power
+of two), doubling reuse per fetch.
+
+| ncols=6 | nb=1 | nb=4 | nb=6 |
+|---|---|---|---|
+| 192 threads, cpw=1 | 1517.72 | 3106.31 | 4901.29 |
+| 96 threads, cpw=2 | **1517.79** | 3101.46 | 4900.30 |
+
+**Identical to 0.005%.** Doubling shared-memory read reuse changes nothing, so the kernel is
+not limited by shared-read bandwidth either.
+
+### What is now excluded for this kernel
+
+| axis | tested | result |
+|---|---|---|
+| warps in flight | 384 threads, occupancy 2/3/4, doubling warps | neutral or worse (3 ways) |
+| K-chunk loop | nbatch_K 64 / 128 / 256 | **128 is optimal, -10.3%**; 256 costs +44% |
+| KV tile depth | nbatch_fa 32 / 64 / 128 | 64 optimal |
+| Q-column reuse | cpw 1 vs 2 | **identical** |
+| tile width | ncols 6/12/24/30/36/48 | exact-fit widths already taken |
+
+### Where the remaining 3.6x actually lives
+
+The q4_0 path at nb=1 is 1518 us; the **f16** path at the same shape is **1118 us**. So the
+dequant is ~400 us (26%), and even removing it entirely leaves 1118 us — still **3.6x off the
+0.31 ms bandwidth floor**. The gap is therefore not quantisation and not any launch-geometry
+parameter: it is the kernel's structure at low column counts, where each KV element is loaded,
+written to shared, and read back for only six MACs.
+
+Closing it needs a different kernel for this shape — dequantise K into registers and
+accumulate all six columns per thread, skipping the shared round-trip for K entirely. That is
+a rewrite, not a parameter, and it is the honest remaining path to 30 t/s single-token.
