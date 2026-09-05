@@ -4203,3 +4203,36 @@ at 30.260 while k=4 (nb=5) did not — that was this threshold, not acceptance, 
 Cold-start skew is severe at 81k: the same config measured **26.437 t/s as the first run of a
 batch and 30.136 warm**. Always discard a warmup run and interleave A/B within one session;
 cross-session comparison on this machine is worthless.
+
+## Attempt 128 — internal AllReduce on Pascal (REJECTED, -17%)
+
+Every run prints `internal AllReduce init failed (n_devices != 2?); falling back to
+meta-backend butterfly`. Under `-sm tensor` an AllReduce runs **once per layer** (65 per
+forward pass), so the fallback path is on the critical path of the 95 ms/pass GPU idle from
+attempt 125.
+
+The real reason for the fallback is not n_devices — it is
+`ggml_cuda_ar_pipeline_init` rejecting `cc < GGML_CUDA_CC_VOLTA`, because the chunked kernel
+polls with `__nanosleep` (sm70+). That poll reads a `volatile` int, so the sleep is only a
+backoff: replaced it with a `clock64()` spin of comparable length and gated the whole thing
+behind `GGML_CUDA_AR_PRE_VOLTA=1`.
+
+It initializes and runs cleanly on P100 — no warning, no hang. But it is **slower**:
+
+| MTP 81k, graphs on | AR off (butterfly) | AR on (internal) |
+|---|---|---|
+| pair 1 | 29.919 | 24.931 |
+| pair 2 | 30.207 | 25.188 |
+
+**-17%, consistent across both interleaved pairs.** tg256 also drops slightly, 27.08 -> 26.66.
+
+Correctness was fine either way: **PPL 2.6194 +/- 0.0199** with the path's default BF16
+round-trip on F32 reductions, and **2.6186** with `GGML_CUDA_AR_BF16_THRESHOLD=0`, both inside
+the gate. So this was rejected on speed, not numerics.
+
+Why it loses: these are **P100-PCIe** cards. The pipelined chunked AllReduce is built around
+NVLink bandwidth and Volta's cheap `__nanosleep` backoff; over PCIe with a clock64 spin, the
+meta backend's generic butterfly is simply better. Upstream's Volta gate is correct here, for
+a reason it does not state.
+
+Reverted.
