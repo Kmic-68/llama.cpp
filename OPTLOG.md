@@ -3689,3 +3689,47 @@ launch overhead saved. Reverted.
    entirely and gives the identical 2.7566. The corpus behind 2.6209 is
    `p100-handoff/ppl-orig.txt`, which gives 2.6186. Following CLAUDE.md literally makes every
    build look like a correctness failure.
+
+## Attempt 114 — MTP at near-full context, MEASURED
+
+`llama-speculative-simple`, `--spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min 0.2
+-ngld 99 -ubd 256`, `-c 262144 -b 262144 -ub 2048`, 262144-token prompt built from 400
+distinct repo files (43% duplicate lines; the first attempt used ppl-orig.txt concatenated 3x
+= 71% duplicate, which would have made drafting artificially easy and the number worthless).
+
+    encoded  228958 tokens in 1571.148 s, speed: 145.727 t/s
+    decoded     133 tokens in    9.291 s, speed:  14.315 t/s
+    n_draft = 4, n_drafted = 130, n_accept = 100, accept = 76.923%
+
+**14.3 t/s at 228958 context with 76.9% acceptance.**
+
+Acceptance is *better* than the ~72% the budget model said 30 t/s needed, and the result is
+still less than half of it — so the model was wrong, not the draft head. 133 tokens with 100
+accepted is 33 verify passes in 9.291 s = **281 ms per pass**, against the ~135 ms predicted.
+
+The missing term is the **draft passes themselves**. n_draft = 4 means four sequential draft
+forwards per verify pass, each doing its own attention over 228958 tokens of KV. The budget
+counted only the verify pass. Corrected:
+
+    pass = verify(nb = k+1) + k * draft_step + weights + other
+
+With verify(nb=5) ~= 16*5.0 = 80 ms, weights 28, other 15 -> 135 ms, the residual
+281 - 135 = ~146 ms over 4 draft steps is ~37 ms per draft step -- the same order as a full
+decode step, which is what it is.
+
+### n_draft is already near its optimum
+
+Geometric model at p = 0.769 (E[accepted] = sum p^i, matches the observed 3.03):
+
+| n_draft | tokens/pass | est. pass ms | est. ms/token |
+|---|---|---|---|
+| 2 | 2.36 | ~180 | 76 |
+| **4** | **4.03** | **281 (measured)** | **69.9** |
+| 8 | 4.92 | ~370 | 75 |
+
+Raising n_draft buys sub-linear token gains against linear draft cost; lowering it loses more
+throughput than it saves. 4 is right, and 14.3 t/s is close to what MTP can do at this
+context with these kernels.
+
+**30 t/s at 262144 needs 33.3 ms/token, i.e. a 2.1x cut from 69.9 ms.** The draft steps are
+now ~52% of the pass, so they -- not the verify attention -- are the largest remaining target.
