@@ -4258,3 +4258,34 @@ depth they are worth 8.2%. The lesson is that attempt 124's "n_draft is flat" wa
 across a configuration boundary without knowing the boundary existed.
 
 **Full-context progression this session: 17.396 -> 20.264 -> 21.221/21.463 -> 23.216 t/s.**
+
+## Attempt 129b — CORRECTION: why n_draft=3 wins (it is not the mmid threshold)
+
+Attempt 129 attributed k=3's +8.2% to the fused-MoE mmid threshold keeping CUDA graphs
+enabled for the verify pass. **That explanation is wrong.** The model has no `expert_count`
+in its metadata — `qwen35.feed_forward_length = 17408`, 65 blocks, 24 heads / 4 KV — so it is
+**dense**. There are no `GGML_OP_MUL_MAT_ID` nodes in this graph at all, and
+`get_mmvq_mmid_max_batch` never runs.
+
+The real cause is the **flash-attn tile-width step**:
+
+| n_draft | nb | tile | FA/pass | us/token |
+|---|---|---|---|---|
+| **3** | 4 | 24-wide, ncols1=4 — **exact fill** | **50.5 ms** | 788 |
+| 4 | 5 | 36-wide, ncols1=6 — one column wasted | 78.4 ms | 980 |
+
+One more drafted token forces the next tile width: **+27.9 ms/pass**. Adding the extra draft
+step (~11 ms) gives 38.9 ms against the 43.8 ms measured gap (154 vs 197.8 ms/pass). That is
+the whole effect.
+
+### The actionable rule
+
+**Pick n_draft so that `nb == n_draft+1` exactly fills a tile.** Available `ncols1` are
+1/2/4/6/8, so the sweet spots are **nb in {4, 6, 8}, i.e. n_draft in {3, 5, 7}**. Landing one
+past a boundary (nb=5, nb=7) pays for a whole extra tile width and wastes it.
+
+Per-token FA cost ranks **nb=8 (702 us) < nb=4 (788) < nb=6 (817)**, so k=7 is worth testing:
+its attention is cheapest per token, but it pays four more draft steps than k=3.
+
+This also means attempt 127's mmid result (+0.75%) was measuring nothing at all on this
+model — consistent with it being indistinguishable from noise.
