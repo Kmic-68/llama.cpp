@@ -4093,3 +4093,35 @@ Same shapes, q4_0 cache vs f16 cache, kv=262144, with the new tile widths:
 At the shape that matters the dequant is now only 14%, so a perfect dequant is worth ~1.05x
 overall — it is no longer the main lever. Note f16 reads 537 MB against q4_0's 151 MB and is
 still *faster*: the kernel is issue-bound, not bandwidth-bound, at every one of these shapes.
+
+## Attempt 124 — n_draft against context length (marginal, ~2%)
+
+Hypothesis: the optimal n_draft rises with context, because the verify pass carries a large
+fixed attention cost (78.6 ms/pass at 229k vs ~28 at 81k) that is amortized over more
+drafted tokens. Tested at both depths.
+
+At 80949 context, -n 384:
+
+| n_draft | t/s | accept |
+|---|---|---|
+| 2 | 27.671 | 94.403% |
+| **3** | **30.260** | 91.318% |
+| 4 | 29.901 | 86.000% |
+| 6 | 29.972 | 78.537% |
+
+Note k=2 has the *highest* acceptance and is the *slowest*: what matters is tokens produced
+per verify pass, not the fraction accepted.
+
+At 228958 context, -n 512:
+
+| n_draft | tokens/pass | ms/pass | t/s | accept |
+|---|---|---|---|---|
+| 4 | 4.24 | 209 | 20.264 | 81.109% |
+| **6** | 5.17 | 250 | **20.651** | 69.732% |
+
+**Only +1.9%, against the ~10% projected.** The projection assumed acceptance would hold at
+its k=4 value; instead it fell from 81.1% to 69.7%, cancelling most of the amortization gain.
+Longer draft chains are accepted less often at depth. k=8 produced no result (timed out).
+
+n_draft is therefore flat from 3 to 6 and is not a lever. Best config is k=6 at 20.651 t/s,
+but k=4 at 20.264 is within 2% and has better acceptance.
