@@ -4407,6 +4407,16 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
     if (graph->graph == nullptr) {
+        // Pascal supports CUDA graphs; upstream gates them on architecture alone. Profiling the
+        // MTP path shows ~95 ms of a 148 ms verify pass is GPU idle across ~3000 kernel launches,
+        // so this is worth measuring there even though single-token decode showed no gain.
+        static const bool pre_volta_graphs = [] {
+            const char * s = getenv("GGML_CUDA_GRAPHS_PRE_VOLTA");
+            return s && atoi(s) != 0;
+        }();
+        if (pre_volta_graphs) {
+            // fall through: do not disable
+        } else
         if (ggml_cuda_info().devices[cuda_ctx->device].cc < GGML_CUDA_CC_VOLTA) {
             if (!graph->disable_due_to_gpu_arch) {
                 GGML_LOG_DEBUG("%s: disabling CUDA graphs due to GPU architecture\n", __func__);

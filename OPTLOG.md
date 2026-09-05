@@ -4125,3 +4125,44 @@ Longer draft chains are accepted less often at depth. k=8 produced no result (ti
 
 n_draft is therefore flat from 3 to 6 and is not a lever. Best config is k=6 at 20.651 t/s,
 but k=4 at 20.264 is within 2% and has better acceptance.
+
+## Attempt 125 — where the decode time actually goes (profile differencing)
+
+Profiled MTP at 81k with nvprof twice (-n 384 and -n 1) and differenced the call counts,
+which are exact integers, to cancel the prefill that swamps a single profile. 87 verify
+passes, 348 draft steps in the difference:
+
+| kernel | dcalls | /pass | ms/pass |
+|---|---|---|---|
+| `mul_mat_vec_q<Q6_K, ncols_dst=5>` | 85850 | 986.8 | **105.19** |
+| `mul_mat_vec_q<Q6_K, ncols_dst=1>` (draft) | 6192 | 71.2 | 12.11 |
+| flash_attn_tile (both instances) | 858 | 9.9 | **5.79** |
+| everything else (12 kernels) | — | ~2100 | ~9.6 |
+| **total GPU busy, 2 GPUs summed** | | | **106.7** |
+
+Per GPU that is ~53 ms against a **measured 148 ms wall per pass — 64% of the pass is GPU
+idle**. The pass issues ~3000 kernel launches. **Flash attention is 5.8 ms of it**, which is
+the whole session's optimisation target, and it is not the bottleneck at this context.
+
+At 229k the same gap is ~77 ms of the 209 ms pass. Closing it entirely would give ~132 ms
+= **~32 t/s**.
+
+## Attempt 126 — CUDA graphs, retested on the right workload (KEPT, opt-in)
+
+Attempts 113 and 116 measured CUDA graphs as neutral-to-worse and rejected them. **Both used
+single-token llama-bench**, which has none of the launch pressure. Retested on the MTP path:
+
+| workload | graphs off | graphs on | |
+|---|---|---|---|
+| MTP, 81k, n_draft=4 | 28.130 t/s | **30.012 t/s** | **+6.7%** |
+| single-token tg256 | **31.23** | 30.61 | -2.0% |
+
+Correctness with graphs on: **PPL 2.6186 +/- 0.0199** (identical), **3/3 backends, all ops
+pass**.
+
+Kept as an **opt-in** (`GGML_CUDA_GRAPHS_PRE_VOLTA=1`) rather than flipping the default: the
+gain is workload-specific and the default path is CLAUDE.md's tg256 metric, which graphs cost
+2%. MTP users should set it.
+
+Lesson: a negative result is only valid for the workload it was measured on. This one was
+wrong twice for that reason.
