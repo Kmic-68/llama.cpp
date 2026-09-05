@@ -4289,3 +4289,27 @@ its attention is cheapest per token, but it pays four more draft steps than k=3.
 
 This also means attempt 127's mmid result (+0.75%) was measuring nothing at all on this
 model — consistent with it being indistinguishable from noise.
+
+## Attempt 130 — mmid at full context, and the dense-model confirmation (REJECTED)
+
+At 228958 context, graphs on, with a k=3 stock control in the same batch:
+
+| config | t/s | accept |
+|---|---|---|
+| k=4, mmid=8 | 19.432 | 81.109% |
+| k=6, mmid=8 | 20.016 | 69.732% |
+| **k=3, stock (control)** | **22.069** | 83.827% |
+
+The control is the point: k=3 measured **23.216** an hour earlier and **22.069** here, on
+identical code — the machine drifted ~5% across the batch. Normalising by it, k=4/mmid=8 is
+~20.4 against 21.463 stock, i.e. mmid=8 **hurts slightly and certainly does not help**.
+
+**Settled directly:** the model has **no `ffn_*_exps` tensors** — dense, no
+`GGML_OP_MUL_MAT_ID` nodes, so `get_mmvq_mmid_max_batch` and
+`ggml_cuda_mul_mat_id_needs_sync` never execute. The override is inert on this model, which
+is exactly why it measures as noise-or-worse everywhere it was tried. Attempts 127 and 129's
+mmid reasoning are both void; attempt 129b's tile-width explanation stands.
+
+Override reverted; the tree matches what ships.
+
+**Standing best: k=3 at 23.216 t/s** (22.069 on a drifted machine).
