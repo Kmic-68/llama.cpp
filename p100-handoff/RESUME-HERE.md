@@ -47,6 +47,8 @@ decode, not the speculative path.**
 | `2c5405fef` | exact-fit tile widths — the verify shape was **37% padding** |
 | `e339c6243` | CUDA graphs allowed on pre-Volta, opt-in (+6.7% MTP) |
 | `0f759f41e` | **`nbatch_K` 128 for the narrow gqa-6 tiles, -10.3% on the decode shape** |
+| `e5bd6c5a3` | eval coverage for this shape (there was none) + `GGML_TEST_PRINT_ERR=1` |
+| `aa22ccee0` | **bound the fp16 accumulation error in flash-attn (8.7x accuracy at depth, 2.4% cost)** |
 
 `2c5405fef`: the `ncols2 == 6` ladder offered `cols_per_block` 6/12/24/48 only, so `ncols1`
 was 1/2/4/8 and a 5-token verify padded into two 4-token tiles. `cols_per_block` must be a
@@ -56,6 +58,23 @@ multiple of `ncols2 == 6` **and** `cpw == ncols/nwarps` must be a power of two (
 `0f759f41e`: `nbatch_K = 128` halves the K-chunk loop from 4 to 2 at DKQ=256.
 **1691 -> 1518 us at nb=1**, reproducible to 0.1%. Config-specific: -1.6% at ncols=24 but
 **+17% worse at ncols=36**, so it is applied only to the narrow tiles.
+
+
+### The fp16 accumulation fix (`aa22ccee0`)
+
+`VKQ` accumulated the attention output over the **whole** KV cache in a half2 register — a
+quarter-million adds in an 11-bit mantissa at 262144. NMSE against the fp32 CPU reference grew
+as sqrt(context): 3.185e-06 at kv=512, **2.773e-05 at kv=65536**.
+
+Fixed by accumulating in half2 *within* a KV tile and folding into an fp32 running sum once per
+tile: **3.205e-06 at kv=65536, and flat with context**. The inner loop keeps its single HMUL2,
+so it costs 2.4% at nb=1 (17.5% if you simply accumulate in fp32, and extending the sm_61 fp16
+exemption to sm_60 does not build here at all — the 36-wide tile would need 50176 B of shared
+against a 48 KiB limit).
+
+**This shape had no eval coverage before**, which is why it went unnoticed. `test-backend-ops`
+now covers kv 512/4096/16384/65536 for it, and `GGML_TEST_PRINT_ERR=1` prints NMSE for passing
+cases so precision regressions are visible rather than merely under tolerance.
 
 ### The tile-width rule (why n_draft = 3)
 

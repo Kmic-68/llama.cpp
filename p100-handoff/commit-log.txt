@@ -1,3 +1,6 @@
+aa22ccee0 cuda: bound fp16 accumulation error in the flash-attn tile kernel
+e5bd6c5a3 tests: add eval coverage for the P100 operating shape and optional error printing
+30332a5a0 handoff: final session-7 update
 e0fe3056c docs: wide loads in the q4_0 dequant rejected (+7%)
 0edc0fc74 docs: cpw makes no difference; tile-kernel parameter space is closed
 0f759f41e cuda: nbatch_K 128 for the narrow gqa-6 tiles (-10.3% on the decode shape)
@@ -68,3 +71,5 @@ f85e154ed optlog: exhaust the MTP flag space
 14197de6e optlog: MTP is host-sync bound -- the real route to 60 t/s
 2a1f29afd handoff: record the mmvq unpack-redundancy finding and its measured ceiling
 2a5e3524e optlog: price the redundant weight unpack in mmvq (not capturable cheaply)
+8ef141ee3 optlog: close out the GEMM-gap investigation
+c816521cb optlog: retract the thermal-throttling explanation for the GEMM gap
