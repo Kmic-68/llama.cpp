@@ -4313,3 +4313,26 @@ mmid reasoning are both void; attempt 129b's tile-width explanation stands.
 Override reverted; the tree matches what ships.
 
 **Standing best: k=3 at 23.216 t/s** (22.069 on a drifted machine).
+
+## The single-token bound at 262144, with numbers
+
+Stated as arithmetic rather than assertion, from this session's measurements.
+
+Model is 20.88 GiB, tensor-split -> **10.44 GiB of weights read per GPU per token**.
+
+| bandwidth | weights alone | single-token ceiling |
+|---|---|---|
+| measured for mul_mat_vec_q on this box, 196 GB/s | 57.2 ms | **17.5 t/s** |
+| best figure seen anywhere in this project, 487 GB/s | 23.0 ms | 43.4 t/s |
+| P100 theoretical peak, 732 GB/s | 15.3 ms | 65.3 t/s |
+
+Measured plain decode at 228958 context is **12.2 t/s = 82 ms/token**, and the budget
+accounts for it: ~53 ms of weights plus 16 x 1.69 ms of flash-attn = 80 ms.
+
+**30 t/s requires 33.3 ms/token in total.** Attention over 229k tokens is 27 ms of that by
+itself, leaving 6.3 ms for the weights — which cannot go below 14.6 ms even at the card's
+theoretical peak bandwidth, and are 57.2 ms at the rate this workload actually achieves.
+
+So single-token 30 t/s at 262144 is not a tuning gap; it is excluded by the memory system by
+roughly 2.5x at peak and 5x in practice. **MTP is the only route to 30 t/s at this context**,
+which is why the work is there: 7.32 -> 12.0 -> 17.4 -> 23.2 t/s across sessions 5-7.
