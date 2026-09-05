@@ -3987,3 +3987,48 @@ So ~2.2 s of one-time cost; **steady-state MTP at 228958 context is ~18.8 t/s**.
 33.3 ms/token = 138.6 ms/pass, so a **1.6x cut** is still required. Largest remaining items
 per pass at this context: verify attention ~80 ms (16 layers x ~5 ms at nb=5), the four
 draft steps ~45 ms (of which only ~2.9 ms each is GPU work), weights ~28 ms.
+
+## Attempt 120 — occupancy analysis of the tile kernel; config tuning is exhausted
+
+### Correcting the efficiency figure
+
+Attempt 119 said the kernel runs at ~6% of fp16 peak. Wrong — test-backend-ops reports it
+directly. Same kernel, same build, kv=262144:
+
+| shape | GFLOP/run | time | TFLOPS | % of ~18.7 peak |
+|---|---|---|---|---|
+| nb=2048 (prefill) | 6600 | 619310 us | **10.65** | 57% |
+| nb=6 (MTP verify) | 19.33 | 6063 us | **3.19** | **17%** |
+
+So 17%, not 6%. The interesting fact is the same kernel reaching 57% at prefill shapes.
+
+### The grid is full; the occupancy is not
+
+`launch_fattn` picks `parallel_blocks = 56` for nb=6 (ntiles_dst = 2, blocks_per_wave =
+56*2), giving 1 x 56 x 2 = **112 blocks over 56 SMs — exactly one wave**. The GPU is filled.
+
+Registers and shared memory cap warps per SM:
+
+| ncols | REG | SHARED | blocks/SM @192thr | warps/SM |
+|---|---|---|---|---|
+| 48 (nb>8) | 127 | 29184 | 2 | **12 of 64** |
+| 24 | 144 | 24064 | 2 | 12 |
+| 12 | 168 | 16384 | 2 (reg-limited) | 12 |
+
+Shared memory is dominated by `Q_tmp` = ncols*DKQ/2*4 = 24576 B at ncols=48, which alone
+caps ncols=48 at 2 blocks/SM whatever the register count.
+
+### More warps do not help — so it is not latency-bound
+
+`__launch_bounds__` is already wired to the config's `occupancy` field. Setting nthreads=384
+with occupancy 2 forces ptxas to ~85 registers and yields 2 blocks x 12 warps = **24 warps/SM,
+double the baseline**. Measured: nb=6 6066 us vs 6067 us baseline — **exactly neutral**.
+
+That is the informative result. Doubling occupancy changing nothing rules out memory latency
+as the limiter and points at shared-memory throughput or dependent-instruction chains in the
+inner loop. Also retested under the new dequant cost model and now neutral where it used to
+matter: nbatch_K 32 vs 64 (6035 vs 6067), 384 vs 192 threads (pre-dequant this was 9617 vs
+9243, a 4% loss; now nil).
+
+**Config-level tuning of this kernel is exhausted.** Remaining gains need inner-loop
+restructuring (register blocking, fewer shared-memory round trips), not table entries.
