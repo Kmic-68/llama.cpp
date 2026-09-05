@@ -4236,3 +4236,25 @@ meta backend's generic butterfly is simply better. Upstream's Volta gate is corr
 a reason it does not state.
 
 Reverted.
+
+## Attempt 129 — n_draft=3 at full context (KEPT, +8.2%)
+
+Attempt 124 concluded n_draft was flat, from k=4 vs k=6. **k=3 was never tested at depth.**
+Interleaved in one session at 228958 context, graphs on:
+
+| n_draft | t/s | accept |
+|---|---|---|
+| **3** | **23.216** | 85.880% |
+| 4 | 21.463 | 81.109% |
+
+**+8.2%.** Not an acceptance effect. `n_draft=3` makes the verify pass carry `nb == 4`,
+which is exactly `get_mmvq_mmid_max_batch(GGML_TYPE_Q6_K, Pascal) == 4`, so
+`ggml_cuda_mul_mat_id_needs_sync()` returns false and **CUDA graphs stay enabled for the
+verify pass**. At `nb == 5` they are disabled for it.
+
+This couples two results that looked separately unimpressive: the mmid threshold alone
+measured +0.75% (attempt 127) and CUDA graphs alone +6.7% at 81k (attempt 126). Together at
+depth they are worth 8.2%. The lesson is that attempt 124's "n_draft is flat" was measured
+across a configuration boundary without knowing the boundary existed.
+
+**Full-context progression this session: 17.396 -> 20.264 -> 21.221/21.463 -> 23.216 t/s.**
