@@ -3631,3 +3631,20 @@ Still short of 30 at realistic acceptance, but 9242 -> 6213 is the first change 
 the MTP verify shape materially. Note `get_alloc_size` still reserves the 512 MiB per GPU of
 f16 staging that this path no longer uses -- reserving it is safe, not reserving it when
 some other path needs it would not be, so that saving is a separate follow-up.
+
+### Follow-up: skip the f16 staging reservation for the q4_0-direct path
+
+`get_alloc_size` was still reserving the whole-cache f16 staging that this path no longer
+reads. Factored the predicate into `ggml_cuda_fattn_tile_q4_0_direct(dst)` and used it in
+all three places (kernel choice, need_f16 for the launch, and the allocation), so they
+cannot diverge — claiming no staging while the kernel then reads it would read
+uninitialized memory.
+
+Per fattn.cu's own note that staging is 512 MiB per GPU at 262144 (2 KV heads x 256 dim x
+262144 positions x 2 B, K and V). **Not directly measured here**: the staging scales with
+current KV occupancy, so a short prompt shows no difference (10545/10289 MiB either way),
+and confirming it needs a genuinely full cache. Perf-neutral (warm: nb=1 1833 us,
+nb=6 6242 us). PPL 2.6186 +/- 0.0199, tg256 28.11 +/- 1.97, 3/3 backends, all ops pass.
+
+Note on measurement hygiene: the first perf run after a build reads ~8% slow (clock ramp) —
+nb=2048 gave 682208 us then 629067 us on the same binary. Discard the first run.

@@ -1317,6 +1317,47 @@ static __global__ void flash_attn_tile(
 #endif // FLASH_ATTN_AVAILABLE
 }
 
+// Whether the tile kernel will read a q4_0 K/V cache directly out of shared memory rather
+// than having launch_fattn convert the whole cache to f16 first. Used both to pick the
+// kernel and to decide whether ggml_cuda_flash_attn_ext_get_alloc_size must reserve the
+// f16 staging (512 MiB per GPU at 262144) -- the two must agree exactly, because claiming
+// no staging is needed while the kernel then reads it would read uninitialized memory.
+static bool ggml_cuda_fattn_tile_q4_0_direct(const ggml_tensor * dst) {
+    static const bool enabled = [] {
+        const char * s = getenv("GGML_CUDA_FA_TILE_Q4_0");
+        return !s || atoi(s) != 0;
+    }();
+    if (!enabled) {
+        return false;
+    }
+
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * V    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+
+    if (K->type != GGML_TYPE_Q4_0 || V->type != GGML_TYPE_Q4_0) {
+        return false;
+    }
+    if (Q->ne[0] != 256 || V->ne[0] != 256) {
+        return false; // only DKQ == DV == 256 is instantiated
+    }
+
+    float max_bias = 0.0f;
+    memcpy(&max_bias, (const float *) dst->op_params + 1, sizeof(float));
+
+    // Mirrors use_gqa_opt in launch_fattn_tile_switch_ncols2, plus the ncols2 == 6 arm being
+    // reached only after the gqa_ratio % 8 arm above it has failed.
+    if (!mask || max_bias != 0.0f || K->ne[1] % FATTN_KQ_STRIDE != 0) {
+        return false;
+    }
+    if (K->ne[2] == 0 || Q->ne[2] % K->ne[2] != 0) {
+        return false;
+    }
+    const int gqa_ratio = Q->ne[2] / K->ne[2];
+    return gqa_ratio % 8 != 0 && gqa_ratio % 6 == 0 && Q->ne[2] % 6 == 0;
+}
+
 template <int DKQ, int DV, int ncols2, bool use_logit_softcap>
 static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * Q = dst->src[0];
@@ -1337,7 +1378,9 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
 
         // A q4_0 cache is dequantized straight into the shared tile, so launch_fattn must not
         // also convert the whole cache to f16 (need_f16_K/V = false below).
-        const bool kv_q4_0 = K->type == GGML_TYPE_Q4_0 && V->type == GGML_TYPE_Q4_0;
+        const bool kv_q4_0 = ggml_cuda_fattn_tile_q4_0_direct(dst);
+        GGML_UNUSED(K);
+        GGML_UNUSED(V);
 
 #define GGML_CUDA_LAUNCH_TILE_GQA6(cols_per_block_)                                                    \
         {                                                                                              \
