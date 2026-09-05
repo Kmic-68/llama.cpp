@@ -4184,9 +4184,14 @@ Interleaved, same session, graphs on, k=4, 81k:
 | pair | mmid=4 | mmid=8 | delta |
 |---|---|---|---|
 | warm pair (v2) | 30.136 | 30.281 | +0.5% |
-| rep1 (v3, warmup discarded) | 30.064 | 30.347 | +0.9% |
+| rep1 (v3, warmup discarded) | 30.064 | 30.347 | +0.94% |
+| rep2 | 30.192 | 30.330 | +0.46% |
+| rep3 | 29.974 | 30.230 | +0.85% |
+| **mean of v3** | **30.077** | **30.302** | **+0.75%** |
 
-**~1%, inside the noise band. Rejected.** The mechanism is real but removing the sync does not
+**+0.75%, consistently positive across all three interleaved pairs — a real effect, but far
+too small to justify diverging from upstream's tuned heuristic, and smaller still at 262144
+where the same 65 syncs are spread over a longer pass. Rejected.** The mechanism is real but removing the sync does not
 pay: the fused Q6_K kernel at batch 5 evidently costs about what the avoided sync saves.
 
 It does explain the n_draft curve at 81k, though: k=3 (nb=4, under the limit) measured fastest
