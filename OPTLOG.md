@@ -3895,3 +3895,46 @@ Both remaining components are **host-side per-forward-pass overhead, not GPU wor
 Together ~142 ms of the 281 ms pass — **50% of a full-context MTP pass is host overhead**.
 Removing both lands at ~29 t/s; an ideal draft step takes it past 30. This is llama.cpp
 per-decode overhead, not a CUDA kernel problem, which is why kernel work has stopped paying.
+
+## Attempt 118 — the allocation overhead is linear in n_ctx; eight causes eliminated
+
+Shape of the penalty, tiny prompt (near-empty cache), n_draft=4, 24 passes each:
+
+| -c | ms/pass |
+|---|---|
+| 8192 | 89.2 |
+| 32768 | 101.0 |
+| 131072 | 157.5 |
+| 262144 | 222.9 |
+
+**Linear in allocated n_ctx**: ~5.3e-4 ms per allocated token per pass (segment slopes
+4.80 / 5.75 / 4.99 e-4). At 262144 that is ~138 ms over an ~85 ms base. Note it scales with
+the *allocation*, not the occupancy — the cache here holds ~113 tokens in every one of these.
+
+526 ns per allocated cell per pass is far too slow for a simple loop, and strace already put
+the time in the driver (sys 2.69 -> 8.80 s, user +1.0 s), so this is not a llama.cpp CPU loop.
+
+### Eliminated so far (each measured, none of them it)
+
+| candidate | result |
+|---|---|
+| O(cells.size()) seq_rm/seq_cp/seq_add/seq_div scans | +2.7%, inside noise |
+| CUDA graphs (Pascal, large ctx) | 23.40 vs 23.11 |
+| pinned host memory (`GGML_CUDA_NO_PINNED=1`) | 20.57 vs 19.23 |
+| target ubatch (512 vs 2048) | 22.91 vs 23.02 |
+| draft ubatch (`-ubd` 64 vs 256) | 23.03 vs 21.43 |
+| **P2P mapping** (`GGML_CUDA_P2P=0`) | **224.9 vs 227.0 ms/pass** |
+| **CPU sampler sync** (`-sm layer` enables backend sampling) | D/V ratio 0.31 vs 0.32 |
+| **draft KV cache dtype** (`-ctkd/-ctvd q4_0`, 537 -> 151 MB) | 18.30 vs 18.51 t/s |
+| `reset_shift` / kv-cells O(size) loops | ~0.1 ms, too cheap by 3 orders |
+
+Plain `llama-cli` decode with the same 262144 cache shows **no penalty at all** (30.7 t/s at
+both 4096 and 262144), so it needs the second (draft) context to appear.
+
+### Next probes for whoever picks this up
+
+The signature is: linear in allocated bytes/cells, driver-side (sys/ioctl), requires two
+contexts, independent of every buffer knob tried above. Worth trying next: `perf record` on
+the sys side to name the kernel path; instrumenting `ggml_backend_sched` reserve/alloc calls
+per decode on the draft context; and checking whether the draft context re-plans its graph
+each pass (its ubatch alternates between prefill and 1-token shapes).
