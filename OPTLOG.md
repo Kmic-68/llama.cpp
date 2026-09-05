@@ -4064,3 +4064,32 @@ Every previous measurement used nb=6 or nb=8, which land on the same tile count,
 padding never showed up as a difference. It only appeared once the sweep included nb=5 and 7
 and the pairs (3,4), (5,6), (7,8) turned out identical.
 Gates: PPL 2.6186 +/- 0.0199, 3/3 backends, all ops pass, tg256 25.39 +/- 3.34 (noisy state).
+
+## Attempt 121b — full-context result for the exact-fit tiles
+
+    encoded 228958 tokens in 1532.256 s, speed: 149.425 t/s
+    decoded    517 tokens in   25.514 s, speed:  20.264 t/s
+    n_draft = 4, n_drafted = 487, n_accept = 395, accept = 81.109%
+
+**17.396 -> 20.264 t/s at 228958 context (1.16x)**, from the tile-width change alone.
+122 passes in 25.514 s = 209 ms/pass, 4.24 tokens/pass.
+
+## Attempt 122 — nbatch_fa 64 on the 36-wide config (REVERTED)
+
+nb=5 over three runs: 4825 / 4860 / 4886 us (mean 4857) against 4898 for nbatch_fa=32,
+i.e. <1% and inside the noise band; nb=3/4 were slightly worse (3169 vs 3152). Reverted.
+
+## Attempt 123 — how much the dequant still costs
+
+Same shapes, q4_0 cache vs f16 cache, kv=262144, with the new tile widths:
+
+| nb | q4_0 | f16 | dequant cost |
+|---|---|---|---|
+| 1 | 1687 us | 1118 us | 569 us (51%) |
+| 4 | 3157 | 2556 | 601 us (24%) |
+| **5 (MTP verify)** | **4912** | **4219** | **693 us (14%)** |
+| 6 | 4914 | 4224 | 690 us (14%) |
+
+At the shape that matters the dequant is now only 14%, so a perfect dequant is worth ~1.05x
+overall — it is no longer the main lever. Note f16 reads 537 MB against q4_0's 151 MB and is
+still *faster*: the kernel is issue-bound, not bandwidth-bound, at every one of these shapes.
