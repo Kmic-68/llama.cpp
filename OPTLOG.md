@@ -3938,3 +3938,52 @@ contexts, independent of every buffer knob tried above. Worth trying next: `perf
 the sys side to name the kernel path; instrumenting `ggml_backend_sched` reserve/alloc calls
 per decode on the draft context; and checking whether the draft context re-plans its graph
 each pass (its ubatch alternates between prefill and 1-token shapes).
+
+## Attempt 119 — CORRECTION: the "allocation overhead" is one-time warmup, and the real full-context number
+
+### The 104 ms/pass allocation overhead does not exist
+
+Attempts 116/118 measured a penalty "per pass" that scaled linearly with allocated n_ctx.
+It is a **one-time startup cost**, which 24-pass runs divided by the pass count into a
+convincing artifact. Evidence:
+
+- Instrumented `memory_update`'s full-cache graph reserve: **0 calls** in a whole run. The
+  leading suspect never fires.
+- Instrumented `llama_context::decode()`: calls 51-100 average **7.2 ms at -c 8192 and
+  7.4 ms at -c 262144** — identical. The whole difference is in the first 50 calls
+  (1059.6 ms vs 6982.0 ms).
+- Marginal throughput, short context, 96 -> 384 tokens:
+
+| -c | n=96 | n=384 | marginal |
+|---|---|---|---|
+| 8192 | 47.08 | 45.41 | 44.8 t/s |
+| 262144 | 18.47 | **32.25** | **43.9 t/s** |
+
+Steady-state decode is the same at both allocations; the fixed cost is ~3.3 s of worst-case
+buffer allocation on first decode. Everything in attempts 116 and 118 that treated this as
+per-pass overhead is withdrawn, including the eight "eliminated causes" — there was no
+per-pass phenomenon to explain.
+
+### Real full-context MTP, measured over 516 tokens
+
+    encoded 228958 tokens in 1450.189 s, speed: 157.881 t/s
+    decoded    516 tokens in   29.662 s, speed:  17.396 t/s
+    n_draft = 4, n_drafted = 496, n_accept = 392, accept = 79.032%
+
+| generation length | t/s |
+|---|---|
+| 133 tokens (attempt 114) | 14.315 |
+| **516 tokens** | **17.396** |
+| marginal over the extra 383 | **18.80** |
+
+So ~2.2 s of one-time cost; **steady-state MTP at 228958 context is ~18.8 t/s**.
+
+**Methodology note: `-n 128` is too short to measure long-context decode.** It amortizes a
+~2-3 s fixed cost over ~30 passes and understates throughput by ~25%. Use >= 512 tokens.
+
+### Distance to 30 t/s
+
+124 passes in 29.662 s = 239 ms/pass (221 ms steady), 4.16 tokens/pass. 30 t/s needs
+33.3 ms/token = 138.6 ms/pass, so a **1.6x cut** is still required. Largest remaining items
+per pass at this context: verify attention ~80 ms (16 layers x ~5 ms at nb=5), the four
+draft steps ~45 ms (of which only ~2.9 ms each is GPU work), weights ~28 ms.
