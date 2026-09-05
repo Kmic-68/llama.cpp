@@ -1,3 +1,13 @@
+e0fe3056c docs: wide loads in the q4_0 dequant rejected (+7%)
+0edc0fc74 docs: cpw makes no difference; tile-kernel parameter space is closed
+0f759f41e cuda: nbatch_K 128 for the narrow gqa-6 tiles (-10.3% on the decode shape)
+9f8617b15 docs: occupancy on the nb=1 tile config rejected; tile config space exhausted
+0606819b9 docs: correct the plain-decode baseline and retract the single-token ceiling
+13ffebe9a docs: quantify the single-token ceiling at 262144
+3ae9e6072 docs: mmid is inert on this model (dense, no expert tensors); k=3 stands at 23.2
+a282507b9 docs: correct why n_draft=3 wins -- FA tile-width step, not the mmid threshold
+4d562c0b7 docs: n_draft=3 is +8.2% at full context (23.216 t/s)
+ccc9ea0d0 handoff: bring the package up to date through session 7
 606215cbf docs: internal AllReduce on Pascal rejected (-17%)
 f59c3f56f docs: complete 3-rep data for the fused-MoE threshold (+0.75%, still rejected)
 17c5e60b8 docs: fused-MoE batch threshold rejected (~1%, inside noise)

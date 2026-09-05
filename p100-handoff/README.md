@@ -2,17 +2,19 @@
 
 2x Tesla P100-PCIE-16GB, tensor-split, Qwen3.5 27B Q6_K, q4_0 KV cache.
 
-**Current numbers (2026-09-05, HEAD `606215cbf`)** -- these supersede everything
+**Current numbers (2026-09-05, end of session 7)** -- these supersede everything
 else in this file. The table below is short-context (2048); for the long-context
-picture, which is what the recent sessions were about, see
-`RESUME-HERE.md` -- **MTP decode at 262144 is now 23.2 t/s**, up from 17.4 at the
-start of session 7 and 7.32 before session 5.
+picture, which is what the recent sessions were about, read `RESUME-HERE.md`.
 
-| long-context workload | value |
+| long-context workload @ 228958 ctx | value |
 |---|---|
-| MTP decode @ 228958 ctx (`n_draft=3`, graphs on) | **23.216 t/s**, 85.9% accept |
-| plain decode @ 228958 ctx | 12.2 t/s |
-| prefill @ 228958 ctx | ~150 t/s |
+| MTP decode (`n_draft=3`, graphs on) | **23.2 t/s**, 86% accept |
+| **plain single-token decode** | **21.5 t/s** fresh / 23.7 cached |
+| prefill | ~150 t/s |
+
+MTP is worth almost nothing at this depth (23.2 vs 21.5-23.7 plain); it is worth
+1.7x at short context. **Optimise plain decode.** The whole remaining gap is
+flash attention: 23.7 of every 46.6 ms per token.
 
 Short-context numbers as of session 7:
 
@@ -79,7 +81,7 @@ GPUs that, like Pascal, lack an integer divider and DP4A.
 | `session3.diff` | the 2026-08-31/09-01 changes alone (on top of `5d1fafb01`) |
 | `session4-longcontext.diff` | the cuBLAS-GEMM attention path alone (on top of `9183630c8`) |
 | `session5-longcontext.diff` | session 5's long-context work alone |
-| `session7-mtp-decode.diff` | **session 7**: exact-fit tile widths + CUDA graphs opt-in (on top of `428c483ae`) |
+| `session7-mtp-decode.diff` | **session 7**: exact-fit tile widths, CUDA graphs opt-in, nbatch_K=128 (on top of `428c483ae`) |
 | `RESUME-HERE.md` | **start here** -- current state and ranked next steps |
 | `VERIFICATION.md` | numerical audit (covers up to `134a4f4a5`; later changes noted at the top) |
 | `CORPUS.md` | why the perplexity gate corpus drifted, and which target goes with which file |
@@ -160,6 +162,20 @@ MTP speed is also content-dependent — acceptance drives it:
 | prose | 37.68 | 22.05 | 58.3% |
 
 ## The findings that mattered
+
+### 0. (session 7, END) The two numbers that matter, and a stale constant that misled everything
+
+**CLAUDE.md's "achieved bandwidth ~196 GB/s of 732" is stale by 2.5x.** Back-solving a clean
+measurement gives **490 GB/s**. Any budget built on 196 badly understates the memory system --
+it produced a published "single-token 30 t/s is physically impossible" conclusion that was
+simply wrong, and had to be retracted.
+
+**The decisive kernel diagnostic:** at nb=1, kv=262144, the **f16** KV path runs at
+**480 GB/s -- the bandwidth limit** -- while **q4_0 runs at 99 GB/s**. q4_0 reads 4x fewer
+bytes and is still slower. So ~1200 us of its 1518 us is dequant overhead, and it is *not* the
+loads (wide loads measure +7% worse) and *not* the memory path. It is dequant arithmetic plus
+the shared-memory round trip, and closing it needs a register-blocked kernel for the
+low-column shape -- a rewrite, not a parameter.
 
 ### 0a. (session 7) 64% of an MTP verify pass is GPU idle, and flash-attn is 5.8 ms of it
 
@@ -345,12 +361,18 @@ The expensive ones from earlier sessions:
 
 ## Where the remaining headroom is
 
-**Current (session 7, long context).** At 229k an MTP pass is ~200 ms: weights ~53 ms/GPU,
-flash-attn ~78.6 ms/GPU, **~68 ms GPU idle**. Closing the idle entirely would give ~32 t/s,
-which is the whole remaining gap to the 30 t/s goal. Three attacks on it: CUDA graphs
-(+6.7% at 81k, +2.2% at depth), the mmid threshold (+0.75%), the internal AllReduce (-17%).
-What is left is cutting launch *count* — 987 matmuls per pass over 65 layers is ~15/layer —
-which is a llama.cpp host-path change, not a CUDA kernel change.
+**Current (end of session 7).** Plain decode at 229k is **46.6 ms/token = 21.5 t/s**:
+
+| | ms/token |
+|---|---|
+| weights + everything else | 22.9 (490 GB/s, 67% of peak) |
+| **flash attention** | **23.7** |
+
+30 t/s needs 33.3 ms/token, so **attention must fall ~2.3x** and it is the entire gap. The
+tile kernel's parameter space is **closed** -- warps in flight (3 ways), `nbatch_K` (128 is
+optimal), `nbatch_fa`, `cpw`, tile widths and dequant load width have all been measured. The
+remaining path is structural: dequantise K into registers and accumulate all six columns per
+thread, skipping the shared round trip. See RESUME-HERE.md for the full closed-axis table.
 
 The tile kernel itself runs at **17% of fp16 peak** at the verify shape (3.19 TFLOPS) against
 **57%** at prefill shapes (10.65). Config space for it is exhausted: thread count, occupancy,
