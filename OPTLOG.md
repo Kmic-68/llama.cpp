@@ -4336,3 +4336,51 @@ theoretical peak bandwidth, and are 57.2 ms at the rate this workload actually a
 So single-token 30 t/s at 262144 is not a tuning gap; it is excluded by the memory system by
 roughly 2.5x at peak and 5x in practice. **MTP is the only route to 30 t/s at this context**,
 which is why the work is there: 7.32 -> 12.0 -> 17.4 -> 23.2 t/s across sessions 5-7.
+
+## Attempt 131 — CORRECTION: plain decode at 262144 is ~21.5 t/s, not 12.2, and the
+## single-token "ceiling" I published was wrong
+
+Built a `llama-server` harness (prefill once, sweep configs against the cached prefix:
+**20 s per config instead of 27 min**). Two notes on getting it up: the server auto-sizes its
+slot count and each slot allocates a full 262144 KV cache, so **`-np 1` is required** or it
+OOMs at startup; and a crashing server writes a multi-GB core that fills the disk.
+
+It immediately contradicted the CLI baseline, so I ran a fresh full prefill, drafting off:
+
+| | prefill | decode |
+|---|---|---|
+| **fresh full prefill, no cache** | 229099 tok @ 145.6 t/s | **21.47 t/s** |
+| cached repeat | prompt_n=4 | **23.69 t/s** |
+
+**Plain single-token decode at 228958 context is ~21.5-23.7 t/s.**
+
+### Both of my earlier numbers were artifacts
+
+- **12.2 t/s (llama-cli) was my measurement error.** That run used `-n 128`. Attempt 119
+  established that 128 tokens is too short at this depth because a ~2-3 s fixed startup is
+  amortised over too few tokens. I recorded that lesson and then failed to apply it to the
+  plain-decode baseline. A true ~28 t/s with ~5 s of fixed cost reads as ~13 t/s.
+- **28.1 t/s (cached sweeps) was cool-card state**, not a real improvement.
+
+### The single-token bound published earlier is retracted
+
+The bound rested on CLAUDE.md's **196 GB/s**. Back-solving from a clean measurement:
+
+    21.47 t/s = 46.6 ms/token
+      flash-attn, 16 layers      23.7 ms
+      weights + everything else  22.9 ms  ->  490 GB/s effective
+
+**The 196 GB/s constant is stale by 2.5x** — it predates this project's mul_mat_vec_q work.
+Every budget in this log that used it understates the memory system. The claimed "single-token
+ceiling of 17.5 t/s" is disproven by simply measuring 21.5.
+
+Corrected: 30 t/s single-token needs 33.3 ms/token. Weights are 22.9 ms, leaving 10.4 ms for
+attention, which currently costs 23.7 ms — so **attention must fall ~2.3x**. That is a hard
+target but it is a kernel problem, not a memory-system exclusion.
+
+### And MTP is worth much less at depth than assumed
+
+Plain 21.5-23.7 against MTP 23.2 (attempt 129). The server agrees: `speculative.n_max=0`
+measured **28.099** and `n_max=7` **28.040** in the same session — indistinguishable. At
+228958 context MTP is close to free of benefit, which reframes the whole strategy: the target
+is single-token decode, and within it, **flash-attn at 23.7 of 46.6 ms per token**.
