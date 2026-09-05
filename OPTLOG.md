@@ -4486,3 +4486,18 @@ written to shared, and read back for only six MACs.
 Closing it needs a different kernel for this shape — dequantise K into registers and
 accumulate all six columns per thread, skipping the shared round-trip for K entirely. That is
 a rewrite, not a parameter, and it is the honest remaining path to 30 t/s single-token.
+
+## Attempt 135 — wide loads in the q4_0 dequant (REJECTED, +7%)
+
+The f16 path at nb=1 runs at **480 GB/s — the bandwidth limit** — while q4_0 runs at
+**99 GB/s**, so ~1200 us of the 1518 us is dequant overhead, not memory. The loader fetched
+its 8 bytes of `qs` as **eight scalar byte loads**, which looked like the obvious cause.
+
+Replacing them with one unaligned 8-byte `memcpy`: **1627.86 us (+7%)**. Splitting into two
+4-byte loads: **1627.67 us**, identical. Both worse than the byte loads.
+
+A q4_0 block is 18 bytes, so `qs` is never 8-byte aligned and only 4-byte aligned for even
+block indices. The eight scalar loads coalesce across threads and the compiler's unaligned
+wide load does not beat that. Reverted.
+
+So the ~1200 us is the dequant **arithmetic and shared-memory writes**, not the loads.
