@@ -4682,3 +4682,51 @@ therefore be ordered around it.
 Current verified state on HEAD: tg256 **30.75 +/- 0.19** (baseline 17.51, **1.76x**),
 PPL **2.6199 +/- 0.0199** against `p100-handoff/ppl-orig.txt`, `test-backend-ops` **3/3
 backends**, flash-attn NMSE flat at **3.0e-06** from kv=512 to kv=262144.
+
+## Attempt 140 — KL-divergence vs the pre-fix build at 65536 context — PARTIAL (1 of 3 chunks)
+
+The fp16 fix (attempt 136) had been justified only by NMSE against a CPU reference, plus a
+perplexity gate at `-c 4096` where the bug barely bites (3.31e-06 pre-fix vs 2.89e-06 fixed).
+That is not evidence about model output. This measures output directly, with the metric the
+community post uses.
+
+Method: build pre-fix (`aa22ccee0^` `fattn-tile.cuh`), write `--kl-divergence-base` at
+`-c 65536` over 842 KB of text, restore the fix, rebuild, re-run with `--kl-divergence`.
+
+Chunk 1 (65536 context, ~32k evaluated tokens):
+
+| metric (fixed vs pre-fix) | value |
+|---|---|
+| KL divergence | **0.00484 +/- 0.00009** |
+| same top token | **97.345 +/- 0.089 %** |
+| ln(PPL(fixed)/PPL(pre-fix)) | 0.00051 +/- 0.00062 |
+| pre-fix PPL @ 65536 | 2.5100 +/- 0.0148 |
+
+**The two builds disagree on the top token 2.7% of the time at 64k context.** The defect is
+real and reaches the output; it is not a rounding curiosity. But note what this does and does
+not say: it measures how much the fix *changed* things, not which is closer to correct. The
+NMSE sweep is what establishes direction (9x closer to the fp32 reference at kv=65536). And
+the perplexity ratio is zero within error, so on this corpus the changed tokens are not
+demonstrably better predictions — only different.
+
+Chunks 2 and 3 were not collected; the run was killed (see below). One chunk with these error
+bars is enough to establish the magnitude, not enough to quote a median over the corpus.
+
+### The reason it was killed — a real trap
+
+`--kl-divergence` reads the **entire** base logits file into host RAM. The file is
+`n_tokens x n_vocab x 2 bytes`; at 151k vocab that is **~302 KB per token**, so:
+
+| context | chunks | base file | host RAM needed |
+|---|---|---|---|
+| 4096 | 3 | 3.0 GB | 3 GB |
+| **65536** | **3** | **48.8 GB** | **50 GB** |
+
+On a 62 GB machine this left 479 MB free and 7.6 GB swapped, and the box began thrashing —
+the desktop and the Sunshine stream became unusable while both GPUs still showed 96-98%, which
+made it look like GPU contention. It was not. **Diagnose system lag with `free`/`vmstat`
+before blaming the GPUs.**
+
+Sizing rule for any future KLD run here: keep `n_ctx x n_chunks x 302 KB` under ~20 GB. One
+65536 chunk is ~20 GB and is the practical maximum on this machine — which is exactly the
+measurement above, so the useful experiment is a **single-chunk** run, not a full corpus.
