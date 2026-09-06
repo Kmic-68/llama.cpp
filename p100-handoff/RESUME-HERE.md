@@ -12,6 +12,48 @@
 All work is committed. Tree is clean apart from your own `CLAUDE.md` edit and untracked
 `ppl.txt`.
 
+## NEXT UP (stopped mid-task 2026-09-06, nothing left running)
+
+**Job 1 is DONE and the answer is negative — read this before defending the fp16 fix.**
+Measured both builds against an fp32 attention reference (`-fa off`, which forces the non-flash
+path), 16384 context, f16 KV, `-sm layer`, 3 chunks:
+
+| vs fp32 reference | fixed (`aa22ccee0`) | pre-fix | significant? |
+|---|---|---|---|
+| Mean KLD | 0.004034 +/- 0.000078 | 0.004069 +/- 0.000074 | **no** |
+| Median KLD | 0.000562 | 0.000602 | no |
+| Same top token | 97.627 +/- 0.097 % | 97.660 +/- 0.096 % | no |
+| Mean PPL | 2.5604 | 2.5591 | no |
+
+Directionally right on every metric, significant on none. Both builds sit ~0.004 mean KLD from
+the reference, and that floor comes from the rest of the flash-attention path (fp16 products,
+reduction order, tiling) -- it swamps the accumulation error, which at 16384 is only
+8.36e-06 vs 2.59e-06 NMSE. **The fix bounds a real error but buys no measurable output quality
+at any depth where an fp32 reference can be built.** Non-flash attention cannot materialise a
+262144^2 score matrix, so the operating point cannot be checked this way. Keep it as insurance
+or revert it for the 2.4% -- that is a judgement call, not a settled one.
+
+Constraints learned: `-sm tensor` requires flash attention, so the reference must use
+`-sm layer`; and `--kl-divergence` loads the whole base file into host RAM at ~302 KB/token,
+so keep `n_ctx x n_chunks` under ~65k tokens (~20 GB) on this 62 GB box.
+
+**Job 2 is NOT done — this is the open task.** The ask: extensive testing that the model
+performs the same as stock, before any patches. Plan, with the HEAD side barely started:
+
+1. HEAD battery (`llama-bench` tg256+pp2048 cold, full `test-backend-ops test`, gate
+   perplexity) -- *interrupted, rerun it*. Script at `scratchpad/battery.sh`, takes a label.
+2. Write a KLD base from HEAD with the production flags
+   (`-sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -c 4096`) over ~170 KB of `ppl-orig.txt`
+   (~10 chunks, ~12 GB -- sized to stay off swap).
+3. `git checkout f280b2698 -- ggml src common tools tests`, full rebuild, run the same
+   battery plus `--kl-divergence` against that base. Stock ignores the `-DP100_*` flags
+   harmlessly.
+4. `git checkout HEAD -- ggml src common tools tests`, rebuild, re-verify with
+   `./tools/gate.sh`.
+
+Budget honestly: two full CUDA rebuilds, roughly 1.5-3 h each, plus the runs.
+
+
 ## SESSION 7 (current state)
 
 | workload at 228958 real context | value |
