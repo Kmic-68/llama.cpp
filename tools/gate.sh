@@ -11,7 +11,10 @@ cd "$(dirname "$0")/.."
 
 MODEL=${MODEL:-/mnt/fast/models/Qwen3.8-27B-Q6_K.gguf}
 CORPUS=p100-handoff/ppl-orig.txt
-BIN=./build-opt/bin
+# repo layout uses build-opt/bin; the release package ships binaries in build/
+if   [ -x ./build-opt/bin/llama-perplexity ]; then BIN=./build-opt/bin
+elif [ -x ./build/llama-perplexity ];        then BIN=./build
+else echo "no llama-perplexity found in ./build-opt/bin or ./build" >&2; exit 2; fi
 
 if [ ! -f "$CORPUS" ]; then echo "missing gate corpus: $CORPUS" >&2; exit 2; fi
 
@@ -21,15 +24,19 @@ if [ "$stray" -gt 0 ]; then
     pgrep -af "$BIN/llama-"
 fi
 
+# The metric runs FIRST, on cold cards. This is not cosmetic: the same build measures
+# 30.75 +/- 0.19 cold and 24.9 +/- 2.6 straight after a perplexity run. A hot-card reading
+# looks exactly like a 20% regression.
+echo "== tg256 (CLAUDE.md metric; baseline 17.51) =="
+nvidia-smi --query-gpu=index,temperature.gpu --format=csv,noheader | sed 's/^/   GPU temp before: /'
+ulimit -c 0
+GGML_CUDA_P2P=1 "$BIN/llama-bench" -m "$MODEL" \
+    -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -p 0 -n 256 -r 5 2>&1 | grep -E "tg256"
+
 echo "== perplexity (gate: 2.6209 +/- 0.0199 against $CORPUS) =="
 ulimit -c 0
 "$BIN/llama-perplexity" -m "$MODEL" -f "$CORPUS" \
     -sm tensor -ngl 99 -c 4096 -ctk q4_0 -ctv q4_0 2>&1 | grep -E "Final estimate"
-
-echo "== tg256 (CLAUDE.md metric; baseline 17.51) =="
-echo "   NB: this swings 25-31 t/s with card temperature. Compare only within a session."
-GGML_CUDA_P2P=1 "$BIN/llama-bench" -m "$MODEL" \
-    -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -p 0 -n 256 -r 5 2>&1 | grep -E "tg256"
 
 echo "== flash-attn eval (expect 3/3 backends) =="
 "$BIN/test-backend-ops" test -o FLASH_ATTN_EXT 2>&1 | grep -E "backends passed|FAIL"

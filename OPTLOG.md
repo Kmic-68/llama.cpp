@@ -4658,3 +4658,27 @@ climbing; continued at that rate it would have been approaching the tolerance by
 
 Gates: **3/3 backends passed**, **PPL 2.6199 +/- 0.0199** against `p100-handoff/ppl-orig.txt`,
 tg256 **29.08 +/- 1.11**. Tests only, no kernel change.
+
+## Attempt 139 — the tg256 spread this session was thermal, not code — resolved
+
+Readings on one unchanged build, in the order taken:
+
+| condition | tg256 |
+|---|---|
+| after a 7-min perplexity run (cards 74 C) | 25.04 +/- 3.40 |
+| after a 7-min perplexity run, r=5 | 24.91 +/- 2.55 |
+| idle a few minutes (cards ~71 C) | 29.08 +/- 1.11 |
+| **cold start (cards 44/48 C)** | **30.75 +/- 0.19** |
+
+Same binary, same flags, a 23% spread. The tell is the variance: the cold run is +/-0.19,
+the hot ones +/-2.5 to +/-3.4. A hot-card reading is indistinguishable from a 20% regression
+by its mean alone, and this session nearly attributed one to a code change.
+
+`tools/gate.sh` now runs the benchmark **first**, before the perplexity run heats the cards,
+and prints GPU temperature before the run so the number can be judged. Pitfall 4 in
+RESUME-HERE.md already said cold-start skew was severe; it did not say the gate script must
+therefore be ordered around it.
+
+Current verified state on HEAD: tg256 **30.75 +/- 0.19** (baseline 17.51, **1.76x**),
+PPL **2.6199 +/- 0.0199** against `p100-handoff/ppl-orig.txt`, `test-backend-ops` **3/3
+backends**, flash-attn NMSE flat at **3.0e-06** from kv=512 to kv=262144.
