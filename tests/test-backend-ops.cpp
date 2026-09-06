@@ -9952,7 +9952,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // This shape had NO eval coverage, so the tile kernel's q4_0 path and its half2 VKQ
     // accumulator were never checked against the CPU reference. kv is swept so that
     // accumulation error against context length is visible rather than assumed.
-    for (int kv : {512, 4096, 16384, 65536}) {
+    // 262144 is the real operating context, so the sweep runs all the way out to it: the
+    // claim that the error stays flat once accumulation is bounded is worth measuring at
+    // the depth actually used rather than extrapolating from 65536.
+    for (int kv : {512, 4096, 16384, 65536, 131072, 262144}) {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
     }
 

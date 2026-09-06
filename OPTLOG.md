@@ -4550,43 +4550,111 @@ Gates: **PPL 2.6199 +/- 0.0199** (moved from 2.6186 toward CLAUDE.md's stated 2.
 expected when the arithmetic gets more accurate), **3/3 backends**, tg256 **31.21 +/- 0.11**
 against 31.23 — unchanged.
 
-## Attempt 137 — extend the fp32 fold to the vec flash-attn kernel — REVERTED
 
-`fattn-vec.cuh:151` carries the same unbounded fp16 accumulator that attempt 136 fixed in
-the tile kernel: `half2 VKQ[ncols][(D/2)/nthreads_V]` sums the attention output over the
-entire KV cache in an 11-bit mantissa.
+## Attempt 137 — extend the fp32 fold to the vec flash-attn kernel — REJECTED (and the first
+## verdict on it was wrong)
 
-Applied the identical treatment: a `float2 VKQ_f` running sum beside the half2 tile partial,
-online-softmax rescaling moved onto VKQ_f, a fold-and-zero at the end of each `k_VKQ_0`
-iteration, and the epilogue staging the fp32 result back through VKQ so the shared-memory
-combine layout and its size are untouched. Non-fp16 path aliases `VKQ_f` to `VKQ` by
-reference, so it compiles to the same code as before.
+Applied the attempt-136 treatment to `fattn-vec.cuh`: a `float2 VKQ_f` running sum beside the
+half2 tile partial, rescaling moved onto it, a fold-and-zero per `k_VKQ_0` iteration, and the
+epilogue staging the fp32 result back through VKQ so the shared-memory combine layout was
+untouched.
 
-Result — correctness failure, reverted:
+**Two mistakes were made judging it. Both are worth more than the change was.**
 
-| gate | required | measured |
+### Mistake 1: the premise was false — there is no half2 accumulator here on CUDA
+
+`fattn-vec.cuh:151` reads `half2 VKQ[ncols][(D/2)/nthreads_V]`, which looks like exactly the
+bug attempt 136 fixed in the tile kernel. It is dead code on this hardware. The gate is:
+
+```c
+#if defined(GGML_USE_HIP) && (defined(RDNA2) || defined(RDNA3) || defined(RDNA4) || defined(__gfx906__) || defined(CDNA))
+#define V_DOT2_F32_F16_AVAILABLE
+#endif
+```
+
+`V_DOT2_F32_F16_AVAILABLE` is **AMD-only** — it guards the `v_dot2_f32_f16` inline asm. It is
+never defined on a CUDA build, so every NVIDIA build, P100 included, already takes the `#else`
+branch and accumulates VKQ in `float2`. The vec kernel never had the accumulation problem.
+
+Note this is a *different* macro from `FAST_FP16_AVAILABLE`, which is the one the community
+post is about and which *is* defined on sm_60. The two are one letter apart in effect and easy
+to conflate; attempt 136's tile fix is correctly gated on `FAST_FP16_AVAILABLE`.
+
+### Mistake 2: the perplexity "failure" was a corpus mix-up, not a regression
+
+The first run reported **PPL 2.7567 +/- 0.0215** against CLAUDE.md's 2.6209 +/- 0.0199 and the
+change was reverted as a correctness failure. It was not one. `./ppl.txt` yields 2.7566 on
+**any** build, stock included — `p100-handoff/CORPUS.md` says so explicitly, and session 7
+had already verified it by disabling the kernel path at runtime and reproducing the identical
+number.
+
+Proof it had nothing to do with the change, gathered after the revert:
+
+| build | corpus | PPL |
 |---|---|---|
-| perplexity | 2.6209 +/- 0.0199 | **2.7567 +/- 0.0215** |
-| test-backend-ops -o FLASH_ATTN_EXT | pass | 3/3 backends passed |
-| tg256 | ~31.2 t/s | **26.00 +/- 2.43** |
+| with the vec patch | `./ppl.txt` | 2.7567 +/- 0.0215 |
+| patch reverted | `./ppl.txt` | 2.7567 +/- 0.0215 |
+| `fattn-vec.cuh` restored to upstream `9e58d4d69` | `./ppl.txt` | 2.7567 +/- 0.0215 |
+| patch reverted | `p100-handoff/ppl-orig.txt` | **2.6199 +/- 0.0199** |
 
-Note what this says about coverage: `test-backend-ops` passed 3/3 on a build that moves
-perplexity by 0.14. The FA eval tolerance is not tight enough to catch this, so the eval
-suite is not a substitute for the perplexity gate on this kernel.
+Three different vec kernels, one identical number: the vec kernel is not even exercised by a
+perplexity run (batch 2048 goes to the tile/mma path). The corpus was the only variable.
 
-Two effects, probably distinct:
-- **Wrong results.** Not yet localised. The reasoning behind dropping the in-loop `VKQ`
-  rescale (VKQ is zero at that point, having been folded and zeroed at the end of the
-  previous iteration) is the least-verified step and is the first thing to re-check; the
-  safe version keeps scaling both accumulators.
-- **Speed.** 31.2 -> 26.0 with variance blowing out to +/-2.43. `flash_attn_ext_vec` runs
-  under `__launch_bounds__` with minblocks 4 and is already register-starved; a second
-  per-column accumulator array is very likely spilling. The tile kernel absorbed the same
-  fold for +2.4%/+4.4%/+5.4%, but it has register headroom the vec kernel does not.
+**CLAUDE.md's workflow step 4 names `./ppl.txt`, and that file cannot produce the 2.6209 it
+demands.** Following the instruction literally produces a false correctness failure every
+time. The gate corpus is `p100-handoff/ppl-orig.txt`. This is the second session to be caught
+by it.
 
-So the vec kernel is *not* a copy-paste of the tile fix. If it is worth doing it needs
-either a cheaper fold (fold every N iterations rather than every one, trading a bounded
-amount of accuracy for register lifetime) or a rethink of where the fp32 sum lives.
+### The change is still rejected, on the metric
 
-Reverted to the tile-kernel-only fix from attempt 136. The tile kernel is what this model's
-shape (D=256, gqa 6, q4_0 KV) dispatches to, so the shipped configuration is unaffected.
+With the premise gone, the only thing left to weigh is cost, and it is real: tg256 fell from
+~31 to **26.00 +/- 2.43**. The likely cause is the non-fp16 path's
+`float2 (& VKQ_f)[ncols][...] = VKQ;` alias — taking a reference to a local array forces it out
+of registers into local memory, and `flash_attn_ext_vec` runs under `__launch_bounds__` with
+minblocks 4 and has no headroom to spare. So: no accuracy benefit on CUDA, measurable slowdown.
+Rejected.
+
+### State restored
+
+`fattn-vec.cuh` is back at HEAD (the GQA-folding work is intact — it was briefly replaced with
+upstream only as a diagnostic). Rebuilt and re-gated against the correct corpus:
+**PPL 2.6199 +/- 0.0199**, tg256 **29.08 +/- 1.11** at 74 C (the 31.2 figure was measured on
+cooler cards; ranging 25-31 across the day tracks temperature, not code).
+
+### Method note
+
+Also relevant, and independently confirmed today: **`.cuh` -> `template-instances/*.cu`
+dependency tracking does not fire.** Editing `fattn-vec.cuh` and running `cmake --build`
+rebuilt 185 KB worth of other objects and *zero* fattn-vec instances. Every edit to a kernel
+header must be followed by
+`grep -rl "<header>" ggml/src/ggml-cuda/ | xargs touch` or the measurement is of the old
+binary. This is the single easiest way to record a fictitious result in this repo.
+
+## Attempt 138 — measure the tile kernel's error out to the real 262144 context — KEPT
+
+Attempt 136 bounded the tile kernel's fp16 accumulation but only measured to kv=65536; the
+claim that the residual then stays flat was extrapolation. Extended the eval sweep in
+`tests/test-backend-ops.cpp` to 131072 and 262144 and measured it.
+
+NMSE against the CPU fp32 reference, `hsk=hsv=256, nh=2, nr23=[6,1], nb=1, q4_0 K and V`,
+tolerance 5.000e-04, both GPUs reported:
+
+| kv | GPU0 | GPU1 | before attempt 136 |
+|---|---|---|---|
+| 512 | 2.847e-06 | 3.096e-06 | 3.185e-06 |
+| 4096 | 2.894e-06 | 2.895e-06 | 3.310e-06 |
+| 16384 | 2.588e-06 | 3.066e-06 | 8.357e-06 |
+| 65536 | 3.099e-06 | 3.165e-06 | 2.773e-05 |
+| 131072 | 3.552e-06 | 2.787e-06 | not measured |
+| **262144** | **3.004e-06** | **2.840e-06** | not measured |
+
+Flat across a 512x range in context, on both cards, with no trend — 2.6e-06 to 3.6e-06 is
+run-to-run scatter, not growth. The remaining error is fp16 *product* rounding plus the
+post-softmax weights stored as `__shared__ half`; neither accumulates, which is exactly what
+this sweep was built to test. 150x of headroom against the tolerance at the operating point.
+
+For contrast, the pre-fix series was already 8.7x its own kv=512 value by 65536 and still
+climbing; continued at that rate it would have been approaching the tolerance by 262144.
+
+Gates: **3/3 backends passed**, **PPL 2.6199 +/- 0.0199** against `p100-handoff/ppl-orig.txt`,
+tg256 **29.08 +/- 1.11**. Tests only, no kernel change.
