@@ -1,5 +1,14 @@
 # Resume point — 262144 decode is ~23 t/s; the tile kernel's parameter space is closed
 
+> ## READ FIRST: do not gate against `./ppl.txt`
+>
+> CLAUDE.md's workflow step 4 names `./ppl.txt` and demands **2.6209 +/- 0.0199**. That file
+> returns **2.7566 on any build, stock included** — the band belongs to
+> `p100-handoff/ppl-orig.txt` (**2.6186-2.6199**). Following CLAUDE.md literally reports a
+> correctness failure on every run, and **two sessions have now reverted good work over it**.
+>
+> Run **`./tools/gate.sh`**. It uses the right corpus and also runs tg256 and the FA eval.
+
 All work is committed. Tree is clean apart from your own `CLAUDE.md` edit and untracked
 `ppl.txt`.
 
@@ -67,14 +76,40 @@ quarter-million adds in an 11-bit mantissa at 262144. NMSE against the fp32 CPU 
 as sqrt(context): 3.185e-06 at kv=512, **2.773e-05 at kv=65536**.
 
 Fixed by accumulating in half2 *within* a KV tile and folding into an fp32 running sum once per
-tile: **3.205e-06 at kv=65536, and flat with context**. The inner loop keeps its single HMUL2,
-so it costs 2.4% at nb=1 (17.5% if you simply accumulate in fp32, and extending the sm_61 fp16
-exemption to sm_60 does not build here at all — the 36-wide tile would need 50176 B of shared
-against a 48 KiB limit).
+tile. The inner loop keeps its single HMUL2, so it costs 2.4% at nb=1 (17.5% if you simply
+accumulate in fp32, and extending the sm_61 fp16 exemption to sm_60 does not build here at all
+-- the 36-wide tile would need 50176 B of shared against a 48 KiB limit).
+
+**Measured flat out to the real operating context** (`2dcd8cafd`), NMSE vs the fp32 CPU
+reference, tolerance 5e-4:
+
+| kv | before | after (GPU0 / GPU1) |
+|---|---|---|
+| 512 | 3.185e-06 | 2.847e-06 / 3.096e-06 |
+| 4096 | 3.310e-06 | 2.894e-06 / 2.895e-06 |
+| 16384 | 8.357e-06 | 2.588e-06 / 3.066e-06 |
+| 65536 | 2.773e-05 | 3.099e-06 / 3.165e-06 |
+| 131072 | -- | 3.552e-06 / 2.787e-06 |
+| **262144** | -- | **3.004e-06 / 2.840e-06** |
+
+No trend across a 512x range in context. What is left is fp16 *product* rounding plus the
+post-softmax weights stored as `__shared__ half`; neither accumulates, and 150x of tolerance
+headroom remains at the operating point.
 
 **This shape had no eval coverage before**, which is why it went unnoticed. `test-backend-ops`
-now covers kv 512/4096/16384/65536 for it, and `GGML_TEST_PRINT_ERR=1` prints NMSE for passing
+now sweeps kv 512 through 262144 for it, and `GGML_TEST_PRINT_ERR=1` prints NMSE for passing
 cases so precision regressions are visible rather than merely under tolerance.
+
+### The vec kernel does NOT have this bug (checked)
+
+`fattn-vec.cuh:151` declares `half2 VKQ[ncols][(D/2)/nthreads_V]` and looks like the same
+problem. It is dead code on NVIDIA. It sits under `V_DOT2_F32_F16_AVAILABLE`, which is defined
+only for `GGML_USE_HIP` with an RDNA/CDNA/gfx906 target -- it guards `v_dot2_f32_f16` inline
+asm. Every CUDA build takes the `#else` branch and already accumulates in `float2`. Do not
+"fix" it: a fold was tried and cost tg256 ~31 -> 26.0 for no accuracy gain.
+
+Do not confuse that macro with `FAST_FP16_AVAILABLE`, which *is* defined on sm_60 and is the
+one the community fp16 post is about. The tile fix above is gated on the latter.
 
 ### The tile-width rule (why n_draft = 3)
 
@@ -139,6 +174,15 @@ P100-**PCIe** cards and that pipeline assumes NVLink), the fused-MoE mmid thresh
    decode). Difference two runs' **call counts**, which are exact integers.
 7. **`./ppl.txt` is not the gate corpus.** It yields **2.7566 on any build**, stock included.
    The 2.6209 gate belongs to `p100-handoff/ppl-orig.txt` (2.6186).
+9. **Editing a `.cuh` does NOT rebuild `template-instances/*.cu`.** Dependency tracking does
+   not fire for them. A `cmake --build` after editing `fattn-vec.cuh` rebuilt 185 KB of other
+   objects and **zero** vec instances, so the next benchmark measured the old binary. Always
+   follow a kernel-header edit with
+   `grep -rl "<header>" ggml/src/ggml-cuda/ | xargs touch`. This is the easiest way to record
+   a result that never happened.
+10. **`setsid` without `-w` returns immediately** — the parent exits and the build keeps
+   running detached, so a script that greps the log right after "finishing" reads a truncated
+   file. Use `setsid -w`, or poll on a sentinel file the background command touches.
 8. **CLAUDE.md's "196 GB/s achieved" is stale by 2.5x.** Back-solving a clean measurement
    gives **490 GB/s**. Budgets built on 196 understate the memory system badly — that constant
    produced a "single-token 30 t/s is physically impossible" conclusion that was simply wrong.
