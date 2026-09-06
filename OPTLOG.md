@@ -4549,3 +4549,44 @@ part worth keeping fp16 for.
 Gates: **PPL 2.6199 +/- 0.0199** (moved from 2.6186 toward CLAUDE.md's stated 2.6209, as
 expected when the arithmetic gets more accurate), **3/3 backends**, tg256 **31.21 +/- 0.11**
 against 31.23 — unchanged.
+
+## Attempt 137 — extend the fp32 fold to the vec flash-attn kernel — REVERTED
+
+`fattn-vec.cuh:151` carries the same unbounded fp16 accumulator that attempt 136 fixed in
+the tile kernel: `half2 VKQ[ncols][(D/2)/nthreads_V]` sums the attention output over the
+entire KV cache in an 11-bit mantissa.
+
+Applied the identical treatment: a `float2 VKQ_f` running sum beside the half2 tile partial,
+online-softmax rescaling moved onto VKQ_f, a fold-and-zero at the end of each `k_VKQ_0`
+iteration, and the epilogue staging the fp32 result back through VKQ so the shared-memory
+combine layout and its size are untouched. Non-fp16 path aliases `VKQ_f` to `VKQ` by
+reference, so it compiles to the same code as before.
+
+Result — correctness failure, reverted:
+
+| gate | required | measured |
+|---|---|---|
+| perplexity | 2.6209 +/- 0.0199 | **2.7567 +/- 0.0215** |
+| test-backend-ops -o FLASH_ATTN_EXT | pass | 3/3 backends passed |
+| tg256 | ~31.2 t/s | **26.00 +/- 2.43** |
+
+Note what this says about coverage: `test-backend-ops` passed 3/3 on a build that moves
+perplexity by 0.14. The FA eval tolerance is not tight enough to catch this, so the eval
+suite is not a substitute for the perplexity gate on this kernel.
+
+Two effects, probably distinct:
+- **Wrong results.** Not yet localised. The reasoning behind dropping the in-loop `VKQ`
+  rescale (VKQ is zero at that point, having been folded and zeroed at the end of the
+  previous iteration) is the least-verified step and is the first thing to re-check; the
+  safe version keeps scaling both accumulators.
+- **Speed.** 31.2 -> 26.0 with variance blowing out to +/-2.43. `flash_attn_ext_vec` runs
+  under `__launch_bounds__` with minblocks 4 and is already register-starved; a second
+  per-column accumulator array is very likely spilling. The tile kernel absorbed the same
+  fold for +2.4%/+4.4%/+5.4%, but it has register headroom the vec kernel does not.
+
+So the vec kernel is *not* a copy-paste of the tile fix. If it is worth doing it needs
+either a cheaper fold (fold every N iterations rather than every one, trading a bounded
+amount of accuracy for register lifetime) or a rethink of where the fp32 sum lives.
+
+Reverted to the tile-kernel-only fix from attempt 136. The tile kernel is what this model's
+shape (D=256, gqa 6, q4_0 KV) dispatches to, so the shipped configuration is unaffected.
