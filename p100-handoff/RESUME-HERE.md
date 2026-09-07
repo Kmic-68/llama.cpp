@@ -12,47 +12,74 @@
 All work is committed. Tree is clean apart from your own `CLAUDE.md` edit and untracked
 `ppl.txt`.
 
-## NEXT UP (stopped mid-task 2026-09-06, nothing left running)
+## SESSION 8 (2026-09-07): both questions answered
 
-**Job 1 is DONE and the answer is negative — read this before defending the fp16 fix.**
-Measured both builds against an fp32 attention reference (`-fa off`, which forces the non-flash
-path), 16384 context, f16 KV, `-sm layer`, 3 chunks:
+**The 2026-09-06 entry that said "the fp16 fix is not measurably better" was wrong, and the
+experiment behind it was broken.** Superseded by OPTLOG attempts 141-142. Details:
 
-| vs fp32 reference | fixed (`aa22ccee0`) | pre-fix | significant? |
+### 1. The fp16 fix is real, and bigger than anyone had measured
+
+NMSE vs the fp32 CPU reference, both arms measured in the same session, both GPUs,
+`hsk=256,nh=2,nr23=[6,1],type_K/V=q4_0,nb=1`, tolerance 5.000e-04:
+
+| kv | fixed | pre-fix | ratio |
 |---|---|---|---|
-| Mean KLD | 0.004034 +/- 0.000078 | 0.004069 +/- 0.000074 | **no** |
-| Median KLD | 0.000562 | 0.000602 | no |
-| Same top token | 97.627 +/- 0.097 % | 97.660 +/- 0.096 % | no |
-| Mean PPL | 2.5604 | 2.5591 | no |
+| 512    | 3.0e-06 | 3.0e-06 | 1.0x |
+| 16384  | 2.9e-06 | 7.8e-06 | 2.6x |
+| 65536  | 2.7e-06 | 2.7e-05 | 9.5x |
+| 131072 | 3.0e-06 | 5.3e-05 | 18x  |
+| **262144** | **3.2e-06** | **1.01e-04** | **31x** |
 
-Directionally right on every metric, significant on none. Both builds sit ~0.004 mean KLD from
-the reference, and that floor comes from the rest of the flash-attention path (fp16 products,
-reduction order, tiling) -- it swamps the accumulation error, which at 16384 is only
-8.36e-06 vs 2.59e-06 NMSE. **The fix bounds a real error but buys no measurable output quality
-at any depth where an fp32 reference can be built.** Non-flash attention cannot materialise a
-262144^2 score matrix, so the operating point cannot be checked this way. Keep it as insurance
-or revert it for the 2.4% -- that is a judgement call, not a settled one.
+At the real operating context the pre-fix error is within 5x of outright test failure.
+Prior work stopped at 65536 and understated the defect ~4x. **The growth is linear in kv,
+not sqrt** -- `aa22ccee0`'s commit message is wrong on that point.
 
-Constraints learned: `-sm tensor` requires flash attention, so the reference must use
-`-sm layer`; and `--kl-divergence` loads the whole base file into host RAM at ~302 KB/token,
-so keep `n_ctx x n_chunks` under ~65k tokens (~20 GB) on this 62 GB box.
+End-to-end (KLD of pre-fix against the fixed build's logits, production flags, control =
+fixed vs itself at ~-0.00001): 0.006994 at 4096, 0.008562 at 16384; max KLD 0.223 -> 0.660.
+Only the *growth* is attributable to the fix -- the absolute 0.007 at 4096 is the generic
+divergence between two fp16 kernels, since at that depth their NMSE is equal.
 
-**Job 2 is NOT done — this is the open task.** The ask: extensive testing that the model
-performs the same as stock, before any patches. Plan, with the HEAD side barely started:
+**Do not try KLD at 65536.** The base file is n_tokens x n_vocab x 2 B = 19.8 GB and the
+host watchdog kills the run. Attempted three times. 16384 (4.9 GB) is the ceiling here.
 
-1. HEAD battery (`llama-bench` tg256+pp2048 cold, full `test-backend-ops test`, gate
-   perplexity) -- *interrupted, rerun it*. Script at `scratchpad/battery.sh`, takes a label.
-2. Write a KLD base from HEAD with the production flags
-   (`-sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -c 4096`) over ~170 KB of `ppl-orig.txt`
-   (~10 chunks, ~12 GB -- sized to stay off swap).
-3. `git checkout f280b2698 -- ggml src common tools tests`, full rebuild, run the same
-   battery plus `--kl-divergence` against that base. Stock ignores the `-DP100_*` flags
-   harmlessly.
-4. `git checkout HEAD -- ggml src common tools tests`, rebuild, re-verify with
-   `./tools/gate.sh`.
+### 2. The build produces the same model as stock f280b2698
 
-Budget honestly: two full CUDA rebuilds, roughly 1.5-3 h each, plus the runs.
+| probe | stock | HEAD |
+|---|---|---|
+| full op suite | 3/3, no FAIL | 14587/14587, 3/3 |
+| gate PPL c=4096 | 2.6209 +/- 0.01994 | 2.6199 +/- 0.01993 |
+| PPL c=32768 | 2.2813 +/- 0.03147 | 2.2801 +/- 0.03147 |
+| KLD vs stock, 25k tok | ref | 0.007129 +/- 0.000138, same-top 96.206% |
 
+Equal on every aggregate measure. Greedy generation differs in wording -- that is what
+96.2% top-token agreement over 96 tokens implies (0.962^96 ~ 2%), not a defect.
+
+**Stock on ppl-orig.txt measures 2.6209 exactly** -- that is where CLAUDE.md's gate constant
+came from, and independent proof that `./ppl.txt` was never the gate corpus.
+
+### 3. Traps that cost time today -- read before measuring anything
+
+- **Snapshot RUNPATH.** `/mnt/fast/p100-scratch/build-*` binaries carry an absolute
+  `RUNPATH=/home/kaden/llama-opt/build-opt/bin`, so they load `libggml-cuda.so` from
+  **build-opt**, not from themselves. A pre-fix binary ran the fixed kernel and the two arms
+  agreed to seven significant digits. Always go through `scratchpad/runbuild.sh`, which sets
+  `LD_LIBRARY_PATH` (RUNPATH loses to it). Distinct md5s prove the builds differ, NOT that
+  the run used them.
+- **Detach long jobs.** The harness watchdog kills tracked background commands (reported as
+  "low on memory" even at 59 GB available). Five runs died this way. `setsid bash -c "..." &
+  disown` survives; poll a sentinel file.
+- **A build snapshot is 11 s, a rebuild is ~25 min.** `cp -a build-opt /mnt/fast/...`. The
+  old "1.5-3 h per rebuild" estimate was for a from-scratch build and is wrong for
+  incremental ones. There is no reason to rebuild to switch between variants.
+- **gate.sh's "3/3 backends" was flash-attention only** (~1% of the suite). Now labelled,
+  and `./tools/gate.sh --full` runs all 14587.
+
+### 4. Still open
+
+A single intermittent **CUDA1 FAIL** in the full op suite, seen once and not reproduced;
+the identity was lost because the battery kept only `tail -5` (now fixed to keep full logs).
+GPU ECC volatile counters are 0/0, so it is not memory corruption. Stock passed its one full
+run. Repeat runs were in flight at end of session -- see `scratchpad/final.log`.
 
 ## SESSION 7 (current state)
 
