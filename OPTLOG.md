@@ -4833,3 +4833,41 @@ Step 4 first reported "IDENTICAL" while both generation files were **0 bytes**: 
 rejected `-no-cnv` (this build wants `-st/--single-turn`) and stderr went to /dev/null, so
 `diff` compared two empty files. A pass with no output is not a pass. Fixed and re-run with
 output verified non-empty before comparing.
+
+## Attempt 143 — the two loose ends (2026-09-07)
+
+**(a) Perplexity cannot resolve the fp16 fix.** Fixed vs pre-fix, production flags, 1 chunk:
+
+| context | fixed | pre-fix | difference |
+|---|---|---|---|
+| 65536 | 2.4051 +/- 0.02409 | 2.4039 +/- 0.02405 | 0.0012, inside +/-0.024 |
+
+Indistinguishable. Combined with attempt 141 this gives the fix's honest shape: **definitive
+at the kernel level** (31x lower NMSE at 262144), **visible in the logit distribution** (KLD
+growing 0.0070 -> 0.0086 over 4096 -> 16384 against a ~0 control), and **invisible to
+perplexity** at every depth measurable here. Perplexity averages over the whole vocabulary
+and is simply too blunt for a ~1e-04 attention-output perturbation.
+
+Deeper is not measurable on this box, and the reason is host RAM, not GPU:
+`llama-perplexity` reserves n_ctx x n_vocab floats = 131072 x 151936 x 4 B = **79.6 GB**,
+and dies in `std::vector<float>::reserve` with `std::bad_alloc`. (The KLD base file has a
+separate 302 KB/token limit that caps KLD at 16384.) So 65536 is the deepest end-to-end
+number obtainable, and it is a null result.
+
+**(b) The intermittent CUDA1 failure: 1 in 5, unexplained, not attributable.**
+
+| build | full-suite runs | FAIL |
+|---|---|---|
+| HEAD | 5 | 1 (the first; never reproduced) |
+| stock f280b2698 | 1 | 0 |
+
+~73,000 test executions on HEAD, one failure. The failing test's identity was lost because
+`battery.sh` kept only `tail -5` -- now fixed to retain the whole log. GPU ECC volatile and
+uncorrected counters are 0/0 on both cards, so it is not memory corruption; one card shows 6
+lifetime corrected single-bit errors, which is normal and handled.
+
+**This cannot be attributed to our changes.** One occurrence, no identity, and a stock
+sample size of one. It is equally consistent with a borderline-tolerance test somewhere in
+the suite (many CUDA ops reduce via atomics, so bit-exactness across runs is not
+guaranteed) as with anything we did. Recorded as open rather than dismissed. The next
+occurrence will be diagnosable because the log is now kept.
