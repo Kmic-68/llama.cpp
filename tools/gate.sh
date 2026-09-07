@@ -38,5 +38,16 @@ ulimit -c 0
 "$BIN/llama-perplexity" -m "$MODEL" -f "$CORPUS" \
     -sm tensor -ngl 99 -c 4096 -ctk q4_0 -ctv q4_0 2>&1 | grep -E "Final estimate"
 
-echo "== flash-attn eval (expect 3/3 backends) =="
-"$BIN/test-backend-ops" test -o FLASH_ATTN_EXT 2>&1 | grep -E "backends passed|FAIL"
+# NOTE: this is FLASH_ATTN_EXT ONLY, roughly 1% of the op suite. Its "3/3 backends" has
+# been quoted in handoffs as if it meant the whole suite passed. It does not. The full
+# suite (~25 min, 14587 tests) caught an intermittent CUDA1 failure that this never would.
+# Run `./tools/gate.sh --full` before claiming a build is clean.
+if [ "${1:-}" = "--full" ]; then
+    echo "== FULL op suite (14587 tests, ~25 min) =="
+    "$BIN/test-backend-ops" test 2>&1 | tee /tmp/gate-ops-full.log | grep -E "backends passed|FAIL"
+    echo "   (full log: /tmp/gate-ops-full.log)"
+else
+    echo "== flash-attn eval ONLY (-o FLASH_ATTN_EXT; NOT the full suite) =="
+    "$BIN/test-backend-ops" test -o FLASH_ATTN_EXT 2>&1 | grep -E "backends passed|FAIL"
+    echo "   run './tools/gate.sh --full' for all 14587 tests"
+fi

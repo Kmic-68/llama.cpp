@@ -4730,3 +4730,106 @@ before blaming the GPUs.**
 Sizing rule for any future KLD run here: keep `n_ctx x n_chunks x 302 KB` under ~20 GB. One
 65536 chunk is ~20 GB and is the practical maximum on this machine — which is exactly the
 measurement above, so the useful experiment is a **single-chunk** run, not a full corpus.
+
+## Attempt 141 — the fp16 accumulation fix, measured properly (2026-09-07)
+
+Re-measured `aa22ccee0` from scratch because the prior evidence had a hole: the pre-fix
+numbers in attempt 138 were never reproduced in the same session as the fixed ones, and the
+first two attempts today were invalid (see the RUNPATH note below).
+
+NMSE vs the fp32 CPU reference, `test-backend-ops -o FLASH_ATTN_EXT`, filtered to
+`hsk=256,hsv=256,nh=2,nr23=[6,1],type_K=q4_0,type_V=q4_0,nb=1`, tolerance 5.000e-04:
+
+| kv | fixed GPU0 | fixed GPU1 | pre-fix GPU0 | pre-fix GPU1 | ratio |
+|---|---|---|---|---|---|
+| 512    | 3.036e-06 | 2.996e-06 | 2.995e-06 | 2.921e-06 | 1.0x |
+| 4096   | 2.811e-06 | 2.822e-06 | 3.439e-06 | 2.898e-06 | 1.1x |
+| 16384  | 2.933e-06 | 2.891e-06 | 7.766e-06 | 7.388e-06 | 2.6x |
+| 65536  | 2.662e-06 | 2.959e-06 | 2.685e-05 | 2.385e-05 | 9.5x |
+| 131072 | 3.002e-06 | 2.732e-06 | 5.320e-05 | 4.280e-05 | 18x  |
+| 262144 | 3.215e-06 | 2.710e-06 | 1.012e-04 | 8.880e-05 | 31x  |
+
+Two things this changes:
+
+- **At the real 262144 operating context the pre-fix error is 1.01e-04, within 5x of the
+  5.000e-04 test tolerance.** Previous work only ever measured to 65536 (2.77e-05) and so
+  understated the defect by ~4x.
+- **The growth is linear in kv, not sqrt.** `aa22ccee0`'s commit message says "the error
+  grows as sqrt(context)"; 65536 -> 131072 -> 262144 doubles the error each time kv doubles.
+  The message is wrong on that point; the fix it describes is not.
+
+End-to-end, KLD of the pre-fix build against the fixed build's own logits (production flags,
+`-sm tensor -fa 1 -ctk q4_0 -ctv q4_0`, 1 chunk). Taking the fixed build as reference makes
+the shared error floor cancel, which the earlier fp32-reference design could not do:
+
+| context | control (fixed vs itself) | pre-fix vs fixed | max KLD |
+|---|---|---|---|
+| 4096  | -0.000010 +/- 0.000000 | 0.006994 +/- 0.000251 | 0.223 |
+| 16384 | -0.000008 +/- 0.000000 | 0.008562 +/- 0.000201 | 0.660 |
+
+The control is ~0, so the runs are deterministic and the divergence is real. But note what
+the 4096 row means: at that depth the two kernels have essentially equal NMSE, so 0.007 is
+the generic divergence between two fp16 kernels that round differently, NOT the benefit of
+the fix. Only the *growth* from 4096 onward is attributable to the accumulation defect, and
+over 4096->16384 that growth is +22% mean / 3x max.
+
+65536 KLD was attempted three times and abandoned: the base file is n_tokens x n_vocab x 2 B
+= 19.8 GB at 65536, and the host watchdog kills the run. 16384 (4.9 GB) is the practical
+ceiling for this measurement on a 62 GB box.
+
+### Two invalid measurements, recorded so they are not repeated
+
+1. **RUNPATH leak.** Build snapshots under `/mnt/fast/p100-scratch/build-*` carry an
+   absolute `RUNPATH=/home/kaden/llama-opt/build-opt/bin`, so running
+   `build-prefix/bin/llama-perplexity` loads `libggml-cuda.so` from **build-opt** — whatever
+   is checked out there. Both arms of the first comparison ran the fixed kernel and agreed
+   to seven significant digits. Distinct md5s of the snapshot .so files prove the builds
+   differ, not that the run used them. Always invoke via `scratchpad/runbuild.sh`, which
+   sets `LD_LIBRARY_PATH` (RUNPATH loses to it).
+2. **Wrong grep.** The first NMSE filter matched `type_KV=q4_0`; the field is really
+   `type_K=q4_0,type_V=q4_0`, so it silently selected nothing.
+
+Both were caught only because the results were *too* clean. Bit-identical logits from two
+different kernels are impossible; that implausibility was the entire signal.
+
+## Attempt 142 — does the optimised build still produce the same model as stock? (2026-09-07)
+
+The ask: extensive testing that the model performs the same as it did before any of this
+work. Reference is upstream **f280b2698**, built from `git checkout f280b2698 -- ggml src
+common tools tests` into the same `build-opt` with the same cmake line (the `-DP100_*`
+defines are unreferenced in stock and harmless). Both builds kept as snapshots and invoked
+through `runbuild.sh` so each loads its own `libggml-cuda.so`.
+
+| probe | stock f280b2698 | HEAD | verdict |
+|---|---|---|---|
+| full `test-backend-ops` | 3/3 backends, no FAIL | 14587/14587, 3/3 | pass both |
+| gate PPL, c=4096, ppl-orig.txt | **2.6209 +/- 0.01994** | **2.6199 +/- 0.01993** | equal within error |
+| long-context PPL, c=32768 | 2.2813 +/- 0.03147 | 2.2801 +/- 0.03147 | equal within error |
+| KLD vs stock, 6x4096 = 25k tokens | reference | mean **0.007129 +/- 0.000138** | see below |
+| Mean PPL(Q)/PPL(base) | 1 | 0.998129 +/- 0.001198 | 1.6 sigma, not significant |
+| same top token | -- | 96.206 +/- 0.172 % | 3.8% argmax disagreement |
+| RMS dp | -- | 2.904 +/- 0.065 % | |
+| greedy generation, temp 0, 96 tok | coherent | coherent | **differs in wording** |
+
+**Conclusion: equal on every aggregate measure, not bit-identical on individual tokens.**
+Perplexity matches stock at both 4096 and 32768 well inside the error bars, and HEAD is
+marginally *lower* (0.19%, 1.6 sigma -- noise, not an improvement). The distributional
+difference (mean KLD 0.0071) is almost exactly the divergence between the fixed and pre-fix
+tile kernels measured in attempt 141 (0.0070), i.e. **the whole body of optimisation work
+perturbs the output distribution about as much as one fp16 kernel variant does.**
+
+Greedy generation diverges in wording. That is the arithmetic consequence of 96.2% top-token
+agreement, not a defect: P(all 96 tokens agree) = 0.962^96 ~ 2%. Both continuations were
+on-topic and equivalent in quality. Anyone expecting token-identical output from a different
+kernel on quantised KV should not.
+
+**Where the 2.6209 in CLAUDE.md comes from.** Stock on `ppl-orig.txt` measures 2.6209 +/-
+0.01994 -- the gate constant, to four decimals. That independently confirms `ppl-orig.txt`
+is the corpus the band was derived from, and that `./ppl.txt` (2.7566 on every build,
+stock included) never was. See the banner in `p100-handoff/RESUME-HERE.md`.
+
+### A test that passed for the wrong reason
+Step 4 first reported "IDENTICAL" while both generation files were **0 bytes**: `llama-cli`
+rejected `-no-cnv` (this build wants `-st/--single-turn`) and stderr went to /dev/null, so
+`diff` compared two empty files. A pass with no output is not a pass. Fixed and re-run with
+output verified non-empty before comparing.
