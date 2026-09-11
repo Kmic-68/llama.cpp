@@ -4871,3 +4871,52 @@ sample size of one. It is equally consistent with a borderline-tolerance test so
 the suite (many CUDA ops reduce via atomics, so bit-exactness across runs is not
 guaranteed) as with anything we did. Recorded as open rather than dismissed. The next
 occurrence will be diagnosable because the log is now kept.
+
+## Attempt 144 — the error law behind the fp16 fix (2026-09-11)
+
+Not a code change. Re-verification after 4 days idle, plus the analytic model that
+explains attempt 141's numbers.
+
+Gate, cold cards (34/32 C), build md5 f6c31217:
+  tg256   31.10 +/- 0.11 t/s   (baseline 17.51 -> 1.78x)
+  PPL     2.6199 +/- 0.01993   (gate 2.6209 +/- 0.0199, reproduced to 5 s.f.)
+  FA eval 3/3 backends
+
+### The model
+nbatch_fa = 64 for DKQ=DV=256, so a context of kv tokens puts T = kv/64 successive
+fp16 additions through the VKQ accumulator. Independent roundings accumulate as a
+random walk => error ~ sqrt(T)*u, so NMSE (= error squared) ~ linear in kv:
+
+    NMSE_prefix(kv) = eps0 + alpha*kv      eps0 = 2.897e-06, alpha = 3.5134e-10
+    NMSE_fixed(kv)  = eps0                 (fold resets the accumulator every tile)
+
+Fit alpha at 262144 ONLY, then extrapolate to every other measured context:
+
+  kv        measured     predicted    resid
+  512       2.958e-06    3.077e-06     -4.0%
+  4096      3.169e-06    4.337e-06    -36.9%   (whole quantity ~= the floor here)
+  16384     7.577e-06    8.654e-06    -14.2%
+  65536     2.535e-05    2.592e-05     -2.3%
+  131072    4.800e-05    4.895e-05     -2.0%
+  262144    9.500e-05    9.500e-05      fit
+
+log-log exponent of (NMSE - eps0) vs kv = 1.075 measured, 1.000 predicted.
+Fixed kernel least-squares slope = 1.4e-13/token: 3.7e-08 over the whole 512x
+sweep, ~1% of its floor. Flat, +/-4% scatter, no trend.
+
+Magnitude check: RMS rel err at 262144 = 9.75e-03 = 20.0*u (u = 2^-11). Naive
+random walk with T=4096 predicts 64*u. Measured is 3.2x BELOW the bound, which is
+the right direction: softmax concentrates weight on ~10% of tiles, so the effective
+T is ~400, not 4096.
+
+Extrapolated crossover of the 5.0e-04 test tolerance: kv = 1,414,862. Model's
+native context is 262144, documented extensible to 1M with YaRN, where the unfixed
+kernel would sit at 3.71e-04 = 74% of tolerance. Fixed sits at 0.6% everywhere.
+
+### Correction
+I recorded in attempt 141 that aa22ccee0's commit message was wrong to call the
+growth sqrt. It is not wrong. The message describes the growth of the ERROR; 141
+quoted NMSE, which is that error squared. sqrt error and linear NMSE are one law in
+two units. Attempt 141's "the commit message is wrong on that point" is retracted.
+
+Report published: https://claude.ai/code/artifact/dd5cd75e-f1ed-4e30-b6c6-523c72b58db0
