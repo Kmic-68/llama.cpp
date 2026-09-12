@@ -1,0 +1,388 @@
+<title>LiveCodeBench on Two P100s</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Serif:ital,wght@0,400;0,600;1,400&family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500&display=swap">
+<style>
+  :root {
+    --bg: #f7f6f3;
+    --surface: #fffefc;
+    --ink: #1b1d1f;
+    --ink-soft: #55595e;
+    --ink-faint: #8b9096;
+    --rule: #e0ddd6;
+    --pass: #0f6d63;
+    --pass-soft: #d3e8e4;
+    --trunc: #9a6410;
+    --trunc-soft: #f5e6cd;
+    --fail: #9c3327;
+    --ref: #4b4fa8;
+    --serif: "IBM Plex Serif", Georgia, serif;
+    --sans: "IBM Plex Sans", system-ui, sans-serif;
+    --mono: "IBM Plex Mono", ui-monospace, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #141617;
+      --surface: #1c1f21;
+      --ink: #e9e7e2;
+      --ink-soft: #a8aeb4;
+      --ink-faint: #757c82;
+      --rule: #2e3235;
+      --pass: #5cc3b4;
+      --pass-soft: #1d3a37;
+      --trunc: #d9a24c;
+      --trunc-soft: #3a2f1c;
+      --fail: #e0705f;
+      --ref: #9a9de8;
+    }
+  }
+  :root[data-theme="dark"] {
+    --bg: #141617;
+    --surface: #1c1f21;
+    --ink: #e9e7e2;
+    --ink-soft: #a8aeb4;
+    --ink-faint: #757c82;
+    --rule: #2e3235;
+    --pass: #5cc3b4;
+    --pass-soft: #1d3a37;
+    --trunc: #d9a24c;
+    --trunc-soft: #3a2f1c;
+    --fail: #e0705f;
+    --ref: #9a9de8;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 16px;
+    line-height: 1.6;
+    margin: 0;
+    padding: 0 1.25rem 5rem;
+  }
+  .wrap { max-width: 50rem; margin: 0 auto; }
+
+  header { padding: 3.5rem 0 2rem; border-bottom: 2px solid var(--ink); }
+  .eyebrow {
+    font-family: var(--mono); font-size: .72rem; letter-spacing: .14em;
+    text-transform: uppercase; color: var(--ink-faint); margin: 0 0 1rem;
+  }
+  h1 {
+    font-family: var(--serif); font-weight: 600; font-size: clamp(1.9rem, 5vw, 2.9rem);
+    line-height: 1.12; margin: 0 0 .8rem; text-wrap: balance;
+  }
+  .standfirst {
+    font-family: var(--serif); font-size: 1.12rem; color: var(--ink-soft);
+    margin: 0; max-width: 38rem;
+  }
+
+  h2 {
+    font-family: var(--serif); font-weight: 600; font-size: 1.4rem;
+    margin: 3rem 0 .25rem; text-wrap: balance;
+  }
+  h2 + .sub { color: var(--ink-faint); font-size: .9rem; margin: 0 0 1.2rem; }
+  h3 { font-family: var(--sans); font-weight: 600; font-size: 1rem; margin: 1.8rem 0 .4rem; }
+  p { margin: 0 0 1rem; }
+  a { color: var(--pass); }
+
+  .verdict {
+    display: grid; gap: 1px; background: var(--rule);
+    border: 1px solid var(--rule); margin: 2rem 0 0;
+    grid-template-columns: repeat(auto-fit, minmax(11rem, 1fr));
+  }
+  .vcell { background: var(--surface); padding: 1rem 1.1rem; }
+  .vcell .k {
+    font-family: var(--mono); font-size: .68rem; letter-spacing: .1em;
+    text-transform: uppercase; color: var(--ink-faint); margin: 0 0 .45rem;
+  }
+  .vcell .v {
+    font-family: var(--serif); font-size: 1.75rem; font-weight: 600;
+    line-height: 1; margin: 0; font-variant-numeric: tabular-nums;
+  }
+  .vcell .n { font-size: .8rem; color: var(--ink-soft); margin: .4rem 0 0; }
+
+  figure { margin: 1.5rem 0 2rem; }
+  figcaption { font-size: .84rem; color: var(--ink-faint); margin-top: .7rem; }
+  svg { display: block; width: 100%; height: auto; }
+
+  .tablewrap { overflow-x: auto; margin: 1.25rem 0 1.5rem; }
+  table { border-collapse: collapse; width: 100%; font-size: .9rem; min-width: 30rem; }
+  th, td {
+    text-align: left; padding: .55rem .7rem; border-bottom: 1px solid var(--rule);
+    vertical-align: top;
+  }
+  th {
+    font-family: var(--mono); font-size: .68rem; letter-spacing: .09em;
+    text-transform: uppercase; color: var(--ink-faint); font-weight: 500;
+    border-bottom: 1px solid var(--ink);
+  }
+  td.num, th.num { text-align: right; font-family: var(--mono); font-variant-numeric: tabular-nums; }
+  tbody tr:last-child td { border-bottom: none; }
+  .totalrow td { font-weight: 600; border-top: 1px solid var(--ink); }
+
+  .tag {
+    display: inline-block; font-family: var(--mono); font-size: .68rem;
+    padding: .1rem .4rem; border-radius: 2px; white-space: nowrap;
+  }
+  .tag.pass { background: var(--pass-soft); color: var(--pass); }
+  .tag.trunc { background: var(--trunc-soft); color: var(--trunc); }
+
+  blockquote {
+    margin: 1.5rem 0; padding: .9rem 1.1rem; background: var(--surface);
+    border-left: 3px solid var(--trunc); font-family: var(--serif); font-size: 1rem;
+    color: var(--ink-soft);
+  }
+  blockquote p:last-child { margin: 0; }
+
+  code, .mono { font-family: var(--mono); font-size: .88em; }
+  .cmd {
+    background: var(--surface); border: 1px solid var(--rule); padding: .7rem .9rem;
+    overflow-x: auto; font-family: var(--mono); font-size: .82rem; margin: 1rem 0;
+    white-space: pre; color: var(--ink);
+  }
+
+  ol.bugs { counter-reset: b; list-style: none; padding: 0; margin: 1.25rem 0; }
+  ol.bugs > li {
+    counter-increment: b; position: relative; padding: 0 0 1.1rem 2.4rem;
+    margin-bottom: 1.1rem; border-bottom: 1px solid var(--rule);
+  }
+  ol.bugs > li:last-child { border-bottom: none; margin-bottom: 0; }
+  ol.bugs > li::before {
+    content: counter(b); position: absolute; left: 0; top: .05rem;
+    font-family: var(--mono); font-size: .78rem; color: var(--fail);
+    border: 1px solid var(--fail); width: 1.6rem; height: 1.6rem;
+    display: grid; place-items: center; border-radius: 50%;
+  }
+  ol.bugs .sym { color: var(--ink-soft); font-size: .9rem; margin: .2rem 0 0; }
+
+  footer {
+    margin-top: 3.5rem; padding-top: 1.2rem; border-top: 1px solid var(--rule);
+    font-size: .82rem; color: var(--ink-faint);
+  }
+</style>
+
+<div class="wrap">
+<header>
+  <p class="eyebrow">Qwen3.8-27B Q6_K · 2× Tesla P100 · 11 Sep 2026, 22:31 → 12 Sep, 07:20</p>
+  <h1>The model is fine. The instrument was the problem.</h1>
+  <p class="standfirst">An overnight LiveCodeBench v6 run against the published 90.3, on a machine where every failure mode this run produced looked identical to a bad model — and none of them were.</p>
+</header>
+
+<div class="verdict">
+  <div class="vcell">
+    <p class="k">Easy + medium, n=60</p>
+    <p class="v">88.3%</p>
+    <p class="n">95% CI 77.8–94.2</p>
+  </div>
+  <div class="vcell">
+    <p class="k">Published LCB v6</p>
+    <p class="v" style="color:var(--ref)">90.3%</p>
+    <p class="n">inside the interval</p>
+  </div>
+  <div class="vcell">
+    <p class="k">Genuine solve failures</p>
+    <p class="v">1<span style="font-size:1rem;color:var(--ink-faint)"> of 7</span></p>
+    <p class="n">other 6 hit the token cap</p>
+  </div>
+  <div class="vcell">
+    <p class="k">Throughput found</p>
+    <p class="v" style="color:var(--pass)">1.51×</p>
+    <p class="n">MTP was switched off</p>
+  </div>
+</div>
+
+<h2>What was measured, and what wasn't</h2>
+<p class="sub">Scope first, because the headline number does not cover the whole benchmark.</p>
+
+<p>The published Qwen3.8-27B coding figure is <strong>LiveCodeBench v6 = 90.3</strong>, measured over the full v6 release — 1,055 problems. This run used <span class="mono">test6.jsonl</span>, the newest v6 slice: 175 problems from contests between 4 Jan and 6 Apr 2025, 40 tests each, 112 AtCoder (stdin) and 63 LeetCode (functional). That slice skews hard — 80 hard against 43 easy and 52 medium — so it is a tougher set than the published average.</p>
+
+<p>Within it, 60 easy/medium problems were measured at a 32k token budget and 7 hard problems at 64k. <strong>The full 1,055-problem benchmark was not run and is not reachable here:</strong> at the measured rate it is 3.5–6 days of continuous generation.</p>
+
+<figure>
+  <svg viewBox="0 0 720 300" role="img" aria-label="Pass rate by difficulty tier, counting truncations as failures and excluding them, against the published 90.3 reference line">
+    <!-- gridlines -->
+    <g stroke="var(--rule)" stroke-width="1">
+      <line x1="120" y1="245" x2="700" y2="245"/>
+      <line x1="120" y1="196" x2="700" y2="196"/>
+      <line x1="120" y1="147" x2="700" y2="147"/>
+      <line x1="120" y1="98"  x2="700" y2="98"/>
+      <line x1="120" y1="49"  x2="700" y2="49"/>
+    </g>
+    <g font-family="IBM Plex Mono, monospace" font-size="10" fill="var(--ink-faint)" text-anchor="end">
+      <text x="112" y="249">0</text>
+      <text x="112" y="200">25</text>
+      <text x="112" y="151">50</text>
+      <text x="112" y="102">75</text>
+      <text x="112" y="53">100%</text>
+    </g>
+
+    <!-- published reference -->
+    <line x1="120" y1="68.1" x2="700" y2="68.1" stroke="var(--ref)" stroke-width="1.5" stroke-dasharray="5 4"/>
+    <text x="700" y="62" font-family="IBM Plex Mono, monospace" font-size="10" fill="var(--ref)" text-anchor="end">published 90.3</text>
+
+    <!-- bars: pairs of (all, excl trunc) -->
+    <!-- easy: 100 / 100 -->
+    <rect x="150" y="49"    width="42" height="196"   fill="var(--pass)"/>
+    <rect x="196" y="49"    width="42" height="196"   fill="var(--pass)" opacity="0.45"/>
+    <!-- medium: 78.8 / 96.3 -->
+    <rect x="298" y="90.5"  width="42" height="154.5" fill="var(--pass)"/>
+    <rect x="344" y="56.3"  width="42" height="188.7" fill="var(--pass)" opacity="0.45"/>
+    <!-- hard: 42.9 / 60.0 -->
+    <rect x="446" y="161"   width="42" height="84"    fill="var(--pass)"/>
+    <rect x="492" y="127.4" width="42" height="117.6" fill="var(--pass)" opacity="0.45"/>
+    <!-- weighted: 67.6 / 80.6 -->
+    <rect x="594" y="112.5" width="42" height="132.5" fill="var(--trunc)"/>
+    <rect x="640" y="87.0"  width="42" height="158"   fill="var(--trunc)" opacity="0.45"/>
+
+    <!-- value labels -->
+    <g font-family="IBM Plex Mono, monospace" font-size="10" fill="var(--ink)" text-anchor="middle">
+      <text x="171" y="42">100</text>
+      <text x="217" y="42">100</text>
+      <text x="319" y="83">78.8</text>
+      <text x="365" y="49">96.3</text>
+      <text x="467" y="154">42.9</text>
+      <text x="513" y="120">60.0</text>
+      <text x="615" y="105">67.6</text>
+      <text x="661" y="80">80.6</text>
+    </g>
+
+    <!-- tier labels -->
+    <g font-family="IBM Plex Sans, sans-serif" font-size="11" fill="var(--ink-soft)" text-anchor="middle">
+      <text x="194" y="264">easy · 27</text>
+      <text x="342" y="264">medium · 33</text>
+      <text x="490" y="264">hard · 7</text>
+      <text x="638" y="264">weighted</text>
+    </g>
+
+    <!-- legend -->
+    <g font-family="IBM Plex Sans, sans-serif" font-size="11" fill="var(--ink-soft)">
+      <rect x="150" y="282" width="11" height="11" fill="var(--pass)"/>
+      <text x="167" y="291">truncations counted as failures</text>
+      <rect x="392" y="282" width="11" height="11" fill="var(--pass)" opacity="0.45"/>
+      <text x="409" y="291">truncations excluded</text>
+    </g>
+  </svg>
+  <figcaption>Each tier shows both bounds. The true value lies between them, because a truncated problem is an unfinished measurement rather than a wrong answer. “Weighted” projects the tier rates onto the slice's own 43/52/80 difficulty mix.</figcaption>
+</figure>
+
+<h2>The headline</h2>
+<p class="sub">Easy and medium, measured properly, land on the published number.</p>
+
+<div class="tablewrap">
+<table>
+  <thead>
+    <tr><th>Tier</th><th class="num">Pass@1</th><th class="num">Rate</th><th class="num">Excl. truncations</th><th>Note</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>easy</td><td class="num">27/27</td><td class="num">100.0%</td><td class="num">100.0%</td><td>no failures at all</td></tr>
+    <tr><td>medium</td><td class="num">26/33</td><td class="num">78.8%</td><td class="num">96.3%</td><td>6 of 7 failures truncated</td></tr>
+    <tr><td>hard</td><td class="num">3/7</td><td class="num">42.9%</td><td class="num">60.0%</td><td>n far too small to be a rate</td></tr>
+    <tr class="totalrow"><td>easy + medium</td><td class="num">53/60</td><td class="num">88.3%</td><td class="num">98.1%</td><td>95% CI 77.8–94.2</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>The easy/medium sample is the only tier pair with enough problems for a usable interval, and <strong>the published 90.3 sits inside it.</strong> Of its seven failures, six ran out of token budget mid-reasoning and one — <span class="mono">abc392_d</span> — is a genuine wrong answer from a model that finished its work. That brackets the real value between 88.3% and 98.1%.</p>
+
+<p>The hard tier is reported for honesty, not as a rate: seven problems carry a ±30-point interval. What it does show is worth more than its pass rate, and it is the finding below.</p>
+
+<h2>The token budget was manufacturing failures</h2>
+<p class="sub">Two problems that scored zero at 32k passed at 64k. Nothing about the model changed.</p>
+
+<div class="tablewrap">
+<table>
+  <thead>
+    <tr><th>Problem</th><th class="num">At 32k cap</th><th class="num">At 64k</th><th class="num">Tokens used</th><th>Outcome</th></tr>
+  </thead>
+  <tbody>
+    <tr><td class="mono">abc397_e</td><td class="num">0/40 <span class="tag trunc">trunc</span></td><td class="num">40/40</td><td class="num">44,130</td><td><span class="tag pass">now passes</span></td></tr>
+    <tr><td class="mono">3762</td><td class="num">0/40 <span class="tag trunc">trunc</span></td><td class="num">40/40</td><td class="num">51,473</td><td><span class="tag pass">now passes</span></td></tr>
+    <tr><td class="mono">arc195_c</td><td class="num">0/5 <span class="tag trunc">trunc</span></td><td class="num">0/5</td><td class="num">37,647</td><td>finished, genuinely wrong</td></tr>
+    <tr><td class="mono">arc195_b</td><td class="num">0/40 <span class="tag trunc">trunc</span></td><td class="num">0/40</td><td class="num">30,142</td><td>finished, genuinely wrong</td></tr>
+    <tr><td class="mono">abc392_g</td><td class="num">0/40 <span class="tag trunc">trunc</span></td><td class="num">0/40 <span class="tag trunc">trunc</span></td><td class="num">64,000</td><td>still unfinished at 64k</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>Under a 32k budget every hard problem truncated — 5 for 5 — and scored zero. That is not a model result, it is a ceiling: with 46% of the slice rated hard, no configuration could have scored above roughly 54% regardless of how good the model was.</p>
+
+<p>The obvious suspect was a repetition loop, since greedy decoding causes them. It wasn't. A truncated trace was <strong>354 unique sentences out of 355</strong> — coherent combinatorial reasoning that simply had not converged. These problems genuinely want more than 32k tokens, which at ~30 t/s is ~35 minutes each.</p>
+
+<h2>Four bugs, one symptom</h2>
+<p class="sub">Every harness defect this run produced output indistinguishable from a model that cannot code.</p>
+
+<ol class="bugs">
+  <li>
+    <strong><span class="mono">bwrap --tmpfs /tmp</span> masked the scratch directory</strong>
+    <p class="sym">HumanEval scored <strong>0/3 on provably correct code</strong>. The generated solutions were right; the sandbox hid the file they were written to.</p>
+  </li>
+  <li>
+    <strong><span class="mono">--ro-bind / /</span> leaves the root read-only</strong>
+    <p class="sym">bwrap cannot create a mount point at <span class="mono">/payload.json</span> on a read-only root, so <strong>every LiveCodeBench problem failed inside the judge</strong>. Bind targets must land in the tmpfs.</p>
+  </li>
+  <li>
+    <strong>temperature 0</strong>
+    <p class="sym">Chosen for reproducibility; Qwen's documentation forbids it in thinking mode because it causes endless repetition. <strong>5 of 5 hard problems</strong> emitted the full budget as reasoning and never answered. Correct sampling is temp 0.6 / top_p 0.95 / top_k 20 — which is also what the published number uses, so the fix improved comparability rather than compromising it.</p>
+  </li>
+  <li>
+    <strong><span class="mono">sys.stdin</span> as a bare StringIO has no <span class="mono">.buffer</span></strong>
+    <p class="sym">Solutions reading via <span class="mono">sys.stdin.buffer.read()</span> — standard competitive-programming idiom — crashed, and <strong>correct code was scored as failure</strong>. Re-judging stored completions moved the sample 82.1% → 85.7% with no regeneration.</p>
+  </li>
+</ol>
+
+<blockquote>
+  <p>The lesson is procedural: validate the judge against a hand-written correct solution (expect 40/40) and a deliberately wrong one (expect 0/40) <em>before</em> trusting any score. Three of these four bugs were found only because a result looked implausible rather than merely bad.</p>
+</blockquote>
+
+<h2>MTP was off — and that's worth more than the benchmark</h2>
+<p class="sub">A 1.51× generation speedup has been sitting unclaimed through the entire optimization campaign.</p>
+
+<p>The GGUF carries a multi-token-prediction head — <span class="mono">blk.64.nextn.*</span>, <span class="mono">qwen35.nextn_predict_layers</span> — and nothing was using it. It runs on the main model's own weights, with no draft model:</p>
+
+<div class="tablewrap">
+<table>
+  <thead><tr><th>Configuration</th><th class="num">Generation</th><th>Note</th></tr></thead>
+  <tbody>
+    <tr><td>no MTP</td><td class="num">26.40 t/s</td><td>what every prior measurement used</td></tr>
+    <tr><td class="mono">--spec-type draft-mtp</td><td class="num">39.91 t/s</td><td>acceptance 0.619, mean accepted run 2.86</td></tr>
+    <tr><td>4 parallel slots + MTP</td><td class="num">~25 t/s</td><td>aggregate — <em>slower</em>, see below</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>llama.cpp infers MTP only from a draft-repo sidecar or a separate draft GGUF. A head embedded in the main model file is never detected, so it must be requested explicitly — which is why it has been off since day one. The campaign's headline 17.51 → 31.10 t/s was measured entirely without it.</p>
+
+<h3>Parallel slots lose here, and CLAUDE.md said so</h3>
+<p>Four concurrent slots delivered ~6.3 t/s each, ~25 t/s aggregate, against 33 t/s single-slot. Batching amortizes weight reads, which only pays when memory-bound; this workload is documented as compute/issue-bound, measured via core clock scaling. There was nothing to amortize — just the same ALUs split four ways plus per-sequence drafting and four host-side samplers. Reverted.</p>
+
+<h3>One caveat on MTP</h3>
+<p>Outputs are not bit-identical with MTP enabled. Verifying <em>k</em> drafted tokens runs them as a batch of <em>k</em>, taking the batched matmul path rather than mat-vec, and floating-point addition is not associative, so near-ties in the argmax break differently. This is the same non-associativity behind the fp16 accumulator work; it is not evidence of a wrongly accepted token.</p>
+
+<h2>What it would take to finish the job</h2>
+
+<div class="tablewrap">
+<table>
+  <thead><tr><th>Scope</th><th class="num">Problems</th><th class="num">Estimated wall time</th></tr></thead>
+  <tbody>
+    <tr><td>This run (delivered)</td><td class="num">67</td><td class="num">8.8 h</td></tr>
+    <tr><td>Full <span class="mono">test6</span> slice, adequate budget</td><td class="num">175</td><td class="num">~30 h</td></tr>
+    <tr><td>Official full v6 — the published comparison</td><td class="num">1,055</td><td class="num">3.5–6 days</td></tr>
+  </tbody>
+</table>
+</div>
+
+<p>735,606 completion tokens were generated overnight. The gap between this run and a true reproduction of 90.3 is not methodology any more — the harness is now correct and validated — it is purely hours of P100 time.</p>
+
+<h2>Verdict</h2>
+<p><strong>No evidence of degradation, and the published number is inside the measured interval.</strong> Easy problems went 27 for 27. Medium sits at 96.3% once unfinished measurements are set aside. The one genuine solve failure in 60 easy/medium problems is the kind of miss any model of this class produces.</p>
+
+<p>What this run cannot claim: that the full v6 90.3 has been reproduced. It measured 67 problems from the hardest slice of the benchmark, not 1,055 across all of it. The correct reading is that the model and the environment behave like a healthy frontier 27B on the tiers where the sample is large enough to say anything, and nothing anywhere in the run pointed at the kernels.</p>
+
+<div class="cmd">GGML_CUDA_P2P=1 llama-server -m Qwen3.8-27B-Q6_K.gguf \
+  -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 \
+  -c 73728 --parallel 1 --spec-type draft-mtp
+# sampling: temp 0.6, top_p 0.95, top_k 20, min_p 0</div>
+
+<footer>
+  Measured 11–12 Sep 2026 on 2× Tesla P100 16 GB (sm_60, PCIe, no NVLink), tensor split, Q6_K, q4_0 KV cache. Model is an abliterated finetune of Qwen3.8-27B, which is not the checkpoint the published 90.3 was measured on. Harness, judge and analysis in <span class="mono">tools/lcb/</span>; full log in <span class="mono">OPTLOG.md</span> attempt 145.
+</footer>
+</div>

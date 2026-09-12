@@ -5008,3 +5008,32 @@ min per hard problem, and this slice is 46% hard, so measuring all three tiers
 in one night was never possible. Phase B measures 8 hard problems at 64k.
 
 Kept: MTP on, single slot, thinking-mode sampling. Reverted: 4 parallel slots.
+
+### Result, phase B (hard, 64k token budget, n=7)
+
+    pass@1 = 3/7 = 42.9%   (3/5 = 60.0% excluding the 2 that truncated even at 64k)
+
+n=7 is not a rate (95% CI 15.8-75.0). Its value is the controlled comparison:
+two problems that scored 0/40 under the 32k cap PASS at 64k with no other
+change — abc397_e (44,130 tok) and 3762 (51,473 tok). Two others finished
+inside 64k and were genuinely wrong (arc195_c at 37,647; arc195_b at 30,142),
+and abc392_g was still unfinished at 64,000. So the 32k ceiling was
+manufacturing failures, and the hard tier remains under-measured, not proven.
+
+### Combined, projected onto the slice difficulty mix (43 easy / 52 medium / 80 hard)
+
+    tier     all            excl truncations
+    easy     27/27 = 100.0%  27/27 = 100.0%
+    medium   26/33 =  78.8%  26/27 =  96.3%
+    hard      3/7  =  42.9%   3/5  =  60.0%
+    weighted         67.6%            80.6%
+    unweighted over all measured: 56/67 = 83.6%  (95% CI 72.9-90.6)
+
+735,606 completion tokens overnight. NOT a reproduction of the published 90.3:
+that is the full v6 release (1,055 problems, easier mix), which is 3.5-6 days
+of generation here. What is established is that easy/medium — the only tiers
+with usable n — contain the published value in their interval, and that nothing
+in the run implicates the kernels.
+
+Artifact: https://claude.ai/code/artifact/d7d65dc3-0779-443e-8a4e-2c14a0d560fb
+Raw results preserved in p100-handoff/lcb_em.json and lcb_hard.json.
