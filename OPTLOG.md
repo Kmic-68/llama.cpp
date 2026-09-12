@@ -5166,3 +5166,125 @@ and a `min`/`max` cap, no arithmetic. `ggml_backend_cuda_buffer_init_tensor` gai
 Audits of `fattn-tile.cuh`/`fattn-vec.cuh` (the fp16 fold, q4_0 tile dequant) and of
 the new `fattn-gemm.cu` path (QK^T under `CUBLAS_COMPUTE_16F` at k=256) are separate
 and reported under their own attempt numbers.
+
+## Attempt 147 — audit of mmvq.cu / vecdotq.cuh against the strict standard (2026-09-12)
+
+Same standard as attempt 146: bit-identical, or strictly fewer roundings. Nothing else
+passes. Audited by re-deriving from the code, then proving each claim with a CPU
+program (`scratchpad/mine/vd/`). **Attempt 138's claim that these reassociations are
+"never worse" was asserted, not measured. Measured now, two of them are worse.**
+
+### PASSES — the two `__vsubss4` eliminations are exactly equivalent
+
+Both replace a saturating per-byte subtract with shift/mask/OR plus a power-of-two
+rescale folded into the return. Proved, not argued (`vd/unpack.c`):
+
+| | domain | mismatches |
+|---|---|---|
+| q6_K: `vil4\|vih4` vs `4*__vsubss4(vil\|vih, 0x20202020)` | complete per-byte domain, 128 cases | **0** |
+| q3_K: `vil32\|vih32` vs `32*__vsubss4(vil, vih)` | complete per-byte domain, 32 cases | **0** |
+| q6_K, cross-byte bit leakage from the word shifts | 160,000,000 byte-comparisons over 20M random (vl,vh) | **0** |
+
+The q6_K bias trick is worth recording: `b - 32` is the sign-extension of a 6-bit `b`
+from bit 5, so `((vh << (6-4i)) & 0xC0C0C0C0) ^ 0x80808080` *is* the bias — the XOR
+subtracts 128 when bit 7 is set and adds 128 when it is not, and in both cases the
+signed byte comes out as `4*b_lo + 64*b_hi - 128 = 4*(b-32)`. Verified in both branches.
+Saturation was confirmed **unreachable** in the upstream form (`vil|vih` in [0,63], minus
+32, never leaves int8), so `__vsubss4` was a plain subtract all along.
+
+Scale folding is exact: `d*0.25f*sumf` and `d3*(1.0f/32.0f)*sumf` scale by powers of two,
+which commutes with rounding, so q3_K — whose accumulation structure is otherwise
+untouched — is **BIT-IDENTICAL** end to end.
+
+### PASSES, and is strictly better — `VDR_Q6_K_Q8_1_MMVQ` 1 -> 4
+
+The group's dot product is now accumulated in an **int32** across all four lanes before
+any float appears. Bound derived independently: per-byte |product| <= 128*128, four bytes
+per dp4a, four lanes => peak |acc| = 4*4*128*128 = **262144 = 2^18**, inside float's
+exactly-representable integer range (2^24), so `(float)acc` is exact. The comment's
+claimed bound is correct.
+
+Measured against a long-double reference over 4,000,000 random vdr-groups (`vd/q6acc.c`):
+
+| | mean rel err | max rel err |
+|---|---|---|
+| upstream (vdr=1, four separately-rounded float lanes) | 3.434e-07 | 4.838e-02 |
+| **HEAD (vdr=4, exact int accumulator)** | **5.709e-08** | **3.077e-03** |
+
+6.0x better mean, 15.7x better tail. HEAD closer to exact in 1,903,865 cases, upstream
+closer in 599,243, exact tie in 1,496,892. Fewer roundings **and** measurably more
+accurate. This one is unambiguously good.
+
+### FAILS THE STANDARD — `calc_nwarps` 4 -> 2 at `ncols_dst == 1`
+
+Live in this build: `GGML_CUDA_MMVQ_PASCAL` is gated on `__CUDA_ARCH_LIST__ == 600`
+(`mmvq.cu:106`) and the build targets exactly 60.
+
+Halving the warps halves the thread count per row, so each thread's serial chain over K
+**doubles** and the final tree combines 2 partials instead of 4. Rounding *count* is
+unchanged (a sum of N leaves costs N-1 additions whatever the tree), so this is pure
+REASSOCIATION — and serial chains accumulate error faster than trees, so it is the
+*worse* shape. Modelled faithfully (strided per-thread slices, 5-step xor-butterfly per
+warp, sequential cross-warp sum), K=5120, 200,000 trials (`vd/nwarps.c`):
+
+| | mean rel err | max rel err |
+|---|---|---|
+| nwarps=4 (upstream) | 9.5613e-07 | 5.6810e-03 |
+| nwarps=2 (HEAD) | 1.5846e-06 | 3.1521e-02 |
+
+**1.66x worse mean, 5.5x worse tail.** Upstream closer in 100,937 trials, HEAD closer in
+70,349.
+
+### FAILS THE STANDARD — `split_rows` on the multi-column path
+
+`split_rows` (`mmvq.cu:121`) gives each warp its own output rows and has it walk the whole
+of K, which removes the cross-warp reduction entirely. So `nwarps` stops participating in
+the per-row sum: partials per row go from `nwarps*32` = 64 (upstream, nwarps=2) to **32**,
+and each lane's serial chain doubles. Note this means the `2 -> 4` warp change on this
+path does *not* improve the tree — it is not part of the tree any more.
+
+| | mean rel err | max rel err |
+|---|---|---|
+| 64 partials (upstream) | 1.5846e-06 | 3.1521e-02 |
+| 32 partials (HEAD) | 1.8892e-06 | 1.9704e-02 |
+
+**1.19x worse mean** (tail is actually better, 1.6x). Milder than the decode path.
+
+**Faithfulness caveat, stated plainly:** the leaf granularity in the model is one float
+per K-element, whereas the real kernel's leaves are `vec_dot` results that already sum
+several products exactly in integer. That makes the real absolute errors smaller than the
+table shows. The *ratio* between tree shapes is the robust quantity, because it is driven
+by the doubling of chain length, which holds at any leaf granularity.
+
+### The throughput at stake — and why this is not ALGO3
+
+Unlike ALGO3 (1.8% prefill), reverting the decode retree may be expensive. The closest
+measurement on record is attempt 40's sweep:
+
+| nwarps x rows_per_cuda_block | tg256 t/s |
+|---|---|
+| **2 x 2 (HEAD)** | **27.48** |
+| 2 x 4 | 26.88 |
+| 2 x 1 | 24.55 |
+| 4 x 1 | 22.02 |
+
+**That sweep does not isolate nwarps.** The only 4-warp cell also halves rows, and the
+same table shows rows=1 costs 10.7% on its own (2x1 vs 2x2). So the isolated cost of
+`nwarps 4->2` is somewhere between ~0% and ~25% and the existing data cannot pin it down.
+A clean `4 x 2` vs `2 x 2` A/B is the missing measurement, and it needs the model file.
+**`/mnt/fast` is unmounted, so it could not be run.** No revert made: unlike ALGO3 this is
+potentially a large decode cost, and it is the owner's call.
+
+### Cleanliness, not math — three probe switches ship in production
+
+`vecdotq.cuh:5-8` defines `P100_NOY`, `P100_MEMONLY` and `P100_NOUNPACK`, all `0` and
+therefore inert, with `#if` branches inside the hot q6_K inner loop. The header itself
+says they "break results". Flipping one by accident produces silently wrong output that
+no gate would attribute to them. Worth deleting or moving behind a build flag.
+
+### Also — CLAUDE.md's build command contains four dead flags
+
+`-DP100_NWARPS=8 -DP100_ROWS=4 -DP100_MC_NWARPS=4 -DP100_MC_ROWS=2` are **no longer read**
+(`mmvq.cu:105`, and this log at line 316). The tuning now lives in the source. Anyone
+following CLAUDE.md believes they are setting geometry they are not. CLAUDE.md is
+owner-owned and was not edited.
