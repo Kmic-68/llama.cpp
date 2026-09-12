@@ -155,6 +155,72 @@ instead -- upstream stock `f280b2698`, the prior session's `b44f8fe6f`, and this
 work all identical to every digit. That corpus is a different document, not a
 different result; see `CORPUS.md`. Nothing regressed at any point.
 
+### Task-level check: LiveCodeBench v6 (2026-09-12)
+
+Perplexity and KL answer "did the kernels move the distribution". They do not
+answer "can the model still do the work". That was measured directly against a
+**published** number rather than A/B against stock: `livecodebench/code_generation_lite`
+`test6.jsonl` (175 problems, contests 2026-01-04..2026-04-06, 112 AtCoder stdin +
+63 LeetCode functional, 40 tests/problem), judged in a `bwrap` sandbox, sampling
+at the vendor-specified thinking-mode settings (**temp 0.6, top_p 0.95, top_k 20,
+min_p 0** — greedy is explicitly forbidden for this model and produces endless
+reasoning; see the failure note below).
+
+| slice | n | token cap | pass@1 | 95% Wilson |
+|---|---|---|---|---|
+| easy | 27 | 32768 | **27/27 = 100.0%** | 88..100 |
+| medium | 33 | 32768 | 26/33 = 78.8% | 62..89 |
+| **easy+medium** | **60** | **32768** | **53/60 = 88.3%** | **77.8..94.2** |
+| hard | 8 | 65536 | 4/8 = 50.0% | 21.5..78.5 |
+| all measured | 68 | — | 57/68 = 83.8% | 73.3..90.7 |
+
+**Published Qwen3.8-27B LCB v6 is 90.3%, which is INSIDE the easy+medium
+interval.** 772,886 completion tokens, ~8.8 h wall on the two cards.
+
+Two things this measurement is not:
+
+1. **Not a stock A/B.** It says the optimized build performs at the published
+   level; it does not isolate the kernels, and it cannot — the interval is 16
+   points wide, and the whole patch set moves the model 2.6x less than the q4_0
+   KV cache the benchmark already runs with (above). A task benchmark is a far
+   blunter instrument than the KL number; it is here to catch gross breakage,
+   not low-bit drift.
+2. **Not the official full v6.** `test6` is one of six files and skews hard
+   (43 easy / 52 medium / 80 hard against the full 1,055-problem set's easier
+   mix). Weighted to the `test6` difficulty mix the measured rates give **70.8%**;
+   the full v6 mix is easier than that. Running all 1,055 is 3.5-6 days on this
+   hardware.
+
+**The dominant failure mode is the token cap, not wrong answers.** 6 of the 7
+easy+medium failures and 2 of the 4 hard failures hit the cap mid-reasoning with
+no answer emitted. Excluding them: easy+medium **53/54 = 98.1%**, hard **4/6 =
+66.7%**, weighted **83.7%**. This was verified not to be a repetition loop — a
+truncated trace was probed directly and held **354 unique sentences of 355**.
+Two hard problems that scored 0/40 at a 32k cap scored **40/40** when re-run at
+64k (`abc397_e` finished at 44,130 tokens; LeetCode `3762` at 51,473). So the
+true pass rate sits in a bracket whose lower end is the table above and whose
+upper end is the no-truncation column; a budget under ~48k understates this
+model on hard problems.
+
+**Harness:** `tools/lcb/` (`bench.py`, sandbox judge `driver.py`, offline
+`rejudge.py`, `analyze.py`, unattended supervisors). Raw completions and
+per-problem verdicts: `lcb_em.json`, `lcb_hard.json`.
+
+**Three harness bugs scored correct code as failure — all fixed, all worth knowing:**
+
+| bug | symptom | fix |
+|---|---|---|
+| greedy decoding | 5 of 5 hard problems emitted the entire 32k budget as reasoning and never answered: **0/5** | vendor sampling settings above. Broken run kept as `lcb_greedy_BROKEN.json` |
+| `bwrap --ro-bind / /` | judge could not create its own mount point: `Can't create file at /payload.json: Read-only file system` — **every** problem failed | bind the payload to `/tmp/payload.json`, inside the tmpfs |
+| `sys.stdin` as bare `StringIO` | solutions calling `sys.stdin.buffer.read()` died with `AttributeError` | `TextIOWrapper(BytesIO(...))`. `rejudge.py` recovered `arc195_a`, moving the sample 82.1% -> 85.7% |
+
+The judge was then validated against hand-written solutions before any model
+output was scored: **40/40 correct accepted, 0/40 wrong accepted**, in both
+stdin and functional modes. Two residual `KeyError: 'Solution'` failures
+(`3771`, `3794`) are genuine — the model emitted a bare function instead of the
+required class.
+
+
 ## Results
 
 | Change | Claim | Verdict | Evidence |
@@ -169,6 +235,7 @@ different result; see `CORPUS.md`. Nothing regressed at any point.
 | `VDR_Q6_K_Q8_1_MMVQ` 1→4 | bit-identical | **REFUTED** | four lanes folded into one int accumulator; scale reassociated |
 | flash-attn KV tile fix | bit-identical | **REFUTED** | changes `parallel_blocks` in 21.5% of D=64 and 36.6% of D=256 configs |
 | multi-column `split_rows` | *not* bit-identical | **CONFIRMED** (as stated) | no correctness bug found |
+| whole build, end to end | model still performs at the published level | **CONFIRMED** | LiveCodeBench v6 `test6` easy+medium **53/60 = 88.3%** [77.8..94.2]; published 90.3 inside the interval |
 
 ### Why the three refutations are "better", not "worse"
 

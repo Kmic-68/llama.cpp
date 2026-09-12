@@ -1,0 +1,98 @@
+[
+ {
+  "id": "arc195_c",
+  "platform": "atcoder",
+  "difficulty": "hard",
+  "ok": false,
+  "passed": 0,
+  "total": 5,
+  "err": "",
+  "tok": 32000,
+  "finish": "length",
+  "code": ""
+ },
+ {
+  "id": "3748",
+  "platform": "leetcode",
+  "difficulty": "medium",
+  "ok": true,
+  "passed": 40,
+  "total": 40,
+  "err": "",
+  "tok": 1638,
+  "finish": "stop",
+  "code": "from typing import List\n\nclass Solution:\n    def sortMatrix(self, grid: List[List[int]]) -> List[List[int]]:\n        n = len(grid)\n\n        for d in range(-(n - 1), n):\n            cells = []\n            for i in range(max(0, d), min(n, n + d)):\n                j = i - d\n                cells.append((i, j))\n\n            values = [grid[i][j] for i, j in cells]\n\n            if d >= 0:\n                values.sort(reverse=True)\n            else:\n                values.sort()\n\n            for (i, j), value in zip(cells, values):\n                grid[i][j] = value\n\n        return grid\n"
+ },
+ {
+  "id": "3760",
+  "platform": "leetcode",
+  "difficulty": "medium",
+  "ok": true,
+  "passed": 40,
+  "total": 40,
+  "err": "",
+  "tok": 3540,
+  "finish": "stop",
+  "code": "from typing import List\n\nclass Solution:\n    def assignElements(self, groups: List[int], elements: List[int]) -> List[int]:\n        max_group = max(groups)\n        answer_by_value = [-1] * (max_group + 1)\n        seen = [False] * (max_group + 1)\n\n        for index, value in enumerate(elements):\n            if value <= max_group and not seen[value]:\n                seen[value] = True\n                for multiple in range(value, max_group + 1, value):\n                    if answer_by_value[multiple] == -1:\n                        answer_by_value[multiple] = index\n\n        return [answer_by_value[group] for group in groups]\n"
+ },
+ {
+  "id": "abc397_e",
+  "platform": "atcoder",
+  "difficulty": "hard",
+  "ok": false,
+  "passed": 0,
+  "total": 40,
+  "err": "",
+  "tok": 32000,
+  "finish": "length",
+  "code": ""
+ },
+ {
+  "id": "abc392_g",
+  "platform": "atcoder",
+  "difficulty": "hard",
+  "ok": false,
+  "passed": 0,
+  "total": 40,
+  "err": "",
+  "tok": 32000,
+  "finish": "length",
+  "code": ""
+ },
+ {
+  "id": "3762",
+  "platform": "leetcode",
+  "difficulty": "hard",
+  "ok": false,
+  "passed": 0,
+  "total": 40,
+  "err": "KeyError: 'Solution'",
+  "tok": 32000,
+  "finish": "length",
+  "code": ""
+ },
+ {
+  "id": "arc195_b",
+  "platform": "atcoder",
+  "difficulty": "hard",
+  "ok": false,
+  "passed": 0,
+  "total": 40,
+  "err": "",
+  "tok": 32000,
+  "finish": "length",
+  "code": ""
+ },
+ {
+  "id": "abc398_a",
+  "platform": "atcoder",
+  "difficulty": "easy",
+  "ok": true,
+  "passed": 40,
+  "total": 40,
+  "err": "",
+  "tok": 974,
+  "finish": "stop",
+  "code": "import sys\n\ndef main():\n    N = int(sys.stdin.readline().strip())\n\n    if N % 2 == 0:\n        half = N // 2 - 1\n        print('-' * half + '==' + '-' * half)\n    else:\n        half = (N - 1) // 2\n        print('-' * half + '=' + '-' * half)\n\nif __name__ == \"__main__\":\n    main()\n"
+ }
+]
