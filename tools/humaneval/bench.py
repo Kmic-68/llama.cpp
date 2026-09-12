@@ -50,10 +50,10 @@ BWRAP = ["bwrap", "--ro-bind", "/", "/", "--dev", "/dev", "--proc", "/proc",
 
 def check(code, p, workdir):
     prog = code + "\n\n" + p["test"] + f"\n\ncheck({p['entry_point']})\nprint('__PASS__')\n"
-    path = os.path.join(workdir, "prog.py")
-    open(path, "w").write(prog)
+    # program goes in on stdin: bwrap's --tmpfs /tmp would mask any file we wrote there
     try:
-        r = subprocess.run(BWRAP + ["python3", path], capture_output=True, text=True, timeout=20)
+        r = subprocess.run(BWRAP + ["python3", "-"], input=prog,
+                           capture_output=True, text=True, timeout=20)
         return ("__PASS__" in r.stdout), (r.stderr.strip().splitlines() or [""])[-1][:200]
     except subprocess.TimeoutExpired:
         return False, "TIMEOUT"
