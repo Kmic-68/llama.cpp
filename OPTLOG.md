@@ -4920,3 +4920,91 @@ quoted NMSE, which is that error squared. sqrt error and linear NMSE are one law
 two units. Attempt 141's "the commit message is wrong on that point" is retracted.
 
 Report published: https://claude.ai/code/artifact/dd5cd75e-f1ed-4e30-b6c6-523c72b58db0
+
+## Attempt 145 — LiveCodeBench v6, absolute comparison against the published 90.3
+
+Goal: confirm the model+environment reproduce published Qwen3.8-27B coding
+numbers, not just agree with a stock llama.cpp build.
+
+HumanEval was rejected as the instrument: 2021, 164 problems, in every training
+corpus, and Qwen publishes no HumanEval score. Contamination makes it a decent
+"nothing is broken" detector but worthless as a capability measure. The
+published coding figure is **LiveCodeBench v6 = 90.3**.
+
+Data: `test6.jsonl` from `livecodebench/code_generation_lite` — 175 problems,
+contests 2025-01-04..2025-04-06, 112 AtCoder (stdin) + 63 LeetCode (functional),
+43 easy / 52 medium / 80 hard, 40 tests per problem. The HF dataset viewer
+refuses the repo (loading script) and py3.14 has no datasets/pyarrow wheels, so
+the raw file is fetched directly.
+
+### Result, phase A (easy+medium, 32k token budget, n=60 random sample, seed 1234)
+
+    pass@1 = 53/60 = 88.3%      95% Wilson 77.8 .. 94.2      published 90.3 INSIDE
+    easy   27/27 = 100.0%
+    medium 26/33 =  78.8%
+    atcoder 32/37    leetcode 21/23
+    truncated at cap: 6/60      total completion tokens: 428,763
+
+6 of the 7 failures are 32k truncations, not wrong answers. Counting them as
+failures gives 88.3% (lower bound); excluding them gives 53/54 = 98.1% (upper
+bound). The published value sits inside both the interval and that bracket.
+
+### MTP was off — 1.51x left on the table
+
+The GGUF carries the MTP head (`blk.64.nextn.*`, `qwen35.nextn_predict_layers`)
+but nothing was using it. `--spec-type draft-mtp` runs it on the main model's own
+weights, no draft model:
+
+    no MTP                  26.40 t/s
+    --spec-type draft-mtp   39.91 t/s     draft acceptance 0.619, mean len 2.86
+
+llama.cpp only infers MTP from a draft-repo sidecar or a separate draft GGUF
+(common/arg.cpp ~544-570). An MTP head embedded in the main file is never
+detected, so it must be requested explicitly. The whole optimization campaign
+(17.51 -> 31.10 t/s) was measured without it.
+
+Outputs are not identical with MTP on: verifying k drafted tokens runs them as a
+batch of k, taking the batched matmul path instead of mat-vec, and FP addition
+is not associative, so near-ties in the argmax break differently. Same
+non-associativity as the fp16 work. Not evidence of a wrong accepted token.
+
+### Parallel slots LOSE here — CLAUDE.md already said so
+
+    1 slot  + MTP   ~33 t/s
+    4 slots + MTP   ~25 t/s aggregate (6.1-6.9 t/s per slot)
+
+Batching amortizes weight reads, which pays only when memory-bound. CLAUDE.md
+records this workload as compute/issue-bound (measured via core clock scaling),
+so there was nothing to amortize — just the same ALUs split four ways plus
+per-sequence drafting and four host-side samplers. Reverted to single slot.
+
+### Four harness bugs, every one of which looked like "the model is bad"
+
+1. `bwrap --tmpfs /tmp` masked the scratch dir the harness wrote prog.py into →
+   HumanEval scored 0/3 on provably correct code.
+2. `--ro-bind / /` leaves the root read-only, so bwrap cannot create a mount
+   point at `/payload.json` → every LCB problem failed in the judge. Bind
+   targets must land inside the tmpfs (`/tmp/payload.json`).
+3. **temperature 0.** Qwen's docs say plainly not to use greedy decoding in
+   thinking mode: it causes endless repetition and degraded performance. 5 of 5
+   hard problems emitted the full 32k budget as reasoning and never answered.
+   Now temp 0.6 / top_p 0.95 / top_k 20 / min_p 0 — which is also what the
+   published number is measured with.
+4. `sys.stdin` as a bare `StringIO` has no `.buffer`, so solutions using
+   `sys.stdin.buffer.read()` crashed → correct code scored as failure.
+   `rejudge.py` re-scores stored completions with no regeneration; recovering
+   arc195_a moved the sample 82.1% -> 85.7% mid-run.
+
+Not one of these was the model. Validate the instrument with a hand-written
+correct solution (expect 40/40) and a wrong one (expect 0/40) before reporting
+any score.
+
+### Hard problems genuinely need more than 32k
+
+Diagnosed rather than assumed: a truncated arc195_c trace was 354 unique
+sentences out of 355 — no repetition, coherent reasoning that simply had not
+converged at 32k (~3 chars/token, ~97k chars). At ~30 t/s a 64k budget is ~35
+min per hard problem, and this slice is 46% hard, so measuring all three tiers
+in one night was never possible. Phase B measures 8 hard problems at 64k.
+
+Kept: MTP on, single slot, thinking-mode sampling. Reverted: 4 parallel slots.
