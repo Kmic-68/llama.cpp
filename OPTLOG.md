@@ -5070,3 +5070,99 @@ warm cards, short context; attempt 145 measured build-opt with default flags on
 a mixed-content 1500-token generation, and this file already records that speed
 is content-dependent (48.8 code / 37.7 prose) and that sampling defaults are
 within noise of greedy. Unverified by measurement — a tuned re-run is the check.
+
+## Attempt 146 — ruthless math audit: cuBLAS ALGO3 reverted (2026-09-12)
+
+Audit standard set by the owner: **every changed computation must be bit-identical
+to upstream, or use strictly fewer floating-point roundings. Reassociation does not
+pass.** Full scope: 19 changed compute files, `f280b2698..HEAD` (the other 84 changed
+files are docs, handoff artifacts, harness tools and `tests/test-backend-ops.cpp`).
+
+### REVERTED: cuBLAS `CUBLAS_GEMM_ALGO3` for wide f16 GEMMs
+
+| | |
+|---|---|
+| verdict | **REASSOCIATION — fails the standard** |
+| scope | fired only at `cc < VOLTA && cu_compute_type == CUBLAS_COMPUTE_16F && ne11 >= 512`, i.e. **prefill only**; decode goes through mmvq and never reached it |
+| why it fails | a different cuBLAS algorithm is a different k-accumulation order. Both algos run under `CUBLAS_COMPUTE_16F` — which is **upstream's** compute type, not ours — so neither is nominally more precise, and cuBLAS internals are opaque, so "fewer roundings" cannot be established either way |
+| measured cost of keeping it | perplexity 2.6209 -> 2.6214 (0.03 sigma) — attributable to this change per VERIFICATION.md |
+| measured gain given up | ~1.8% prefill (15.31 -> 16.79 TFLOPS on ffn gate/up at n=2048, and similar on three other shapes) |
+| owner's decision | "1.8% prefill isn't worth degradation" |
+
+The GEMM call is now **byte-identical to upstream** (`diff` against
+`f280b2698:ggml/src/ggml-cuda/ggml-cuda.cu` over the block: identical). The
+`cublasStatus_t` fallback retry that existed only to catch an unavailable ALGO3
+went with it. Build clean.
+
+**Gate NOT run: `/mnt/fast` is unmounted, so the model file is unavailable.** The
+expectation is 2.6214 -> 2.6209 and prefill ~442 -> ~434 t/s; both must be confirmed
+once the mount is back. This is the one thing in this attempt that is unverified.
+
+### PROVED CLEAN: the f16 tensor-parallel all-reduce
+
+Partial sums are shipped over PCIe as f16 when
+`ggml_cuda_peer_copy_compressible()` allows it. Claim: lossless. **It is**, and on
+this model it is a proof rather than a probe result. The chain, verified link by
+link in code:
+
+- all 506 matmul weights in the GGUF are Q6_K; the only non-quantized 2D tensors are
+  48 `ssm_conv1d` [4,10240], consumed by `GGML_OP_SSM_CONV`
+  (`llama-model-loader.cpp:996`), never a `MUL_MAT` operand
+- MMQ is compiled out: `mmq.cu:316` rejects `highest_compiled_arch < 610`, and this
+  build targets `60`. So a wide-batch quantized matmul cannot take an f32-output path
+- quantized src0 on P100 -> `compute_type = GGML_TYPE_F16` (`ggml_cuda_mul_mat_cublas`)
+- `prefer_f32_output` is **false** on sm_60 (`ggml-cuda.cu:1533`), so the GEMM writes a
+  `half` temp and widens it at `:1668`
+
+=> every peer-copy-eligible tensor holds exactly-f16-representable f32 values.
+
+Exhaustive CPU proofs (`scratchpad/mine/f16rt.c`, `f16nan.c`):
+
+| claim | domain | result |
+|---|---|---|
+| `half -> float -> half` is exact | all 65536 half patterns | **0 mismatches** (2046 NaN excluded) |
+| probe predicate == "is f16-representable" | all 4294967296 floats | admits exactly **63490** = 63488 finite halves + ±inf |
+| probe never admits a lossy value | all 4294967296 floats | **0** cases of probe-ok-but-lossy; all 1024 predicate/bitwise disagreements are NaN, i.e. conservative |
+
+Residual: the predicate *infers* f16-exactness from `op == MUL_MAT && ne[1] >= 512 &&
+cc < VOLTA` rather than checking the compute path, and the probe runs once. The only
+hole is heterogeneity (first exchange f16-exact, a later one not), which needs
+`GGML_PREC_F32` — and none of its five call sites (`llama-graph.cpp:1877, 1975, 2612,
+2845, 2932`) fires for `qwen35` with `-fa 1`. A uniform switch (`GGML_CUDA_CUBLAS_COMPUTE_TYPE=f32`,
+or an sm_61+ build enabling MMQ) is caught by the probe.
+
+### PROVED CLEAN: gated delta-net software pipelining
+
+`warp_reduce_sum(float2)` is **upstream code, unmodified** — the fork's `common.cuh`
+diff contains no `warp_reduce` change — and it applies the same `__shfl_xor_sync`
+offset sequence to each component independently, so `.x` reproduces the scalar
+`warp_reduce_sum(attn_partial)` bit for bit. Dataflow checked term by term:
+`kv_next` uses token t+1's `k` against the state after token t (exactly upstream's
+next-iteration value); `snapshot(t)` runs with `s_shard` holding the post-token-t
+state; the walked pointers reproduce identical addresses (integer arithmetic);
+the final iteration's `kv_next = 0` is reduced and discarded. **BIT-IDENTICAL.**
+
+### OPEN HAZARD (correctness, not rounding): q8_1 cache x CUDA-graph replay
+
+`mmvq_q8_1_ptr[dev]` is a raw grow-only `cudaMalloc` (`mmvq.cu:1583-1589`) whose
+pointer is baked into captured graph kernel parameters, while
+`ggml_cuda_graph_update_required` (`ggml-cuda.cu:2760`) compares **only ggml node
+properties** and short-circuits entirely when `cgraph->uid` matches. A graph captured
+before a realloc would replay against a freed pointer — silent garbage, not a crash.
+
+Not live in this configuration: the buffer is grow-only and the first prefill drives
+it to its global maximum (max over all `ne10`, at `ne11 = ub`) before the
+steady-state decode graph is captured. Nothing in the code enforces that ordering,
+and it is only reachable with `GGML_CUDA_GRAPHS_PRE_VOLTA=1` — which
+`docs/QUICKSTART.md` tells MTP users to set. Suggested fix: bump an epoch counter on
+realloc and force `cuda_graph_update_required`.
+
+### MATH-UNCHANGED
+
+`common/arg.cpp`, `common/common.h`, `common/speculative.cpp` — a draft-ubatch flag
+and a `min`/`max` cap, no arithmetic. `ggml_backend_cuda_buffer_init_tensor` gained a
+`tensor->data != nullptr` guard.
+
+Audits of `fattn-tile.cuh`/`fattn-vec.cuh` (the fp16 fold, q4_0 tile dequant) and of
+the new `fattn-gemm.cu` path (QK^T under `CUBLAS_COMPUTE_16F` at k=256) are separate
+and reported under their own attempt numbers.
