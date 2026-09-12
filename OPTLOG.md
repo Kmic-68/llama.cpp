@@ -5423,3 +5423,80 @@ change was made for. Recorded, not fixed.
   (nbatch_fa=64) — better than upstream *base*, worse than the current fallback.
 - A HIP-only guard gap in `ggml_cuda_fattn_tile_q4_0_direct` (fails loudly, not silently).
 - `cc` read from two different device indices (`fattn.cu:555` vs `:596`); identical on 2x P100.
+
+## Attempt 149 — audit of the elementwise / dequant / index family (2026-09-12)
+
+Last slice: `norm.cu`, `unary.cu`, `concat.cu`, `cpy.cu`, `binbcast.cu`, `convert.cu`.
+With this, **all 19 changed compute files are audited** (the other 84 changed files are docs,
+handoff artifacts, harness tools and `tests/test-backend-ops.cpp`).
+
+The thing I was looking for here — a float division replaced by a reciprocal multiply, which
+is two roundings instead of one and differs unless the reciprocal is exact — **is not present.**
+The commit titled "stop dividing in the elementwise and norm kernels on Pascal" removes
+**64-bit integer** div/mod from index arithmetic, not float division. `norm.cu` still computes
+`tmp / ncols` and `rsqrtf(mean + eps)`; no `__fdividef`, `__frcp_rn`, `__expf`, `__logf` or any
+other fast-math intrinsic was substituted anywhere in the six files.
+
+### BIT-IDENTICAL — rms_norm row kept in registers
+
+The fast path (`ncols <= block_size*max_regs`, max_regs=8) loads the row once into registers
+and reuses it for the scale pass. Verified:
+- same strided ownership (`col = tid + u*block_size`, u ascending == upstream's
+  `col += block_size`), so each thread sums the same terms in the same order;
+- padding is **appended, not interleaved**: out-of-range lanes contribute `tmp += 0.0f*0.0f`.
+  That is a bitwise no-op here because `tmp` starts at `+0.0f` and accumulates squares, so it
+  can never be `-0.0f` (the one value `+0.0f` addition would change);
+- identical reduction: same `block_reduce<SUM, block_size>` with the same block_size, hence the
+  same tree;
+- the store association is textually identical to upstream — `scale * x[col] * mul[mul_col] +
+  add[add_col]` vs `scale * xv[u] * mul[...] + add[...]`, and `xv[u]` is that same load;
+- `mean`/`scale` lines unchanged.
+The other three `extern __shared__` moves are declaration hoists. MATH-UNCHANGED.
+
+### PROVED — the fastdiv index replacement is exact inside its guard, and the guard is tight
+
+`unary.cu`, `concat.cu` and `cpy.cu` replace 64-bit integer division with
+Granlund-Montgomery multiply-shift. Independent test (`scratchpad/mine/vd/fd.c`), sweeping every
+quotient transition (`k*d-1`, `k*d`, `k*d+1`) plus random and endpoint numerators, over 47
+divisors including the stated worst case `2^30+1`, powers of two, `2^31`, primes and this
+model's real dimensions (5120, 8704, 10240, 151936):
+
+**286,286,219 checks inside the guard (numerator <= 2^31): 0 failures.**
+
+The guard is tight, and the header comment is off by one in the safe direction: it claims the
+first failure is at `n = 2^31+1`, but `2^31+1` is still exact — the first failure is at
+**`n = 2^31+2`** with `d = 2^30+1`, where fastdiv returns **0** for a true quotient of **2**.
+That is a catastrophic index error, not a rounding, so the guard is load-bearing. All three
+call sites bound **both** numerator and divisor: `unary.cu:305`, `:427` and `cpy.cu:253-255`
+fall back to an i64 reference kernel, `concat.cu:78-79` asserts. Correct in every case.
+
+### PROVED BIT-IDENTICAL — vectorised q6_K dequant
+
+The arithmetic is textually identical to upstream's `dequantize_q6_K`: `d * sc * (q - 32)`,
+same left-to-right association, so the entire claim reduces to the index mapping. That domain
+is 256 elements and fully enumerable, so the prior "4096 random superblocks" sample is now a
+proof (`scratchpad/mine/vd/q6map.c`):
+
+**All 256 outputs of a superblock: 0 mapping mismatches, 0 coverage errors, and each output
+written exactly once by both kernels.**
+
+Every output draws the same scale byte, the same `ql` byte and nibble half, and the same `qh`
+bit pair. The non-obvious part is that HEAD's `il0 = (4*t) & 31` clears the low two bits of
+upstream's `il`, which cannot change the `il/16` scale bucket (16 is a multiple of 4) and is
+exactly restored by `+ k` in the byte index. Misaligned outputs fall back to the reference
+kernel (`(uintptr_t) y % (4*sizeof(dst_t)) == 0`).
+
+### BIT-IDENTICAL — binbcast flat fast path
+
+The new `k_bin_bcast_flat` uses the **same** comma-fold as upstream's general kernel,
+`result = (..., (result = bin_op(result, (float) src1s[i])))` — unchanged at `binbcast.cu:87`
+and `:190` — so the operand order over the variadic sources is identical. The only difference
+is the index: `[i]` instead of `[i_src1 + size_t(i10)*s10]`. The fast-path predicate requires
+`ggml_is_contiguous` **and** `ggml_are_same_shape(x, dst)` for src0, src1, dst and every
+variadic extra, under which memory order and logical index coincide in all operands, so the two
+index expressions select the same element. `ne == 0` and null-pointer cases are guarded.
+
+### Nothing else in these files touches a computation
+
+`cpy.cu` and `concat.cu` are index-only. The f32<->f16 vectorised convert is a load/store width
+change; conversions still go through `ggml_cuda_cast`. No rounding mode changed.
