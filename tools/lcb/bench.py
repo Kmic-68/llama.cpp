@@ -14,6 +14,15 @@ AP.add_argument("--max-tokens", type=int, default=16384)
 AP.add_argument("--tests", type=int, default=40)
 AP.add_argument("--workers", type=int, default=1)
 AP.add_argument("--resume", action="store_true")
+# Qwen thinking-mode sampling. Greedy decoding is explicitly discouraged by Qwen:
+# it causes endless repetition, which showed up here as 32k of reasoning and no answer
+# on 5 of 5 hard problems.
+AP.add_argument("--temp", type=float, default=0.6)
+AP.add_argument("--top-p", type=float, default=0.95)
+AP.add_argument("--top-k", type=int, default=20)
+AP.add_argument("--min-p", type=float, default=0.0)
+AP.add_argument("--presence-penalty", type=float, default=0.0)
+AP.add_argument("--req-seed", type=int, default=1234)
 A = AP.parse_args()
 
 ROWS = [json.loads(l) for l in open(A.data)]
@@ -59,7 +68,9 @@ def generate(r):
     body = json.dumps({
         "messages": [{"role": "system", "content": SYS},
                      {"role": "user", "content": prompt(r)}],
-        "temperature": 0.0, "top_p": 1.0, "max_tokens": A.max_tokens, "stream": False,
+        "temperature": A.temp, "top_p": A.top_p, "top_k": A.top_k, "min_p": A.min_p,
+        "presence_penalty": A.presence_penalty, "seed": A.req_seed,
+        "max_tokens": A.max_tokens, "stream": False,
     }).encode()
     req = urllib.request.Request(f"http://127.0.0.1:{A.port}/v1/chat/completions",
                                  data=body, headers={"Content-Type": "application/json"})
