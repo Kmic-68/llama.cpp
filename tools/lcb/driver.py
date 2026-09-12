@@ -16,7 +16,9 @@ def norm(s):
 def run_stdin(t):
     g = {"__name__": "__main__"}
     out = io.StringIO()
-    sys.stdin = io.StringIO(t["input"])
+    # TextIOWrapper over BytesIO so sys.stdin.buffer works: solutions routinely
+    # read via sys.stdin.buffer.read(), which a bare StringIO cannot serve.
+    sys.stdin = io.TextIOWrapper(io.BytesIO(t["input"].encode()), encoding="utf-8")
     with contextlib.redirect_stdout(out):
         try:
             exec(compile(code, "sol.py", "exec"), g)

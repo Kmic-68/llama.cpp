@@ -23,10 +23,14 @@ AP.add_argument("--top-k", type=int, default=20)
 AP.add_argument("--min-p", type=float, default=0.0)
 AP.add_argument("--presence-penalty", type=float, default=0.0)
 AP.add_argument("--req-seed", type=int, default=1234)
+AP.add_argument("--difficulty", default="")
 A = AP.parse_args()
 
 ROWS = [json.loads(l) for l in open(A.data)]
 random.Random(A.seed).shuffle(ROWS)
+if A.difficulty:
+    keep = set(A.difficulty.split(","))
+    ROWS = [r for r in ROWS if r["difficulty"] in keep]
 ROWS = ROWS[:A.n]
 
 # --resume: keep finished problems, re-run only what is missing
@@ -77,7 +81,9 @@ def generate(r):
     with urllib.request.urlopen(req, timeout=3600) as f:
         j = json.load(f)
     c = j["choices"][0]
-    return c["message"]["content"], j.get("usage", {}).get("completion_tokens", 0), c.get("finish_reason", "")
+    msg = c["message"]
+    raw = (msg.get("reasoning_content") or "") + "\n===CONTENT===\n" + (msg.get("content") or "")
+    return msg.get("content") or "", j.get("usage", {}).get("completion_tokens", 0), c.get("finish_reason", ""), raw
 
 def extract(text):
     text = re.sub(r"<think>.*?</think>", "", text, flags=re.S)
@@ -114,7 +120,7 @@ def one(i_r):
     i, r = i_r
     ts = time.time()
     try:
-        text, ntok, fin = generate(r)
+        text, ntok, fin, raw = generate(r)
     except Exception as e:
         return i, {"id": r["question_id"], "ok": False, "err": f"GEN {e}", "tok": 0,
                    "difficulty": r["difficulty"], "platform": r["platform"]}
@@ -124,7 +130,8 @@ def one(i_r):
     ok = v["total"] > 0 and v["passed"] == v["total"]
     row = {"id": r["question_id"], "platform": r["platform"], "difficulty": r["difficulty"],
            "ok": bool(ok), "passed": v["passed"], "total": v["total"], "err": v["err"],
-           "tok": ntok, "finish": fin, "code": code}
+           "tok": ntok, "finish": fin, "code": code,
+           "raw_head": raw[:1200], "raw_tail": raw[-2500:]}
     with lock:
         results[i] = row
         done[0] += 1
