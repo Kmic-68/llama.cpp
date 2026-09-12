@@ -5037,3 +5037,36 @@ in the run implicates the kernels.
 
 Artifact: https://claude.ai/code/artifact/d7d65dc3-0779-443e-8a4e-2c14a0d560fb
 Raw results preserved in p100-handoff/lcb_em.json and lcb_hard.json.
+
+### Retraction (attempt 145): "MTP was off" was wrong
+
+Attempt 145 above claims MTP was never enabled and that `--spec-type draft-mtp`
+is an unclaimed 1.51x. That is wrong and is retracted.
+
+MTP was already known, tuned and in production here: attempt 17 retuned the
+multi-column path, the "MTP flag tuning" section sweeps `--spec-draft-n-max`
+and `--spec-draft-p-min` to an optimum, attempt 81 tested and rejected CUDA
+graphs on the MTP path, and this file states plainly that the user runs MTP in
+production. Shell history shows `--spec-type draft-mtp --spec-draft-n-max ...`
+in use well before attempt 145.
+
+What was actually off was MTP *in the benchmark harness invocation*. Worse, the
+harness enabled MTP with **default** draft parameters:
+
+    no MTP                                26.40 t/s
+    MTP, default draft params (measured)  39.91 t/s   <- what 145 called "1.51x"
+    MTP, n-max 6 / p-min 0.75 (this file)  38.15 t/s   <- same rung, prior session
+    MTP, n-max 3 / p-min 0.05              48.90 t/s   <- tuned, standard prompt
+    MTP, n-max 4 / p-min 0.2               54.48 t/s   <- warm, best of 6
+
+So 39.91 is the untuned middle rung, not the ceiling, and the 1.51x was
+untuned-vs-none. The correct statement is that the LCB harness ran MTP
+untuned and therefore ~25-30% slower than this machine's tuned configuration;
+the benchmark's correctness is unaffected, but its wall-clock estimates were
+pessimistic by that margin.
+
+Nothing indicates a regression: the 54.48 reading was build-faq, tuned flags,
+warm cards, short context; attempt 145 measured build-opt with default flags on
+a mixed-content 1500-token generation, and this file already records that speed
+is content-dependent (48.8 code / 37.7 prose) and that sampling defaults are
+within noise of greedy. Unverified by measurement — a tuned re-run is the check.
