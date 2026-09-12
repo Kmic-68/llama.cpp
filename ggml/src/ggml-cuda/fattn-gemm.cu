@@ -10,8 +10,8 @@
 // are cuBLAS calls instead of hand-written tiles:
 //
 //   for each KV chunk:
-//       S = K^T Q                      (GEMM, f16 accumulate -- matches the tile kernel,
-//                                       which also keeps KQ in half)
+//       S = K^T Q                      (GEMM, f16 accumulate -- NOT what the tile kernel
+//                                       does; see the FIXME at the QK^T call)
 //       m_new = max(m, rowmax(S+mask))
 //       corr  = exp(m - m_new);  P = exp(S + mask - m_new)
 //       l     = l*corr + rowsum(P)
@@ -217,6 +217,15 @@ bool ggml_cuda_flash_attn_ext_gemm_supported(const ggml_tensor * dst) {
     if (Q->ne[2] % K->ne[2] != 0) {
         return false;
     }
+    // The softmax kernel takes a single flat mask pointer: it applies mask->nb[1] per query
+    // row but nothing per head or per sequence, while the sequence loop below advances Q, K,
+    // V and dst by their nb[3]. Upstream's tile kernel offsets the mask by
+    // nb33*(sequence % ne33) (fattn-tile.cuh:860); this path has no equivalent, so a mask
+    // that is not broadcast across heads and sequences would silently be read from
+    // sequence 0 for every sequence. Decline those shapes and let the tile kernel take them.
+    if (mask->ne[2] != 1 || mask->ne[3] != 1) {
+        return false;
+    }
     // F16 needs no conversion at all (cuBLAS takes an arbitrary lda, so we point it straight
     // at the cache). Anything else must have a strided dequantizer; note F16 itself is NOT in
     // ggml_get_to_fp16_nc_cuda's switch, so check the type before the function pointer.
@@ -337,12 +346,29 @@ void ggml_cuda_flash_attn_ext_gemm(ggml_backend_cuda_context & ctx, ggml_tensor 
                 }
 
                 // S = K^T Q  -> [nkv_c x nt] per head, column-major.
-                // f16 accumulate: the tile kernel also keeps KQ in half, so this matches
-                // the existing numerical behaviour rather than degrading it.
+                //
+                // FIXME(2026-09-12 audit): the justification below is FALSE and this is a
+                // real precision regression. The tile kernel does NOT keep KQ in half --
+                // upstream fattn-tile.cuh:604 declares `float KQ_acc[...]`, an fp32
+                // accumulator; what it keeps in half are the products and Q_tmp. So
+                // COMPUTE_16F here replaces an fp32 accumulation of k=256 terms with an
+                // fp16 one, costing ~sqrt(256)*2^-11 ~= 8e-3 relative error per logit
+                // against upstream's ~2e-3.
+                // Two further upstream guards are missing, both active on sm_60:
+                //   - Q is not pre-scaled by scale*0.25 before the accumulation
+                //     (fattn-tile.cuh:932-937, written for precisely this hardware), so the
+                //     fp16 accumulator has 64x less overflow headroom and an inf logit can
+                //     reach expf(inf-inf) = NaN. NOTE: alpha cannot fix this -- cuBLAS
+                //     applies alpha AFTER the accumulation. The scale must move into
+                //     fattn_gemm_q_to_f16, with a matching *4 where scale is applied now.
+                //   - FATTN_KQ_MAX_OFFSET is not added to the running max, unlike tile, vec
+                //     and mma, removing another 8x of headroom for the f16 P/Otmp.
+                // Fixing the accumulator means COMPUTE_32F, measured at 6.2 vs 14.65 TFLOPS
+                // on this shape, i.e. roughly halving long-context prefill. Left as the
+                // owner's call; the pre-scale and the max offset are free and are not.
                 {
-                    // f16 compute here, unlike PV: QK^T sums only k=D=256 terms and the tile
-                    // kernel likewise keeps KQ in half, so this matches existing precision
-                    // while running at the 2:1 fp16 rate (measured 14.65 vs 6.2 TFLOPS for
+                    // f16 compute here, unlike PV: QK^T sums only k=D=256 terms
+                    // and it runs at the 2:1 fp16 rate (measured 14.65 vs 6.2 TFLOPS for
                     // COMPUTE_32F at this shape).
                     // alpha/beta must match the COMPUTE type, not the data type -- with
                     // COMPUTE_16F cuBLAS reads these as half*, with COMPUTE_32F as float*.

@@ -592,9 +592,12 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
 
-    // Opt-in cuBLAS-GEMM attention for pre-Volta. On Pascal the tile kernel runs at 18.6%
+    // cuBLAS-GEMM attention for pre-Volta. On Pascal the tile kernel runs at 18.6%
     // of peak while cuBLAS reaches 13-15 TFLOPS at these same shapes; attention is ~86% of
-    // prefill at 262144 context. Off by default -- set GGML_CUDA_FA_GEMM=1.
+    // prefill at 262144 context.
+    // ON by default -- ggml_cuda_fa_gemm_enabled() is `!s || s[0] != '0'`. Set
+    // GGML_CUDA_FA_GEMM=0 to fall back to upstream. (This comment previously said the
+    // opposite, which is how a default-on precision regression went unnoticed.)
     if (ggml_cuda_fa_gemm_enabled() && ggml_cuda_flash_attn_ext_gemm_supported(dst) &&
         ggml_cuda_info().devices[ggml_cuda_get_device()].cc < GGML_CUDA_CC_VOLTA) {
         ggml_cuda_flash_attn_ext_gemm(ctx, dst);

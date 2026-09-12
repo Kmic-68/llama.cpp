@@ -5288,3 +5288,138 @@ no gate would attribute to them. Worth deleting or moving behind a build flag.
 (`mmvq.cu:105`, and this log at line 316). The tuning now lives in the source. Anyone
 following CLAUDE.md believes they are setting geometry they are not. CLAUDE.md is
 owner-owned and was not edited.
+
+## Attempt 148 — audit of the flash-attention paths (2026-09-12)
+
+Two adversarial audits, both of whose structural claims I re-verified in the source before
+recording them. Where a claim is relayed unverified it says so.
+
+### THE HEADLINE: the cuBLAS-GEMM attention path is ON BY DEFAULT and is materially less accurate
+
+`ggml_cuda_fa_gemm_enabled()` (`fattn-gemm.cu:420`) is `return !s || (s[0] != '0')` — env
+**unset means enabled**. The comment at `fattn.cu:597` said *"Off by default -- set
+GGML_CUDA_FA_GEMM=1"*, which is **false**, and is how a default-on precision regression went
+unnoticed. Corrected in this commit.
+
+Gate (`fattn-gemm.cu:208`): `Q->ne[1] >= 128 && K->ne[1] >= 4096`. So decode (`Q->ne[1]==1`)
+and MTP draft/verify batches (4-6) never take it, and the first `-ub 2048` prefill chunk does
+not either — but **every subsequent prefill ubatch at long context does**. It replaces
+`BEST_FATTN_KERNEL_TILE`.
+
+**Both** GEMMs ship `CUBLAS_COMPUTE_16F` with `half` alpha/beta and `CUDA_R_16F` throughout
+(`:351-361`, `:385-395`). The claim in `docs/FINDINGS.md` that PV uses `CUBLAS_COMPUTE_32F`
+"because it sums thousands of positive terms" is **stale** — it describes an earlier revision.
+
+The change was justified in-code, three times (`fattn-gemm.cu:13`, `:339-341`), by the claim
+that *"the tile kernel also keeps KQ in half"*. **That claim is false.** Upstream
+`fattn-tile.cuh:604` declares `float KQ_acc[...] = {0.0f}` — the k=256 QK^T accumulator is
+**fp32**. What the tile kernel keeps in half are the *products* and `Q_tmp`, not the
+accumulation (`common.cuh:774-783`: `const float2 tmp = __half22float2(v*u); acc += tmp.x +
+tmp.y` on the sm_60 branch).
+
+Measured independently (`scratchpad/mine/vd/qk16.c`, `_Float16`, 200k dot products per row,
+D=256, scale=1/16, upstream modelled with half products + fp32 accumulate + the `scale*0.25`
+pre-scale):
+
+| element RMS | GEMM (fp16 acc) mean rel err | upstream (fp32 acc + pre-scale) | GEMM non-finite | true \|q·k\| > 65504 |
+|---|---|---|---|---|
+| 1 | 9.72e-03 | 2.44e-03 | 0 | 0 |
+| 2 | 1.83e-02 | 2.57e-03 | 0 | 0 |
+| 8 | 1.11e-02 | 1.81e-03 | 0 | 0 |
+| 32 | 1.20e-02 | 1.27e-06* | **37** | 24 |
+| 64 | 1.52e-02 | — | **116711** | 63848 |
+
+**~4x worse mean relative error per attention logit.** Since the logit feeds `expf`, that is a
+percent-level error on every attention weight. Two upstream guards are also missing, both
+**active on sm_60**:
+
+1. **No `scale*0.25` pre-scale of Q.** Upstream `fattn-tile.cuh:932-937` scales Q down and
+   restores with `KQ_acc *= 4.0f` at `:631`, under a comment that names this exact hardware:
+   *"Without the v_dot2_f32_f16 instruction there is a higher risk of numerical overflow in
+   the KQ calculation."* Both factors are exact powers of two at D=256, so it costs nothing and
+   buys 64x headroom. Its absence is why the fp16 accumulator goes non-finite **more often than
+   the true value overflows** (37 vs 24 at RMS 32): partial sums overflow where the result
+   would not. An inf logit reaches `expf(inf - inf)` = NaN; the guard at `:101` catches
+   `-FLT_MAX/4`, not `+inf`.
+   **Note: `alpha` cannot fix this.** cuBLAS applies alpha *after* the accumulation. The scale
+   must move into `fattn_gemm_q_to_f16` with a matching `*4` where `scale` is applied now.
+   (The audit's suggested one-line `alpha = __float2half(scale*0.25f)` is wrong for this
+   reason.)
+2. **`FATTN_KQ_MAX_OFFSET` (3·ln2) is not added to the running max.** Upstream applies it in
+   tile (`:816`), vec (`:342`) and mma (`:723`, `:800`) — all three — capping probabilities at
+   1/8 to give the f16 P and the PV accumulator 3 bits of headroom. Absent here (no occurrence
+   in `fattn-gemm.cu`), stacking on top of the missing 64x.
+
+Fixing the accumulator means `CUBLAS_COMPUTE_32F`, which the author measured at 6.2 vs 14.65
+TFLOPS on this shape — roughly halving long-context prefill, since attention is ~86% of it.
+**Left for the owner to decide.** A `FIXME` recording all of the above now sits at the QK^T
+call so the false justification cannot be re-derived from the source.
+
+### FIXED — mask sequence/head stride ignored (silent wrong answer)
+
+`fattn-gemm.cu` loops `for (s = 0; s < ns; ++s)` and advances Q, K, V and dst by `nb[3]`, but
+passes the mask as a flat `mask->data` with no per-sequence offset, while upstream does
+`mask + nb33*(sequence % ne33)` (`fattn-tile.cuh:860`). `gemm_supported()` checked neither
+`mask->ne[2]` nor `mask->ne[3]`, and the upstream dispatch only rejects `ne[2] != 1`. With
+`ns > 1` every sequence would attend through sequence 0's mask. **Masked today by `-np 1`**
+(ns == 1). Now declined outright: `if (mask->ne[2] != 1 || mask->ne[3] != 1) return false;`
+falls back to the tile kernel, which handles it correctly. Build clean.
+
+### The fp16 VKQ fold: the label is wrong, the change is still right
+
+The repo calls the fold FEWER-ROUNDINGS. Arithmetically it is **MORE**: it adds
+`ceil(N_b/nbatch_fa)` fp32 additions per output element that upstream never performed (+4096
+per element at 262144 with nbatch_fa=64), while shortening the half chain from `N_b` to
+`nbatch_fa`. No rounding is added at *lower* precision and no term is dropped or reordered, so
+error falls by roughly `sqrt(N_b/nbatch_fa)` — and for `N_b <= nbatch_fa` the output is
+bit-identical to upstream. The change is good; the claim should read "+1 fp32 rounding per KV
+tile, half chain N -> nbatch_fa", not "fewer roundings".
+
+### LOSSY — q4_0 tile dequant overflows where upstream saturates gracefully
+
+`fattn-tile.cuh:500-501` computes the bias **in half**: `offs = __hmul2(dh, -8.0h)`. For
+`|d| >= 8192` that is ±inf (half max 65504), so `__hfma2` returns ±inf where upstream's float
+`dm = -8*d` (`convert.cu:107`) stays finite and only the *result* rounds. Reported exhaustive
+enumeration over all 16 nibbles x 65536 half scales = 1,048,576 cases: **982,204 bit-identical,
+66,372 mismatches, every one with `|d| >= 8192`** (e.g. `d = 8192, q = 8`: upstream `0`, HEAD
+`-inf`). An inf in the K/V tile makes the whole head NaN.
+
+Unreachable for a healthy model: q4_0's `d` is `max|x|/8`, so this needs `max|activation| >=
+65536`. Invisible to perplexity and to the op suite. **The obvious one-line fix does not
+work** — `__float2half2_rn(-8.0f*__half2float(d))` still rounds to ±inf on store. A correct
+fix keeps the whole expression in float as upstream does, which gives back the ALU saving the
+change was made for. Recorded, not fixed.
+
+### Confirmed correct (claims that survived falsification)
+
+- **`V_DOT2_F32_F16_AVAILABLE` really is HIP-only** — verified myself at `common.cuh:770-772`:
+  it requires `GGML_USE_HIP` plus an RDNA/CDNA/gfx906 target, and nothing in the tree defines
+  it for CUDA. So `fattn-vec.cuh:151`'s `half2 VKQ[...]` is dead on every CUDA build, the
+  `float2` branch is taken, and **there is no unfixed fp16 accumulation in the vec kernel.**
+  The repo's claim here was right. Note `FAST_FP16_AVAILABLE` *is* set on sm_60
+  (`common.cuh:261-263`) and is a different macro.
+- P-onto-S aliasing: no read-after-overwrite (same-index read-before-write per thread, one
+  owner per index, `__syncthreads()` fencing the reduction, cuBLAS never reads C at `beta=0`).
+- GEMM shapes, strides and leading dimensions independently re-derived and correct; the gqa
+  loop is collapsed into the column dimension, valid because all 6 query heads of a kv head
+  share one K/V. `s01` is passed in blocks, matching `dequantize_block`'s expectation.
+- Softmax is the stable max-subtracted form, fp32 max/exp/denominator, real `expf` (not
+  `__expf`/`h2exp`), monotone running max, and fully-masked rows provably do not NaN (the
+  `-FLT_MAX/4` sentinel prevents `exp(-inf - -inf)`; `O`/`l` start from an exact memset zero).
+- Masked positions contribute exactly zero (f16 `-inf` short-circuits to `p = 0.0f`).
+- `nbatch_K = 128` does not regroup the QK^T dot: each accumulator sums strictly ascending `k`
+  with no cross-thread split. BIT-IDENTICAL.
+
+### Relayed, NOT independently verified
+
+- A latent bug in the `np > 1` combine on the FAST_FP16 tile path
+  (`fattn-tile.cuh:1191-1250`): it stages and reduces `VKQ`, which the fold has just zeroed,
+  and never touches `VKQ_f`, so it would emit ~1/np of the correct numerator. Reported
+  unreachable because `np == 1` for all 58 rows of
+  `ggml_cuda_fattn_tile_get_config_nvidia_fp16`; I could not confirm that enumeration cheaply.
+  If true, a `static_assert(np == 1)` under `FAST_FP16_AVAILABLE` closes it permanently, and
+  adding any fp16 config with `nwarps > ncols` would otherwise silently corrupt attention.
+- PV fp16 accumulation over k=2048 measured 1.7x worse than the fork's own tile kernel
+  (nbatch_fa=64) — better than upstream *base*, worse than the current fallback.
+- A HIP-only guard gap in `ggml_cuda_fattn_tile_q4_0_direct` (fails loudly, not silently).
+- `cc` read from two different device indices (`fattn.cu:555` vs `:596`); identical on 2x P100.
