@@ -1587,6 +1587,9 @@ void ggml_cuda_mul_mat_vec_q(
             }
             CUDA_CHECK(cudaMalloc(&ctx.mmvq_q8_1_ptr[dev], q8_1_bytes));
             ctx.mmvq_q8_1_cap[dev] = q8_1_bytes;
+            // the pointer just moved; any CUDA graph captured against the old one must be
+            // re-captured rather than replayed (see ggml_cuda_graph::mmvq_q8_1_epoch)
+            ctx.mmvq_q8_1_epoch++;
         }
 
         const int64_t s11 = src1->nb[1] / ts_src1;

@@ -2737,6 +2737,13 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     const void * graph_key = ggml_cuda_graph_get_key(cgraph);
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
+    // Checked before the uid fast path, which otherwise returns false without comparing
+    // anything: the q8_1 activation buffer can move without any ggml node property changing.
+    if (graph->mmvq_q8_1_epoch != cuda_ctx->mmvq_q8_1_epoch) {
+        graph->mmvq_q8_1_epoch = cuda_ctx->mmvq_q8_1_epoch;
+        return true;
+    }
+
     if (cgraph->uid != 0 &&
         cgraph->uid == graph->uid) {
         GGML_LOG_DEBUG("CUDA Graph id %zu reused\n", cgraph->uid);

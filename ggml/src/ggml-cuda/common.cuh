@@ -1271,6 +1271,15 @@ struct ggml_cuda_graph {
     std::vector<cudaGraphNode_t> nodes;
     bool disable_due_to_gpu_arch = false;
     bool warmup_complete = false;
+    // Generation of ggml_backend_cuda_context::mmvq_q8_1_ptr this graph was captured
+    // against. The q8_1 activation cache is a raw grow-only cudaMalloc whose pointer is
+    // baked into captured kernel parameters, and ggml_cuda_graph_update_required() compares
+    // only ggml node properties -- it cannot see an internal buffer move. Without this a
+    // graph captured before a realloc would replay against a freed pointer: silent garbage,
+    // not a crash. Not reachable in the documented configuration, because the first prefill
+    // drives the buffer to its global maximum before the steady-state decode graph is
+    // captured, but nothing enforced that ordering.
+    int mmvq_q8_1_epoch = -1;
     uint64_t uid = 0;
     int64_t last_used_time = 0;
     struct node_properties {
@@ -1475,6 +1484,10 @@ struct ggml_backend_cuda_context {
     // Allocated once and grown on demand -- sizes are stable across a run, so no cudaMalloc
     // ends up on the hot path.
     enum peer_stage_dir { PEER_STAGE_OUT = 0, PEER_STAGE_IN = 1 };
+    // Incremented every time mmvq_q8_1_ptr is (re)allocated, so a captured CUDA graph that
+    // holds the old pointer in its kernel parameters can be detected and re-captured.
+    int mmvq_q8_1_epoch = 0;
+
     void * peer_stage[2]     = { nullptr, nullptr };
     size_t peer_stage_cap[2] = { 0, 0 };
     // Signals that the landing buffer has been widened and may be refilled. A sender waits on the

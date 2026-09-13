@@ -5500,3 +5500,83 @@ index expressions select the same element. `ne == 0` and null-pointer cases are 
 
 `cpy.cu` and `concat.cu` are index-only. The f32<->f16 vectorised convert is a load/store width
 change; conversions still go through `ggml_cuda_cast`. No rounding mode changed.
+
+## Attempt 150 — fixing the audit findings without losing speed; one retraction (2026-09-12)
+
+### RETRACTION of attempt 147: the mmvq reassociations are NOT worse
+
+Attempt 147 reported `calc_nwarps` 4→2 at `ncols_dst==1` as **1.66x worse** and `split_rows` as
+**1.19x worse**. **Both figures were artifacts of an unfaithful model and are withdrawn.**
+
+The model used 5120 individual float products as leaves, giving 80-term serial chains per thread.
+The real kernel's leaves are `vec_dot` results, each of which already sums 32 quant products
+exactly in integer. For Q6_K, `QI6_K = 256/(4*2) = 32`, `vdr = 4`, so `blocks_per_iter =
+4*nwarps`: a 5120-wide row is **20 blocks**, and each thread's serial chain is **3 terms at 2
+warps and 2 at 4 warps** (5 and 3 for an 8704-wide row). Remodelled faithfully — per-lane chains
+over K-windows, the `tmp_shared` cross-warp adds, then the 32-lane butterfly — and measured with a
+cancellation-proof statistic (absolute error on unit-variance leaves, 400k trials):
+
+| | 20 blocks (ne10=5120) | 34 blocks (ne10=8704) |
+|---|---|---|
+| decode: nwarps=2 (HEAD) / nwarps=4 (upstream) | **0.978x** | **1.001x** |
+| multi-column: split_rows (HEAD) / nwarps=2 non-split (upstream) | **1.025x** | **1.065x** |
+
+Equivalent to within noise. There was no accuracy problem to fix.
+
+The attempted fix made that expensive: splitting the decode accumulator into 8 alternating
+accumulators measured **tg256 19.39 +/- 0.02 against 31.04 +/- 0.17 — a 37.5% regression**,
+almost certainly from `tmp[j][i][acc_sel]` being a runtime-indexed register array, which ptxas
+cannot keep as distinct registers. It was never gated beyond `tg256` and has been removed; the
+2-accumulator intermediate was never measured.
+
+### Fixed and gated
+
+| fix | cost | gate |
+|---|---|---|
+| cuBLAS ALGO3 reverted (attempt 146) | ~1.8% prefill, accepted by owner | PPL 2.6214 → **2.6204** |
+| GEMM: Q pre-scaled by `scale*0.25` before the fp16 accumulation | none | PPL 2.6204, tg256 31.04 |
+| GEMM: `FATTN_KQ_MAX_OFFSET` restored | none | same run |
+| q4_0 tile dequant bias taken in integer | one instruction **cheaper** | same run |
+| GEMM: mask `ne[2]/ne[3] != 1` declined (silent wrong answer at ns>1) | none | same run |
+| q8_1 cache × CUDA-graph replay: generation counter | none | PPL **2.6204**, tg256 **31.05 +/- 0.13** |
+| `static_assert(np == 1)` on the fp16 tile path | compile time | same run |
+
+The `static_assert` **compiling** is itself a result: it verifies the claim, previously relayed
+unverified, that every row of the fp16 tile config table has `np == 1`, so the `np > 1` combine
+that reduces the zeroed `VKQ` instead of `VKQ_f` is unreachable. Adding a config with
+`nwarps > ncols` is now a compile error rather than a silent wrong answer.
+
+The CUDA-graph fix is subtle in one respect: the generation check must run **before** the
+`cgraph->uid` fast path in `ggml_cuda_graph_update_required`, which otherwise returns `false`
+without comparing anything.
+
+### Verified on inspection this session (no change needed)
+
+- **Alloc-size vs dispatch predicate.** `ggml_cuda_fa_gemm_enabled` warns that
+  `get_alloc_size` must gate on the same predicate or the kernel writes past the allocation. Both
+  `fattn.cu:557` and `:601` call the same `ggml_cuda_flash_attn_ext_gemm_supported()`, so the new
+  mask guard applies to both. The flagged `cc` device-index difference is also harmless: dispatch
+  calls `ggml_cuda_set_device(ctx.device)` immediately before reading `ggml_cuda_get_device()`.
+- **Vectorised f32<->f16 convert (`convert.cu`).** Previously asserted, now read: 4 elements per
+  thread with the identical per-element `ggml_cuda_cast`, reads and writes exactly `4*k4 = k`
+  elements, gated on `k % 4 == 0` and 16-byte alignment of both ends with a scalar fallback.
+  Bit-identical, no over-read.
+- **dp4a emulation.** PRMT mode `0x9180` yields `[a0, sext(a0), a1, sext(a1)]` and `0xB3A2` the
+  same for bytes 2-3, then four `mad.wide.s16` accumulate the byte-pair products, matching the
+  prior exhaustive proof's model. Every product is <= 128*128 and the largest accumulation is
+  2^18, so saturating vs wrapping semantics cannot differ anywhere reachable.
+
+### New finding, low severity — 15-byte over-read of exactly-sized buffers
+
+The mmvq staging windows round up to 16-byte units: `nu4 = (m + nblk*blck_size + 15)/16`. For
+the last block run of the last row this reads up to **15 bytes past the end of the data**. The
+over-read bytes are staged but never consumed by `vec_dot`, and no underread is possible (ggml-cuda
+aligns tensor data to 32 bytes). Two places have no slack to absorb it:
+
+- the q8_1 activation buffer, `cudaMalloc`'d at exactly `q8_1_bytes`, where `ne10_padded` adds
+  nothing because this model's widths (5120, 8704) are already multiples of 512;
+- the last quantized tensor in a weight buffer when its size is a multiple of 32.
+
+It cannot fault in practice (for `ne11 <= 8` the q8_1 size is never page-aligned, and CUDA
+allocates in coarse granularity), but it is a genuine read past an allocation. Fix: 16 bytes of
+slack on both. Pending, to land with the next build.
