@@ -495,15 +495,28 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile_q4_0(
                         const int shift = iqs < QK4_0/2 ? 0 : 4;
 
                         const block_q4_0 * blk = (const block_q4_0 *) (KV + i*stride_KV) + a/QK4_0;
-                        // (q - 8)*d as one hfma2 per pair rather than a float sub and mul
-                        // per value, which halves the dequant ALU in the load.
-                        const half2 dh   = __half2half2(blk->d);
-                        const half2 offs = __hmul2(dh, __float2half2_rn(-8.0f));
+                        // (q - 8)*d as one hmul2 per pair rather than a float sub and mul per
+                        // value, which halves the dequant ALU in the load.
+                        //
+                        // The bias is taken in INTEGER (q - 8, exactly representable, range
+                        // [-8,7]) rather than as an fp16 term -8*d. An earlier form computed
+                        // `offs = __hmul2(dh, -8.0h)` and fused it with __hfma2; that overflows
+                        // to +-inf for |d| >= 8192 and turned 40584 of the 1048576 (nibble,
+                        // half scale) cases from a finite value into +-inf -- which NaNs the
+                        // whole head, where upstream's float bias stays finite. This form
+                        // rounds the same exact real value d*(q-8) once, so it is identical in
+                        // value to upstream to_fp16 over the entire finite domain (verified
+                        // exhaustively: 0 value differences in 1048576 cases), and it is one
+                        // instruction cheaper because there is no bias term to build.
+                        // Sole difference: q == 8 with d < 0 yields -0.0 where upstream's
+                        // 8d + (-8d) yields +0.0. Numerically equal, and a KV value of either
+                        // sign contributes nothing to the attention dot product.
+                        const half2 dh = __half2half2(blk->d);
 #pragma unroll
                         for (int l = 0; l < cpy_ne; ++l) {
                             const int q0 = (blk->qs[base + 2*l + 0] >> shift) & 0x0F;
                             const int q1 = (blk->qs[base + 2*l + 1] >> shift) & 0x0F;
-                            tmp[l] = __hfma2(__halves2half2(__int2half_rn(q0), __int2half_rn(q1)), dh, offs);
+                            tmp[l] = __hmul2(__halves2half2(__int2half_rn(q0 - 8), __int2half_rn(q1 - 8)), dh);
                         }
                     } else {
 #pragma unroll

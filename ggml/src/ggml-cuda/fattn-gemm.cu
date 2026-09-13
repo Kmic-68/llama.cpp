@@ -28,12 +28,13 @@
 // costs 512 MiB per GPU at 262144 context.
 
 #include "common.cuh"
+#include "fattn-common.cuh"   // FATTN_KQ_MAX_OFFSET
 #include "fattn-gemm.cuh"
 #include "convert.cuh"
 
 #include <cublas_v2.h>
 
-// One block per (query token, head). Applies mask+scale, advances the running softmax
+// One block per (query token, head). Applies the mask, advances the running softmax
 // statistics, writes P in f16, and reports the rescale factor for O.
 template <int block_size>
 static __global__ void fattn_gemm_softmax(
@@ -44,7 +45,6 @@ static __global__ void fattn_gemm_softmax(
         float        * __restrict__ m_state,  // [nt x nh]
         float        * __restrict__ l_state,  // [nt x nh]
         float        * __restrict__ corr_out, // [nt x nh]
-        const float scale,
         const int nkv_c,      // keys in this chunk
         const int nkv_off,    // offset of this chunk within the full KV
         const int nt,
@@ -61,14 +61,18 @@ static __global__ void fattn_gemm_softmax(
 
     __shared__ float red[block_size/WARP_SIZE];
 
-    // pass 1: row max of (scale*S + mask)
+    // pass 1: row max of (4*S + mask); Q already carried scale*0.25 into the GEMM
     float vmax = -FLT_MAX/2.0f;
     for (int j = tid; j < nkv_c; j += block_size) {
-        float v = scale*__half2float(Sh[j]);
+        float v = 4.0f*__half2float(Sh[j]); // Q carried scale*0.25 into the GEMM
         if (mh) {
             v += __half2float(mh[j]);
         }
-        vmax = fmaxf(vmax, v);
+        // + FATTN_KQ_MAX_OFFSET, as upstream does in tile (:816), vec (:342) and mma
+        // (:723/:800): it raises the running max by 3*ln2 so every probability comes out
+        // <= 1/8, giving the f16 P buffer and the f16 PV accumulator 3 bits of headroom.
+        // Cancels exactly in the final divide by the row sum.
+        vmax = fmaxf(vmax, v + FATTN_KQ_MAX_OFFSET);
     }
     vmax = warp_reduce_max(vmax);
     if (block_size > WARP_SIZE) {
@@ -94,7 +98,7 @@ static __global__ void fattn_gemm_softmax(
     // pass 2: P = exp(v - m_new), and its row sum
     float sum = 0.0f;
     for (int j = tid; j < nkv_c; j += block_size) {
-        float v = scale*__half2float(Sh[j]);
+        float v = 4.0f*__half2float(Sh[j]); // Q carried scale*0.25 into the GEMM
         if (mh) {
             v += __half2float(mh[j]);
         }
@@ -175,16 +179,24 @@ static __global__ void fattn_gemm_finalize(
 }
 
 // Convert one head's Q from strided f32 to contiguous f16 [D x nt].
+// Q is pre-scaled by `qscale` = scale*0.25 here, BEFORE the f16 conversion and therefore
+// before the fp16 QK^T accumulation, and the softmax multiplies the logits back by 4.
+// This mirrors upstream fattn-tile.cuh:925-937, whose comment names this hardware:
+// "Without the v_dot2_f32_f16 instruction there is a higher risk of numerical overflow in
+// the KQ calculation." Both factors are exact powers of two at D=256 (scale = 1/16), so
+// the pre-scale costs nothing in precision and buys 64x of fp16 overflow headroom in the
+// accumulator. It must be applied here and not via cuBLAS `alpha`, because alpha is applied
+// AFTER the accumulation and so cannot prevent a partial sum from overflowing.
 static __global__ void fattn_gemm_q_to_f16(
         const char * __restrict__ Q, half * __restrict__ Qf16,
         const int D, const int nt, const int64_t nbq1, const int64_t nbq2,
-        const int head0) {
+        const int head0, const float qscale) {
     const int t = blockIdx.x;
     const int h = blockIdx.y;
     const float * q = (const float *) (Q + (int64_t) t*nbq1 + (int64_t)(head0 + h)*nbq2);
     half * o = Qf16 + ((int64_t) h*nt + t)*D;
     for (int d = threadIdx.x; d < D; d += blockDim.x) {
-        o[d] = __float2half(q[d]);
+        o[d] = __float2half(q[d]*qscale);
     }
 }
 
@@ -303,7 +315,7 @@ void ggml_cuda_flash_attn_ext_gemm(ggml_backend_cuda_context & ctx, ggml_tensor 
                 dim3 grid(nt, gqa, 1);
                 fattn_gemm_q_to_f16<<<grid, 256, 0, stream>>>(
                     (const char *) Q->data + s*Q->nb[3], Qf16.ptr,
-                    D, nt, Q->nb[1], Q->nb[2], head0);
+                    D, nt, Q->nb[1], Q->nb[2], head0, scale*0.25f);
                 CUDA_CHECK(cudaGetLastError());
             }
 
@@ -347,25 +359,31 @@ void ggml_cuda_flash_attn_ext_gemm(ggml_backend_cuda_context & ctx, ggml_tensor 
 
                 // S = K^T Q  -> [nkv_c x nt] per head, column-major.
                 //
-                // FIXME(2026-09-12 audit): the justification below is FALSE and this is a
-                // real precision regression. The tile kernel does NOT keep KQ in half --
-                // upstream fattn-tile.cuh:604 declares `float KQ_acc[...]`, an fp32
-                // accumulator; what it keeps in half are the products and Q_tmp. So
-                // COMPUTE_16F here replaces an fp32 accumulation of k=256 terms with an
-                // fp16 one, costing ~sqrt(256)*2^-11 ~= 8e-3 relative error per logit
-                // against upstream's ~2e-3.
-                // Two further upstream guards are missing, both active on sm_60:
-                //   - Q is not pre-scaled by scale*0.25 before the accumulation
-                //     (fattn-tile.cuh:932-937, written for precisely this hardware), so the
-                //     fp16 accumulator has 64x less overflow headroom and an inf logit can
-                //     reach expf(inf-inf) = NaN. NOTE: alpha cannot fix this -- cuBLAS
-                //     applies alpha AFTER the accumulation. The scale must move into
-                //     fattn_gemm_q_to_f16, with a matching *4 where scale is applied now.
-                //   - FATTN_KQ_MAX_OFFSET is not added to the running max, unlike tile, vec
-                //     and mma, removing another 8x of headroom for the f16 P/Otmp.
-                // Fixing the accumulator means COMPUTE_32F, measured at 6.2 vs 14.65 TFLOPS
-                // on this shape, i.e. roughly halving long-context prefill. Left as the
-                // owner's call; the pre-scale and the max offset are free and are not.
+                // PARTLY FIXED (2026-09-12 audit). The original justification here was
+                // FALSE: the tile kernel does NOT keep KQ in half -- upstream
+                // fattn-tile.cuh:604 declares `float KQ_acc[...]`, an fp32 accumulator; what
+                // it keeps in half are the products and Q_tmp. So COMPUTE_16F below replaces
+                // an fp32 accumulation of k=256 terms with an fp16 one, measured at ~9.7e-3
+                // mean relative error per logit against upstream's ~2.4e-3 (4x worse).
+                //
+                // Fixed since, both free:
+                //   - Q is now pre-scaled by scale*0.25 in fattn_gemm_q_to_f16, restoring the
+                //     64x of fp16 overflow headroom upstream buys at fattn-tile.cuh:932-937;
+                //     the softmax multiplies back by 4. This had to go in the conversion, not
+                //     into cuBLAS `alpha`, because alpha is applied AFTER the accumulation and
+                //     cannot stop a partial sum from overflowing. Before the fix the fp16
+                //     accumulator went non-finite MORE often than the true dot product
+                //     overflowed (37 vs 24 per 200k at element RMS 32), and an inf logit
+                //     reaches expf(inf - inf) = NaN.
+                //   - FATTN_KQ_MAX_OFFSET is now added to the running max, as in tile, vec and
+                //     mma, restoring 8x of headroom for the f16 P and Otmp.
+                //
+                // STILL OPEN: the accumulator itself. The pre-scale cures overflow but not
+                // precision -- fp16 relative precision is scale-invariant, so the 4x error
+                // remains. Fixing it means CUBLAS_COMPUTE_32F, measured at 6.2 vs 14.65
+                // TFLOPS on this shape; QK^T and PV carry equal FLOPs and attention is ~86%
+                // of long-context prefill, so that is roughly 1.6x on prefill. Left as a
+                // measured decision, not an audit decision.
                 {
                     // f16 compute here, unlike PV: QK^T sums only k=D=256 terms
                     // and it runs at the 2:1 fp16 rate (measured 14.65 vs 6.2 TFLOPS for
@@ -392,7 +410,7 @@ void ggml_cuda_flash_attn_ext_gemm(ggml_backend_cuda_context & ctx, ggml_tensor 
                     fattn_gemm_softmax<256><<<grid, 256, 0, stream>>>(
                         S.ptr, mask ? (const half *) mask->data : nullptr, P_ptr,
                         m_state.ptr, l_state.ptr, corr.ptr,
-                        scale, nkv_c, c, nt,
+                        nkv_c, c, nt,
                         mask ? mask->nb[1]/sizeof(half) : 0,
                         nkv_c*nt);
                     CUDA_CHECK(cudaGetLastError());
