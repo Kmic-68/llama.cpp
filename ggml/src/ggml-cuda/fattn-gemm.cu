@@ -10,10 +10,10 @@
 // are cuBLAS calls instead of hand-written tiles:
 //
 //   for each KV chunk:
-//       S = K^T Q                      (GEMM, f16 accumulate -- NOT what the tile kernel
-//                                       does; see the FIXME at the QK^T call)
+//       S = K^T Q                      (GEMM, f16 accumulate by default -- NOT what the tile
+//                                       kernel does; see the note at the QK^T call)
 //       m_new = max(m, rowmax(S+mask))
-//       corr  = exp(m - m_new);  P = exp(S + mask - m_new)
+//       corr  = exp(m - m_new);  P = exp(S + mask - m_new)   (P in its own buffer, not in S)
 //       l     = l*corr + rowsum(P)
 //       Otmp  = V P                    (GEMM, f16 accumulate over one chunk)
 //       O     = O*corr + Otmp          (fused rescale + f32 accumulate across chunks)
@@ -34,14 +34,56 @@
 
 #include <cublas_v2.h>
 
+// Precision, chosen at runtime.
+//
+//   default -- COMPUTE_16F for both GEMMs: fp16 scores and probabilities, and an fp16 PV partial
+//     per chunk folded into an fp32 running output. The QK^T dot product (k = D = 256)
+//     accumulates in fp16, where upstream's tile kernel accumulates KQ in fp32
+//     (fattn-tile.cuh:604): ~4x more error per attention logit.
+//   GGML_CUDA_FA_GEMM_PREC=32 -- fp32 accumulation everywhere, and more precise than upstream:
+//     QK^T runs COMPUTE_32F over the same fp16 K and Q (a product of two halves needs 22
+//     significant bits, so every product is EXACT in fp32 -- upstream rounds each product to
+//     half first); scores and probabilities are fp32 (upstream keeps them in half); V is
+//     dequantized straight to fp32 (exact for q4_0, where upstream rounds V to half); PV is
+//     all-fp32. Costs 11% of pp2048 at depth 16384 and 27% at 65536.
+//
+// What the default costs in model output is measured by paired per-chunk perplexity against
+// PREC=32 (OPTLOG attempt 152). PREC=32 is kept as the reference.
+static bool ggml_cuda_fa_gemm_prec32() {
+    static const bool v = [] {
+        const char * s = getenv("GGML_CUDA_FA_GEMM_PREC");
+        return s && atoi(s) == 32;
+    }();
+    return v;
+}
+
+static __device__ __forceinline__ float fattn_gemm_to_f(const half  x) { return __half2float(x); }
+static __device__ __forceinline__ float fattn_gemm_to_f(const float x) { return x; }
+template <typename T> static __device__ __forceinline__ T fattn_gemm_store(const float x);
+template <> __device__ __forceinline__ half  fattn_gemm_store<half >(const float x) { return __float2half(x); }
+template <> __device__ __forceinline__ float fattn_gemm_store<float>(const float x) { return x; }
+
 // One block per (query token, head). Applies the mask, advances the running softmax
-// statistics, writes P in f16, and reports the rescale factor for O.
-template <int block_size>
+// statistics, writes the chunk's probabilities, and reports the rescale factor for O.
+//
+// OUT OF PLACE, deliberately: S and P must be separate buffers. From 98de4588f until 2026-09-13 P
+// was written over S (saving 50 MB), and that is not safe here. Pass 2 loads S[j] and then
+// stores P[j] at the same address, and on this toolchain the store can land before the load, so
+// the load reads back a probability as a score: exp(4*P - m) with P <= 1/8 and a very negative
+// row max m gives values up to ~1e7. Measured by running the kernel twice on identical inputs
+// inside the op (fp32, 16384 context, ~2240 softmax launches per run): in place with the two
+// aliased __restrict__ parameters of the original, with one restrict pointer, and with no
+// restrict at all, all mismatch (4, 6 and 3 launches); perplexity varies run to run (3.3165,
+// 3.3189, 3.3199; 3.3144-3.3272). Out of place: 0 mismatches in ~6700 launches, 3.3165 every
+// run. The fp16 instantiation showed no mismatch in 15360 checked launches, but it is the same
+// pattern, and there a read-back probability overflows half to inf and NaNs the output -- a
+// 4096-context perplexity run once went NaN in exactly that way and did not reproduce.
+// Cost of the separate buffer: ~1% of the op, and nkv_c*nt*gqa more elements of scratch.
+template <int block_size, typename T>
 static __global__ void fattn_gemm_softmax(
-        const half   * __restrict__ S,        // [nkv_c x nt] per head, column-major (f16:
-                                              // halves what is the dominant traffic term here)
+        const T      * __restrict__ S,        // [nkv_c x nt] per head, column-major: scores
+        T            * __restrict__ P,        // out, same layout, a separate buffer: probabilities
         const half   * __restrict__ mask,     // [nkv_pad x nt], contiguous, may be null
-        half         * __restrict__ P,        // out, same layout as S
         float        * __restrict__ m_state,  // [nt x nh]
         float        * __restrict__ l_state,  // [nt x nh]
         float        * __restrict__ corr_out, // [nt x nh]
@@ -49,14 +91,14 @@ static __global__ void fattn_gemm_softmax(
         const int nkv_off,    // offset of this chunk within the full KV
         const int nt,
         const int64_t s_mask, // mask row stride in elements
-        const int64_t s_head) // per-head stride of S/P in elements
+        const int64_t s_head) // per-head stride of S and P in elements
 {
     const int t = blockIdx.x;
     const int h = blockIdx.y;
     const int tid = threadIdx.x;
 
-    const half  * Sh = S + h*s_head + (int64_t) t*nkv_c;
-    half        * Ph = P + h*s_head + (int64_t) t*nkv_c;
+    const T * Sh = S + h*s_head + (int64_t) t*nkv_c;
+    T       * Ph = P + h*s_head + (int64_t) t*nkv_c;
     const half  * mh = mask ? mask + (int64_t) t*s_mask + nkv_off : nullptr;
 
     __shared__ float red[block_size/WARP_SIZE];
@@ -64,13 +106,13 @@ static __global__ void fattn_gemm_softmax(
     // pass 1: row max of (4*S + mask); Q already carried scale*0.25 into the GEMM
     float vmax = -FLT_MAX/2.0f;
     for (int j = tid; j < nkv_c; j += block_size) {
-        float v = 4.0f*__half2float(Sh[j]); // Q carried scale*0.25 into the GEMM
+        float v = 4.0f*fattn_gemm_to_f(Sh[j]);
         if (mh) {
             v += __half2float(mh[j]);
         }
         // + FATTN_KQ_MAX_OFFSET, as upstream does in tile (:816), vec (:342) and mma
         // (:723/:800): it raises the running max by 3*ln2 so every probability comes out
-        // <= 1/8, giving the f16 P buffer and the f16 PV accumulator 3 bits of headroom.
+        // <= 1/8, giving the f16 probabilities and the f16 PV accumulator 3 bits of headroom.
         // Cancels exactly in the final divide by the row sum.
         vmax = fmaxf(vmax, v + FATTN_KQ_MAX_OFFSET);
     }
@@ -98,12 +140,12 @@ static __global__ void fattn_gemm_softmax(
     // pass 2: P = exp(v - m_new), and its row sum
     float sum = 0.0f;
     for (int j = tid; j < nkv_c; j += block_size) {
-        float v = 4.0f*__half2float(Sh[j]); // Q carried scale*0.25 into the GEMM
+        float v = 4.0f*fattn_gemm_to_f(Sh[j]);
         if (mh) {
             v += __half2float(mh[j]);
         }
         const float p = (v <= -FLT_MAX/4.0f || m_new <= -FLT_MAX/4.0f) ? 0.0f : expf(v - m_new);
-        Ph[j] = __float2half(p);
+        Ph[j] = fattn_gemm_store<T>(p);
         sum += p;
     }
     sum = warp_reduce_sum(sum);
@@ -146,8 +188,9 @@ static __global__ void fattn_gemm_fill(float * __restrict__ p, const float v, co
 // Fusing the rescale into the accumulate is also cheaper than the rescale-only kernel it
 // replaces: that one read+wrote O and then the beta=1 GEMM read+wrote O again (50 MB per
 // chunk at nt=2048, gqa=6); this reads O+Otmp and writes O once (38 MB).
+template <typename T>
 static __global__ void fattn_gemm_accum_O(
-        float * __restrict__ O, const half * __restrict__ Otmp,
+        float * __restrict__ O, const T * __restrict__ Otmp,
         const float * __restrict__ corr,
         const int DV, const int nt) {
     const int t = blockIdx.x;
@@ -155,9 +198,9 @@ static __global__ void fattn_gemm_accum_O(
     const float c = corr[h*nt + t];
     const int64_t off = ((int64_t) h*nt + t)*DV;
     float      * Oh = O    + off;
-    const half * Th = Otmp + off;
+    const T    * Th = Otmp + off;
     for (int d = threadIdx.x; d < DV; d += blockDim.x) {
-        Oh[d] = Oh[d]*c + __half2float(Th[d]);
+        Oh[d] = Oh[d]*c + fattn_gemm_to_f(Th[d]);
     }
 }
 
@@ -248,6 +291,19 @@ bool ggml_cuda_flash_attn_ext_gemm_supported(const ggml_tensor * dst) {
         if (t->nb[1] % sizeof(half) != 0) {
             return false;
         }
+        // The strided dequantizers are handed s01 = nb[1]/type_size, i.e. they assume each KV
+        // position is one contiguous run of blocks. Upstream asserts exactly this before the
+        // same call (fattn-common.cuh:1036, GGML_ASSERT(K->nb[0] == ts)); a permuted view
+        // would otherwise be read with the wrong stride and silently produce plausible-looking
+        // attention. Decline instead, so such a tensor falls back to the tile kernel.
+        if (t->nb[0] != ggml_type_size(t->type)) {
+            return false;
+        }
+    }
+    // PREC=32 reads V as fp32: in place for F32, otherwise it needs a strided fp32 dequantizer.
+    // Decline rather than reach the GGML_ASSERT in the kernel.
+    if (ggml_cuda_fa_gemm_prec32() && V->type != GGML_TYPE_F32 && ggml_get_to_fp32_nc_cuda(V->type) == nullptr) {
+        return false;
     }
     return true;
 }
@@ -279,19 +335,30 @@ void ggml_cuda_flash_attn_ext_gemm(ggml_backend_cuda_context & ctx, ggml_tensor 
     // path's whole-cache f16 conversion.
     const int64_t chunk = 2048;
 
+    const bool prec32 = ggml_cuda_fa_gemm_prec32();
+
     ggml_cuda_pool & pool = ctx.pool();
+    // ORDER MATTERS: the VMM pool requires frees in exact reverse order of allocations, and
+    // destructors run in reverse order of DECLARATION. So every buffer is allocated at the
+    // point it is declared -- the unused one of each fp16/fp32 pair stays null, and null is
+    // skipped on free.
     ggml_cuda_pool_alloc<half>  Qf16(pool, D*nt*gqa);
     ggml_cuda_pool_alloc<half>  Kf16(pool, D*chunk);
-    ggml_cuda_pool_alloc<half>  Vf16(pool, DV*chunk);
-    // P aliases S: in the second pass each thread reads S[j] then writes P[j] at the same
-    // index, and every first-pass load is fenced by the reduction's __syncthreads, so one
-    // buffer serves both. Worth 50 MB at ub=2048, which lowers the context length at which
-    // this path's fixed scratch undercuts the tile path's context-proportional staging.
-    ggml_cuda_pool_alloc<half>  S(pool, chunk*nt*gqa);
-    half * const P_ptr = S.ptr;
+    ggml_cuda_pool_alloc<half>  Vf16(pool);
+    ggml_cuda_pool_alloc<float> Vf32(pool);
+    if (prec32) { Vf32.alloc(DV*chunk); } else { Vf16.alloc(DV*chunk); }
+    // scores, and the probabilities computed from them -- two buffers, never one (see the kernel)
+    ggml_cuda_pool_alloc<half>  S(pool);
+    ggml_cuda_pool_alloc<float> S32(pool);
+    if (prec32) { S32.alloc(chunk*nt*gqa); } else { S.alloc(chunk*nt*gqa); }
+    ggml_cuda_pool_alloc<half>  P(pool);
+    ggml_cuda_pool_alloc<float> P32(pool);
+    if (prec32) { P32.alloc(chunk*nt*gqa); } else { P.alloc(chunk*nt*gqa); }
     ggml_cuda_pool_alloc<float> O(pool, DV*nt*gqa);
-    // f16 destination of the PV GEMM for one chunk; folded into O by fattn_gemm_accum_O.
-    ggml_cuda_pool_alloc<half>  Otmp(pool, DV*nt*gqa);
+    // destination of the PV GEMM for one chunk; folded into O by fattn_gemm_accum_O.
+    ggml_cuda_pool_alloc<half>  Otmp(pool);
+    ggml_cuda_pool_alloc<float> Otmp32(pool);
+    if (prec32) { Otmp32.alloc(DV*nt*gqa); } else { Otmp.alloc(DV*nt*gqa); }
     ggml_cuda_pool_alloc<float> m_state(pool, nt*gqa);
     ggml_cuda_pool_alloc<float> l_state(pool, nt*gqa);
     ggml_cuda_pool_alloc<float> corr(pool, nt*gqa);
@@ -301,10 +368,18 @@ void ggml_cuda_flash_attn_ext_gemm(ggml_backend_cuda_context & ctx, ggml_tensor 
     const bool V_is_f16 = V->type == GGML_TYPE_F16;
     const to_fp16_nc_cuda_t to_fp16_K = K_is_f16 ? nullptr : ggml_get_to_fp16_nc_cuda(K->type);
     const to_fp16_nc_cuda_t to_fp16_V = V_is_f16 ? nullptr : ggml_get_to_fp16_nc_cuda(V->type);
-    GGML_ASSERT((K_is_f16 || to_fp16_K) && (V_is_f16 || to_fp16_V));
+    // PREC=32 reads V as fp32: an F32 cache in place (the fp32 analogue of F16 above), anything
+    // else through the strided fp32 dequantizer. Note the two converter tables differ -- the
+    // fp16 one covers F32 but not F16, the fp32 one F16 but not F32 -- so F32 must be in place.
+    const bool V_is_f32 = V->type == GGML_TYPE_F32;
+    const to_fp32_nc_cuda_t to_fp32_V = (prec32 && !V_is_f32) ? ggml_get_to_fp32_nc_cuda(V->type) : nullptr;
+    GGML_ASSERT(!prec32 || V_is_f32 || to_fp32_V);
+    GGML_ASSERT(K_is_f16 || to_fp16_K);
+    GGML_ASSERT(prec32 || V_is_f16 || to_fp16_V);
 
     const int64_t dst_s1 = dst->nb[1]/sizeof(float);
     const int64_t dst_s2 = dst->nb[2]/sizeof(float);
+    const int64_t s_mask = mask->nb[1]/sizeof(half);
 
     for (int64_t s = 0; s < ns; ++s) {
         for (int64_t kvh = 0; kvh < nhkv; ++kvh) {
@@ -338,8 +413,7 @@ void ggml_cuda_flash_attn_ext_gemm(ggml_backend_cuda_context & ctx, ggml_tensor 
                 const char * Kp = (const char *) K->data + s*K->nb[3] + kvh*K->nb[2] + c*K->nb[1];
                 const char * Vp = (const char *) V->data + s*V->nb[3] + kvh*V->nb[2] + c*V->nb[1];
                 const half * Kmat;
-                const half * Vmat;
-                int64_t ldK, ldV;
+                int64_t ldK;
                 if (K_is_f16) {
                     Kmat = (const half *) Kp;
                     ldK  = K->nb[1]/sizeof(half);
@@ -348,7 +422,20 @@ void ggml_cuda_flash_attn_ext_gemm(ggml_backend_cuda_context & ctx, ggml_tensor 
                     Kmat = Kf16.ptr;
                     ldK  = D;
                 }
-                if (V_is_f16) {
+                const half  * Vmat   = nullptr;
+                const float * Vmat32 = nullptr;
+                int64_t ldV;
+                if (prec32) {
+                    if (V_is_f32) {
+                        Vmat32 = (const float *) Vp;
+                        ldV    = V->nb[1]/sizeof(float);
+                    } else {
+                        // exact for q4_0: d*(q-8) needs 15 significant bits, float has 24
+                        to_fp32_V(Vp, Vf32.ptr, DV, nkv_c, 1, 1, V->nb[1]/ggml_type_size(V->type), 0, 0, stream);
+                        Vmat32 = Vf32.ptr;
+                        ldV    = DV;
+                    }
+                } else if (V_is_f16) {
                     Vmat = (const half *) Vp;
                     ldV  = V->nb[1]/sizeof(half);
                 } else {
@@ -359,46 +446,56 @@ void ggml_cuda_flash_attn_ext_gemm(ggml_backend_cuda_context & ctx, ggml_tensor 
 
                 // S = K^T Q  -> [nkv_c x nt] per head, column-major.
                 //
-                // PARTLY FIXED (2026-09-12 audit). The original justification here was
+                // Precision history (2026-09-12 audit). The original justification here was
                 // FALSE: the tile kernel does NOT keep KQ in half -- upstream
                 // fattn-tile.cuh:604 declares `float KQ_acc[...]`, an fp32 accumulator; what
-                // it keeps in half are the products and Q_tmp. So COMPUTE_16F below replaces
-                // an fp32 accumulation of k=256 terms with an fp16 one, measured at ~9.7e-3
-                // mean relative error per logit against upstream's ~2.4e-3 (4x worse).
+                // it keeps in half are the products and Q_tmp. So COMPUTE_16F replaces an fp32
+                // accumulation of k=256 terms with an fp16 one, measured at ~9.7e-3 mean
+                // relative error per logit against upstream's ~2.4e-3 (4x worse).
                 //
                 // Fixed since, both free:
-                //   - Q is now pre-scaled by scale*0.25 in fattn_gemm_q_to_f16, restoring the
-                //     64x of fp16 overflow headroom upstream buys at fattn-tile.cuh:932-937;
-                //     the softmax multiplies back by 4. This had to go in the conversion, not
-                //     into cuBLAS `alpha`, because alpha is applied AFTER the accumulation and
+                //   - Q is pre-scaled by scale*0.25 in fattn_gemm_q_to_f16, restoring the 64x
+                //     of fp16 overflow headroom upstream buys at fattn-tile.cuh:932-937; the
+                //     softmax multiplies back by 4. This had to go in the conversion, not into
+                //     cuBLAS `alpha`, because alpha is applied AFTER the accumulation and
                 //     cannot stop a partial sum from overflowing. Before the fix the fp16
                 //     accumulator went non-finite MORE often than the true dot product
                 //     overflowed (37 vs 24 per 200k at element RMS 32), and an inf logit
                 //     reaches expf(inf - inf) = NaN.
-                //   - FATTN_KQ_MAX_OFFSET is now added to the running max, as in tile, vec and
-                //     mma, restoring 8x of headroom for the f16 P and Otmp.
+                //   - FATTN_KQ_MAX_OFFSET is added to the running max, as in tile, vec and
+                //     mma, restoring 8x of headroom for the f16 probabilities and Otmp.
                 //
-                // STILL OPEN: the accumulator itself. The pre-scale cures overflow but not
-                // precision -- fp16 relative precision is scale-invariant, so the 4x error
-                // remains. Fixing it means CUBLAS_COMPUTE_32F, measured at 6.2 vs 14.65
-                // TFLOPS on this shape; QK^T and PV carry equal FLOPs and attention is ~86%
-                // of long-context prefill, so that is roughly 1.6x on prefill. Left as a
-                // measured decision, not an audit decision.
-                {
-                    // f16 compute here, unlike PV: QK^T sums only k=D=256 terms
-                    // and it runs at the 2:1 fp16 rate (measured 14.65 vs 6.2 TFLOPS for
-                    // COMPUTE_32F at this shape).
-                    // alpha/beta must match the COMPUTE type, not the data type -- with
-                    // COMPUTE_16F cuBLAS reads these as half*, with COMPUTE_32F as float*.
-                    // Mismatching them reinterprets the bits and silently degenerates
-                    // attention into a uniform average of V.
+                // The accumulator's precision itself is a measured decision, not an oversight:
+                // COMPUTE_32F runs 6.2 vs 14.65 TFLOPS on this shape, and the 4x per-logit
+                // error does not reach perplexity (see the precision note at the top).
+                // GGML_CUDA_FA_GEMM_PREC=32 selects the fp32 accumulation.
+                //
+                // alpha/beta must match the COMPUTE type, not the data type -- with
+                // COMPUTE_16F cuBLAS reads these as half*, with COMPUTE_32F as float*.
+                // Mismatching them reinterprets the bits and silently degenerates attention
+                // into a uniform average of V.
+                if (prec32) {
+                    // fp16 K and Q in, fp32 S out, fp32 compute: every half*half product is
+                    // exact in fp32 and the k=256 sum accumulates in fp32.
+                    const float alpha = 1.0f;
+                    const float beta  = 0.0f;
+                    CUBLAS_CHECK(cublasGemmEx(
+                        cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                        nkv_c, nt*gqa, D,
+                        &alpha,
+                        Kmat,     CUDA_R_16F, ldK,
+                        Qf16.ptr, CUDA_R_16F, D,
+                        &beta,
+                        S32.ptr,  CUDA_R_32F, nkv_c,
+                        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+                } else {
                     const half alpha = __float2half(1.0f);
                     const half beta  = __float2half(0.0f);
                     CUBLAS_CHECK(cublasGemmEx(
                         cublas, CUBLAS_OP_T, CUBLAS_OP_N,
                         nkv_c, nt*gqa, D,
                         &alpha,
-                        Kmat, CUDA_R_16F, ldK,
+                        Kmat,     CUDA_R_16F, ldK,
                         Qf16.ptr, CUDA_R_16F, D,
                         &beta,
                         S.ptr,    CUDA_R_16F, nkv_c,
@@ -407,33 +504,47 @@ void ggml_cuda_flash_attn_ext_gemm(ggml_backend_cuda_context & ctx, ggml_tensor 
 
                 {
                     dim3 grid(nt, gqa, 1);
-                    fattn_gemm_softmax<256><<<grid, 256, 0, stream>>>(
-                        S.ptr, mask ? (const half *) mask->data : nullptr, P_ptr,
-                        m_state.ptr, l_state.ptr, corr.ptr,
-                        nkv_c, c, nt,
-                        mask ? mask->nb[1]/sizeof(half) : 0,
-                        nkv_c*nt);
+                    if (prec32) {
+                        fattn_gemm_softmax<256, float><<<grid, 256, 0, stream>>>(
+                            S32.ptr, P32.ptr, (const half *) mask->data,
+                            m_state.ptr, l_state.ptr, corr.ptr, nkv_c, c, nt, s_mask, nkv_c*nt);
+                    } else {
+                        fattn_gemm_softmax<256, half><<<grid, 256, 0, stream>>>(
+                            S.ptr, P.ptr, (const half *) mask->data,
+                            m_state.ptr, l_state.ptr, corr.ptr, nkv_c, c, nt, s_mask, nkv_c*nt);
+                    }
                     CUDA_CHECK(cudaGetLastError());
                 }
 
                 // Otmp = V P, then O = O*corr + Otmp.
                 //
-                // f16 compute: COMPUTE_32F with f16 inputs runs 6.4-6.7 TFLOPS on Pascal
-                // against 11.0-14.6 for COMPUTE_16F, and PV is ~half of attention's flops.
-                // The f16 sum here spans one chunk; cross-chunk accumulation is f32 in
-                // fattn_gemm_accum_O. Upstream's Pascal tile kernel accumulates VKQ in
-                // half2 over the ENTIRE cache and passes the same tests, so this is the
-                // more conservative of the two.
+                // f16 compute by default: COMPUTE_32F with f16 inputs runs 6.4-6.7 TFLOPS on
+                // Pascal against 11.0-14.6 for COMPUTE_16F, and PV is ~half of attention's
+                // flops. The f16 sum here spans one chunk; cross-chunk accumulation is f32 in
+                // fattn_gemm_accum_O. Upstream's Pascal tile kernel accumulates VKQ in half2
+                // over the ENTIRE cache, so this is the more conservative of the two.
                 // alpha/beta must match the COMPUTE type, not the data type.
-                {
+                if (prec32) {
+                    const float alpha = 1.0f;
+                    const float beta  = 0.0f;
+                    CUBLAS_CHECK(cublasGemmEx(
+                        cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                        DV, nt*gqa, nkv_c,
+                        &alpha,
+                        Vmat32,     CUDA_R_32F, ldV,
+                        P32.ptr,    CUDA_R_32F, nkv_c,
+                        &beta,
+                        Otmp32.ptr, CUDA_R_32F, DV,
+                        CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+                } else {
                     const half alpha = __float2half(1.0f);
                     const half beta  = __float2half(0.0f);
                     CUBLAS_CHECK(cublasGemmEx(
                         cublas, CUBLAS_OP_N, CUBLAS_OP_N,
                         DV, nt*gqa, nkv_c,
                         &alpha,
-                        Vmat, CUDA_R_16F, ldV,
-                        P_ptr,    CUDA_R_16F, nkv_c,
+                        Vmat,     CUDA_R_16F, ldV,
+                        P.ptr,    CUDA_R_16F, nkv_c,
                         &beta,
                         Otmp.ptr, CUDA_R_16F, DV,
                         CUBLAS_COMPUTE_16F, CUBLAS_GEMM_DEFAULT));
@@ -441,7 +552,11 @@ void ggml_cuda_flash_attn_ext_gemm(ggml_backend_cuda_context & ctx, ggml_tensor 
 
                 {
                     dim3 grid(nt, gqa, 1);
-                    fattn_gemm_accum_O<<<grid, 256, 0, stream>>>(O.ptr, Otmp.ptr, corr.ptr, DV, nt);
+                    if (prec32) {
+                        fattn_gemm_accum_O<float><<<grid, 256, 0, stream>>>(O.ptr, Otmp32.ptr, corr.ptr, DV, nt);
+                    } else {
+                        fattn_gemm_accum_O<half><<<grid, 256, 0, stream>>>(O.ptr, Otmp.ptr, corr.ptr, DV, nt);
+                    }
                     CUDA_CHECK(cudaGetLastError());
                 }
             }
