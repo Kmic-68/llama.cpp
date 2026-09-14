@@ -943,6 +943,15 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
             GGML_ASSERT(tensor->nb[0] == ggml_element_size(tensor));
             size += ggml_row_size(tensor->type, MATRIX_ROW_PADDING - ne0 % MATRIX_ROW_PADDING);
         }
+#if defined(__CUDA_ARCH_LIST__) && __CUDA_ARCH_LIST__ == 600
+        // The Pascal mul_mat_vec_q staging reads whole 16-byte units, rounding each block run
+        // up: up to 15 bytes past the last block of the last row. Those bytes are never used,
+        // but when ne0 is already a multiple of MATRIX_ROW_PADDING (5120 and 8704 both are)
+        // nothing above adds slack, so the read can leave the allocation. Same gate as the
+        // staging code in mmvq.cu. Costs 16 bytes per quantized tensor; zero-filled by
+        // ggml_backend_cuda_buffer_init_tensor like the rest of the padding.
+        size += 16;
+#endif
     }
 
     return size;

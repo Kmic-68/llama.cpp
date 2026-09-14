@@ -1585,7 +1585,10 @@ void ggml_cuda_mul_mat_vec_q(
                 CUDA_CHECK(cudaFree(ctx.mmvq_q8_1_ptr[dev]));
                 ctx.mmvq_q8_1_ptr[dev] = nullptr;
             }
-            CUDA_CHECK(cudaMalloc(&ctx.mmvq_q8_1_ptr[dev], q8_1_bytes));
+            // + 16: the Pascal staging reads whole 16-byte units and can run up to 15 bytes past
+            // the last block. q8_1_bytes has no slack of its own when ne10 is already a multiple
+            // of MATRIX_ROW_PADDING, so without this the read leaves the allocation.
+            CUDA_CHECK(cudaMalloc(&ctx.mmvq_q8_1_ptr[dev], q8_1_bytes + 16));
             ctx.mmvq_q8_1_cap[dev] = q8_1_bytes;
             // the pointer just moved; any CUDA graph captured against the old one must be
             // re-captured rather than replayed (see ggml_cuda_graph::mmvq_q8_1_epoch)
