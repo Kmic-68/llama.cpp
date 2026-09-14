@@ -537,17 +537,35 @@ void ggml_cuda_flash_attn_ext_gemm(ggml_backend_cuda_context & ctx, ggml_tensor 
                         Otmp32.ptr, CUDA_R_32F, DV,
                         CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
                 } else {
+                    // ALGO4, not DEFAULT. cuBLAS's fp16 GEMM kernels on Pascal come in two
+                    // accuracy families: ALGO4-6 accumulate in blocks, ALGO1-3 in long fp16
+                    // chains, and DEFAULT switches to the long chains from nt*gqa ~ 6000 on --
+                    // i.e. every prefill ubatch of 1024 tokens or more. Against an fp64 product of
+                    // the same fp16 inputs, at k=2048: NMSE 2.9e-5 for DEFAULT, 2.8e-6 for
+                    // ALGO4-6, with the same split at every nt from 128 to 2048 (OPTLOG attempt
+                    // 152). This is the dominant error of the fp16 path. ALGO4 is the most even
+                    // of the three on speed: ~8% over DEFAULT at nt=2048, level at nt <= 1024,
+                    // where ALGO6 is up to 1.5x slower. Any failure (an unsupported algorithm on
+                    // another GPU or cuBLAS) falls back to DEFAULT.
                     const half alpha = __float2half(1.0f);
                     const half beta  = __float2half(0.0f);
-                    CUBLAS_CHECK(cublasGemmEx(
-                        cublas, CUBLAS_OP_N, CUBLAS_OP_N,
-                        DV, nt*gqa, nkv_c,
-                        &alpha,
-                        Vmat,     CUDA_R_16F, ldV,
-                        P.ptr,    CUDA_R_16F, nkv_c,
-                        &beta,
-                        Otmp.ptr, CUDA_R_16F, DV,
-                        CUBLAS_COMPUTE_16F, CUBLAS_GEMM_DEFAULT));
+                    for (const cublasGemmAlgo_t algo : {CUBLAS_GEMM_ALGO4, CUBLAS_GEMM_DEFAULT}) {
+                        const cublasStatus_t st = cublasGemmEx(
+                            cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                            DV, nt*gqa, nkv_c,
+                            &alpha,
+                            Vmat,     CUDA_R_16F, ldV,
+                            P.ptr,    CUDA_R_16F, nkv_c,
+                            &beta,
+                            Otmp.ptr, CUDA_R_16F, DV,
+                            CUBLAS_COMPUTE_16F, algo);
+                        if (st == CUBLAS_STATUS_SUCCESS) {
+                            break;
+                        }
+                        if (algo == CUBLAS_GEMM_DEFAULT) {
+                            CUBLAS_CHECK(st);
+                        }
+                    }
                 }
 
                 {
