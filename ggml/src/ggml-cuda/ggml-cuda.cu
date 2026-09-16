@@ -1581,14 +1581,34 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
                                            (const float *) src1_ptr, s11,
                     (const float *) beta,  (float       *)  dst_ptr, ne0));
     } else if (ne12 == 1 && ne13 == 1) {
-        CUBLAS_CHECK(
-            cublasGemmEx(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
+        // Pascal P100 (cc 6.0), COMPUTE_16F: cuBLAS's COMPUTE_16F algorithms fall into two accuracy
+        // families on this card -- ALGO1-3 accumulate each output in one long fp16 chain, ALGO4-6 in
+        // blocks -- and DEFAULT_TENSOR_OP picks the long chains from ~256 rows up (64 for an LM head).
+        // At this path's shapes (every prefill matmul of a quantized weight: MMQ is never chosen on
+        // sm_60) that is NMSE ~2.2e-8*k against an fp64 product of the same fp16 inputs, 7e-5 to 2e-4
+        // for k = 3072..8704, where the blocked ALGO6 gives 1.2-1.3e-5 at every shape. At 512 and 1024
+        // rows the default is also the slow kernel: pp512 240 -> 391 t/s, pp1024 318 -> 412, pp2048
+        // level (Qwen3.8-27B Q6_K, -sm tensor). OPTLOG attempt 153. Any failure falls back to the
+        // default.
+        const cublasGemmAlgo_t algo = cu_compute_type == CUBLAS_COMPUTE_16F && cc == GGML_CUDA_CC_PASCAL ?
+            CUBLAS_GEMM_ALGO6 : CUBLAS_GEMM_DEFAULT_TENSOR_OP;
+        cublasStatus_t st = cublasGemmEx(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
                     ne01, ne11, ne10,
                     alpha, src0_ptr, cu_data_type_a, s01,
                            src1_ptr, cu_data_type_b, s11,
                     beta,   dst_ptr, cu_data_type,   ne0,
                     cu_compute_type,
-                    CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+                    algo);
+        if (st != CUBLAS_STATUS_SUCCESS && algo != CUBLAS_GEMM_DEFAULT_TENSOR_OP) {
+            st = cublasGemmEx(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
+                    ne01, ne11, ne10,
+                    alpha, src0_ptr, cu_data_type_a, s01,
+                           src1_ptr, cu_data_type_b, s11,
+                    beta,   dst_ptr, cu_data_type,   ne0,
+                    cu_compute_type,
+                    CUBLAS_GEMM_DEFAULT_TENSOR_OP);
+        }
+        CUBLAS_CHECK(st);
     } else if (r2 == 1 && r3 == 1 && is_src0_cont_2 && is_src1_cont_2) {
         // with a [0, 2, 1, 3] perm. and ne02==1 the matrix strides need to be determined from dim 3:
         const int64_t sma = ne02 == 1 ? s03 : s02;
