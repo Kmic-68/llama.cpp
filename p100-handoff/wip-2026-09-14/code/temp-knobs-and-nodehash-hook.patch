@@ -1,0 +1,331 @@
+@@ -1438,6 +1438,16 @@
+     static inline auto convert_nc(ggml_type src_type) { return ggml_get_to_fp16_nc_cuda(src_type); }
+ };
+ 
++// TEMP A/B knob (remove before commit): GGML_CUDA_MM16_ALGO=-1 restores CUBLAS_GEMM_DEFAULT_TENSOR_OP.
++static cublasGemmAlgo_t ggml_cuda_gemm16_algo_pascal() {
++    static const cublasGemmAlgo_t algo = [] {
++        const char * s = getenv("GGML_CUDA_MM16_ALGO");
++        const int a = s ? atoi(s) : 6;
++        return a < 0 ? CUBLAS_GEMM_DEFAULT_TENSOR_OP : (cublasGemmAlgo_t) (CUBLAS_GEMM_ALGO0 + a);
++    }();
++    return algo;
++}
++
+ template<ggml_type compute_type>
+ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+     using traits = batched_mul_mat_traits<compute_type>;
+@@ -1581,17 +1591,8 @@
+                                            (const float *) src1_ptr, s11,
+                     (const float *) beta,  (float       *)  dst_ptr, ne0));
+     } else if (ne12 == 1 && ne13 == 1) {
+-        // Pascal P100 (cc 6.0), COMPUTE_16F: cuBLAS's COMPUTE_16F algorithms fall into two accuracy
+-        // families on this card -- ALGO1-3 accumulate each output in one long fp16 chain, ALGO4-6 in
+-        // blocks -- and DEFAULT_TENSOR_OP picks the long chains from ~256 rows up (64 for an LM head).
+-        // At this path's shapes (every prefill matmul of a quantized weight: MMQ is never chosen on
+-        // sm_60) that is NMSE ~2.2e-8*k against an fp64 product of the same fp16 inputs, 7e-5 to 2e-4
+-        // for k = 3072..8704, where the blocked ALGO6 gives 1.2-1.3e-5 at every shape. At 512 and 1024
+-        // rows the default is also the slow kernel: pp512 240 -> 391 t/s, pp1024 318 -> 412, pp2048
+-        // level (Qwen3.8-27B Q6_K, -sm tensor). OPTLOG attempt 153. Any failure falls back to the
+-        // default.
+         const cublasGemmAlgo_t algo = cu_compute_type == CUBLAS_COMPUTE_16F && cc == GGML_CUDA_CC_PASCAL ?
+-            CUBLAS_GEMM_ALGO6 : CUBLAS_GEMM_DEFAULT_TENSOR_OP;
++            ggml_cuda_gemm16_algo_pascal() : CUBLAS_GEMM_DEFAULT_TENSOR_OP;
+         cublasStatus_t st = cublasGemmEx(cublas_h, CUBLAS_OP_T, CUBLAS_OP_N,
+                     ne01, ne11, ne10,
+                     alpha, src0_ptr, cu_data_type_a, s01,
+@@ -1672,12 +1673,11 @@
+     }
+ }
+ 
+-// The compute type ggml_cuda_mul_mat_cublas uses for dst = src0 x src1 on a device of compute capability cc.
+-static ggml_type ggml_cuda_mul_mat_cublas_compute_type(const ggml_tensor * src0, const ggml_tensor * dst, int cc) {
++static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+     ggml_type compute_type = src0->type;
+     if (ggml_is_quantized(compute_type)) {
+-        compute_type = fast_fp16_hardware_available(cc) ? GGML_TYPE_F16 : GGML_TYPE_F32;
+-    } else if (compute_type == GGML_TYPE_F16 && !fast_fp16_hardware_available(cc)) {
++        compute_type = fast_fp16_hardware_available(ggml_cuda_info().devices[ctx.device].cc) ? GGML_TYPE_F16 : GGML_TYPE_F32;
++    } else if (compute_type == GGML_TYPE_F16 && !fast_fp16_hardware_available(ggml_cuda_info().devices[ctx.device].cc)) {
+         compute_type = GGML_TYPE_F32;
+     }
+     if (dst->op_params[0] == GGML_PREC_F32) {
+@@ -1700,11 +1700,6 @@
+             GGML_LOG_WARN("%s: unknown value for GGML_CUDA_CUBLAS_COMPUTE_TYPE: %s", __func__, env_cpp.c_str());
+         }
+     }
+-    return compute_type;
+-}
+-
+-static void ggml_cuda_mul_mat_cublas(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+-    const ggml_type compute_type = ggml_cuda_mul_mat_cublas_compute_type(src0, dst, ggml_cuda_info().devices[ctx.device].cc);
+ 
+     switch (compute_type) {
+         case GGML_TYPE_F32:
+@@ -2553,15 +2548,11 @@
+ // exactly-f16 values and can be shipped over PCIe at half the bytes with no loss at all.
+ // Narrow batches go through mul_mat_vec_q instead, which produces genuine f32, hence the
+ // ne[1] threshold -- it matches the condition under which the cuBLAS f16 path is taken.
+-// The compute type is checked per exchange: the one-time probe below only sees the first
+-// exchange, and a matmul whose weights are F32 or BF16, or that requests GGML_PREC_F32 (GLM4
+-// does for these very projections), produces genuine f32 even when the first one did not.
+ static bool ggml_cuda_peer_copy_compressible(const ggml_tensor * src, const ggml_tensor * dst, int cc) {
+     return cc < GGML_CUDA_CC_VOLTA
+         && src->op   == GGML_OP_MUL_MAT
+         && src->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32
+         && src->ne[1] >= 512
+-        && ggml_cuda_mul_mat_cublas_compute_type(src->src[0], src, cc) == GGML_TYPE_F16
+         && ggml_is_contiguous(src) && ggml_is_contiguous(dst)
+         && ggml_nelements(src) == ggml_nelements(dst)
+         && ggml_nelements(src) % 2 == 0
+@@ -2601,12 +2592,6 @@
+         const int src_physical = ggml_cuda_get_physical_device(cuda_ctx_src->device);
+         const int dst_physical = ggml_cuda_get_physical_device(cuda_ctx_dst->device);
+         if (src_physical == dst_physical) {
+-            // Same exposure as the peer path below: the destination is a different virtual device with
+-            // its own stream, and the all-reduce's ADD of the previous exchange may still be pending on
+-            // it while this copy refills the reduction buffer. Order against it.
+-            if (cuda_ctx_dst->work_event != nullptr) {
+-                CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx_src->stream(), cuda_ctx_dst->work_event, 0));
+-            }
+             CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
+         } else {
+ #ifdef GGML_CUDA_NO_PEER_COPY
+@@ -2694,23 +2679,25 @@
+                 return true;
+             }
+ 
+-            // The destination may still have a reader pending on its compute stream. The tensor-parallel
+-            // all-reduce lands every exchange in the same per-device reduction buffer
+-            // (ggml-backend-meta.cpp, bcj.bufs[i_buf]) and folds it in with an ADD queued on the
+-            // destination stream. This copy stream is otherwise ordered against the source only, so a
+-            // source that had raced ahead to the next layer could overwrite that buffer before the
+-            // destination's ADD of the previous layer had read it. The compressed path above guards the
+-            // same reuse with peer_stage_free.
+-            // Waiting on the destination's existing work marker is enough: graph_compute records it after
+-            // every graph, the meta backend's ADD included, and that ADD is enqueued before the next
+-            // layer's copies are issued. Re-recording it here would also capture this exchange's wait on
+-            // the opposite copy and serialise the two directions again.
+-            if (cuda_ctx_dst->work_event == nullptr) {
++            // The destination may still have a reader pending on its compute stream. The tensor
++            // parallel all-reduce lands every exchange in the same per-device reduction buffer
++            // (ggml-backend-meta.cpp, bcj.bufs[i_buf]), read by an ADD queued on the destination
++            // stream. The copy stream is ordered against the source only, so a source that has
++            // raced ahead to the next layer could overwrite that buffer before the destination's
++            // ADD of the previous layer has read it. The compressed path above guards the same
++            // reuse with peer_stage_free; this is the uncompressed equivalent: wait for
++            // everything already enqueued on the destination. Uncompressed exchanges are the
++            // small decode partials and non-f16-exact configurations, so the serialisation this
++            // reintroduces for them costs little; f16 prefill exchanges keep the full-duplex path.
++            static const int TEMP_peer_wait_dst = [] { const char * e = getenv("GGML_CUDA_PEER_WAIT_DST"); return e ? atoi(e) : 1; }(); // TEMP A/B knob: 0 off, 1 record+wait, 2 wait on the existing marker
++            if (TEMP_peer_wait_dst == 1 || (TEMP_peer_wait_dst == 2 && cuda_ctx_dst->work_event == nullptr)) {
+                 ggml_cuda_set_device(cuda_ctx_dst->device);
+                 cuda_ctx_dst->record_work();
+                 ggml_cuda_set_device(cuda_ctx_src->device);
++                CUDA_CHECK(cudaStreamWaitEvent(copy_stream, cuda_ctx_dst->work_event, 0));
++            } else if (TEMP_peer_wait_dst == 2) {
++                CUDA_CHECK(cudaStreamWaitEvent(copy_stream, cuda_ctx_dst->work_event, 0));
+             }
+-            CUDA_CHECK(cudaStreamWaitEvent(copy_stream, cuda_ctx_dst->work_event, 0));
+ 
+             CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, dst_physical, src->data, src_physical, ggml_nbytes(dst), copy_stream));
+             CUDA_CHECK(cudaEventRecord(cuda_ctx_src->copy_event, copy_stream));
+@@ -4228,6 +4215,170 @@
+     return 0;
+ }
+ 
++// TEMP DEBUG (remove before commit): GGML_CUDA_DBG_NODEHASH=1 prints (to stderr: llama's log callback drops ggml INFO) a hash of every computed node's
++// output bytes, to compare whole forward passes bit-for-bit across runs. One thread per 1024-word
++// block; the thread only loads the tensor and stores once into a separate buffer.
++static __global__ void dbg_nodehash_blocks(const uint32_t * w, uint32_t * out, const int64_t nwords, const int64_t nblocks) {
++    const int64_t b = (int64_t) blockDim.x*blockIdx.x + threadIdx.x;
++    if (b >= nblocks) {
++        return;
++    }
++    const int64_t start = b*1024;
++    const int64_t end   = start + 1024 < nwords ? start + 1024 : nwords;
++    uint32_t h1 = 0x811c9dc5u ^ (uint32_t) b;
++    uint32_t h2 = 0x9e3779b9u + (uint32_t) b;
++    for (int64_t i = start; i < end; i++) {
++        const uint32_t x = w[i];
++        h1 = (h1 ^ x) * 16777619u;
++        h2 = (h2 + x) * 2654435761u + (uint32_t) i;
++    }
++    out[b] = h1 ^ (h2 * 2246822519u);
++}
++
++// mode 2: fold the block hashes on the GPU into one slot per node, read back once per graph, so the
++// op sequence runs with no host synchronize between nodes (a synchronize once masked the softmax race)
++static __global__ void dbg_nodehash_fold(const uint32_t * in, uint32_t * out, const int64_t n, const int64_t slot) {
++    uint32_t h = 0x811c9dc5u ^ (uint32_t) n;
++    for (int64_t i = 0; i < n; i++) {
++        h = (h ^ in[i]) * 16777619u;
++        h ^= h >> 15;
++    }
++    out[slot] = h;
++}
++
++static int dbg_nodehash_mode() {
++    static const int v = [] { const char * s = getenv("GGML_CUDA_DBG_NODEHASH"); return s ? atoi(s) : 0; }();
++    return v;
++}
++static bool dbg_nodehash_enabled() { return dbg_nodehash_mode() != 0; }
++
++struct dbg_nodehash_deferred {
++    uint32_t * slots = nullptr;
++    int64_t    cap   = 0;
++    std::vector<std::string> labels;
++};
++static dbg_nodehash_deferred dbg_nh_deferred[GGML_CUDA_MAX_DEVICES];
++static std::atomic<uint64_t> dbg_nh_seq{0};
++
++static void dbg_nodehash_flush(ggml_backend_cuda_context * cuda_ctx) {
++    dbg_nodehash_deferred & d = dbg_nh_deferred[cuda_ctx->device];
++    if (d.labels.empty()) {
++        return;
++    }
++    std::vector<uint32_t> host(d.labels.size());
++    CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
++    CUDA_CHECK(cudaMemcpy(host.data(), d.slots, host.size()*sizeof(uint32_t), cudaMemcpyDeviceToHost));
++    for (size_t k = 0; k < host.size(); k++) {
++        fprintf(stderr, "%s h=%08x\n", d.labels[k].c_str(), host[k]);
++    }
++    d.labels.clear();
++}
++
++// mode 3: count non-finite values in every F32 node output; print the first nodes that have any
++static __global__ void dbg_nonfinite_blocks(const uint32_t * w, uint32_t * out, const int64_t nwords, const int64_t nblocks) {
++    const int64_t b = (int64_t) blockDim.x*blockIdx.x + threadIdx.x;
++    if (b >= nblocks) {
++        return;
++    }
++    const int64_t start = b*1024;
++    const int64_t end   = start + 1024 < nwords ? start + 1024 : nwords;
++    uint32_t c = 0;
++    for (int64_t i = start; i < end; i++) {
++        c += ((w[i] >> 23) & 0xff) == 0xff ? 1u : 0u;
++    }
++    out[b] = c;
++}
++
++static void dbg_nonfinite(ggml_backend_cuda_context * cuda_ctx, const ggml_tensor * node, int idx) {
++    static std::atomic<int> printed{0};
++    static std::atomic<uint64_t> checked{0};
++    if (node->type != GGML_TYPE_F32 || node->data == nullptr || printed.load() >= 40) {
++        return;
++    }
++    const int64_t nwords = (int64_t) (ggml_nbytes(node) / 4);
++    if (nwords == 0) {
++        return;
++    }
++    const int64_t nblocks = (nwords + 1023) / 1024;
++    ggml_cuda_pool_alloc<uint32_t> out(cuda_ctx->pool(), nblocks);
++    const int bs = 256;
++    const int64_t ngrid = (nblocks + bs - 1) / bs;
++    GGML_ASSERT(ngrid <= INT_MAX);
++    dbg_nonfinite_blocks<<<dim3((unsigned) ngrid, 1, 1), dim3(bs, 1, 1), 0, cuda_ctx->stream()>>>(
++        (const uint32_t *) node->data, out.get(), nwords, nblocks);
++    std::vector<uint32_t> host(nblocks);
++    CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
++    CUDA_CHECK(cudaMemcpy(host.data(), out.get(), nblocks*sizeof(uint32_t), cudaMemcpyDeviceToHost));
++    uint64_t total = 0; int64_t first = -1;
++    for (int64_t k = 0; k < nblocks; k++) { total += host[k]; if (host[k] && first < 0) { first = k; } }
++    const uint64_t n = checked++;
++    if (total > 0) {
++        printed++;
++        fprintf(stderr, "NONFINITE dev=%d check=%llu i=%d op=%s name=%s ne=%lld,%lld,%lld,%lld count=%llu first_word=%lld src0=%s src1=%s\n",
++            cuda_ctx->device, (unsigned long long) n, idx, ggml_op_desc(node), node->name,
++            (long long) node->ne[0], (long long) node->ne[1], (long long) node->ne[2], (long long) node->ne[3],
++            (unsigned long long) total, (long long) first*1024,
++            node->src[0] ? node->src[0]->name : "-", node->src[1] ? node->src[1]->name : "-");
++    }
++}
++
++static void dbg_nodehash(ggml_backend_cuda_context * cuda_ctx, const ggml_tensor * node, int idx) {
++    const int64_t nbytes = (int64_t) ggml_nbytes(node);
++    const int64_t nwords = nbytes / 4;
++    if (dbg_nodehash_mode() == 3) {
++        dbg_nonfinite(cuda_ctx, node, idx);
++        return;
++    }
++    if (dbg_nodehash_mode() == 2) {
++        dbg_nodehash_deferred & d = dbg_nh_deferred[cuda_ctx->device];
++        if (d.slots == nullptr) {
++            d.cap = 1 << 20;
++            CUDA_CHECK(cudaMalloc((void **) &d.slots, d.cap*sizeof(uint32_t)));
++        }
++        GGML_ASSERT((int64_t) d.labels.size() < d.cap);
++        const int64_t slot = (int64_t) d.labels.size();
++        char label[512];
++        snprintf(label, sizeof(label), "NODEHASH dev=%d seq=%llu i=%d op=%s name=%s ne=%lld,%lld,%lld,%lld",
++            cuda_ctx->device, (unsigned long long) dbg_nh_seq++, idx, ggml_op_desc(node), node->name,
++            (long long) node->ne[0], (long long) node->ne[1], (long long) node->ne[2], (long long) node->ne[3]);
++        d.labels.emplace_back(label);
++        if (node->data == nullptr || nwords == 0) {
++            CUDA_CHECK(cudaMemsetAsync(d.slots + slot, 0, sizeof(uint32_t), cuda_ctx->stream()));
++            return;
++        }
++        const int64_t nblocks = (nwords + 1023) / 1024;
++        ggml_cuda_pool_alloc<uint32_t> out(cuda_ctx->pool(), nblocks);
++        const int bs = 256;
++        const int64_t ngrid = (nblocks + bs - 1) / bs;
++        GGML_ASSERT(ngrid <= INT_MAX);
++        dbg_nodehash_blocks<<<dim3((unsigned) ngrid, 1, 1), dim3(bs, 1, 1), 0, cuda_ctx->stream()>>>(
++            (const uint32_t *) node->data, out.get(), nwords, nblocks);
++        dbg_nodehash_fold<<<dim3(1, 1, 1), dim3(1, 1, 1), 0, cuda_ctx->stream()>>>(out.get(), d.slots, nblocks, slot);
++        return;
++    }
++    uint64_t h = 1469598103934665603ull ^ (uint64_t) nbytes;
++    const uint64_t seq = dbg_nh_seq++;
++    if (node->data != nullptr && nwords > 0) {
++        const int64_t nblocks = (nwords + 1023) / 1024;
++        ggml_cuda_pool_alloc<uint32_t> out(cuda_ctx->pool(), nblocks);
++        const int bs = 256;
++        const int64_t ngrid = (nblocks + bs - 1) / bs;
++        GGML_ASSERT(ngrid <= INT_MAX);
++        dbg_nodehash_blocks<<<dim3((unsigned) ngrid, 1, 1), dim3(bs, 1, 1), 0, cuda_ctx->stream()>>>(
++            (const uint32_t *) node->data, out.get(), nwords, nblocks);
++        std::vector<uint32_t> host(nblocks);
++        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
++        CUDA_CHECK(cudaMemcpy(host.data(), out.get(), nblocks*sizeof(uint32_t), cudaMemcpyDeviceToHost));
++        for (int64_t k = 0; k < nblocks; k++) {
++            h = (h ^ host[k]) * 1099511628211ull;
++        }
++    }
++    fprintf(stderr, "NODEHASH dev=%d seq=%llu i=%d op=%s name=%s ne=%lld,%lld,%lld,%lld h=%016llx\n",
++        cuda_ctx->device, (unsigned long long) seq, idx, ggml_op_desc(node), node->name,
++        (long long) node->ne[0], (long long) node->ne[1], (long long) node->ne[2], (long long) node->ne[3],
++        (unsigned long long) h);
++}
++
+ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
+     bool graph_evaluated_or_captured = false;
+ 
+@@ -4378,6 +4529,9 @@
+                             ggml_op_name(cgraph->nodes[last_fused]->op), cgraph->nodes[last_fused]->name);
+ #endif
+                     i += nodes_to_skip;
++                    if (dbg_nodehash_enabled()) {
++                        dbg_nodehash(cuda_ctx, cgraph->nodes[i], i);
++                    }
+                     continue;
+                 }
+ #ifndef NDEBUG
+@@ -4402,11 +4556,17 @@
+                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
+                 }
+                 GGML_ASSERT(ok);
++                if (dbg_nodehash_enabled()) {
++                    dbg_nodehash(cuda_ctx, node, i);
++                }
+ 
+                 if (!is_concurrent_event_active) {
+                     try_launch_concurrent_event(node);
+                }
+             }
++            if (dbg_nodehash_mode() == 2) {
++                dbg_nodehash_flush(cuda_ctx);
++            }
+         }
+ 
+ #ifdef USE_CUDA_GRAPH

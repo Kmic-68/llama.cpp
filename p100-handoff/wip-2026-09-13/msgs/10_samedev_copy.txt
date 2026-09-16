@@ -1,0 +1,21 @@
+fix: the same-GPU copy between two virtual devices waits for the destination's reader too
+
+GGML_CUDA_DEVICES can put several virtual devices on one physical GPU, and cpy_tensor_async then
+takes the same-device branch: a cudaMemcpyAsync on the *source's* stream. The destination is still
+a separate backend with its own stream, and the tensor-parallel all-reduce reuses one reduction
+buffer per device, so this copy can land before the destination's ADD of the previous exchange has
+read it -- the same failure the peer path had, on a different branch. It waits on the destination's
+work marker now, exactly as the peer path does.
+
+On inspection, not on measurement. The configuration that would exercise it -- more virtual
+devices than physical GPUs -- does not produce a number worth comparing: three and four virtual
+devices on these two P100s intermittently read nan on this model, with the guard on and with it
+off, and the nan follows the GEMM attention path rather than the copies (OPTLOG attempt 153
+section 8c). Two physical GPUs, which is what this fork ships on, never take this branch at all:
+src_physical == dst_physical is false for every exchange, so the guard is inert there and the
+gates are unchanged by it.
+
+OPTLOG attempt 153.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk

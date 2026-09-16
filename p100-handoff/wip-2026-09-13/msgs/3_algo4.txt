@@ -1,0 +1,20 @@
+precision: GEMM attention PV requests cuBLAS ALGO4 instead of GEMM_DEFAULT
+
+cuBLAS's COMPUTE_16F GEMM algorithms on Pascal fall into two accuracy families. Against an fp64
+product of the same fp16 inputs at the PV shape (DV=256, k=2048 keys): ALGO1-3 accumulate in long
+fp16 chains, NMSE 2.9e-5; ALGO4-6 accumulate in blocks, NMSE 2.8e-6. GEMM_DEFAULT switches to the
+long-chain family from n = nt*gqa ~ 6000 -- every prefill ubatch of 1024 tokens or more,
+including the production -ub 2048. ALGO4-6 were never worse at any shape tested (nt 128-2048,
+k 128-2048), independent of ggml's handle settings and of pointer alignment.
+
+PV was the path's dominant fp16 error (moving QK^T to fp32: op NMSE 4.1e-5 -> 3.9e-5; moving PV:
+-> 2.3e-6). With ALGO4 the op NMSE at nb=2048 goes 3.98-4.25e-5 -> 1.20-1.24e-5 and no longer
+depends on batch width. ALGO4 over ALGO5/6: same accuracy, most even speed (~8% slower than
+DEFAULT at nt=2048, level at nt <= 1024; ALGO6 up to 1.5x slower at nt=128). Any failure falls
+back to DEFAULT. QK^T stays on DEFAULT: the blocked family is only 2.1x more accurate there, at
+11-15% of the call.
+
+OPTLOG attempt 152.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk

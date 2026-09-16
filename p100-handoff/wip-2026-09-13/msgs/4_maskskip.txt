@@ -1,0 +1,19 @@
+perf: GEMM attention skips all-zero mask chunks, decided on the GPU
+
+Adding +-0 to a logit changes neither the row max nor exp(v - m), so a KV chunk whose mask slice
+is all zero can skip the mask loads -- under a causal mask, every chunk but the last. A scan
+kernel finds each row's first nonzero mask column; the softmax skips the mask for a chunk of row t
+that ends at or before it. General, not causal-specific; -0.0 counts as zero, NaN as nonzero.
+
+The decision stays on the GPU. A first version read the boundary back to the host, and a host
+synchronize inside a -sm tensor subgraph idles the other GPU until this one catches up.
+
+Bit-identical: skip on == skip off (fp16 3.3185, fp32 3.3165 on one 16k chunk). pp2048,
+interleaved and cooled: @ d16384 360.9 t/s with the skip vs 357.9 without (+0.8%, two rounds);
+@ d65536 221.2 +- 7.1 vs 197.7 +- 9.4 (+12%, one round, noisy -- the skipped share grows with
+depth).
+
+OPTLOG attempt 152.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk

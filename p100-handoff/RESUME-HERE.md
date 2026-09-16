@@ -1,4 +1,4 @@
-# Resume point — 262144 decode is ~23 t/s; the tile kernel's parameter space is closed
+# Resume point — two silent data races closed, prefill matmuls 10x more accurate and faster
 
 > ## READ FIRST: do not gate against `./ppl.txt`
 >
@@ -9,8 +9,56 @@
 >
 > Run **`./tools/gate.sh`**. It uses the right corpus and also runs tg256 and the FA eval.
 
-All work is committed. Tree is clean apart from your own `CLAUDE.md` edit and untracked
+## SESSION 2026-09-13/16 (OPTLOG attempts 151-153): two silent races closed, prefill matmuls fixed
+
+Everything below this section predates it and still stands except where it is contradicted here.
+All work is committed; the tree is clean apart from your own `CLAUDE.md` edit and untracked
 `ppl.txt`.
+
+**Two data races were found and fixed. Both were in every build up to 2026-09-13, including the
+binaries that shipped in `/mnt/fast/p100-llamacpp-release/build` (now refreshed; the old bundle is
+`build-2026-09-06/`).**
+
+1. **The GEMM attention softmax wrote the probabilities over the scores it was still reading.**
+   On this toolchain the store can land before the load of the same element, `__restrict__` or
+   not. It corrupts a few attention rows per long prompt, and in fp16 it can NaN the output.
+   Fixed by giving `P` its own buffer (attempt 152). The same shape in `fattn_gemm_accum_O` was
+   fixed the same way in attempt 153, bit-identically.
+2. **An uncompressed tensor-parallel peer copy could overwrite the all-reduce's reduction buffer
+   before the destination's ADD had read it** — the copies have been on a dedicated stream since
+   a4d1103c5, ordered against the source only. This one hits **decode, MTP and prompt tails under
+   512 tokens**, and it is why a fp32-matmul perplexity run went NaN at chunk 14. Fixed by waiting
+   on the destination's work marker (attempt 153, section 5). A test build that delays the
+   destination's ADD makes the failure deterministic — MTP decode dropped to 43% draft acceptance
+   with different text — and shows the fix removing it.
+
+**The prefill matmuls were on cuBLAS's long-chain fp16 accumulator.** `CUBLAS_GEMM_DEFAULT_TENSOR_OP`
+picks it from ~256 rows up; the blocked `ALGO6` is 10x more accurate at every shape here and
+faster below 2048 rows. Against the shipped release: **pp512 +19%, pp1024 +10%, pp4096 at the
+default `-ub 512` +18%**, pp2048 at `-ub 2048` -3.0%, and the gate perplexity fell 2.6204 → 2.6097,
+within 0.0005 of an all-fp32 run.
+
+**Gates on the final build** (`tools/gate.sh` semantics): perplexity **2.6097 ± 0.0198** (band
+2.6209 ± 0.0199), tg256 **30.64 ± 0.19** on cool cards, `test-backend-ops -o FLASH_ATTN_EXT`
+3961/3961, full suite 14593/14593, both GPUs.
+
+**One thing is left open**, and it is not in anything that ships: with `GGML_CUDA_DEVICES` set
+higher than the number of physical GPUs, runs are not reproducible — 4 nan in 8 identical runs at
+three virtual devices, and the runs that complete disagree in the fourth decimal. It is not the
+copy guards (it happens with them on and off), not the zero-slice path (which never executes
+here), and it follows the GEMM attention path: with `GGML_CUDA_FA_GEMM=0` the same command is
+identical five times out of five. Two physical GPUs are bit-stable. OPTLOG attempt 153 §8c has the
+table; that is the thread to pull if anyone wants virtual-device emulation to be trustworthy.
+
+**What to watch out for next time.**
+
+- A determinism check that synchronizes cannot see a race between devices. Node-by-node hashing
+  called the build deterministic while unhooked runs were not.
+- `test-backend-ops` cannot see either race: one comparison per case, with a tolerance, on random
+  data, one backend at a time.
+- The instrument that did work: paired per-chunk perplexity (`--ppl-output-type 1`) over repeated
+  unhooked runs, compared against the per-chunk majority — and, once a mechanism is suspected, a
+  build that *forces* the race with a delay on one device's stream.
 
 ## SESSION 8 (2026-09-07): both questions answered
 

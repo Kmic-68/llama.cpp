@@ -1,0 +1,22 @@
+fix: zero a disabled slice by filling it, not by multiplying whatever was there by 0
+
+The tensor-parallel all-reduce zeroes the output of any device whose slice of the graph came out
+empty, so the butterfly can fold it in like any other partial. It did that by scaling that output
+by 0.0f, under its own comment:
+
+    node_zero->op = GGML_OP_SCALE; // FIXME 0.0f * NaN == NaN
+
+Nothing computed that slice, so the buffer still holds whatever the graph allocator left there, and
+0.0f times a NaN bit pattern is a NaN that the reduction then sums into every device. GGML_OP_FILL
+writes the constant and never reads the buffer; the CUDA and CPU backends both implement it.
+
+By inspection: on this model the branch does not execute. It was found while chasing an unrelated
+nan under GGML_CUDA_DEVICES, and a verbose run logs the zero-slice path zero times, so there is no
+before/after to show -- hence the GGML_LOG_DEBUG line, which is the only way to tell that a device
+ever ran with an empty slice. Gates on the build that carries it are unchanged: perplexity
+2.6097 +/- 0.0198 (band 2.6209 +/- 0.0199), tg256 30.64 +/- 0.19, FLASH_ATTN_EXT 3961/3961, full suite 14593/14593, both GPUs.
+
+OPTLOG attempt 153 section 8c.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk

@@ -1,0 +1,16 @@
+fix: 16 bytes of slack for the sm_60 mmvq staging over-read
+
+The Pascal mul_mat_vec_q staging reads whole 16-byte units, rounding each block run up, so it
+can read up to 15 bytes past the last block of the last row. When ne0 is already a multiple of
+MATRIX_ROW_PADDING (5120 and 8704 both are) nothing added slack to a quantized tensor, and the
+q8_1 activation buffer had none either.
+
+- quantized tensor allocations get +16 bytes under the same __CUDA_ARCH_LIST__ == 600 gate as
+  the staging code; init_tensor zero-fills them like the rest of the padding
+- the q8_1 activation buffer is allocated +16 bytes
+
+It cannot fault in practice (allocation granularity), but it was a read past an allocation.
+OPTLOG attempt 151.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk

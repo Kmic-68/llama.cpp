@@ -5580,3 +5580,674 @@ aligns tensor data to 32 bytes). Two places have no slack to absorb it:
 It cannot fault in practice (for `ne11 <= 8` the q8_1 size is never page-aligned, and CUDA
 allocates in coarse granularity), but it is a genuine read past an allocation. Fix: 16 bytes of
 slack on both. Pending, to land with the next build.
+
+## Attempt 151 — a precise GEMM attention mode, and runtime proof of the CUDA-graph fix (2026-09-12)
+
+### Runtime proof: CUDA-graph replay is now correct
+
+MTP decode (`llama-speculative-simple --spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min
+0.2`, greedy, seed 42, 256 tokens) with `GGML_CUDA_GRAPHS_PRE_VOLTA` off and on:
+
+| | t/s | accept | graphs reused |
+|---|---|---|---|
+| graphs OFF | 53.78 | 79.84% | — |
+| graphs ON | 53.57 | 79.84% | **61** |
+
+**Generated text byte-identical, graphs on vs off (868 bytes)**, and off-vs-off identical (the
+run is deterministic, so the comparison means something). 61 replays of captured graphs against
+eager execution with no divergence. This also re-measures the MTP record on the current build:
+53.6–53.8 t/s against the 54.48 best-of-six on warm cards.
+
+### Precise mode: `GGML_CUDA_FA_GEMM_PREC=32`
+
+Runtime-selectable, default unchanged. QK^T becomes `CUBLAS_COMPUTE_32F` over the same fp16 K
+and Q with an fp32 S; the softmax reads and writes fp32; V is dequantized straight to fp32;
+PV is all-fp32. Every half×half product needs 22 significant bits, so **products are exact** —
+upstream's tile kernel rounds each product to half before accumulating in fp32.
+
+**Accuracy against the CPU fp32 reference** (`test-backend-ops -o FLASH_ATTN_EXT`, new eval cases
+at GEMM-firing shapes: D=256, 2 KV heads, GQA 6, q4_0 KV; `GGML_TEST_PRINT_ERR=1`):
+
+| NMSE vs CPU fp32 | nb=512 | nb=2048 |
+|---|---|---|
+| GEMM fp16 (default) | 1.14–1.24e-05 | 3.98–4.25e-05 |
+| **GEMM fp32 (precise)** | **1.44–1.63e-06** | **1.54–1.70e-06** |
+| tile kernel (`GGML_CUDA_FA_GEMM=0`) | 2.20–2.33e-06 | 2.26–2.34e-06 |
+
+Each range spans kv = 4096, 16384, 65536: all three are flat with context. Precise mode is
+**1.4x more accurate than the fp32-accumulating tile kernel** and **7–26x more accurate than the
+fp16 default**. The fp16 default's error also grows with batch width (512 → 2048); neither fp32
+variant does. No failures or aborts in any variant.
+
+### Bug found in the first cut, fixed before anything was committed
+
+Both GEMM modes aborted with `GGML_ASSERT(ptr == pool_addr + pool_used)` (ggml-cuda.cu:681): the
+VMM pool requires frees in exact reverse order of allocation, and destructors run in reverse
+order of declaration. The first cut declared the precision-dependent buffers empty and allocated
+them after `O`. Now each buffer is allocated where it is declared, with the unused precision's
+twin left null (skipped on free).
+
+### Other fixes in this build
+
+- **15-byte over-read closed.** mmvq staging rounds each block run up to whole 16-byte units and
+  can read up to 15 bytes past the last block. 16 bytes of slack added to quantized tensor
+  allocations on sm_60 (same `__CUDA_ARCH_LIST__ == 600` gate as the staging) and to the q8_1
+  activation buffer.
+- **GEMM stride guard.** `gemm_supported()` now declines K/V with `nb[0] != ggml_type_size(type)`,
+  the same condition upstream asserts before the same strided dequantizer
+  (`fattn-common.cuh:1036`, `GGML_ASSERT(K->nb[0] == ts)`). A permuted view would otherwise be read
+  with the wrong stride. Normal KV views always satisfy it (`ggml.c:1832` sets `nb[0] =
+  ggml_type_size(type)` for every new tensor, views included).
+
+### Verified clean this session (no change)
+
+**q8_1 activation cache vs in-place mutation.** A cache hit is only safe if an activation cannot
+change between two matmuls that share it. ggml lets a node take over its parent's buffer only
+when `p_hn->n_children == 1` (`ggml-alloc.c:657`), i.e. when that node is the parent's *last*
+remaining consumer, with the count decremented in graph order. So every matmul that could hit the
+cache for an activation executes before anything may overwrite it.
+
+### Speed — the first measurement was thermally confounded
+
+First three-way run, pp2048 at depth 16384, in run order: GEMM fp16 **372.83** (cold) → GEMM
+fp32 328.04 → tile 303.65 → GEMM fp16 again **323.37 ± 6.73** (hot). The two fp16 readings
+disagree by 13% on the same binary. A controlled A/B (both cards cooled to <= 42 C before every
+run, variants alternated, depths 16384 and 65536) follows below.
+
+
+Controlled A/B (both cards cooled to <= 42 C before every run, variants alternated):
+
+| pp2048 | GEMM fp16 | GEMM fp32 (`PREC=32`) | fp32 cost |
+|---|---|---|---|
+| @ d16384 | 371.86 ± 0.89, 372.01 ± 0.72 | 329.80 ± 0.71, 329.53 ± 1.46 | **-11.4%** |
+| @ d65536 | 235.95 ± 6.11 | 171.73 ± 1.14 | **-27.2%** |
+
+VRAM at the production operating point (`llama-server -c 262144 -b 262144 -ub 2048 -np 1`, MTP
+draft, 19966-token prompt), sampled every 500 ms: peak **15999 MiB on GPU0** (incl. Sunshine's
+392) and **15743 MiB on GPU1**, identical for both modes. Prompt 334.8 t/s (fp16) vs 315.3 t/s
+(fp32).
+
+## Attempt 152 — GEMM attention: a silent data race in the softmax, the real fp16 error source, cleanup (2026-09-13)
+
+### 1. KLD cannot rank these variants
+
+First instrument tried: `llama-perplexity --kl-divergence` at 16384 context against an fp32 GEMM
+reference. Every variant — fp16 default, PV in fp32, QK^T+PV in fp32, a rounded normaliser —
+landed on mean KLD ≈ 0.008 (0.007975-0.008286), although they are 7-26x apart in op-level
+accuracy; and a change that should have been exactly zero (fp32, mask skip on vs off) gave 0.0043.
+Two things were going on. Any bit-level change at all diverges a 16k-token sequence chaotically
+to about the same KLD, so KLD against one reference cannot rank rounding choices. And the
+"exactly zero" control was not zero — which was the bug below.
+
+### 2. Bug: the in-place softmax races — found, misdiagnosed once, then proven
+
+**Symptom.** fp32 GEMM perplexity on one 16384-token chunk, identical command, varied run to run:
+3.3165 most often, but also 3.3144, 3.3154, 3.3155, 3.3158, 3.3159, 3.3160, 3.3197, 3.3224, 3.3272.
+fp16 GEMM and the tile kernel repeated exactly every time (fp16 3.3185 on all 5 runs, tile 3.3134
+on all 4).
+
+**First diagnosis, wrong.** The softmax kernel took scores `S` and probabilities `P` as two
+`__restrict__` parameters and the caller passed the same buffer for both (98de4588f, "alias P
+onto S", Sep 1, to save 50 MB). That is undefined behaviour, and dropping `restrict` appeared to
+fix it (2 runs identical). It did not: every run that looked deterministic also had a host
+synchronize in the op, from an early version of the mask skip. With the synchronize removed, the
+"fixed" kernels were nondeterministic again.
+
+**Isolation.**
+- tile path, 3 runs: identical. Not a whole-pipeline problem.
+- `CUDA_LAUNCH_BLOCKING=1` (every launch synchronous): still 3.3155 / 3.3159. Not a stream race.
+- cuBLAS alone (the two fp32 GEMMs at the real shapes, repeated, across processes, with a second
+  active stream): bit-identical every time.
+- Per-call hashes of every GEMM call's inputs and output, 3 runs: the first divergence was a call
+  whose Q, K, V and mask were **bit-identical** across runs and whose output was not.
+- Per-stage checksums inside the op, 4 runs: at the first divergence V, the QK^T scores, the
+  running max `m` and `corr` all matched; the probabilities `P` and the row sum `l` did not. Only
+  the softmax's second pass writes, and it writes `P[j]` to the address it has just read `S[j]`
+  from.
+
+**Proof.** A self-check inside the op runs the softmax twice on identical inputs (a copy of the
+scores and of the running state) and compares everything bitwise. fp32, 16384 context, ~2240
+softmax launches per run:
+
+| softmax variant | mismatched launches | PPL, repeated runs |
+|---|---|---|
+| in place, S and P as two aliased `restrict` params (release) | — | 3.3144-3.3272 |
+| in place, one `restrict` pointer | 4 of 2240; 6 of 2240 | 3.3160, 3.3158, 3.3165, 3.3165, 3.3144 |
+| in place, **no `restrict`** | 3 of 2240 | 3.3189, 3.3199, 3.3165 |
+| **out of place (separate P buffer)** | **0 of ~6700** | **3.3165 ×6** |
+
+The mismatches are not rounding: |ΔP| summed over a launch was 3954, 10984 and 1.6e7, with the
+row max identical — a probability (≤ 1/8) read back as a score against a very negative row max,
+exp(4P − m). So on this toolchain the store in pass 2 can land before the load of the same
+element, with or without `restrict`.
+
+**fp16.** Same pattern, no mismatch in 15360 self-checked launches (seven 16k chunks), but there
+a read-back probability overflows half to inf and turns the attention output into NaN — and one
+4096-context perplexity run on an in-place build went NaN from its third chunk and did not
+reproduce in three reruns. Fixed by construction for both precisions.
+
+**Fix:** the softmax always writes `P` into its own buffer. Cost ~1% of the op (161.6 ms vs
+160.5 in place, same build and thermal state) and `nkv_c·nt·gqa` more elements of scratch —
+50 MB per GPU at `-ub 2048` in fp16. **The release build carries the racing kernel.**
+
+**Contamination.** The 16k quality study earlier today ran on in-place builds (its fp32 reference
+read 3.3224 on the first chunk), so it is discarded and redone below. The 4k study ran on the
+round-4 out-of-place build and stands.
+
+### 3. What the fp16 path costs in model output — paired per-chunk perplexity, race-free
+
+The instrument: per-chunk NLL for every chunk (`--ppl-output-type 1`), paired against fp32 GEMM
+attention (`PREC=32`) chunk by chunk, so the chunk-to-chunk variance of the text cancels. A
+**control** calibrates the noise floor: fp32 attention with the key chunk halved to 1024, i.e.
+pure fp32 reassociation, known not to change accuracy. `-ub 2048`, so every scored token is in a
+GEMM ubatch. All references from out-of-place builds (the 4k reference reproduces bit-exactly on
+the final build).
+
+| mean ΔNLL vs fp32 (nats/token), t in brackets | 4096 ctx × 30 chunks | 16384 ctx × 7 chunks |
+|---|---|---|
+| CONTROL: fp32, chunk 1024 | +0.00052 (1.19) | — |
+| tile kernel | +0.00031 (0.89) | +0.00035 (1.09) |
+| fp16 GEMM, PV `GEMM_DEFAULT` (release) | +0.00058 (1.59) | +0.00099 (1.75) |
+| **fp16 GEMM, PV `ALGO4` (now)** | **+0.00068 (1.30)** | **+0.00068 (1.63)** |
+
+Perplexity: fp32 2.6192 / 2.4980; fp16 now 2.6210 / 2.4998; tile 2.6200 / 2.4989.
+
+No variant is distinguishable from fp32 at this resolution (every |t| < 2), and at 4k none
+moves more than the harmless control. The fp16 path sits within ~0.07% perplexity of fp32 and
+within ~0.04% of tile. The ALGO4 change is real at the op level (3.4x) but not resolvable in
+perplexity (+0.00068 vs +0.00058 at 4k, vs +0.00099 at 16k). **Answer to "does fp16 perform
+like fp32": within the resolution of ~118k scored tokens, yes; the precise mode stays available.**
+
+### 4. The real fp16 error source: cuBLAS picks a long-chain fp16 kernel for PV
+
+Per-accumulator attribution at the op level (NMSE vs CPU fp32, nb=2048): fp16 default 4.1e-5;
+QK^T moved to fp32: 3.9e-5 (no help); **PV moved to fp32: 2.3e-6** (the whole gap).
+
+A standalone harness (`cublasGemmEx` at the path's exact shapes; the same fp16 inputs multiplied
+in fp64 as the reference, so only the accumulation is measured) shows that cuBLAS's COMPUTE_16F
+GEMM kernels on this P100 fall into **two accuracy families**:
+
+| PV NMSE, k=2048 keys | nt=512 (n=3072) | nt=2048 (n=12288) |
+|---|---|---|
+| ALGO1 / ALGO2 / ALGO3 | 3.0e-5 | 2.9e-5 |
+| ALGO4 / ALGO5 / ALGO6 | 2.8e-6 | 2.8e-6 |
+| `CUBLAS_GEMM_DEFAULT` | 2.9e-6 (picks ALGO4-6) | **2.9e-5 (picks ALGO1-3)** |
+
+DEFAULT switches to the long-chain family between n=3072 and n=6144 — i.e. for **every prefill
+ubatch of 1024 tokens or more**, including the production `-ub 2048`. Across nt 128/512/1024/2048
+× k 128-2048, ALGO4-6 are never worse than DEFAULT. Unaffected by ggml's handle settings (TF32
+tensor-op math, 4 MiB workspace) and by pointer alignment; neither family reads C at beta=0, and
+both have the same overflow headroom.
+
+On data faithful to `test-backend-ops` (zero-mean q4_0 V, diffuse attention — the worst case,
+since the sum cancels) the long-chain family's error is linear in chain length, NMSE ≈ 2.05e-8·k,
+and the harness reproduces the op-level numbers exactly:
+
+| k (keys in one fp16 sum) | 128 | 256 | 512 | 1024 | 2048 |
+|---|---|---|---|---|---|
+| ALGO1-3 | 2.6e-6 | 5.3e-6 | 9.6e-6 | 2.07e-5 | 4.27e-5 |
+| ALGO4-6 | 1.3e-6 | 2.7e-6 | 4.8e-6 | 1.04e-5 | 1.08e-5 |
+
+**Fix:** PV requests `CUBLAS_GEMM_ALGO4`, falling back to DEFAULT on any failure. Idle-GPU speed
+relative to DEFAULT (median of 9): 1.087x at nt=2048 k=2048, 0.94-1.03x at nt ≤ 1024. ALGO6 has
+the same accuracy but is up to 1.5x slower at nt=128; ALGO5 is uneven. For QK^T the blocked
+family is only 2.1x more accurate (NMSE 2.0e-6 vs 4.3e-6) at 11-15% of the call — not taken.
+
+| op NMSE vs CPU fp32, kv 4096-65536 | nb=512 | nb=2048 |
+|---|---|---|
+| fp16 before | 1.14-1.24e-5 | 3.98-4.25e-5 |
+| **fp16 now (PV ALGO4)** | **1.18-1.29e-5** | **1.20-1.24e-5** |
+| fp32 (`PREC=32`) | 1.49-1.69e-6 | 1.46-1.64e-6 |
+| tile | 2.18-2.43e-6 | 2.27-2.37e-6 |
+
+The batch-width dependence is gone and the worst case is 3.4x lower at the production batch. It
+remains ~5x the tile kernel on this cancellation-heavy data; closing that would take sub-range
+folds (PV NMSE 2.7e-6 at 256 keys, measured +7.5% of the op) or fp32 PV (+33%).
+
+### 5. Skipping all-zero mask chunks without a host synchronize
+
+Adding ±0 to a logit changes neither the row max nor exp(v − m), so a chunk whose mask slice is
+all zero can skip the mask loads — under a causal mask, every chunk but the last. Priced by
+dropping the mask entirely: 149.4 → 138.5 ms at kv=65536, nb=2048 (-7.3%).
+
+The first version found the zero prefix with a scan kernel, read the minimum back to the host and
+synchronized. Under `-sm tensor` that is the wrong place for a synchronize: the meta backend
+enqueues each subgraph on GPU0 and then GPU1 from one host thread, so a host wait inside GPU0's
+subgraph leaves GPU1 idle until GPU0 catches up — once per attention layer per ubatch per GPU.
+Now the scan's per-row result stays on the GPU and the softmax kernel reads it: a chunk skips the
+mask for row t when it ends at or before that row's first nonzero column. General, not
+causal-specific (sliding windows and other sequences just skip less), -0.0 counts as zero, NaN
+as nonzero. Bit-identical: skip on and off give the same perplexity (fp16 3.3185 = 3.3185 =
+3.3185; fp32 3.3165 = 3.3165 on the out-of-place kernel). Op-level timing cannot show the gain —
+`test-backend-ops` masks are random, so nothing is ever skippable there — end-to-end below.
+
+### 6. Removed
+
+Every experimental knob of attempts 150-152: `GGML_CUDA_FA_GEMM_PREC=qk|pv|qkpv` (only
+`PREC=32` remains), `_PVSUB`, `_BIGP`, `_SUMROUNDED`, `_DIAG_V16/_P16`, `_CHUNK`, `_MASKSKIP`,
+`_PROBE_NOMASK`, `_DBG_MASK`, `_DBG_SYNC`.
+
+### 7. Speed against the shipped release
+
+The release's own prebuilt binaries (`/mnt/fast/p100-llamacpp-release/build`, run with
+`LD_LIBRARY_PATH` pointing there) against this build, interleaved, both cards cooled to <= 50 C
+before every run, same flags (`-sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ub 2048 -b 2048`,
+`GGML_CUDA_P2P=1`). "no skip" is this build with the mask skip disabled.
+
+| t/s | release | this build | this build, no skip | this build vs release |
+|---|---|---|---|---|
+| pp2048 @ d16384 | 370.54, 370.73 | 360.76, 361.04 | 358.30, 357.58 | **-2.6%** |
+| pp2048 @ d65536 | 223.61 ± 3.72 | 221.18 ± 7.06 | 197.66 ± 9.37 | **-1.1%** (within noise) |
+
+pp2048 @ d4096 and tg256 against the release were measured the next day, on the committed build
+(attempt 153, section 1).
+
+The deficit at moderate depth is what the fixes cost: the out-of-place softmax (~1% of the op;
+the release's speed partly came from the racing kernel), PV ALGO4 (~8% of the PV call), and the
+correct load order the racing kernel skipped. At 65k the mask skip pays for all of
+it (221.2 vs 197.7 without the skip, both noisy at this depth). Decode never enters this path.
+
+Tried and dropped: 4096-key chunks (op 161.4-162.3 ms vs 161.9-162.5 at 2048 — no gain for
++100 MB of scratch).
+
+
+## Attempt 153 — prefill matmuls 10x more accurate and up to +63%; a second silent race, in the tensor-parallel peer copies; the GEMM path fully out of place (2026-09-14/16)
+
+### 1. Gates on the GEMM series (attempts 151-152, as built: Vc2)
+
+Run from a binary snapshot of the Vc2 build (library `e815a2ce`):
+
+| gate | result |
+|---|---|
+| `test-backend-ops -o FLASH_ATTN_EXT` (incl. the new prefill-shaped eval cases) | 3961/3961 on CUDA0 and CUDA1 |
+| `test-backend-ops` full suite | 14593/14593 on CUDA0 and CUDA1, 3/3 backends |
+| perplexity, `ppl-orig.txt`, `-c 4096` (band 2.6209 ± 0.0199) | **2.6204 ± 0.0199** — pass |
+| tg256, cool cards, `-r 5` (baseline 17.51) | **30.84 ± 0.20** |
+
+Against the shipped release binaries (interleaved, cards cooled to ≤ 48 °C before every run):
+
+| | release | Vc2 |
+|---|---|---|
+| tg256 | 30.85 ± 0.16, 30.85 ± 0.15 | 30.81 ± 0.13, 30.82 ± 0.17 |
+| pp2048 @ d4096 | 410.85 ± 1.42 | 398.96 ± 1.47 (**-2.9%**) |
+
+With attempt 152's -2.6% @ d16384 and -1.1% @ d65536 (noisy), this is the price of the race fix and
+PV ALGO4 at depth. Decode is unchanged.
+
+### 2. Upstream's prefill matmuls on P100 use the long-chain fp16 accumulator
+
+On P100 every prompt-processing matmul of a quantized weight takes the cuBLAS path: sm_60 is
+below the DP4A cutoff so MMQ is never chosen, and `fast_fp16_hardware_available(600)` makes it
+fp16 — dequantize to half, `cublasGemmEx` with `CUBLAS_COMPUTE_16F` and
+`CUBLAS_GEMM_DEFAULT_TENSOR_OP`, convert back. Attempt 152 found that cuBLAS's COMPUTE_16F
+algorithms split into two accuracy families on this card (ALGO1-3 accumulate each output in one
+long fp16 chain, ALGO4-6 in blocks) and that the default switches to the long chains past a size
+threshold. The same harness at this model's per-GPU matmul shapes (`-sm tensor`), against an fp64
+product of the same fp16 inputs, weights N(0, 0.02), activations N(0, 1) with 8 massive channels:
+
+| shape (k = accumulation length) | rows | DEFAULT_TENSOR_OP NMSE | ALGO5/6 NMSE | ALGO6 time vs default |
+|---|---|---|---|---|
+| ffn_up/gate 5120→8704 | 64 | 1.33e-05 | 1.33e-05 | 0.83x |
+|  | 256 | 1.15e-04 | 1.28e-05 | 0.70x |
+|  | 512 | 1.18e-04 | 1.30e-05 | 0.50x |
+|  | 1024 | 1.16e-04 | 1.29e-05 | 1.07x |
+|  | 2048 | 1.17e-04 | 1.30e-05 | 1.03x |
+| ffn_down 8704→5120 | 64 | 1.21e-05 | 1.21e-05 | 0.80x |
+|  | 256 | 1.94e-04 | 1.19e-05 | 0.90x |
+|  | 512 | 1.93e-04 | 1.19e-05 | 0.52x |
+|  | 1024 | 1.96e-04 | 1.21e-05 | 0.50x |
+|  | 2048 | 1.96e-04 | 1.21e-05 | 1.05x |
+| attn_out 3072→5120 | 64 | 1.33e-05 | 1.33e-05 | 1.13x |
+|  | 256 | 7.12e-05 | 1.30e-05 | 1.00x |
+|  | 512 | 7.04e-05 | 1.33e-05 | 0.71x |
+|  | 1024 | 7.09e-05 | 1.31e-05 | 0.65x |
+|  | 2048 | 7.11e-05 | 1.31e-05 | 1.06x |
+| lm_head 5120→124160 | 64 | 1.17e-04 | 1.28e-05 | 0.65x |
+|  | 256 | 1.18e-04 | 1.28e-05 | 1.10x |
+|  | 512 | 1.17e-04 | 1.30e-05 | 0.96x |
+
+From 256 rows up (64 for the LM head) the default is the long chain: 5-16x the error of the
+blocked family, growing with the input width as the long-chain law predicts (NMSE ≈ 2.2e-8·k).
+At 512 and 1024 rows it is also the slow kernel — the blocked algorithms take half the time.
+ALGO7-23 are not supported for COMPUTE_16F on this card.
+
+**In the model** (`ALGO6` requested on Pascal for COMPUTE_16F, any failure falls back to the
+default; A/B through a temporary env knob, two interleaved cooled rounds, `-b 2048 -ub 2048`):
+
+| | DEFAULT_TENSOR_OP | ALGO6 | ALGO5 |
+|---|---|---|---|
+| pp512 | 240.16, 239.75 | **390.93, 390.74 (+62.9%)** | 381.68, 380.36 |
+| pp1024 | 318.13, 318.07 | **412.75, 411.81 (+29.6%)** | 397.60, 397.98 |
+| pp2048 | 410.88, 410.35 | 410.52, 411.13 (level) | 396.34, 397.34 |
+
+pp512 is every prompt under 512 tokens and every default-`-ub 512` ubatch; pp1024 every prompt tail
+between. **Perplexity**, 4096 x 30 at `-ub 2048`, paired per chunk against an **all-fp32** reference
+(`GGML_CUDA_CUBLAS_COMPUTE_TYPE=f32` + `GGML_CUDA_FA_GEMM_PREC=32`):
+
+| variant | PPL | mean ΔNLL | se | t |
+|---|---|---|---|---|
+| all-fp32 reference | 2.6102 | — | | |
+| control: all-fp32 at `-ub 1024` (reassociation only) | 2.6091 | -0.000419 | 0.000188 | -2.23 |
+| fp16, DEFAULT_TENSOR_OP (upstream) | 2.6210 | +0.004136 | 0.000618 | +6.69 |
+| **fp16, ALGO6** | **2.6191** | +0.003427 | 0.000463 | +7.40 |
+
+ALGO6 minus the default, paired: **-0.000709** (se 0.000473, t -1.50) — the right direction, but
+not separable from the reassociation control at 30 chunks. The fp16 path as a whole is measurably
+worse than fp32 (t ≈ 7); the long-chain accumulator is not most of that gap. ALGO6 is kept for
+its speed and its 10x op-level accuracy, not for a perplexity claim.
+
+The fourth planned row, fp32 matmuls with fp16 attention, went NaN at chunk 14 — which is how
+section 5's race was found. That race can hit any run whose tensor-parallel exchanges are
+uncompressed, which includes the fp32 reference and control above (fp32 matmuls, no P2P). All
+three fp32 rows are re-run on the fixed build in section 7.
+
+### 3. The GEMM running output, accumulated out of place
+
+`fattn_gemm_accum_O` computed `O[d] = O[d]*corr + Otmp[d]` in place: a load and a store of the
+same device address inside the thread loop — the shape that raced in the softmax (attempt 152). At
+DV=256 the loop runs once per thread and no run-to-run difference had been seen, but perplexity
+cannot see a single-element misread. It now reads one buffer and writes the other, swapping per
+chunk (DV·nt·gqa floats more scratch: 12 MB per GPU at `-ub 2048`).
+
+**Bit-identical**: every graph node of a 16k prefill (33254 nodes, both GPUs) hashes the same with
+the in-place and the out-of-place kernel (section 4's instrument). **Free**: pp2048 @ d16384,
+interleaved and cooled, in place 363.54 ± 0.78 and 363.91 ± 0.71, out of place 363.34 ± 1.02 and
+363.85 ± 0.42 — 0.04% apart, well inside the run-to-run spread.
+
+### 4. Is anything else nondeterministic? Every node, every run
+
+A debug hook (not committed) hashed the output bytes of every computed graph node, synchronizing
+after each node so that the hash reads exactly what the node wrote, and runs were compared node by
+node. Production configuration (fp16 matmuls, fp16 GEMM attention), out-of-place build:
+
+| workload | runs | nodes per run | structural mismatches | hash mismatches |
+|---|---|---|---|---|
+| prefill, 16384-token chunk (PPL 3.3132 every run) | 3 | 33254 | 0 | **0** |
+| MTP decode, 256 tokens (accept 78.431%, text `cc629f15` every run) | 2 | 77324 | 0 | **0** |
+
+Every node of the forward pass is deterministic — **under this instrument**. Its per-node
+synchronize is also its blind spot: a host wait between graph computes orders every device's
+queued work before the next graph is issued, so a race *between* devices cannot show. Section 5 is
+exactly such a race, and it only ever appeared in unhooked runs.
+
+### 5. A second silent race: a peer copy can overwrite the all-reduce buffer before its reader runs
+
+**Symptom.** The matmul study's fp32-matmul row (`GGML_CUDA_CUBLAS_COMPUTE_TYPE=f32`, fp16
+attention, no P2P) went NaN at chunk 14. Rerun on identical input, 15 chunks each, it was
+sporadic and not always NaN:
+
+| build (no hooks) | runs | events (first divergent chunk) |
+|---|---|---|
+| in-place accum_O | 2 | 1 — NaN from chunk 6 |
+| out-of-place accum_O | 3 | 1 — **silent**: every value from chunk 3 on is off by ~2e-5 (final cumulative NLL 0.909729 against 0.909724) |
+| out-of-place, peer-fix knob off | 5 | 1 — NaN from chunk 4 |
+
+An event is a chunk whose value differs from the per-chunk majority of all runs; every later chunk
+then differs too. Neither accum_O form removes it, and the silent case matters more than the NaN:
+nothing flags it. A run with a non-finite scan hook (one synchronize per node) showed nothing.
+
+**Mechanism.** The tensor-parallel all-reduce (`ggml-backend-meta.cpp`, `allreduce_fallback`,
+2 GPUs) runs per subgraph boundary: `graph_compute_async` of the subgraph on GPU0 then GPU1, then
+for each direction `push_data` — `ggml_backend_tensor_copy_async` of the partial into
+`node_tmp`, which lives in **the same per-device reduction buffer every time**
+(`bcj.bufs[i_buf]`, `i_buf` = 0 for 2 GPUs) — and an ADD graph on the destination that folds
+`node_tmp` into its partial. Since a4d1103c5 (Aug 31) this fork issues peer copies on a dedicated
+copy stream, so the two directions overlap on full-duplex PCIe; the copy is ordered against the
+**source** only (it waits on the source's `work_event`). A source that has raced ahead to the next
+subgraph can therefore land its next copy in the destination's reduction buffer before the
+destination's ADD of the *previous* boundary has read it — that ADD then sums the wrong partial.
+The compressed (f16) path added in e83a7913a already guards exactly this reuse with
+`peer_stage_free`; the uncompressed path never had an equivalent.
+
+Uncompressed exchanges are every exchange that is not a ≥ 512-row MUL_MAT output shown f16-exact:
+**every decode step, every MTP draft and verify batch, every prompt tail under 512 tokens**, and
+every exchange of a configuration whose partials are not f16-exact (fp32 matmuls — the study's
+configuration, and a much wider window without P2P, where the copy is staged through the host).
+The 2026-09-06 release binaries carry it; they are replaced in section 8.
+
+**Fix.** Before an uncompressed copy, the copy stream also waits on the **destination's** existing
+work marker. `graph_compute` records that marker after every graph — the meta backend's ADD
+included — and the ADD of one boundary is always issued before the next boundary's copies, so the
+marker the copy sees covers the reader it must not overtake. The first version *re-recorded* the
+destination's marker at copy time (v1). That is also correct, but by then the destination's stream
+holds this exchange's wait on the opposite copy, so the two directions serialise again — the
+cost the dedicated copy stream was built to remove. The kept version (v2) waits on the marker as it
+stands and records one only if none exists yet.
+
+**Evidence, statistical** (15 chunks, fp32 matmuls, no P2P, unhooked):
+
+| variant | complete runs | runs with an event |
+|---|---|---|
+| no fix (all unhooked runs above) | 10 | **3** (chunks 3, 4, 6) |
+| v1, record + wait | 4 (+1 clean through 12 chunks) | 0 |
+| **v2, existing marker (final build)** | 6 | **0** |
+
+**Evidence, deterministic.** A test build (not committed) delays GPU1's all-reduce ADD by
+enqueueing dummy `cublasSgemm` calls on its stream — no host synchronize, so the host keeps issuing
+GPU0's next subgraph and copies. That turns the race window from rare into certain:
+
+| 2 chunks of `ppl-orig.txt`, P2P on, per-chunk NLL | no delay | delayed, **fix off** | delayed, v1 | delayed, v2 |
+|---|---|---|---|---|
+| prefill, fp32 matmuls — every exchange uncompressed | 1.596804 / 1.370962 | **1.863645 / 1.618642** | 1.596804 / 1.370962 | 1.596804 / 1.370962 |
+| prefill, fp16 matmuls at `-ub 2048` — exchanges compressed, already guarded | 1.603656 / 1.376813 | 1.603656 / 1.376813 | — | 1.603656 / 1.376813 |
+| MTP decode, 64 tokens, greedy — uncompressed partials | text `9f1947a0`, accept 78.8% | **text `72c8d044`, accept 43.4%** | — | text `9f1947a0`, accept 78.8% |
+
+With the delay and no fix the corruption is total, not marginal, and it is **in the production
+decode configuration** (fp16, P2P, MTP): the draft acceptance rate halves and the generated text
+changes. The fp16 prefill row is the control that shows where the existing f16 guard already
+holds. Both fix variants are unaffected by the delay.
+
+**Cost** (production flags, `GGML_CUDA_P2P=1`, interleaved, cooled to ≤ 46 °C):
+
+| | tg256, `-r 3` (baseline 17.51) | MTP, 256 tokens, greedy |
+|---|---|---|
+| fix off | 30.99, 31.08 | 55.29, 55.33 |
+| v1, record + wait | 30.12, 30.14 (**-2.9%**) | 53.51, 53.51 (**-3.3%**) |
+| **v2, existing marker** | 30.81, 30.80 (**-0.7%**) | 55.02, 54.94 (**-0.6%**) |
+| final build (v2, no knob) | 30.78, 30.78 | 55.00, 55.04 |
+
+All four generate identical text (`7c366f4c`) at 83.333% acceptance. v1's serialisation is worth
+2-3% of decode; v2 costs 0.6-0.7%, which is the wait itself.
+
+### 6. Does the softmax race generalize to upstream kernels with the same shape?
+
+The softmax race was a load and a store of the same device address inside a multi-iteration thread
+loop. Upstream has that shape in `soft_max` in place, `rms_norm`/`norm` in place (their
+two-pass reload paths above 8192 columns) and `group_norm`. A stress harness (not committed) runs
+one big op repeatedly on identical input through the ggml backend and compares every output with
+the first, bit for bit (GPU1, 134M elements per launch — rows longer than the shared-memory
+blocks, so the in-place loads really are global-memory loads):
+
+| case | launches | differing launches |
+|---|---|---|
+| `soft_max`, out of place (control) | 100 | 0 |
+| `soft_max`, in place | 100 + 2000 | 0 |
+| `group_norm`, out of place | 100 | 0 |
+| `rms_norm`, in place | 100 + 2000 | 0 |
+| `norm`, in place | 100 + 2000 | 0 |
+
+Nothing differed. That is 2.68e11 element-computations per in-place case, at a row length
+(134M elements) far past the kernels' shared-memory cache path — so every in-place load really is a
+global load of an address the same thread has already stored to, which is the attention softmax's
+shape. The bound this gives is narrow, not clean: 0 events in 2100 launches puts a 95% upper bound of
+0.14% on the per-launch failure rate, and the attention softmax itself only failed 4 and 6 of 2240
+self-checked launches (0.18-0.27%). So this measures a rate below the one that was biting, it does
+not clear the pattern. Upstream is left alone either way — no kernel gets rewritten on suspicion.
+The two kernels in this fork were made out of place because there the fix is nearly free: ~1% of the
+softmax op, nothing measurable in the accumulator.
+
+### 7. The all-fp32 reference, re-run race-free
+
+Section 2's paired study used an all-fp32 reference: fp32 matmuls (`GGML_CUDA_CUBLAS_COMPUTE_TYPE=f32`)
+and fp32 attention (`GGML_CUDA_FA_GEMM_PREC=32`). fp32 matmul partials are not f16-exact, so every
+tensor-parallel exchange in those runs was uncompressed — exactly the configuration section 5's race
+hits. (Attempt 152's fp32-*attention* study is unaffected: its matmuls were fp16, so its exchanges
+were compressed and guarded.) The three affected rows were re-run on the final build, and the fp16
+ALGO6 row with them, as a check that the final build reproduces the earlier fp16 numbers:
+
+| 4096 × 30 at `-ub 2048`, paired per chunk against the all-fp32 reference | PPL | mean ΔNLL | se | t |
+|---|---|---|---|---|
+| all-fp32 reference (fp32 matmuls + fp32 attention) | 2.6102 | — | | |
+| control: all-fp32 at `-ub 1024` — reassociation only | 2.6091 | -0.000419 | 0.000188 | -2.23 |
+| **fp32 matmuls, fp16 attention** | **2.6095** | **-0.000263** | 0.000191 | **-1.38** |
+| fp16 matmuls, ALGO6 (what ships) | 2.6191 | +0.003427 | 0.000463 | +7.40 |
+| fp16 matmuls, DEFAULT_TENSOR_OP (upstream) | 2.6210 | +0.004136 | 0.000618 | +6.69 |
+
+**Not contaminated after all**: the re-run reference, control and ALGO6 rows reproduce the 09-14
+values *chunk for chunk*, all 30 — so the runs behind section 2's table were not among the ones the
+race hit, and that table stands as measured.
+
+And the decomposition is now unambiguous. **fp16 matmuls minus fp32 matmuls, both with fp16
+attention, paired: +0.003690 (se 0.000452, t 8.16)** — the whole measurable distance from fp32 is
+the matmuls' fp16 inputs and accumulation. With fp32 matmuls, the fp16 GEMM attention path is
+**indistinguishable from all-fp32** (-0.000263, |t| 1.4, smaller than the pure-reassociation
+control's own displacement). So on this model, at this resolution:
+
+- `GGML_CUDA_CUBLAS_COMPUTE_TYPE=f32` buys back essentially the entire gap to fp32 (2.6191 → 2.6095);
+- `GGML_CUDA_FA_GEMM_PREC=32` buys nothing measurable at the model level, though it is 8x more
+  accurate at the op level (attempt 151);
+- ALGO6 is a third of the distance between upstream's fp16 matmuls and fp32 (+0.00343 against
+  +0.00414), and it is faster.
+
+Section 8 prices the precise modes.
+
+### 8. The final build
+
+Source: HEAD + out-of-place accum_O + matmul ALGO6 + peer fix v2 + per-exchange compression type +
+the same-GPU copy guard + the zero-slice fill; no knobs, no debug hooks. Libraries
+`libggml-cuda 11c9bd03`, `libggml-base b7e8e962`.
+
+| gate | result |
+|---|---|
+| `test-backend-ops -o FLASH_ATTN_EXT` | **3961/3961**, 3/3 backends |
+| `test-backend-ops` full suite | **14593/14593**, 3/3 backends |
+| perplexity, `ppl-orig.txt`, `-c 4096` (band 2.6209 ± 0.0199) | **2.6097 ± 0.0198** — pass, and 0.0107 below the previous build |
+| tg256, cool cards, `-r 5` (baseline 17.51) | **30.64 ± 0.19** |
+
+Three earlier builds of the same series read the same perplexity to four decimals and the same
+tg256 within noise: without the zero-slice fill (`4debe26b`) 2.6097 and 30.67 ± 0.18, and without
+the same-GPU guard as well (`df46e6b0`) 2.6097 and 30.72 ± 0.16, both passing 3961/3961 and
+14593/14593 on both GPUs. Neither of the last two changes can move a two-device number: the
+same-GPU branch is never taken with one context per GPU, and a verbose two-device run logs the
+zero-slice path 0 times. The gate corpus reading
+is 0.0107 below attempt 152's 2.6204; it is a single 30-chunk number at 512-row ubatches, so the
+paired study in section 7 — not this — is the accuracy statement.
+
+**Against the shipped release binaries** (2026-09-06, `LD_LIBRARY_PATH` pointed at the bundle),
+interleaved, both cards cooled to ≤ 48 °C before every run, `GGML_CUDA_P2P=1`:
+
+| t/s | release | final | final vs release |
+|---|---|---|---|
+| pp512 (`-b 2048 -ub 2048`) | 326.69, 327.27 | 389.88, 390.26 | **+19.3%** |
+| pp1024 | 375.13, 375.82 | 412.50, 412.80 | **+9.9%** |
+| pp2048 | 423.85, 424.56 | 411.26, 411.67 | **-3.0%** |
+| pp4096, default `-b 2048 -ub 512` (eight 512-row ubatches) | 316.42 | 373.86 | **+18.2%** |
+| pp2048 @ d16384, `-ub 2048` | 372.32 | 363.17 | **-2.5%** |
+| tg256 | 30.85, 30.85 (attempt 153 §1) | 30.72 ± 0.16 | -0.4% |
+
+The default ubatch is 512, so the shape a server actually runs — and every prompt tail — is 18-19%
+faster. The -2.5 to -3% at `-ub 2048` is the price of the correctness work: the ALGO3 revert
+(~1.8%, attempt 146), the out-of-place softmax (~1% of the attention op), PV ALGO4 (~8% of the PV
+call) and the peer-copy wait (~0.7% of decode, less of prefill).
+
+**Decode at depth** (final build, no MTP, cooled): tg128 **30.59 ± 0.03** at depth 0 and
+**28.35 ± 0.13** at depth 20000.
+
+**The production operating point** — `llama-server -c 262144 -b 262144 -ub 2048 -np 1` with the
+MTP draft, two 19966-token requests, VRAM sampled every 500 ms:
+
+| | value |
+|---|---|
+| peak VRAM | **16137 MiB on GPU0** (incl. Sunshine's 392) and **15745 MiB on GPU1**, of 16384 |
+| prompt | 350.5 then 366.1 t/s |
+| generation (256 tokens, MTP) | 21.2 t/s on the first request, 30.1 t/s on the second |
+| draft acceptance | 159 of 375 |
+
+The out-of-place softmax and accum_O together add ~62 MB per GPU to the attempt-152 figure
+(15999/15743), which leaves ~140 MiB of headroom on GPU0 at this context. The first request's
+generation rate is warm-up; the second matches the tg128 @ d20000 measurement above.
+
+### 8b. What the precise modes cost, and what they buy
+
+Section 7 says the whole measurable distance from fp32 is the matmuls. Priced on the final build,
+interleaved and cooled, `-b 2048 -ub 2048`:
+
+| | pp512 | pp2048 | tg256 |
+|---|---|---|---|
+| default (fp16 matmuls, fp16 GEMM attention) | 391.09 ± 0.31 | 413.77 ± 0.88 | 30.78 ± 0.12 |
+| `GGML_CUDA_FA_GEMM_PREC=32` (fp32 attention) | 391.44 ± 0.12 | 414.07 ± 1.59 | — |
+| `GGML_CUDA_CUBLAS_COMPUTE_TYPE=f32` (fp32 matmuls) | **216.80 ± 0.31 (-44.6%)** | **255.07 ± 0.72 (-38.4%)** | — |
+| both | 216.55 ± 0.34 | 255.13 ± 0.86 | 30.77 ± 0.13 |
+
+**Decode is untouched by either mode**, as expected: the GEMM attention path needs
+`Q->ne[1] >= 128` and decode matmuls go through `mul_mat_vec_q`, not cuBLAS. fp32 attention is also
+free at short context; its cost is at depth (-11.4% at d16384, -27.2% at d65536 — attempt 151).
+
+So the whole accuracy/speed trade on this card is one flag: **`GGML_CUDA_CUBLAS_COMPUTE_TYPE=f32`
+buys the last 0.0037 nats/token (perplexity 2.6191 → 2.6095) for ~40% of prefill throughput and
+nothing on decode.** The default stays fp16 + ALGO6 — ALGO6 already took a third of that gap while
+being *faster* — and the flag is documented as the accuracy mode in the release QUICKSTART.
+
+### 8c. More virtual devices than GPUs is not trustworthy — and one real bug found on the way there
+
+The same-GPU copy guard (section 5) only runs when two virtual devices share one physical GPU, so
+`GGML_CUDA_DEVICES` — the fork's virtual-device emulation, round-robin over the real GPUs — was the
+only way to exercise it. It turned out not to be usable as an instrument, for its own reason.
+
+Identical commands, `-sm tensor`, Q4_0, `-c 4096 -b 2048 -ub 512`, fp32 matmuls, 2 chunks, per-chunk
+NLL, no delay injection and no knobs:
+
+| build | devices | runs | nan | the runs that completed |
+|---|---|---|---|---|
+| this session's | 2 physical | 3 | 0 | 1.629033 / 1.392079, three times identical |
+| this session's | 3 virtual | 8 | **4** | 1.629406 / 1.392240 ×3, 1.629406 / 1.392304, 1.629385 / nan |
+| this session's, tile attention | 3 virtual | 5 | 0 | 1.628753 / 1.391795, five times identical |
+| attempt 152 (`vc2`) | 3 virtual | 3 | 0 | 1.629406 / 1.392240, three times identical |
+| 2026-09-06 release | 3 virtual | 3 | 0 | 1.628702 / 1.391983, three times identical |
+| this session's | 4 virtual | 1 | 1 | 1.628850 / nan (and nan from chunk 0 with fp32 matmuls) |
+| this session's, tile attention | 4 virtual | 1 | 0 | 1.628340 / 1.391811 |
+
+Two physical devices are bit-stable; three virtual devices are not, and not only through nan — the
+completed runs disagree with each other in the fourth decimal. The knob build puts it beyond the
+copy guards: at three virtual devices the nan appeared with the same-GPU guard **on** (1 of 3) and
+with it **off** (1 of 2). Sporadic, moving between runs of one binary — the signature of reading
+memory nobody wrote.
+
+**What it is not.** The first suspect was `allreduce_fallback`'s own `// FIXME 0.0f * NaN == NaN`:
+it zeroes the output of any device whose slice came out empty by scaling that output by `0.0f`,
+and nothing computed that slice, so the buffer holds whatever the graph allocator left there. That
+would explain an allocation-dependent NaN exactly. It is a real bug and it is fixed here —
+`GGML_OP_FILL` writes the constant without reading the buffer — but it is **not this one**: a
+verbose run at three virtual devices logs the zero-slice path **0 times** on this model, so the
+branch never executes. Fixed on inspection, not because it was measured.
+
+**Where it does point.** The GEMM attention path, and the table above is the whole argument: with
+`GGML_CUDA_FA_GEMM=0` the same command at three virtual devices is identical five times out of
+five and at four devices is clean, while the GEMM path reads nan in half its runs. Two physical
+devices never show it, and the fork ships on two physical devices, so this is recorded as an open defect of
+the emulation rather than chased further. The consequence for section 5 is only that the same-GPU
+copy guard is committed **on inspection**: it is the peer fix's own wait, on the branch two virtual
+devices on one card take, and no configuration that exercises it produces a trustworthy number.
+
+### 9. Considered and declined
+
+- **One-pass softmax** (skip the second pass for rows whose max did not rise; bit-identical, ~1-2%
+  at depth). It stores `P[j]` twice for the rows that do need the second pass — a new
+  same-address store/store sequence in exactly the kernel whose race is not understood. Not worth
+  1-2%.
+- **A faster PV algorithm to win back the depth trail.** Round-robin timing at the PV shape
+  (DV=256, k=2048, fp16, 30 rounds, median ms; ratio to ALGO4):
+
+  | nt (n = nt·6) | DEFAULT | ALGO4 | ALGO5 | ALGO6 |
+  |---|---|---|---|---|
+  | 128 | 0.122 (1.003x) | 0.121 | 0.118 (0.974x) | 0.180 (1.485x) |
+  | 512 | 0.278 (1.001x) | 0.278 | 0.291 (1.048x) | 0.297 (1.068x) |
+  | 1024 | 0.521 (1.008x) | 0.516 | 0.525 (1.017x) | 0.531 (1.029x) |
+  | 2048 | **0.881 (0.917x)** | 0.960 | 0.968 (1.008x) | 0.957 (0.997x) |
+
+  The only faster choice at nt=2048 is DEFAULT, which is the long-chain kernel attempt 152 moved
+  away from. ALGO4 stays.
+- **ALGO4 for the 2048-row matmuls.** Same accuracy as ALGO6 but 2.2-2.5x slower at n ≥ 1024 in
+  the harness; ALGO6 is level with the default there in the model.
+- **Peer fix v1** (record the destination's marker at copy time): correct, but it serialises the
+  two directions of every uncompressed exchange — see section 5.

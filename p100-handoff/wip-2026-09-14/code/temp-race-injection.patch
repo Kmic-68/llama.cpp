@@ -1,0 +1,51 @@
+@@ -2592,6 +2592,11 @@
+         const int src_physical = ggml_cuda_get_physical_device(cuda_ctx_src->device);
+         const int dst_physical = ggml_cuda_get_physical_device(cuda_ctx_dst->device);
+         if (src_physical == dst_physical) {
++            // same exposure as the peer path below; TEMP knob shares GGML_CUDA_PEER_WAIT_DST
++            static const int TEMP_same_dev_wait_dst = [] { const char * e = getenv("GGML_CUDA_SAMEDEV_WAIT_DST"); return e ? atoi(e) : 1; }();
++            if (TEMP_same_dev_wait_dst != 0 && cuda_ctx_dst->work_event != nullptr) {
++                CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx_src->stream(), cuda_ctx_dst->work_event, 0));
++            }
+             CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
+         } else {
+ #ifdef GGML_CUDA_NO_PEER_COPY
+@@ -4642,6 +4647,38 @@
+ 
+     ggml_cuda_set_device(cuda_ctx->device);
+ 
++    // TEMP race injection -- never commit. Delays the meta backend's all-reduce ADD on one device with
++    // dummy sgemms enqueued on its compute stream (no host synchronize), so the other device's next
++    // copy into the shared reduction buffer can land before this ADD has read it.
++    {
++        static const int TEMP_delay_dev  = [] { const char * e = getenv("GGML_CUDA_TEMP_DELAY_ADD_DEV"); return e ? atoi(e) : -1; }();
++        static const int TEMP_delay_n    = [] { const char * e = getenv("GGML_CUDA_TEMP_DELAY_N");       return e ? atoi(e) : 4000; }();
++        static const int TEMP_delay_reps = [] { const char * e = getenv("GGML_CUDA_TEMP_DELAY_REPS");    return e ? atoi(e) : 8; }();
++        if (TEMP_delay_dev == cuda_ctx->device && cgraph->n_nodes == 1 && cgraph->nodes[0]->op == GGML_OP_ADD) {
++            static void * dA[GGML_CUDA_MAX_DEVICES] = { nullptr };
++            static void * dC[GGML_CUDA_MAX_DEVICES] = { nullptr };
++            static int64_t n_delayed = 0;
++            const int n = TEMP_delay_n;
++            const size_t nb = (size_t) n * n * sizeof(float);
++            if (dA[cuda_ctx->device] == nullptr) {
++                CUDA_CHECK(cudaMalloc(&dA[cuda_ctx->device], nb));
++                CUDA_CHECK(cudaMalloc(&dC[cuda_ctx->device], nb));
++                CUDA_CHECK(cudaMemsetAsync(dA[cuda_ctx->device], 0, nb, cuda_ctx->stream()));
++                fprintf(stderr, "TEMP delay: device %d, %d x sgemm n=%d before every single-node ADD graph\n", cuda_ctx->device, TEMP_delay_reps, n);
++            }
++            const float one = 1.0f, zero = 0.0f;
++            for (int r = 0; r < TEMP_delay_reps; r++) {
++                CUBLAS_CHECK(cublasSgemm(cuda_ctx->cublas_handle(), CUBLAS_OP_N, CUBLAS_OP_N, n, n, n,
++                        &one, (const float *) dA[cuda_ctx->device], n, (const float *) dA[cuda_ctx->device], n,
++                        &zero, (float *) dC[cuda_ctx->device], n));
++            }
++            n_delayed++;
++            if ((n_delayed & (n_delayed - 1)) == 0) {
++                fprintf(stderr, "TEMP delay: %lld ADD graphs delayed\n", (long long) n_delayed);
++            }
++        }
++    }
++
+     bool use_cuda_graph             = false;
+     bool cuda_graph_update_required = false;
+     const void * graph_key = nullptr;

@@ -1,0 +1,81 @@
+diff --git a/OPTLOG.md b/OPTLOG.md
+index 4d8f5981a..757de0f58 100644
+--- a/OPTLOG.md
++++ b/OPTLOG.md
+@@ -5580,3 +5580,76 @@ aligns tensor data to 32 bytes). Two places have no slack to absorb it:
+ It cannot fault in practice (for `ne11 <= 8` the q8_1 size is never page-aligned, and CUDA
+ allocates in coarse granularity), but it is a genuine read past an allocation. Fix: 16 bytes of
+ slack on both. Pending, to land with the next build.
++
++## Attempt 151 — a precise GEMM attention mode, and runtime proof of the CUDA-graph fix (2026-09-12)
++
++### Runtime proof: CUDA-graph replay is now correct
++
++MTP decode (`llama-speculative-simple --spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min
++0.2`, greedy, seed 42, 256 tokens) with `GGML_CUDA_GRAPHS_PRE_VOLTA` off and on:
++
++| | t/s | accept | graphs reused |
++|---|---|---|---|
++| graphs OFF | 53.78 | 79.84% | — |
++| graphs ON | 53.57 | 79.84% | **61** |
++
++**Generated text byte-identical, graphs on vs off (868 bytes)**, and off-vs-off identical (the
++run is deterministic, so the comparison means something). 61 replays of captured graphs against
++eager execution with no divergence. This also re-measures the MTP record on the current build:
++53.6–53.8 t/s against the 54.48 best-of-six on warm cards.
++
++### Precise mode: `GGML_CUDA_FA_GEMM_PREC=32`
++
++Runtime-selectable, default unchanged. QK^T becomes `CUBLAS_COMPUTE_32F` over the same fp16 K
++and Q with an fp32 S; the softmax reads and writes fp32; V is dequantized straight to fp32;
++PV is all-fp32. Every half×half product needs 22 significant bits, so **products are exact** —
++upstream's tile kernel rounds each product to half before accumulating in fp32.
++
++**Accuracy against the CPU fp32 reference** (`test-backend-ops -o FLASH_ATTN_EXT`, new eval cases
++at GEMM-firing shapes: D=256, 2 KV heads, GQA 6, q4_0 KV; `GGML_TEST_PRINT_ERR=1`):
++
++| NMSE vs CPU fp32 | nb=512 | nb=2048 |
++|---|---|---|
++| GEMM fp16 (default) | 1.14–1.24e-05 | 3.98–4.25e-05 |
++| **GEMM fp32 (precise)** | **1.44–1.63e-06** | **1.54–1.70e-06** |
++| tile kernel (`GGML_CUDA_FA_GEMM=0`) | 2.20–2.33e-06 | 2.26–2.34e-06 |
++
++Each range spans kv = 4096, 16384, 65536: all three are flat with context. Precise mode is
++**1.4x more accurate than the fp32-accumulating tile kernel** and **7–26x more accurate than the
++fp16 default**. The fp16 default's error also grows with batch width (512 → 2048); neither fp32
++variant does. No failures or aborts in any variant.
++
++### Bug found in the first cut, fixed before anything was committed
++
++Both GEMM modes aborted with `GGML_ASSERT(ptr == pool_addr + pool_used)` (ggml-cuda.cu:681): the
++VMM pool requires frees in exact reverse order of allocation, and destructors run in reverse
++order of declaration. The first cut declared the precision-dependent buffers empty and allocated
++them after `O`. Now each buffer is allocated where it is declared, with the unused precision's
++twin left null (skipped on free).
++
++### Other fixes in this build
++
++- **15-byte over-read closed.** mmvq staging rounds each block run up to whole 16-byte units and
++  can read up to 15 bytes past the last block. 16 bytes of slack added to quantized tensor
++  allocations on sm_60 (same `__CUDA_ARCH_LIST__ == 600` gate as the staging) and to the q8_1
++  activation buffer.
++- **GEMM stride guard.** `gemm_supported()` now declines K/V with `nb[0] != ggml_type_size(type)`,
++  the same condition upstream asserts before the same strided dequantizer
++  (`fattn-common.cuh:1036`, `GGML_ASSERT(K->nb[0] == ts)`). A permuted view would otherwise be read
++  with the wrong stride. Normal KV views always satisfy it (`ggml.c:1832` sets `nb[0] =
++  ggml_type_size(type)` for every new tensor, views included).
++
++### Verified clean this session (no change)
++
++**q8_1 activation cache vs in-place mutation.** A cache hit is only safe if an activation cannot
++change between two matmuls that share it. ggml lets a node take over its parent's buffer only
++when `p_hn->n_children == 1` (`ggml-alloc.c:657`), i.e. when that node is the parent's *last*
++remaining consumer, with the count decremented in graph order. So every matmul that could hit the
++cache for an activation executes before anything may overwrite it.
++
++### Speed — the first measurement was thermally confounded
++
++First three-way run, pp2048 at depth 16384, in run order: GEMM fp16 **372.83** (cold) → GEMM
++fp32 328.04 → tile 303.65 → GEMM fp16 again **323.37 ± 6.73** (hot). The two fp16 readings
++disagree by 13% on the same binary. A controlled A/B (both cards cooled to <= 42 C before every
++run, variants alternated, depths 16384 and 65536) follows below.

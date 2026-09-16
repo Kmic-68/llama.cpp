@@ -1,0 +1,36 @@
+fix: an uncompressed peer copy could overwrite the all-reduce buffer before its reader ran
+
+The tensor-parallel all-reduce (ggml-backend-meta.cpp, allreduce_fallback) lands every exchange in
+the same per-device reduction buffer, bcj.bufs[i_buf], and folds it into the partial with an ADD
+queued on the destination's compute stream. Since the peer copies moved to a dedicated copy stream
+(a4d1103c5, for full-duplex PCIe), a copy is ordered against the source only: it waits on the
+source's work marker. A source that had raced ahead to the next layer could therefore overwrite the
+destination's reduction buffer before the destination's ADD of the previous layer had read it --
+that ADD then summed the wrong partial. The compressed (f16) path already guarded exactly this
+reuse with peer_stage_free; the uncompressed path had no equivalent.
+
+Uncompressed exchanges are every decode step, every MTP draft/verify batch, every prompt tail below
+512 tokens, and every exchange of a configuration whose partials are not f16-exact.
+
+Found as sporadic whole-chunk corruption with fp32 matmuls (GGML_CUDA_CUBLAS_COMPUTE_TYPE=f32, no
+P2P): 3 of 10 unhooked 15-chunk perplexity runs diverged -- two into NaN, one silently, every chunk
+from the third on off by ~2e-5 nats. Per-node hashing could not see it: any host synchronize
+between graph computes orders the destination's ADD first. Proven instead with a test build that
+delays the destination's ADD with dummy sgemms on its own stream. That makes the race certain, and
+it corrupts the *production* decode path -- MTP at 64 tokens greedy, fp16, P2P: different text and
+43.4% draft acceptance against 78.8%. With the fix, delayed or not, the text and the acceptance
+rate are identical to the undelayed run, and 6 of 6 unhooked fp32 runs agree chunk for chunk.
+
+Fix: before an uncompressed copy, the copy stream also waits on the destination's work marker,
+which graph_compute records after every graph -- including the meta backend's ADD, which is always
+enqueued before the next layer's copies are issued. Waiting on the marker as it stands keeps the
+two directions overlapped; re-recording it at copy time would also capture this exchange's wait on
+the opposite copy and serialise them again -- measured at 2.9% of tg256 and 3.3% of MTP.
+
+Cost of the kept form, production flags, interleaved and cooled: tg256 31.04 -> 30.81 (-0.7%),
+MTP 55.31 -> 54.98 (-0.6%).
+
+OPTLOG attempt 153.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk

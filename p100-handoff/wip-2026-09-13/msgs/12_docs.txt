@@ -1,0 +1,25 @@
+docs: attempts 151-153 -- two silent races, the prefill matmul family, and where fp16 actually costs accuracy
+
+OPTLOG attempt 151 (a precise GEMM attention mode, runtime proof of the CUDA-graph fix), attempt
+152 (the in-place softmax race, found, misdiagnosed once, then proven; the real fp16 error source)
+and attempt 153 (this session): the peer-copy race, the cuBLAS ALGO6 prefill matmuls, the
+out-of-place accumulator, the upstream-kernel stress, the all-fp32 reference re-run race-free, the
+final build's gates, what the precise modes cost, and the `GGML_CUDA_DEVICES` defect that is left
+open.
+
+The headline for anyone reading this later: **the only measurable accuracy gap between this fork
+and an all-fp32 run is the prefill matmuls' fp16 inputs and accumulation** -- paired per-chunk over
+4096 x 30 tokens, fp16 matmuls sit +0.0034 nats/token from fp32 (t 7.4) and fp32 matmuls sit at
+-0.0003 (t -1.4, i.e. indistinguishable). `GGML_CUDA_CUBLAS_COMPUTE_TYPE=f32` buys that back for
+~40% of prefill throughput and nothing at all on decode. The default stays fp16 + ALGO6.
+
+Also here:
+- `p100-handoff/VERIFICATION.md`: the rows this session falsified, with what replaced them.
+- `p100-handoff/release-sync/`: the audit document, the correction notices appended to the release
+  bundle's README/QUICKSTART/FINDINGS, and the two scripts that push binaries, patches, diffs and
+  docs into /mnt/fast/p100-llamacpp-release.
+- `p100-handoff/wip-2026-09-13/`, `wip-2026-09-14/`: the harnesses, scripts and logs behind the
+  numbers, plus the two temporary patches (race injection, node hashing) that reproduce them.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk

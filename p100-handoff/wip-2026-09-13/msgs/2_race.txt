@@ -1,0 +1,32 @@
+fix: GEMM attention softmax writes probabilities out of place -- the in-place write raced
+
+Since 98de4588f the softmax wrote P over the scores S it had just read, in one buffer. On this
+toolchain the store can land before the load of the same element -- with the two aliased
+__restrict__ parameters of the original, with one restrict pointer, and with no restrict at
+all. A probability (<= 1/8) read back as a score gives exp(4P - m) against a very negative row
+max: |dP| up to 1.6e7 on the affected rows. Silent in fp32; in fp16 it overflows half and NaNs
+the output.
+
+Found through run-to-run variation of fp32 perplexity on identical input (3.3144-3.3272 on one
+16k chunk). Isolated: tile path deterministic; CUDA_LAUNCH_BLOCKING=1 still varied; cuBLAS alone
+bit-identical; per-call hashes showed a call with bit-identical inputs and a different output;
+per-stage checksums put the divergence in the softmax's second pass. Proven with an in-op
+self-check running the kernel twice on identical inputs (fp32, 16k, ~2240 launches per run):
+in place 4, 6 and 3 mismatches (restrict, restrict, no restrict); out of place 0 of ~6700.
+fp32 now reads 3.3165 on every run (10 runs). fp16 3.3185 every run.
+
+Cost: ~1% of the attention op, and nkv_c*nt*gqa more elements of scratch (50 MB per GPU at
+-ub 2048 in fp16).
+
+Also in this change:
+- GGML_CUDA_FA_GEMM_PREC=32: fp32 accumulation for both GEMMs over the same fp16 K and Q (exact
+  products), fp32 scores, probabilities and V. NMSE vs CPU fp32 1.5e-6, against 2.3e-6 for the
+  tile kernel. -11% pp2048 at depth 16384, -27% at 65536. Default unchanged.
+- decline K/V with nb[0] != ggml_type_size(type): the strided dequantizers assume it, as
+  upstream asserts before the same call (fattn-common.cuh:1036).
+
+Intermediate state of a three-commit series; the series' final state is what was built and
+gated. OPTLOG attempts 151-152.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk

@@ -1,0 +1,50 @@
+diff --git a/p100-handoff/VERIFICATION.md b/p100-handoff/VERIFICATION.md
+index e123b986c..ab5cffe52 100644
+--- a/p100-handoff/VERIFICATION.md
++++ b/p100-handoff/VERIFICATION.md
+@@ -331,3 +331,45 @@ QK^T uses `CUBLAS_COMPUTE_16F` (k=256; the tile kernel likewise keeps KQ in half
+ PV uses `CUBLAS_COMPUTE_32F` because it sums thousands of positive terms. **The
+ f16-PV variant has never been tested** — fp32 was chosen from caution, not
+ measurement, and it is the single biggest remaining performance lever.
++
++### Update 2026-09-13 — the GEMM attention path, re-verified (OPTLOG attempts 151-152)
++
++Three statements above are now known to be wrong, and one was hiding a real bug.
++
++| earlier statement | status |
++|---|---|
++| "the tile kernel likewise keeps KQ in half" | **False.** Tile accumulates KQ in fp32 (`fattn-tile.cuh:604`); it keeps the products in half. |
++| "PV uses `CUBLAS_COMPUTE_32F`" / "the f16-PV variant has never been tested" | **Stale.** Both GEMMs ship `COMPUTE_16F`. The fp16 PV was measured this session — it is the path's dominant error, and `CUBLAS_GEMM_DEFAULT` made it 10x worse than it needs to be (below). |
++| "correctness of the new attention path: 3949/3949, re-run after every change including the aliasing" | **Insufficient.** The aliasing change (98de4588f) introduced a data race that `test-backend-ops` cannot see: it compares against CPU with a tolerance, once, on random data. |
++
++**The race.** The softmax kernel wrote probabilities over the scores it had just read, in one
++buffer. On this toolchain the store can land before the load of the same element, with or
++without `__restrict__`. Found through run-to-run variation of fp32 perplexity on identical
++input (3.3144 to 3.3272 on one 16k chunk), localized with per-call input/output hashes (a call
++with bit-identical inputs produced a different output) and per-stage checksums (only the
++softmax's second pass disagreed), and proven with an in-op self-check that runs the kernel twice
++on identical inputs: in place 3-6 mismatched launches per ~2240, out of place 0 of ~6700. An
++affected launch is not a rounding difference — summed |ΔP| of 3954 to 1.6e7 against
++probabilities ≤ 1/8. fp16 showed no mismatch in 15360 checked launches but is the same pattern,
++and there the read-back value overflows half and NaNs the output; one 4k perplexity run did go
++NaN and did not reproduce. **Fixed: the probabilities get their own buffer** (~1% of the op,
++50 MB per GPU at `-ub 2048`). Every build since 98de4588f, including the release, has the race.
++
++**Determinism is now a checked property.** fp32 GEMM: 3.3165 on all 10 runs across the
++out-of-place builds. fp16 GEMM: 3.3185 every run. tile: 3.3134 every run.
++
++**Precision.** NMSE against the CPU fp32 reference at the path's shapes (D=256, 2 KV heads,
++GQA 6, q4_0 KV, kv 4096-65536):
++
++| | nb=512 | nb=2048 |
++|---|---|---|
++| fp16 GEMM, release (PV `GEMM_DEFAULT`) | 1.14-1.24e-5 | 3.98-4.25e-5 |
++| **fp16 GEMM, now (PV `ALGO4`)** | 1.18-1.29e-5 | **1.20-1.24e-5** |
++| fp32 GEMM (`GGML_CUDA_FA_GEMM_PREC=32`) | 1.49-1.69e-6 | 1.46-1.64e-6 |
++| tile kernel | 2.18-2.43e-6 | 2.27-2.37e-6 |
++
++Perplexity effect: see the paired studies in OPTLOG attempt 152.
++
++**262144 context, measured** (was "never measured"): `llama-server -c 262144 -b 262144 -ub 2048
++-np 1` with the MTP draft, 19966-token prompt: peak VRAM 15999 MiB on GPU0 (incl. Sunshine) and
++15743 MiB on GPU1, prompt 334.8 t/s (in-place build; the out-of-place fix adds 50 MB of GEMM scratch per GPU).

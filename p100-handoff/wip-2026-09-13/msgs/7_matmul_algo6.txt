@@ -1,0 +1,26 @@
+perf: Pascal fp16 prefill matmuls request cuBLAS ALGO6 -- 10x the accuracy, up to +63%
+
+On P100 every prefill matmul of a quantized weight is a COMPUTE_16F cublasGemmEx (sm_60 never takes
+MMQ). cuBLAS's COMPUTE_16F algorithms split into two accuracy families on this card -- ALGO1-3
+accumulate each output in one long fp16 chain, ALGO4-6 in blocks -- and CUBLAS_GEMM_DEFAULT_TENSOR_OP
+picks the long chains from ~256 rows up (64 for the LM head). Against an fp64 product of the same
+fp16 inputs at this model's per-GPU shapes, the default gives NMSE ~2.2e-8*k (7e-5 at k=3072, 1.2e-4
+at 5120, 2e-4 at 8704); ALGO6 gives 1.2-1.3e-5 at every shape. ALGO7-23 are not supported for 16F.
+
+At 512 and 1024 rows the default is also the slow kernel. Qwen3.8-27B Q6_K, -sm tensor, two
+interleaved cooled rounds:
+
+  pp512   239.96 -> 390.84 t/s  (+62.9%)
+  pp1024  318.10 -> 412.28 t/s  (+29.6%)
+  pp2048  410.62 -> 410.83 t/s  (level)
+
+ALGO5 was the same accuracy and 2.5-3.5% slower than ALGO6 at every size. Perplexity, 4096 x 30 at
+-ub 2048, paired per chunk against an all-fp32 reference (fp32 matmuls and fp32 attention, 2.6102):
+the default +0.00414 NLL (t 6.7), ALGO6 +0.00343 (t 7.4); ALGO6 minus default -0.00071 (t -1.5),
+against a reassociation control of -0.00042. Any failure falls back to the default; other GPUs
+and compute types are unchanged.
+
+OPTLOG attempt 153.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk

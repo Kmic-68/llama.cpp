@@ -1,0 +1,16 @@
+fix: GEMM attention accumulates its running output out of place
+
+fattn_gemm_accum_O computed O[d] = O[d]*corr + Otmp[d] in place: a load and a store of the same
+device address inside the thread loop, the shape that raced in this path's softmax (8978d3018).
+At DV=256 the loop runs once per thread and no run-to-run difference had been seen, but perplexity
+cannot see a single-element misread. The running output now alternates between two buffers,
+swapped per chunk; the second costs DV*nt*gqa floats (12 MB per GPU at -ub 2048).
+
+Bit-identical: every graph node of a 16k prefill (33254 nodes, both GPUs) hashes the same with the
+in-place and the out-of-place kernel. Free: pp2048 at depth 16384, interleaved and cooled, reads
+363.5/363.9 t/s in place against 363.3/363.9 out of place.
+
+OPTLOG attempt 153.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk

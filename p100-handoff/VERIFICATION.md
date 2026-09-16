@@ -331,3 +331,96 @@ QK^T uses `CUBLAS_COMPUTE_16F` (k=256; the tile kernel likewise keeps KQ in half
 PV uses `CUBLAS_COMPUTE_32F` because it sums thousands of positive terms. **The
 f16-PV variant has never been tested** — fp32 was chosen from caution, not
 measurement, and it is the single biggest remaining performance lever.
+
+### Update 2026-09-13 — the GEMM attention path, re-verified (OPTLOG attempts 151-152)
+
+Three statements above are now known to be wrong, and one was hiding a real bug.
+
+| earlier statement | status |
+|---|---|
+| "the tile kernel likewise keeps KQ in half" | **False.** Tile accumulates KQ in fp32 (`fattn-tile.cuh:604`); it keeps the products in half. |
+| "PV uses `CUBLAS_COMPUTE_32F`" / "the f16-PV variant has never been tested" | **Stale.** Both GEMMs ship `COMPUTE_16F`. The fp16 PV was measured this session — it is the path's dominant error, and `CUBLAS_GEMM_DEFAULT` made it 10x worse than it needs to be (below). |
+| "correctness of the new attention path: 3949/3949, re-run after every change including the aliasing" | **Insufficient.** The aliasing change (98de4588f) introduced a data race that `test-backend-ops` cannot see: it compares against CPU with a tolerance, once, on random data. |
+
+**The race.** The softmax kernel wrote probabilities over the scores it had just read, in one
+buffer. On this toolchain the store can land before the load of the same element, with or
+without `__restrict__`. Found through run-to-run variation of fp32 perplexity on identical
+input (3.3144 to 3.3272 on one 16k chunk), localized with per-call input/output hashes (a call
+with bit-identical inputs produced a different output) and per-stage checksums (only the
+softmax's second pass disagreed), and proven with an in-op self-check that runs the kernel twice
+on identical inputs: in place 3-6 mismatched launches per ~2240, out of place 0 of ~6700. An
+affected launch is not a rounding difference — summed |ΔP| of 3954 to 1.6e7 against
+probabilities ≤ 1/8. fp16 showed no mismatch in 15360 checked launches but is the same pattern,
+and there the read-back value overflows half and NaNs the output; one 4k perplexity run did go
+NaN and did not reproduce. **Fixed: the probabilities get their own buffer** (~1% of the op,
+50 MB per GPU at `-ub 2048`). Every build since 98de4588f, including the release, has the race.
+
+**Determinism is now a checked property.** fp32 GEMM: 3.3165 on all 10 runs across the
+out-of-place builds. fp16 GEMM: 3.3185 every run. tile: 3.3134 every run.
+
+**Precision.** NMSE against the CPU fp32 reference at the path's shapes (D=256, 2 KV heads,
+GQA 6, q4_0 KV, kv 4096-65536):
+
+| | nb=512 | nb=2048 |
+|---|---|---|
+| fp16 GEMM, release (PV `GEMM_DEFAULT`) | 1.14-1.24e-5 | 3.98-4.25e-5 |
+| **fp16 GEMM, now (PV `ALGO4`)** | 1.18-1.29e-5 | **1.20-1.24e-5** |
+| fp32 GEMM (`GGML_CUDA_FA_GEMM_PREC=32`) | 1.49-1.69e-6 | 1.46-1.64e-6 |
+| tile kernel | 2.18-2.43e-6 | 2.27-2.37e-6 |
+
+Perplexity effect: see the paired studies in OPTLOG attempt 152.
+
+**262144 context, measured** (was "never measured"): `llama-server -c 262144 -b 262144 -ub 2048
+-np 1` with the MTP draft, 19966-token prompt: peak VRAM 15999 MiB on GPU0 (incl. Sunshine) and
+15743 MiB on GPU1, prompt 334.8 t/s (in-place build; the out-of-place fix adds 50 MB of GEMM scratch per GPU).
+
+### Update 2026-09-15/16 — a second race, and two rows of the scope table corrected (OPTLOG attempt 153)
+
+| earlier statement | status |
+|---|---|
+| `a4d1103c5` concurrent peer copies: "bit-exact, scheduling only -- no arithmetic touched" | **False.** The scheduling is what broke: a copy could land in the all-reduce's reused buffer before the previous exchange's ADD had read it. Sporadic silent corruption or NaN on every uncompressed exchange — decode, MTP, prompt tails under 512 tokens, fp32 configurations. Fixed; below. |
+| `e83a7913a` f16 all-reduce: "guarded by a one-time runtime probe that verifies every element of the first exchange is f16-representable" | **True but incomplete.** Later exchanges were assumed to be like the first. A matmul with F32/BF16 weights or `GGML_PREC_F32` produces non-f16 partials. Now screened per exchange by compute type. For this model nothing changes — every all-reduced projection (`attn_output`, `ffn_down`, `ssm_out`, `nextn.eh_proj`) is Q6_K. |
+| "The optimized build was first confirmed deterministic across two runs" (Method, 3) | Still true for what it checked. But a determinism check that synchronizes cannot see a race *between* devices: node-by-node hashing of 2026-09-14 found 0 differences in 33254 prefill and 77324 decode nodes, while unhooked runs of the same build were not deterministic. |
+
+**The race.** The tensor-parallel all-reduce (`ggml-backend-meta.cpp`, `allreduce_fallback`)
+copies each partial into the destination's reduction buffer — the same buffer at every layer — and
+folds it in with an ADD on the destination's compute stream. The fork's dedicated copy stream
+orders a copy against its source only, so a source already at the next layer could overwrite the
+buffer before the destination's previous ADD had read it. The f16 path guarded that reuse; the
+uncompressed path did not. **Fix:** the copy stream also waits on the destination's work marker,
+which `graph_compute` records after every graph, the ADD included.
+
+**Evidence.** Unforced, on identical input (15 chunks, fp32 matmuls, no P2P, no debug hooks): 3 of
+10 runs diverged from the per-chunk majority — two into NaN (from chunks 4 and 6), one silently
+(from chunk 3, every later chunk off by ~2e-5 nats). With the fix: 0 of 6, and 0 of 4 for the
+serialising variant that was not kept. Forced, with a build that delays one device's all-reduce ADD
+by dummy sgemms on its own stream — no host synchronize, so the other device keeps running ahead —
+the failure becomes deterministic and reaches the production decode path:
+
+| 2 chunks / 64 MTP tokens, P2P on | no delay | delayed, unfixed | delayed, fixed |
+|---|---|---|---|
+| prefill, fp32 matmuls (uncompressed exchanges) | 1.596804 / 1.370962 | **1.863645 / 1.618642** | 1.596804 / 1.370962 |
+| prefill, fp16 matmuls at `-ub 2048` (compressed, already guarded) | 1.603656 / 1.376813 | 1.603656 / 1.376813 | 1.603656 / 1.376813 |
+| MTP decode, greedy | text `9f1947a0`, accept 78.8% | **text `72c8d044`, accept 43.4%** | text `9f1947a0`, accept 78.8% |
+
+Cost of the fix: tg256 31.04 → 30.81 (-0.7%), MTP 55.31 → 54.98 (-0.6%), identical output.
+
+**Prefill matmuls.** Upstream's `CUBLAS_GEMM_DEFAULT_TENSOR_OP` picks cuBLAS's long-chain fp16
+kernels at this model's prefill shapes (NMSE ≈ 2.2e-8·k, up to 2e-4); the blocked ALGO6 is 10x
+more accurate at every shape and faster at 512-1024 rows (pp512 +63%, pp1024 +30%, pp2048 level).
+Paired per-chunk perplexity, 4096 × 30 at `-ub 2048`, against an all-fp32 run (2.6102): upstream's
+fp16 matmuls +0.00414 nats/token (t 6.7), ALGO6 +0.00343 (t 7.4), **fp32 matmuls with fp16
+attention -0.00026 (t -1.4, i.e. indistinguishable from all-fp32)**. fp16 matmuls minus fp32
+matmuls, paired: +0.00369 (t 8.2). So the measurable distance from fp32 is the matmuls' fp16
+inputs and accumulation, not the fp16 GEMM attention; `GGML_CUDA_CUBLAS_COMPUTE_TYPE=f32` buys it
+back, `GGML_CUDA_FA_GEMM_PREC=32` does not change the model-level number (it is 8x at the op
+level).
+
+**The final build** (HEAD `c2dfae805`): perplexity **2.6097 ± 0.0198** on `ppl-orig.txt` at `-c 4096`
+(band 2.6209 ± 0.0199), tg256 **30.64 ± 0.19** on cool cards (baseline 17.51),
+`test-backend-ops -o FLASH_ATTN_EXT` **3961/3961** and the full suite **14593/14593**, 3/3 backends
+on both GPUs. Two further fixes landed with it that no two-device measurement can move, and both
+commit messages say so: the same-GPU copy guard (two physical GPUs never take that branch) and
+`GGML_OP_FILL` for a device whose slice came out empty (a verbose two-device run logs that path 0
+times). The configuration that would exercise the first — more virtual devices than GPUs — is
+itself unreliable on this model; see OPTLOG attempt 153 §8c.

@@ -1,0 +1,9 @@
+test: FLASH_ATTN_EXT eval cases at the GEMM attention path's prefill shapes
+
+The existing q4_0 sweep is nb=1, which never reaches the cuBLAS-GEMM path (it fires at
+Q->ne[1] >= 128 and K->ne[1] >= 4096, on by default). Adds D=256, 2 KV heads, GQA 6, q4_0 KV at
+kv 4096/16384/65536 x nb 512/2048, compared against CPU fp32. GGML_TEST_PRINT_ERR=1 prints the
+NMSE.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk

@@ -1,0 +1,24 @@
+   complete runs: 20 of 21 (excluded: ['1_r5'])
+   no fix                            : 3 of 10 runs with an event
+        0_A2_oop_r2            first divergent chunk: 3
+        0_A2_oop_r3            first divergent chunk: None
+        0_A3_inplace_r3        first divergent chunk: None
+        0_N1_mm_inplace        first divergent chunk: 6
+        0_N2_oop               first divergent chunk: None
+        0_r1                   first divergent chunk: 4
+        0_r2                   first divergent chunk: None
+        0_r3                   first divergent chunk: None
+        0_r4                   first divergent chunk: None
+        0_r5                   first divergent chunk: None
+   v1 record+wait                    : 0 of 4 runs with an event
+        1_r1                   first divergent chunk: None
+        1_r2                   first divergent chunk: None
+        1_r3                   first divergent chunk: None
+        1_r4                   first divergent chunk: None
+   v2 existing marker (final build)  : 0 of 6 runs with an event
+        2_r1                   first divergent chunk: None
+        2_r2                   first divergent chunk: None
+        2_r3                   first divergent chunk: None
+        2_r4                   first divergent chunk: None
+        2_r5                   first divergent chunk: None
+        2_r6                   first divergent chunk: None

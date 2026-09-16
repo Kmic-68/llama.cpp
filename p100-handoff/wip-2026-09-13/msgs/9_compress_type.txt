@@ -1,0 +1,23 @@
+fix: decide peer-copy compression per exchange from the matmul's compute type
+
+A tensor-parallel partial is shipped as f16 only when its values are f16-exact. That was decided
+once per run: a probe checks the first eligible exchange, and every later MUL_MAT output of >= 512
+rows is then compressed. Whether a matmul's output is f16-exact depends on that matmul, though.
+Quantized or F16 weights take the COMPUTE_16F cuBLAS path and are exact; F32 or BF16 weights, and
+matmuls that request GGML_PREC_F32 (GLM4, GLM4_MOE and JAIS2 set it on exactly these output
+projections), produce genuine f32. In a model that mixes the two, the f32 partials were silently
+rounded to f16 whenever the first exchange happened to be exact.
+
+The compute-type decision of ggml_cuda_mul_mat_cublas moves into
+ggml_cuda_mul_mat_cublas_compute_type, and eligibility now requires F16 from it. The probe stays
+as the second guard.
+
+For Qwen3.8-27B Q6_K nothing changes: every matmul whose output is all-reduced -- attn_output,
+ffn_down, ssm_out, nextn.eh_proj -- is Q6_K, and qwen35 requests no fp32 precision, so the
+eligibility of every exchange, the output bits and the speed are as before. The F32 tensors in that
+file are norms, biases, ssm_a and the conv1d weight, none of which is a matmul weight.
+
+OPTLOG attempt 153.
+
+Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
