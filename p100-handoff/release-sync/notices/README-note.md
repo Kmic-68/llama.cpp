@@ -31,10 +31,10 @@ before every run, `-sm tensor -fa 1 -ctk q4_0 -ctv q4_0 GGML_CUDA_P2P=1`:
 | prefill pp2048 | 424.2 | 411.5 (-3.0%) |
 | prefill pp4096 at the default `-ub 512` | 316.4 | **373.9** (+18.2%) |
 | prefill pp2048 at 16384 depth | 372.3 | 363.2 (-2.5%) |
-| decode tg256 (upstream baseline 17.51) | 30.85 | 30.72 |
+| decode tg256 (upstream baseline 17.51) | 30.85 | 30.64 |
 | decode tg128 at 20000 depth | — | 28.35 |
 | MTP decode, 256 tokens, greedy | — | 55.0 |
-| perplexity, `ppl-orig.txt`, `-c 4096` (band 2.6209 ± 0.0199) | 2.6204 (source build of 09-13) | **2.6097** |
+| perplexity, `ppl-orig.txt`, `-c 4096` (band 2.6209 ± 0.0199) | 2.6204 (source build of 09-13) | **2.6097 ± 0.0198** |
 | `test-backend-ops` | — | FLASH_ATTN_EXT 3961/3961, full suite 14593/14593, both GPUs |
 
 At the production operating point (`llama-server -c 262144 -b 262144 -ub 2048 -np 1` with the MTP
