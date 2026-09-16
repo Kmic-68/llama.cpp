@@ -2601,6 +2601,12 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
         const int src_physical = ggml_cuda_get_physical_device(cuda_ctx_src->device);
         const int dst_physical = ggml_cuda_get_physical_device(cuda_ctx_dst->device);
         if (src_physical == dst_physical) {
+            // Same exposure as the peer path below: the destination is a different virtual device with
+            // its own stream, and the all-reduce's ADD of the previous exchange may still be pending on
+            // it while this copy refills the reduction buffer. Order against it.
+            if (cuda_ctx_dst->work_event != nullptr) {
+                CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx_src->stream(), cuda_ctx_dst->work_event, 0));
+            }
             CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(dst), cudaMemcpyDeviceToDevice, cuda_ctx_src->stream()));
         } else {
 #ifdef GGML_CUDA_NO_PEER_COPY
