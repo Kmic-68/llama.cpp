@@ -16,7 +16,7 @@
 //       corr  = exp(m - m_new);  P = exp(S + mask - m_new)   (P in its own buffer, not in S)
 //       l     = l*corr + rowsum(P)
 //       Otmp  = V P                    (GEMM, f16 accumulate over one chunk)
-//       O     = O*corr + Otmp          (fused rescale + f32 accumulate across chunks)
+//       O     = O*corr + Otmp          (fused rescale + f32 accumulate across chunks, out of place)
 //   dst = O / l
 //
 // S is computed TRANSPOSED ([n_kv_chunk x n_tokens], column-major) so that one query's
@@ -233,20 +233,27 @@ static __global__ void fattn_gemm_fill(float * __restrict__ p, const float v, co
 //
 // Fusing the rescale into the accumulate is also cheaper than the rescale-only kernel it
 // replaces: that one read+wrote O and then the beta=1 GEMM read+wrote O again (50 MB per
-// chunk at nt=2048, gqa=6); this reads O+Otmp and writes O once (38 MB).
+// chunk at nt=2048, gqa=6); this reads O+Otmp and writes the next O once (38 MB).
+//
+// Out of place, like the softmax: the running O is read from one buffer and written to the
+// other, and the caller swaps them per chunk. The in-place form loaded and stored the same
+// address inside the thread loop -- the pattern that raced in the softmax. At DV=256 the loop
+// runs once per thread and no run-to-run difference was ever observed, but nothing proves it
+// safe either; the second buffer costs DV*nt*gqa floats (12 MB per GPU at -ub 2048).
 template <typename T>
 static __global__ void fattn_gemm_accum_O(
-        float * __restrict__ O, const T * __restrict__ Otmp,
+        const float * __restrict__ O_in, float * __restrict__ O_out, const T * __restrict__ Otmp,
         const float * __restrict__ corr,
         const int DV, const int nt) {
     const int t = blockIdx.x;
     const int h = blockIdx.y;
     const float c = corr[h*nt + t];
     const int64_t off = ((int64_t) h*nt + t)*DV;
-    float      * Oh = O    + off;
-    const T    * Th = Otmp + off;
+    const float * Ih = O_in  + off;
+    float       * Oh = O_out + off;
+    const T     * Th = Otmp  + off;
     for (int d = threadIdx.x; d < DV; d += blockDim.x) {
-        Oh[d] = Oh[d]*c + fattn_gemm_to_f(Th[d]);
+        Oh[d] = Ih[d]*c + fattn_gemm_to_f(Th[d]);
     }
 }
 
@@ -400,8 +407,10 @@ void ggml_cuda_flash_attn_ext_gemm(ggml_backend_cuda_context & ctx, ggml_tensor 
     ggml_cuda_pool_alloc<half>  P(pool);
     ggml_cuda_pool_alloc<float> P32(pool);
     if (prec32) { P32.alloc(chunk*nt*gqa); } else { P.alloc(chunk*nt*gqa); }
+    // the running output, accumulated out of place: O and O2 swap roles every chunk
     ggml_cuda_pool_alloc<float> O(pool, DV*nt*gqa);
-    // destination of the PV GEMM for one chunk; folded into O by fattn_gemm_accum_O.
+    ggml_cuda_pool_alloc<float> O2(pool, DV*nt*gqa);
+    // destination of the PV GEMM for one chunk; folded into the running output by fattn_gemm_accum_O.
     ggml_cuda_pool_alloc<half>  Otmp(pool);
     ggml_cuda_pool_alloc<float> Otmp32(pool);
     if (prec32) { Otmp32.alloc(DV*nt*gqa); } else { Otmp.alloc(DV*nt*gqa); }
@@ -449,7 +458,9 @@ void ggml_cuda_flash_attn_ext_gemm(ggml_backend_cuda_context & ctx, ggml_tensor 
                 CUDA_CHECK(cudaGetLastError());
             }
 
-            CUDA_CHECK(cudaMemsetAsync(O.ptr, 0, DV*nt*gqa*sizeof(float), stream));
+            float * O_cur = O.ptr;
+            float * O_nxt = O2.ptr;
+            CUDA_CHECK(cudaMemsetAsync(O_cur, 0, DV*nt*gqa*sizeof(float), stream));
             CUDA_CHECK(cudaMemsetAsync(l_state.ptr, 0, nt*gqa*sizeof(float), stream));
             // m = -inf, via a kernel: an H2D copy here would need a stream sync per head
             // group, i.e. 32 pipeline drains per batch.
@@ -626,18 +637,19 @@ void ggml_cuda_flash_attn_ext_gemm(ggml_backend_cuda_context & ctx, ggml_tensor 
                 {
                     dim3 grid(nt, gqa, 1);
                     if (prec32) {
-                        fattn_gemm_accum_O<float><<<grid, 256, 0, stream>>>(O.ptr, Otmp32.ptr, corr.ptr, DV, nt);
+                        fattn_gemm_accum_O<float><<<grid, 256, 0, stream>>>(O_cur, O_nxt, Otmp32.ptr, corr.ptr, DV, nt);
                     } else {
-                        fattn_gemm_accum_O<half><<<grid, 256, 0, stream>>>(O.ptr, Otmp.ptr, corr.ptr, DV, nt);
+                        fattn_gemm_accum_O<half><<<grid, 256, 0, stream>>>(O_cur, O_nxt, Otmp.ptr, corr.ptr, DV, nt);
                     }
                     CUDA_CHECK(cudaGetLastError());
+                    std::swap(O_cur, O_nxt);
                 }
             }
 
             {
                 dim3 grid(nt, gqa, 1);
                 fattn_gemm_finalize<<<grid, 256, 0, stream>>>(
-                    O.ptr, l_state.ptr, (float *) dst->data + s*(dst->nb[3]/sizeof(float)),
+                    O_cur, l_state.ptr, (float *) dst->data + s*(dst->nb[3]/sizeof(float)),
                     DV, nt, nh, head0, dst_s1, dst_s2);
                 CUDA_CHECK(cudaGetLastError());
             }
