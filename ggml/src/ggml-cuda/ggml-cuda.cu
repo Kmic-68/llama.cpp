@@ -2678,6 +2678,24 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
                 return true;
             }
 
+            // The destination may still have a reader pending on its compute stream. The tensor-parallel
+            // all-reduce lands every exchange in the same per-device reduction buffer
+            // (ggml-backend-meta.cpp, bcj.bufs[i_buf]) and folds it in with an ADD queued on the
+            // destination stream. This copy stream is otherwise ordered against the source only, so a
+            // source that had raced ahead to the next layer could overwrite that buffer before the
+            // destination's ADD of the previous layer had read it. The compressed path above guards the
+            // same reuse with peer_stage_free.
+            // Waiting on the destination's existing work marker is enough: graph_compute records it after
+            // every graph, the meta backend's ADD included, and that ADD is enqueued before the next
+            // layer's copies are issued. Re-recording it here would also capture this exchange's wait on
+            // the opposite copy and serialise the two directions again.
+            if (cuda_ctx_dst->work_event == nullptr) {
+                ggml_cuda_set_device(cuda_ctx_dst->device);
+                cuda_ctx_dst->record_work();
+                ggml_cuda_set_device(cuda_ctx_src->device);
+            }
+            CUDA_CHECK(cudaStreamWaitEvent(copy_stream, cuda_ctx_dst->work_event, 0));
+
             CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, dst_physical, src->data, src_physical, ggml_nbytes(dst), copy_stream));
             CUDA_CHECK(cudaEventRecord(cuda_ctx_src->copy_event, copy_stream));
 
