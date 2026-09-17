@@ -34,7 +34,15 @@ install -Dm644 "$REPO/p100-handoff/VERIFICATION.md" "$REL/docs/handoff/VERIFICAT
 # RESUME-HERE.md and the HEAD sha were missed until 2026-09-17: the bundle's copies still named
 # session 7 and commit aa22ccee0, five sessions and 105 commits behind what build/ actually is.
 install -Dm644 "$REPO/p100-handoff/RESUME-HERE.md"  "$REL/docs/handoff/RESUME-HERE.md"
-(cd "$REPO" && git rev-parse HEAD) > "$REL/docs/handoff/HEAD-sha.txt"
+# Two shas, because they can legitimately differ: docs-only commits move HEAD without
+# invalidating build/. diffs/HEAD-SHA.txt is written by refresh-build.sh and is the one that
+# describes the binaries.
+{
+    echo "source HEAD at last sync: $(cd "$REPO" && git rev-parse HEAD)"
+    if [ -f "$REL/diffs/HEAD-SHA.txt" ]; then
+        echo "build/ was built from:    $(tr -d "[:space:]" < "$REL/diffs/HEAD-SHA.txt")"
+    fi
+} > "$REL/docs/handoff/HEAD-sha.txt"
 (cd "$REPO" && git log --oneline -40) > "$REL/docs/handoff/commit-log.txt"
 for f in lcb_em.json lcb_hard.json lcb_greedy_BROKEN.json lcb-report.html; do
     [ -f "$REPO/p100-handoff/$f" ] && install -Dm644 "$REPO/p100-handoff/$f" "$REL/docs/handoff/$f"
