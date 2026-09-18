@@ -66,11 +66,45 @@ Arguments are appended and override the defaults, so `qwen-server --port 9000` m
 | `--mcp-servers-config` | MCP servers exposed as tools |
 | `--host 0.0.0.0 --port 8080` | listen on the LAN rather than loopback |
 
-### Watch VRAM
+### Watch VRAM — and do not size it against a short prompt
 
-This configuration peaks at **16137 MiB on GPU0** of 16384 — about 250 MiB of headroom, and that
-already counts ~392 MiB held by an unrelated desktop-streaming process. A mid-session
-`cudaMalloc failed` is this, not a bug. The levers are `-ub 2048` → `1536`, or a smaller `-c`.
+This configuration peaks at **16137 MiB on GPU0** of 16384 against a **19966-token** prompt. That
+prompt is 8% of the allocated context, and **the budget is not fixed — it grows with how full the
+context actually is.** Sizing against a short prompt is the trap; the figure above has ~250 MiB of
+headroom and still cannot serve a full one.
+
+The growing allocation is the **attention mask**, and it is stock llama.cpp behaviour rather than
+anything this fork added. `llama_kv_cache::get_n_kv()` returns the *used* portion of the cache
+padded to 256 — not the allocated `-c` — and the mask tensor is `n_kv x n_tokens`. So it starts
+small and grows as the prompt fills the cache, which means **it scales with `n_kv x ubatch`**.
+That is why `-ub` is the effective lever. (This fork's GEMM attention path is *not* the cause: it
+chunks K/V at a fixed 2048 and is constant in depth. `GGML_CUDA_FA_GEMM=0` does not help here.)
+
+Measured on a **259118-token** prompt, sampling free VRAM on GPU0 every 5 s:
+
+| `-ub` | free at load | behaviour during prefill | outcome |
+|---|---|---|---|
+| 2048 | 117 MiB | — | **dies 57 s in**, ~4% of the prompt |
+| 512 | 1669 MiB | flat for 20 min, then climbs 1669 → 165 MiB in 7 | **dies at ~95%** |
+
+Both fail identically: `CUDA error: the function failed to launch on the GPU` in
+`ggml_cuda_mul_mat_cublas_impl<F16>`. It is memory exhaustion presenting as a launch failure —
+cuBLAS could not get scratch workspace — not a kernel defect. **As of 2026-09-18 no configuration
+has been demonstrated to serve a genuinely full 262144-token prompt with the MTP draft on
+2x16 GB.** `-ub 512` misses by a couple of hundred MiB, so the two things to try are **`-ub 256`**
+(halves the mask again) and **`-c 200000`** (caps `n_kv` outright). Neither is measured yet.
+
+Note the mask accounts for the scaling law and the lever, but not the full 1504 MiB of growth
+observed above; the rest is unaccounted for. Do not treat this as a closed explanation.
+
+In practice this bites only at extreme depth: a prompt in the tens of thousands of tokens against
+`-c 262144` is comfortable, which is why this went unnoticed for so long.
+
+**If the GPU also drives a display, leave it real headroom.** GPU0 here carries ~392 MiB of
+Sunshine, and the `-ub 2048` failure above starved it badly enough to require restarting the
+desktop session. Budget that process explicitly rather than counting it as slack, and consider
+capping yourself with a watchdog that kills the *server* — by PID — before free memory reaches
+zero.
 
 ## `--spec-draft-n-max`: 3 or 4 depends on your depth
 

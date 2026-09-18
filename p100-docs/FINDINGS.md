@@ -199,7 +199,17 @@ These cost more time than any kernel bug.
    A `cmake --build` after editing `fattn-vec.cuh` rebuilt plenty of other objects and **zero** vec
    instances, so the next benchmark measured the previous binary. Follow any kernel-header edit
    with `grep -rl "<header>" ggml/src/ggml-cuda/ | xargs touch`.
-9. **`test-backend-ops` cannot see a data race.** Both races above passed the full suite — 14593
+9. **A peak-VRAM number is only valid at the context fill it was measured at.** "Peaks at 16137
+   MiB, ~250 MiB of headroom" was measured with a 19966-token prompt against a 262144 context —
+   8% full — and was quoted for weeks as the budget for the configuration. It is not a budget:
+   the attention mask is sized `n_kv x n_tokens` where `n_kv` is the *used* cache, so it grows as
+   the prompt fills, and at a genuinely full prompt the margin is *negative* and the server dies
+   mid-prefill. (First diagnosed here as the GEMM-attention workspace, which was wrong — that path
+   chunks at a fixed 2048 and is constant in depth. Reading the allocation sites took two minutes
+   and would have saved a wrong fix.) Sample free VRAM over a long prefill
+   rather than reading a peak off a short one; the shape of the curve is the finding, and here it
+   was flat for 20 minutes before it moved at all. See "Watch VRAM" in QUICKSTART.
+10. **`test-backend-ops` cannot see a data race.** Both races above passed the full suite — 14593
    cases — for weeks. The suite runs ops one at a time with host synchronization between them,
    which is exactly the condition under which a cross-stream race does not occur. Races need
    unhooked repeated runs, deliberate delay injection, or an in-op self-check. A green suite is
