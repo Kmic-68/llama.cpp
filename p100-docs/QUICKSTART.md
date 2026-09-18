@@ -34,9 +34,9 @@ Arguments are appended and override the defaults, so `qwen-server --port 9000` m
     llama-server \
       -m /mnt/fast/models/Qwen3.8-27B-Q6_K.gguf \
       -ngl 99 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 \
-      -c 262144 -b 262144 -ub 2048 -np 1 \
+      -c 262144 -b 262144 -ub 512 -np 1 \
       --spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min 0.2 \
-      -ngld 99 -ubd 256 \
+      -ngld 99 -ubd 64 -ctkd q4_0 -ctvd q4_0 \
       --jinja --temp 0.3 --top-k 20 \
       --host 0.0.0.0 --port 8080 \
       --tools all \
@@ -51,8 +51,9 @@ Arguments are appended and override the defaults, so `qwen-server --port 9000` m
 | `-ctk q4_0 -ctv q4_0` | q4_0 KV cache. f16 will not fit at this context |
 | **`-np 1`** | **required.** The server auto-sizes its slot count and each slot allocates its own 262144 KV cache. Without this, startup dies with `cudaMalloc failed` on 512 MiB while the GPUs are nearly empty |
 | `-b 262144` | admission limit; must exceed the prompt. Separate from `-ub` |
-| `-ub 2048` | sets the compute shape and prefill speed |
-| **`-ubd 256`** | draft context ubatch. Without it the draft inherits `-ub 2048`, reserves a second 1024 MiB copy of the KQ mask, and the whole config OOMs |
+| **`-ub 512`** | sets the compute shape, prefill speed **and the VRAM ceiling**. The attention mask is `n_kv x ubatch`, so this is the main lever on how full a context you can actually serve. Costs shallow prefill (411 -> 380 t/s) and is within noise at depth (23.02 vs 22.91). `-ub 2048` is faster on short prompts and **cannot serve a full context** -- see "Watch VRAM" |
+| **`-ubd 64`** | draft context ubatch. Without it the draft inherits `-ub`, reserves a second copy of the mask, and the whole config OOMs. 64 is also **faster** than 256 (23.03 vs 21.43), not a tradeoff |
+| **`-ctkd q4_0 -ctvd q4_0`** | q4_0 for the *draft* KV cache: **151 MB instead of 537**, for -2.2% decode. The draft cache is f16 by default even when the target cache is quantized. This is the margin lever that makes a full context fit |
 | `GGML_CUDA_P2P=1` | peer-to-peer between the two cards. Keep it on — without it the exchanges stage through the host, which is slower |
 | `GGML_CUDA_GRAPHS_PRE_VOLTA=1` | CUDA graphs on Pascal: **+6.7% on the speculative path, -2% on single-token decode**. Set it for MTP workloads, leave it off otherwise |
 
@@ -89,13 +90,18 @@ Measured on a **259118-token** prompt, sampling free VRAM on GPU0 every 5 s:
 
 Both fail identically: `CUDA error: the function failed to launch on the GPU` in
 `ggml_cuda_mul_mat_cublas_impl<F16>`. It is memory exhaustion presenting as a launch failure —
-cuBLAS could not get scratch workspace — not a kernel defect. **As of 2026-09-18 no configuration
-has been demonstrated to serve a genuinely full 262144-token prompt with the MTP draft on
-2x16 GB.** `-ub 512` misses by a couple of hundred MiB, so the two things to try are **`-ub 256`**
-(halves the mask again) and **`-c 200000`** (caps `n_kv` outright). Neither is measured yet.
+cuBLAS could not get scratch workspace — not a kernel defect.
 
-Note the mask accounts for the scaling law and the lever, but not the full 1504 MiB of growth
-observed above; the rest is unaccounted for. Do not treat this as a closed explanation.
+Both of those runs predate `-ctkd q4_0 -ctvd q4_0`, which is now in the configuration above.
+`-ub 512` ran out with **165 MiB** left at ~95% of the prompt, and quantizing the draft KV cache
+returns **368 MiB** — so the shipping configuration should clear it, with roughly 200 MiB spare.
+**That is an argument, not a measurement: as of 2026-09-18 no run has served a genuinely full
+262144-token prompt with the MTP draft on 2x16 GB.** If it still comes up short, the next levers
+are `-ub 256` (halves the mask again) and `-c 245760` (caps `n_kv` outright).
+
+Note also that the mask explains the scaling law and the lever, but not the full 1504 MiB of
+growth observed above; the remainder is unaccounted for. Do not treat this as a closed
+explanation.
 
 In practice this bites only at extreme depth: a prompt in the tens of thousands of tokens against
 `-c 262144` is comfortable, which is why this went unnoticed for so long.
