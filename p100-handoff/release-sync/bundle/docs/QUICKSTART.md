@@ -1,17 +1,37 @@
 # Quickstart — the flags that matter
 
-Binaries in `../build/` are built for **sm_60 only** and expect the driver in `ENVIRONMENT.md`
-(580.173.02).
+Binaries are built for **sm_60 only** and expect the driver in `ENVIRONMENT.md` (580.173.02).
 
-**Set `LD_LIBRARY_PATH` unless you `cd` into `build/` first.** The binaries carry a RUNPATH
-pointing at the original build tree, so invoked by absolute path they will silently load a
-different `libggml-cuda.so` if one is there.
+## Put it on PATH
+
+Add this one line to `~/.bashrc`:
+
+    export PATH="/mnt/fast/p100-llamacpp-release/bin:$PATH"
+
+Then `llama-server`, `llama-bench`, `llama-cli` and the other 88 tools just work from anywhere,
+and `qwen-server` starts the tuned configuration below.
+
+**Use `bin/`, not `build/`.** They hold the same 91 programs, but `bin/` are one-line wrappers
+that set `LD_LIBRARY_PATH` to this bundle before exec'ing. The real binaries carry a RUNPATH
+pointing at the tree they were compiled in, so run directly from `build/` they load *that* tree's
+`libggml-cuda.so` if it still exists — a different build, silently, with no error. Check any time
+with:
+
+    ldd $(which llama-server) | grep ggml-cuda
+
+Every path should say `/mnt/fast/p100-llamacpp-release/build`.
 
 ## Serving (the configuration in daily use)
 
-    LD_LIBRARY_PATH=/mnt/fast/p100-llamacpp-release/build \
+With `bin/` on PATH, the whole thing is:
+
+    qwen-server
+
+Arguments are appended and override the defaults, so `qwen-server --port 9000` moves the port and
+`QWEN_MODEL=/path/to.gguf qwen-server` swaps the model. What it runs:
+
     GGML_CUDA_P2P=1 GGML_CUDA_GRAPHS_PRE_VOLTA=1 \
-    /mnt/fast/p100-llamacpp-release/build/llama-server \
+    llama-server \
       -m /mnt/fast/models/Qwen3.8-27B-Q6_K.gguf \
       -ngl 99 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 \
       -c 262144 -b 262144 -ub 2048 -np 1 \
@@ -73,7 +93,7 @@ greedy sampling this build is bit-reproducible run to run on two physical GPUs.)
 
 ## Short context / plain decode
 
-    GGML_CUDA_P2P=1 ./llama-bench -m /mnt/fast/models/Qwen3.8-27B-Q6_K.gguf \
+    GGML_CUDA_P2P=1 llama-bench -m /mnt/fast/models/Qwen3.8-27B-Q6_K.gguf \
       -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -p 0 -n 256 -r 3
 
 Leave `GGML_CUDA_GRAPHS_PRE_VOLTA` **unset** here — it costs ~2% on this workload.
@@ -109,15 +129,15 @@ Use it when the output matters more than the wait; leave it off for interactive 
 
 ## Correctness check
 
-    ../tools/gate.sh
+    /mnt/fast/p100-llamacpp-release/tools/gate.sh
 
 Use the script. It carries the right corpus, and the corpus is the part that drifts — see
 `FINDINGS.md`, "How the measurements lied", item 7.
 
 If you run it by hand anyway:
 
-    ./llama-perplexity -m /mnt/fast/models/Qwen3.8-27B-Q6_K.gguf \
-      -f ../tools/perplexity-gate-corpus.txt \
+    llama-perplexity -m /mnt/fast/models/Qwen3.8-27B-Q6_K.gguf \
+      -f /mnt/fast/p100-llamacpp-release/tools/perplexity-gate-corpus.txt \
       -sm tensor -ngl 99 -c 4096 -ctk q4_0 -ctv q4_0
 
 Expect **2.6097 ± 0.0198** (gate band 2.6209 ± 0.0199). Use *that* corpus — a different wiki dump

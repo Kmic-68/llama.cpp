@@ -27,7 +27,7 @@ been misread here as a correctness failure.
 
 | | |
 |---|---|
-| **`docs/QUICKSTART.md`** | **the flags to run** |
+| **`docs/QUICKSTART.md`** | **start here** — putting it on PATH, and the flags to run |
 | `CHANGES.md` | every code change, grouped, with what it measured |
 | `docs/FINDINGS.md` | what worked, what failed, and how the measurements lied |
 | `docs/BUILD.md` | rebuilding from source |
@@ -36,7 +36,8 @@ been misread here as a correctness failure.
 
 | path | contents |
 |---|---|
-| `build/` | prebuilt binaries and libraries — ready to run, no compile needed |
+| **`bin/`** | **wrappers to put on PATH** — same 91 programs, with `LD_LIBRARY_PATH` set for you, plus `qwen-server` for the tuned configuration |
+| `build/` | the real binaries and libraries. Prefer `bin/`; see QUICKSTART |
 | `patches/` | 165 `git am`-able commits against upstream `f280b2698`, one per commit in apply order |
 | `diffs/` | `all-code.diff` (the same delta squashed into one file), `everything.diff` (incl. docs), and the base/HEAD SHAs |
 | `docs/` | the documentation above, plus `ENVIRONMENT.md`, `COMMUNITY-NOTES.md`, the numerical audit, and `handoff/` |

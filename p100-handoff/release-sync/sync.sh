@@ -77,6 +77,9 @@ for f in lcb_em.json lcb_hard.json lcb_greedy_BROKEN.json lcb-report.html; do
     [ -f "$REPO/p100-handoff/$f" ] && install -Dm644 "$REPO/p100-handoff/$f" "$REL/docs/handoff/$f"
 done
 
+echo "==> bin/ wrappers"
+"$HERE/make-wrappers.sh" "$REL"
+
 echo "==> archive the superseded 2026-09-06 release"
 # Kept, not deleted: the before/after numbers in OPTLOG are against these binaries. One tarball
 # instead of three top-level directories that look like part of the current release.
