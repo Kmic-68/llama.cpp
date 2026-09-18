@@ -10391,6 +10391,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int nb : {8, 6, 5, 4, 1}) {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 262144, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     }
+    // Decode shape across the 32-value block quants, to separate "bytes moved" from "work per
+    // value" without a profiler (nvprof metrics need NVreg_RestrictProfilingToAdminUsers=0).
+    // All of these hold 32 values per block, so a call touches the same number of blocks and
+    // values; only the block size and the dequant differ:
+    //     q4_0 18 B (0.5625 B/val)  q4_1 20 B  q5_0 22 B  q5_1 24 B  q8_0 34 B (1.0625)  f16 2 B/val
+    // If time tracks bytes, the kernel is bandwidth-bound. If it is flat across these while
+    // f16 is faster than all of them, the cost is per-value unpacking, not traffic. q8_0 is
+    // the key point: ~2x the bytes of q4_0 with the cheapest dequant (no nibble unpack).
+    for (ggml_type tkv : {GGML_TYPE_Q4_1, GGML_TYPE_Q5_0, GGML_TYPE_Q5_1, GGML_TYPE_Q8_0}) {
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 262144, 1, true, false, 0, 0, GGML_PREC_F32, tkv, tkv));
+    }
 
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(64, 64, 8, {8, 1}, 7680, 4, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));

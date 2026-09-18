@@ -463,77 +463,63 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile_q4_0(
     constexpr int cpy_nb = ggml_cuda_get_max_cpy_bytes();
     constexpr int cpy_ne = cpy_nb / 4;
 
-    auto load = [&] __device__ (const int n) {
-        const int stride_j = warp_size >> n;
+    // One read of qs[m] carries BOTH values it encodes: m in the low nibble and m + QK4_0/2 in
+    // the high one. The previous form assigned those two values to different threads, each of
+    // which loaded the same 8 bytes and discarded half of every byte -- so q4_0's real DRAM
+    // traffic was 2x its useful bytes (~300 MB per call at kv=262144 against 151 MB of data),
+    // which is why it was no faster than an f16 cache that moves 537 MB. Here one thread reads
+    // the 2*cpy_ne bytes once and emits both halves, to j and j + QK4_0/4.
+    //
+    // The per-value arithmetic is unchanged -- (q - 8) taken in integer, one hmul2 per pair --
+    // so this is bit-identical to the previous loader and to upstream to_fp16.
+    constexpr int VPS    = 4*cpy_ne;        // values produced per slot (both nibble halves)
+    constexpr int NSLOT  = J / VPS;         // slots per row
+    constexpr int SPB    = (QK4_0/2) / (2*cpy_ne); // slots per q4_0 block
+    constexpr int nthr   = nwarps*warp_size;
 
-        if (stride_j == 0) {
-            return;
-        }
+    static_assert(J % VPS == 0, "bad J");
+    static_assert((QK4_0/2) % (2*cpy_ne) == 0, "bad cpy_ne");
+    static_assert(QK4_0 == 32, "bad QK4_0");
 
-        const int j0_start = stride_j == warp_size ? 0 : ((J/2)/cpy_ne) - ((J/2)/cpy_ne) % (2*stride_j);
-        const int j0_stop  =                             ((J/2)/cpy_ne) - ((J/2)/cpy_ne) % (1*stride_j);
-        const int stride_i = warp_size / stride_j;
-
-        if (j0_start == j0_stop) {
-            return;
-        }
+    const int tid = threadIdx.y*warp_size + threadIdx.x;
 
 #pragma unroll
-        for (int i0 = 0; i0 < I; i0 += nwarps*stride_i) {
-            const int i = i0 + threadIdx.y*stride_i + (stride_j == warp_size ? 0 : threadIdx.x / stride_j);
+    for (int w0 = 0; w0 < I*NSLOT; w0 += nthr) {
+        const int w = w0 + tid;
+        if (w0 + nthr <= I*NSLOT || w < I*NSLOT) {
+            const int i     = w / NSLOT;
+            const int s     = w % NSLOT;
+            const int m     = (s % SPB) * (2*cpy_ne);   // byte offset inside qs
+            const int a_lo  = k_dim_0 + (s / SPB)*QK4_0 + m;
 
-            if (i0 + nwarps*stride_i <= I || i < I) {
+            __align__(16) half2 lo[cpy_ne];
+            __align__(16) half2 hi[cpy_ne];
+
+            if (!oob_check || i < i_sup) {
+                const block_q4_0 * blk = (const block_q4_0 *) (KV + i*stride_KV) + a_lo/QK4_0;
+                const half2 dh = __half2half2(blk->d);
 #pragma unroll
-                for (int j0 = j0_start; j0 < j0_stop; j0 += stride_j) {
-                    const int j = j0*cpy_ne + (stride_j == warp_size ? threadIdx.x : threadIdx.x % stride_j)*cpy_ne;
-
-                    __align__(16) half2 tmp[cpy_ne];
-                    if (!oob_check || i < i_sup) {
-                        const int a     = k_dim_0 + 2*j; // absolute head dim, multiple of 2*cpy_ne
-                        const int iqs   = a % QK4_0;
-                        const int base  = iqs < QK4_0/2 ? iqs : iqs - QK4_0/2;
-                        const int shift = iqs < QK4_0/2 ? 0 : 4;
-
-                        const block_q4_0 * blk = (const block_q4_0 *) (KV + i*stride_KV) + a/QK4_0;
-                        // (q - 8)*d as one hmul2 per pair rather than a float sub and mul per
-                        // value, which halves the dequant ALU in the load.
-                        //
-                        // The bias is taken in INTEGER (q - 8, exactly representable, range
-                        // [-8,7]) rather than as an fp16 term -8*d. An earlier form computed
-                        // `offs = __hmul2(dh, -8.0h)` and fused it with __hfma2; that overflows
-                        // to +-inf for |d| >= 8192 and turned 40584 of the 1048576 (nibble,
-                        // half scale) cases from a finite value into +-inf -- which NaNs the
-                        // whole head, where upstream's float bias stays finite. This form
-                        // rounds the same exact real value d*(q-8) once, so it is identical in
-                        // value to upstream to_fp16 over the entire finite domain (verified
-                        // exhaustively: 0 value differences in 1048576 cases), and it is one
-                        // instruction cheaper because there is no bias term to build.
-                        // Sole difference: q == 8 with d < 0 yields -0.0 where upstream's
-                        // 8d + (-8d) yields +0.0. Numerically equal, and a KV value of either
-                        // sign contributes nothing to the attention dot product.
-                        const half2 dh = __half2half2(blk->d);
+                for (int l = 0; l < cpy_ne; ++l) {
+                    const int b0 = blk->qs[m + 2*l + 0];
+                    const int b1 = blk->qs[m + 2*l + 1];
+                    lo[l] = __hmul2(__halves2half2(__int2half_rn((b0 & 0x0F) - 8),
+                                                   __int2half_rn((b1 & 0x0F) - 8)), dh);
+                    hi[l] = __hmul2(__halves2half2(__int2half_rn(((b0 >> 4) & 0x0F) - 8),
+                                                   __int2half_rn(((b1 >> 4) & 0x0F) - 8)), dh);
+                }
+            } else {
 #pragma unroll
-                        for (int l = 0; l < cpy_ne; ++l) {
-                            const int q0 = (blk->qs[base + 2*l + 0] >> shift) & 0x0F;
-                            const int q1 = (blk->qs[base + 2*l + 1] >> shift) & 0x0F;
-                            tmp[l] = __hmul2(__halves2half2(__int2half_rn(q0 - 8), __int2half_rn(q1 - 8)), dh);
-                        }
-                    } else {
-#pragma unroll
-                        for (int l = 0; l < cpy_ne; ++l) {
-                            tmp[l] = make_half2(0.0f, 0.0f);
-                        }
-                    }
-
-                    ggml_cuda_memcpy_1<sizeof(tmp)>(tile_KV + i*(J/2 + J_padding) + j, tmp);
+                for (int l = 0; l < cpy_ne; ++l) {
+                    lo[l] = make_half2(0.0f, 0.0f);
+                    hi[l] = make_half2(0.0f, 0.0f);
                 }
             }
+
+            const int j_lo = (a_lo - k_dim_0) / 2;
+            ggml_cuda_memcpy_1<sizeof(lo)>(tile_KV + i*(J/2 + J_padding) + j_lo,            lo);
+            ggml_cuda_memcpy_1<sizeof(hi)>(tile_KV + i*(J/2 + J_padding) + j_lo + QK4_0/4,  hi);
         }
-    };
-    static_assert(J % 8 == 0, "bad J");
-    static_assert((J/2) % cpy_ne == 0, "bad J");
-    static_assert(QK4_0 == 32, "bad QK4_0");
-    ggml_cuda_unroll<7>{}(load);
+    }
 }
 
 // Same, for the fp32 accumulator tile. A copy here covers cpy_ne == 4 values at a
