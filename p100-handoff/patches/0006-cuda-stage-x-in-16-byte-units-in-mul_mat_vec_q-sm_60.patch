@@ -23,7 +23,6 @@ qwen3.8-27B-Q6_K, 2x Tesla P100, -sm tensor -fa 1 -ctk/-ctv q4_0, tg256:
 24.33 -> 26.21 t/s (17.45 baseline, +50%).
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
 ---
  ggml/src/ggml-cuda/mmvq.cu | 27 +++++++++++++++++----------
  1 file changed, 17 insertions(+), 10 deletions(-)

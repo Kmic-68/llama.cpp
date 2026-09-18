@@ -6,4 +6,3 @@ kv 4096/16384/65536 x nb 512/2048, compared against CPU fp32. GGML_TEST_PRINT_ER
 NMSE.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk

@@ -23,7 +23,6 @@ MUL_MAT 1193/1193. PPL 2.7554 +/- 0.02151 on the standard gate; through
 the changed path 3.6199 +/- 0.08383 against 3.6237 for stock geometry.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
 ---
  ggml/src/ggml-cuda/mmvq.cu     | 55 ++++++++++++++++++++++++++--------
  ggml/src/ggml-cuda/vecdotq.cuh |  8 +++++

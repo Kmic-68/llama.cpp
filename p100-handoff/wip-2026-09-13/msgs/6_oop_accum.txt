@@ -13,4 +13,3 @@ in-place and the out-of-place kernel. Free: pp2048 at depth 16384, interleaved a
 OPTLOG attempt 153.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk

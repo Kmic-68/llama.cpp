@@ -16,7 +16,6 @@ whole attention on 12 blocks of a 56-SM GPU.
 Perplexity unchanged at 2.7565; test-backend-ops FLASH_ATTN_EXT 3949/3949.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
 ---
  ggml/src/ggml-cuda/fattn-vec.cuh | 6 +++++-
  1 file changed, 5 insertions(+), 1 deletion(-)

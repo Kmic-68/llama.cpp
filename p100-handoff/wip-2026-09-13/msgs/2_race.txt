@@ -29,4 +29,3 @@ Intermediate state of a three-commit series; the series' final state is what was
 gated. OPTLOG attempts 151-152.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk

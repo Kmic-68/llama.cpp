@@ -17,4 +17,3 @@ back to DEFAULT. QK^T stays on DEFAULT: the blocked family is only 2.1x more acc
 OPTLOG attempt 152.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk

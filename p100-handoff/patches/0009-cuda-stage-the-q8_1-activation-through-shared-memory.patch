@@ -20,7 +20,6 @@ shared memory. Gated to ncols_dst == 1 on Pascal.
 Perplexity unchanged (2.7554), test-backend-ops MUL_MAT 1193/1193.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
 ---
  ggml/src/ggml-cuda/mmvq.cu | 48 ++++++++++++++++++++++++++++++++++++--
  1 file changed, 46 insertions(+), 2 deletions(-)

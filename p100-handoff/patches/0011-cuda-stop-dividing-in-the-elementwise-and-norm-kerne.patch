@@ -28,7 +28,6 @@ RMS_NORM_MUL_ADD 30/30, L2_NORM 20/20, NORM 50/50, ADD 99/99, MUL 91/91,
 CPY 246/246, CONCAT 177/177, SWIGLU 24/24, SET_ROWS 159/159.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
 ---
  ggml/src/ggml-cuda/binbcast.cu |  54 +++++++++++++
  ggml/src/ggml-cuda/concat.cu   |  21 ++++--

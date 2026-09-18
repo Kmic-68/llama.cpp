@@ -20,4 +20,3 @@ file are norms, biases, ssm_a and the conv1d weight, none of which is a matmul w
 OPTLOG attempt 153.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk

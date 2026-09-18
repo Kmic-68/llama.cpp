@@ -15,7 +15,6 @@ loops.
 Perplexity unchanged (2.7554); RMS_NORM 51/51, RMS_NORM_MUL_ADD 30/30.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
 ---
  ggml/src/ggml-cuda/norm.cu | 43 ++++++++++++++++++++++++++++++++++++--
  1 file changed, 41 insertions(+), 2 deletions(-)

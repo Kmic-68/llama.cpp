@@ -22,7 +22,6 @@ test-backend-ops MUL_MAT 1193/1193. Perplexity through this path
 (-b 7 -ub 7): 3.6199 +/- 0.084 against 3.6237 +/- 0.084 for stock geometry.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
 ---
  ggml/src/ggml-cuda/mmvq.cu | 4 ++--
  1 file changed, 2 insertions(+), 2 deletions(-)

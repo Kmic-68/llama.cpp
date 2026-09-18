@@ -19,7 +19,6 @@ Three ways to keep the wider accesses without touching the arithmetic were
 tried and none was faster.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
 ---
  ggml/src/ggml-cuda/norm.cu | 127 +------------------------------------
  1 file changed, 2 insertions(+), 125 deletions(-)

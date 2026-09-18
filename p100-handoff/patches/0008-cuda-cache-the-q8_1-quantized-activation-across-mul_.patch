@@ -16,7 +16,6 @@ invalidate it at the start of every graph evaluation.
 Perplexity unchanged (2.7554), test-backend-ops MUL_MAT 1193/1193.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
 ---
  ggml/src/ggml-cuda/common.cuh   | 24 ++++++++++++++++++++++
  ggml/src/ggml-cuda/ggml-cuda.cu | 12 +++++++++++

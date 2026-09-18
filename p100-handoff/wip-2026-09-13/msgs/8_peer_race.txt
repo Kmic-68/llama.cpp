@@ -33,4 +33,3 @@ MTP 55.31 -> 54.98 (-0.6%).
 OPTLOG attempt 153.
 
 Co-Authored-By: Claude Opus 5 <noreply@anthropic.com>
-Claude-Session: https://claude.ai/code/session_01AaVsfEiPALnEHpNH9UZbjk
