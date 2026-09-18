@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # Assemble the release bundle on /mnt/fast from this repo.
 #
-# The bundle's prose is authored in ./bundle/ and installed wholesale, so it is never a base
+# The bundle's prose is authored in ../../p100-docs/ (top level, so it is browsable on the fork's
+# GitHub page) and installed wholesale, so it is never a base
 # document with corrections stacked underneath it -- that layering is what made the 09-05 bundle
-# hard to read. Edit ./bundle/, run this, done.
+# hard to read. Edit p100-docs/, run this, done.
 #
 # If /mnt/fast is mounted READ-ONLY (fuseblk,ro), Windows left the NTFS volume dirty (Fast
 # Startup / hibernation). Two ways back to rw, in order of safety:
@@ -30,11 +31,12 @@ fi
 rm -f "$REL/.wtest"
 
 echo "==> authored documentation"
-install -Dm644 "$HERE/bundle/README.md"   "$REL/README.md"
-install -Dm644 "$HERE/bundle/CHANGES.md"  "$REL/CHANGES.md"
-for f in "$HERE"/bundle/docs/*.md; do
-    install -Dm644 "$f" "$REL/docs/$(basename "$f")"
-    echo "    docs/$(basename "$f")"
+DOCS="$REPO/p100-docs"
+install -Dm644 "$DOCS/bundle-README.md" "$REL/README.md"
+install -Dm644 "$DOCS/CHANGES.md"       "$REL/CHANGES.md"
+for f in BUILD COMMUNITY-NOTES FINDINGS QUICKSTART; do
+    install -Dm644 "$DOCS/$f.md" "$REL/docs/$f.md"
+    echo "    docs/$f.md"
 done
 install -Dm644 "$HERE/docs/AUDIT-2026-09-12.md" "$REL/docs/AUDIT-2026-09-12.md"
 
@@ -84,7 +86,7 @@ echo "==> archive the superseded 2026-09-06 release"
 # Kept, not deleted: the before/after numbers in OPTLOG are against these binaries. One tarball
 # instead of three top-level directories that look like part of the current release.
 ARCH="$REL/archive"
-install -Dm644 "$HERE/bundle/archive-README.md" "$ARCH/README.md"
+install -Dm644 "$REPO/p100-docs/archive-README.md" "$ARCH/README.md"
 OLD=()
 for d in build-2026-09-06 patches-2026-09-06 diffs-2026-09-06; do
     [ -d "$REL/$d" ] && OLD+=("$d")
@@ -133,10 +135,10 @@ n_patch=$(ls "$REL"/patches/*.patch 2>/dev/null | wc -l)
 n_attempt=$(grep -oE '^## Attempt [0-9]+' "$REL/logs/OPTLOG.md" | awk '{print $3}' | sort -n | tail -1)
 n_code=$(cd "$REPO" && git log --format='%s' "$(tr -d '[:space:]' < "$REL/diffs/UPSTREAM-BASE-SHA.txt")..$(tr -d '[:space:]' < "$REL/diffs/HEAD-SHA.txt")" \
          | grep -cE '^(cuda|fix|perf|precision|revert|spec|tests?):')
-check "patch files"   "$n_patch"   "$REL/README.md"   '[0-9]+ `git am`-able commits'
+check "patch files"   "$n_patch"   "$REL/README.md" '[0-9]+ `git am`-able commits'
 check "OPTLOG attempts" "$n_attempt" "$REL/README.md" '[0-9]+ attempts'
 check "code commits"  "$n_code"    "$REL/CHANGES.md"  '[0-9]+ code commits'
-[ "$MISMATCH" = 0 ] || { echo "    fix bundle/*.md and re-run"; exit 1; }
+[ "$MISMATCH" = 0 ] || { echo "    fix p100-docs/*.md and re-run"; exit 1; }
 
 echo
 echo "done. HEAD $(cd "$REPO" && git rev-parse --short HEAD)."
