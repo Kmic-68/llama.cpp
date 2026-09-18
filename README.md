@@ -1,7 +1,8 @@
 > ### This is a fork: llama.cpp tuned for 2x Tesla P100 (sm_60)
 >
 > Pascal-targeted CUDA kernel work on top of upstream `f280b2698`. Decode **17.51 → 30.64 t/s**,
-> prefill `pp2048` **222.6 → 411.5 t/s**, and slightly *more* numerically accurate than upstream.
+> prefill `pp2048` **222.6 → 380.4 t/s** at a matched ubatch, and slightly *more* numerically accurate
+> than upstream.
 >
 > **→ [p100-docs/](p100-docs/README.md)** — results, every change, the flags to run, and what failed.
 >

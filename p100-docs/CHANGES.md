@@ -139,7 +139,8 @@ is why the fp16 accumulation error in §2 went unnoticed.
 | | upstream `f280b2698` | this build |
 |---|---|---|
 | decode `tg256` | 17.51 t/s | **30.64 ± 0.19** (1.75x) |
-| prefill `pp2048` | 222.6 t/s | **411.5** (1.85x) |
+| prefill `pp2048`, matched `-ub 512` | 222.6 t/s | **380.4 ± 0.1** (1.71x) |
+| prefill `pp2048`, best (`-ub 2048`) | — | **411.5** |
 | perplexity, `tools/perplexity-gate-corpus.txt`, `-c 4096` | — | **2.6097 ± 0.0198** (gate band 2.6209 ± 0.0199) |
 | `test-backend-ops -o FLASH_ATTN_EXT` | — | 3961/3961, both GPUs |
 | `test-backend-ops` full suite | — | 14593/14593, both GPUs |
