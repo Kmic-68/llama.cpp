@@ -61,7 +61,7 @@ exec "$BUILD/llama-server" \
   -ngl 99 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 \
   -c 262144 -b 262144 -ub 512 -np 1 \
   --spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min 0.2 \
-  -ngld 99 -ubd 64 -ctkd q4_0 -ctvd q4_0 \
+  -ngld 99 -ubd 64 \
   --jinja --temp 0.3 --top-k 20 \
   --host 0.0.0.0 --port 8080 \
   --tools all \
