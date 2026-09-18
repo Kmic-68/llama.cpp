@@ -6315,3 +6315,149 @@ writing into QUICKSTART rather than leaving in a log:
 Untried, for next session: `-ub 512` (the KQ mask at `-ub 2048` reserves 1024 MiB, so this should
 free ~768 MiB) with `-ubd 64`, leaving deliberate headroom for the display. That would also
 confirm the diagnosis was memory pressure rather than a kernel defect.
+
+## Attempt 155 — cutting the tile kernel's redundant shared reads of K (REJECTED, +31.6%)
+
+Attempt 132 found this kernel is not latency-bound and concluded "the limiter is shared-memory
+throughput or dependent-instruction chains", but never localized which traffic. Found it by
+reading the index algebra rather than sweeping parameters.
+
+At the decode config `(DKQ 256, DV 256, ncols 6, nthreads 192, occupancy 2, nbatch_fa 64,
+nbatch_K 128)`:
+
+    cpw = ncols > nwarps ? ncols/nwarps : 1   ->  1      (6 columns, 6 warps)
+    np  = nwarps > ncols ? nwarps/ncols : 1   ->  1
+    i_KQ = i_KQ_0 + (threadIdx.y % np)*warp_size + threadIdx.x
+
+With `np == 1`, `threadIdx.y` drops out of `i_KQ`: **all 6 warps read the identical K tile out of
+shared, each using it for its own single Q column.** K is written to shared once (16 kiB) and read
+back 6 times (96 kiB) per tile. Fewer warps => larger `cpw` => K read once into registers and
+reused across columns. That is the "accumulate all columns per thread" half of the fix named in
+the known-gaps section.
+
+### The config route allows exactly one step, and it loses
+
+`cpw` is doubly constrained: `static_assert(cpw % KQ_cs == 0)` with `KQ_cs == min(cpw, cpy_ne)`,
+and `KQ_cs*sizeof(half)` must be a width `ggml_cuda_memcpy_1` accepts (1/2/4/8/16 B). For
+`ncols == 6` that leaves `cpw` in {1, 2}: `cpw == 3` needs a 6-byte copy, `cpw == 6` fails
+`6 % 4 != 0`. Both were compile errors, not measurements.
+
+| config | threads/SM | nb=1 @ kv=262144 | vs base |
+|---|---|---|---|
+| **base** 192 thr, occ 2, nbatch_fa 64 | 384 | **1651.66 us** | — |
+| cpw 2: 96 thr, occ 4, nbatch_fa 32 | 384 | 1827.71 us | **+10.7%** |
+| cpw 2: 96 thr, occ 2, nbatch_fa 64 | 192 | 2173.58 us | **+31.6%** |
+
+nb=2/3/4/6/8/16 moved <= 0.5% in every build (they use ncols configs I did not touch), which sets
+the noise floor and makes both regressions real.
+
+**The redundant shared reads are real but are not the limiter.** Halving them cost 31.6%. The
+first run's `nbatch_fa 32` was not the culprit -- restoring `nbatch_fa 64` made it *worse*; the
+smaller tile had been partially masking the damage.
+
+### What this adds to attempt 132
+
+132 measured occupancy 2 -> 4 (384 -> 768 threads/SM) as neutral-to-slightly-worse. This measures
+384 -> 192 as -31.6%. Together: **~384 threads/SM is the saturation point for this kernel's
+memory-level parallelism.** Above it more warps buy nothing; below it throughput falls off a
+cliff. Thread count dominates shared-memory traffic at this shape, so trading the former for the
+latter is always a loss.
+
+### What the real fix now requires
+
+Eliminating the redundancy *without* losing threads means each warp owning a subset of KV rows and
+**all** columns. The template cannot express that: `cpw` and `np` are mutually exclusive by
+construction -- `np = nwarps > ncols ? nwarps/ncols : 1` and `cpw = ncols > nwarps ? ncols/nwarps
+: 1`, so one is always 1. It needs the row/column split decoupled *and* the KQ buffer relaid so
+`KQ_cs == 6` is expressible. That is a kernel rewrite, not a constant.
+
+Whether it is worth it, against the same baseline:
+
+| kv=262144, nb=1 | time | bytes | effective |
+|---|---|---|---|
+| q4_0 | 1651.66 us | 151 MB | 91 GB/s |
+| f16  | 1210.08 us | 537 MB | 444 GB/s |
+
+q4_0 reads 4x fewer bytes and takes 36% longer; at the f16 path's measured bandwidth those
+151 MB would be ~340 us. The op is ~4.8x off its own memory system, and 16 layers x ~1.3 ms of
+that is the 23.7 ms of the 46.6 ms/token budget that attempt 131 says must fall to 10.4 ms for
+30 t/s at depth. The prize is real. The config space for reaching it is now provably empty.
+
+Reverted. Config restored to `(256, 256, 6, 192, 2, 64, 128)`.
+
+## Attempt 156 — each q4_0 byte was being read twice (KEPT, -13.1% decode at 262144)
+
+A q4_0 byte encodes two values 16 apart: `qs[m]` holds value `m` in its low nibble and
+`m + QK4_0/2` in its high one. `flash_attn_tile_load_tile_q4_0` assigned those two values to
+**different threads**, each of which loaded the same `2*cpy_ne` bytes and discarded half of every
+byte. q4_0's real DRAM traffic was ~2x its useful bytes -- ~300 MB per call at kv=262144 against
+151 MB of data -- which is exactly why a q4_0 cache was no faster than an f16 cache moving 537 MB.
+
+The loader's own comment reasons carefully about *not straddling* the nibble split. It never uses
+the fact that both halves arrive in the same load. One thread now reads those bytes once and emits
+both, to `j` and `j + QK4_0/4`.
+
+Per-value arithmetic untouched -- `(q - 8)` in integer, one `hmul2` per pair -- so it is
+bit-identical to the previous loader and to upstream `to_fp16`.
+
+| kv | nb=1 | nb=2 | nb=8 | nb=2048 |
+|---|---|---|---|---|
+| 32768 | 229.55 -> 209.05 (-8.9%) | -3.1% | -2.7% | -- |
+| 65536 | 427.13 -> 382.72 (-10.4%) | -4.5% | -3.7% | -1.9% |
+| 131072 | 825.84 -> 728.24 (-11.8%) | -5.6% | -4.0% | -2.1% |
+| 262144 | **1651.66 -> 1434.92 (-13.1%)** | -6.0% | -3.9% | -1.4% |
+
+Every shape at every depth improves; the gain grows with depth and peaks at decode, which is the
+signature of cutting KV traffic. `test-backend-ops -o FLASH_ATTN_EXT` 3961/3961. `gate.sh`
+PPL **2.6097 +/- 0.01982**, unchanged. Commit `961e63c18`.
+
+### How it was found, since the tooling did not help
+
+**There is no profiler on this machine.** `nvprof` fails with `Internal profiling error 4190:27`
+even as root on an idle GPU -- it is CUDA 12.0 against driver 580.173.02, and the legacy profiling
+API is gone. Nsight Compute does not support Pascal. **CLAUDE.md's "nvprof does [support Pascal]"
+is stale.** Do not spend time on it.
+
+What substituted: a quant-type sweep at the decode shape (added to test-backend-ops). f16 moves
+the **most** bytes per value (2.0) and is the **fastest** (1188.92 us), while q5_0 moves 0.6875 and
+is the slowest (2484.78). Zero correlation with byte count, which killed the "bandwidth-bound"
+framing and sent me to read the loader. Caveat for whoever uses those cases: only q4_0 has the
+fused loader, so q4_1/q5_0/q5_1/q8_0 still pay `launch_fattn`'s whole-cache f16 conversion and are
+**not** a clean measure of dequant cost.
+
+### Where the remaining gap is, with the arithmetic
+
+f16 at 537 MB / 1188.92 us = **452 GB/s**, ~92% of this machine's measured 490 GB/s ceiling -- so
+when this kernel is memory-bound it hides all of its math. q4_0's useful bytes are 151 MB, a
+~340 us floor, against 1435 us now: **~1100 us is still exposed overhead.** 30 t/s at depth needs
+650 us/layer (attempt 131's budget: 33.3 ms/token, weights 22.9 ms, leaving 10.4 ms over 16
+layers). Halving `qs` traffic bought 190 us of the ~1300, so raw `qs` bytes were not the dominant
+term either. What is left: the `d` scale loads, the shared staging round trip (K is still read out
+of shared 6x -- see attempt 155, which proves that is unfixable via warp count), and the dequant
+ALU chain.
+
+## Attempt 157 — the 4.4x cliff at full depth is NOT the attention kernel (IN PROGRESS)
+
+Reframing prompted by a question from the user that caught me conflating two numbers.
+
+    server, 228958 tokens (attempt 131)        21.47 t/s     46.6 ms/token
+    server, 259229 tokens (attempt 154/156)     4.85 t/s    206   ms/token
+    FLASH_ATTN_EXT kv=262144 nb=1, isolated    1434.92 us -> 16 layers = 23.0 ms
+
+**The op benchmark shows no cliff at full depth.** 16x1435 us + 22.9 ms of weights predicts
+45.9 ms/token = 21.8 t/s. The server measured 206 ms/token at the same depth. **~160 ms/token is
+unaccounted for, and it is not attention.**
+
+The only thing distinguishing that run is that it ended with **205 MiB free on GPU0**. Leading
+hypothesis: with the pool unable to satisfy allocations from cache, every decode falls back to
+`cudaMalloc`/`cudaFree`, which synchronize. Note `-ctkd/-ctvd q4_0` was **already set** in that
+run, so that lever is spent.
+
+Test set up but not finished (paused): same binary, same `-c 262144 -b 262144 -ub 512`, same
+259118-token prompt, `--spec-type none` to free the draft context (~150 MB; 2607 MiB free at load
+vs 2235). If plain decode returns to ~21 t/s the cliff is allocator starvation and is solved
+rather than merely diagnosed; if it stays ~5 t/s, memory is not the cause and the 160 ms/token
+needs a different explanation.
+
+**This is the 4.4x. The whole kernel programme above is the 1.4x.** Priority order for next
+session is this, not more kernel work.
