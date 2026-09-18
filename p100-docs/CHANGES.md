@@ -147,7 +147,27 @@ is why the fp16 accumulation error in §2 went unnoticed.
 
 At the production operating point (`llama-server -c 262144 -b 262144 -ub 2048 -np 1` with the MTP
 draft, 19966-token prompt): prompt 350-366 t/s, generation 30.1 t/s, peak VRAM **16137 MiB on
-GPU0** (including ~392 MiB of Sunshine) and **15745 MiB on GPU1**, of 16384 each.
+GPU0** (including ~392 MiB of Sunshine) and **15745 MiB on GPU1**, of 16384 each. That prompt is
+only 8% of the allocated context — see "Watch VRAM" in QUICKSTART for what a genuinely full one
+costs.
+
+### Prefill as context fills
+
+`llama-bench -d <depth> -p 2048 -ub 512`, measured on the shipping build:
+
+| depth | `pp2048` | vs. depth 0 |
+|---|---|---|
+| 0 | 380.4 ± 0.1 | — |
+| 65536 | 222.4 ± 0.6 | 0.58x |
+| 131072 | 147.6 ± 12.1 | 0.39x |
+| 262144 | 85.4 ± 0.7 | 0.22x |
+
+Decode at depth is measured through the server instead, because `llama-bench -n 128` is too short
+to be trusted there (FINDINGS §2): **21.5 t/s plain and 23.2 with the MTP draft at 229k tokens**,
+against 30.6 at an empty cache.
+
+Allocating a large `-c` costs decode nothing on its own — `-c 4096` and `-c 262144` both measure
+30.7 t/s with a near-empty cache. **Depth is what costs**, not the allocation.
 
 ## Known gaps
 
@@ -164,6 +184,13 @@ happens with them on and off), the zero-slice branch, the CUDA memory pool, and 
 coverage. It follows the GEMM attention path — with `GGML_CUDA_FA_GEMM=0` the same command is
 identical 5 of 5. **Two physical GPUs are bit-stable**, so nothing that ships is affected; this is
 a defect in a debug-only mode. `logs/OPTLOG.md` attempt 153 §8c has the table.
+
+**Prefill at full depth is ~10% slower than when that path was tuned.** `pp2048` at `-d 262144`
+measured 95.14 t/s during the GEMM-attention work and **85.44 ± 0.68** on the shipping build —
+tight error bars on both, so it is not noise. Part may be thermal (77-78 °C at the end of a long
+re-measurement sweep; the earlier figure's conditions were not recorded), and it is the same sign
+as an already-documented -3.0%. Not bisected. It affects only the deepest prefills; the rest of
+the depth curve above matches its original measurements.
 
 **The remaining performance gap is structural.** Plain decode at 229k is 46.6 ms/token, of which
 flash attention is 23.7. At the decode shape the f16 KV path runs at 480 GB/s — the bandwidth
