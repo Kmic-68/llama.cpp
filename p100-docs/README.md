@@ -30,6 +30,25 @@ and slower than `ALGO6` at 512-1024 rows.
 | [`../OPTLOG.md`](../OPTLOG.md) | the full record — 153 attempts, kept and reverted, with numbers |
 | [`../p100-handoff/`](../p100-handoff/) | the raw engineering record: harnesses, logs, per-session notes |
 
+## Reproducing the numbers
+
+Every measurement above comes from `tools/gate.sh`, which is in this repo:
+
+    ./tools/gate.sh
+
+It runs the perplexity and throughput gates with the corpus they belong to. **Use it rather than
+a hand-typed perplexity command** — the band belongs to one specific corpus, and a different wiki
+dump returns ~2.7566 on *any* build including stock llama.cpp. That mix-up has twice been misread
+here as a correctness failure, which is why the gate lives in a script instead of in prose.
+
+The numerical-accuracy claims come from `test-backend-ops` against its CPU fp32 reference; the
+per-token accuracy comparisons are paired per-chunk perplexity over 4096 x 30 tokens, with the
+t-statistics reported alongside them in [CHANGES.md](CHANGES.md) and [FINDINGS.md](FINDINGS.md).
+
+Two measurement traps will bite you if you benchmark this yourself: cold-start and thermal skew
+reach 13% across sessions (discard a warmup run, interleave A/B within one session), and `-n 128`
+is far too short at long context. Both are in [FINDINGS.md](FINDINGS.md).
+
 ## The short version of what's in it
 
 The decode matvec (`mul_mat_vec_q`, ~85% of decode time) is rebuilt around the observation that
