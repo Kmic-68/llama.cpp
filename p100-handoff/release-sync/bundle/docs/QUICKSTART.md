@@ -14,12 +14,12 @@ and `qwen-server` starts the tuned configuration below.
 **Use `bin/`, not `build/`.** They hold the same 91 programs, but `bin/` are one-line wrappers
 that set `LD_LIBRARY_PATH` to this bundle before exec'ing. The real binaries carry a RUNPATH
 pointing at the tree they were compiled in, so run directly from `build/` they load *that* tree's
-`libggml-cuda.so` if it still exists — a different build, silently, with no error. Check any time
-with:
+`libggml-cuda.so` if it still exists — a different build, silently, with no error. Check any time with:
 
-    ldd $(which llama-server) | grep ggml-cuda
+    LD_DEBUG=libs llama-cli --version 2>&1 | grep -m1 "trying file=.*ggml-cuda"
 
-Every path should say `/mnt/fast/p100-llamacpp-release/build`.
+It should name `/mnt/fast/p100-llamacpp-release/build`. (Plain `ldd $(which llama-server)` tells
+you nothing here — the thing on PATH is the wrapper, which is a shell script.)
 
 ## Serving (the configuration in daily use)
 
