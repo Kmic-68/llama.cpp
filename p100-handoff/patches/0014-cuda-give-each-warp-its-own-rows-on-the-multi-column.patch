@@ -1,4 +1,4 @@
-From c9de43286d76f538c26b3de9e706cc97239263af Mon Sep 17 00:00:00 2001
+From dd0e5289be095129b742e01b22a4dcc2e96629a7 Mon Sep 17 00:00:00 2001
 From: Kaden <kaden@localhost>
 Date: Sun, 30 Aug 2026 18:10:20 -0500
 Subject: [PATCH 14/16] cuda: give each warp its own rows on the multi-column

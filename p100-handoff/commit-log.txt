@@ -1,75 +1,75 @@
-aa22ccee0 cuda: bound fp16 accumulation error in the flash-attn tile kernel
-e5bd6c5a3 tests: add eval coverage for the P100 operating shape and optional error printing
-30332a5a0 handoff: final session-7 update
-e0fe3056c docs: wide loads in the q4_0 dequant rejected (+7%)
-0edc0fc74 docs: cpw makes no difference; tile-kernel parameter space is closed
-0f759f41e cuda: nbatch_K 128 for the narrow gqa-6 tiles (-10.3% on the decode shape)
-9f8617b15 docs: occupancy on the nb=1 tile config rejected; tile config space exhausted
-0606819b9 docs: correct the plain-decode baseline and retract the single-token ceiling
-13ffebe9a docs: quantify the single-token ceiling at 262144
-3ae9e6072 docs: mmid is inert on this model (dense, no expert tensors); k=3 stands at 23.2
-a282507b9 docs: correct why n_draft=3 wins -- FA tile-width step, not the mmid threshold
-4d562c0b7 docs: n_draft=3 is +8.2% at full context (23.216 t/s)
-ccc9ea0d0 handoff: bring the package up to date through session 7
-606215cbf docs: internal AllReduce on Pascal rejected (-17%)
-f59c3f56f docs: complete 3-rep data for the fused-MoE threshold (+0.75%, still rejected)
-17c5e60b8 docs: fused-MoE batch threshold rejected (~1%, inside noise)
-e339c6243 cuda: allow CUDA graphs on pre-Volta as an opt-in (+6.7% on the MTP path)
-9082aad9f docs: n_draft is flat from 3 to 6; +1.9% at 229k, not the projected 10%
-2786b05e2 docs: full-context 20.3 t/s after exact-fit tiles; reject nbatch_fa=64
-2c5405fef cuda: exact-fit tile width for the MTP verify shape
-7a149d2ec docs: tile kernel runs at 17% of peak, and doubling occupancy changes nothing
-cd67386a7 docs: withdraw the per-pass allocation overhead; real full-context MTP is 17.4 t/s
-76a703170 docs: allocation overhead is linear in n_ctx; eight candidate causes eliminated
-6efcfe7a1 docs: correct the MTP ceiling -- 30 t/s is reachable; the draft step is host-bound
-30e6ee033 docs: diagnose the 2.2x large-n_ctx penalty in the MTP path
-d4bdd92a9 docs: plain 12.2 vs MTP 14.3 t/s at 229k, and the draft cost decomposed
-8fa29fd43 docs: MTP at 228958 context measures 14.3 t/s at 76.9% acceptance
-f0393db54 cuda: dequantize with hfma2 in the tile loader
-2a6907ab8 cuda: don't reserve f16 staging when the tile kernel reads q4_0 directly
-3ee12f08c cuda: dequantize the q4_0 KV tile into shared memory in the tile kernel
-ba6bcac64 tests: isolate the tile kernel's full-cache dequantization cost
-59f299f87 docs: quantify the 262144 ceiling and reject three tile occupancy configs
-ce20ad9a7 cuda: fold GQA in the 2-column vec path and scale minblocks with ncols
-362c6172f cuda: fold the full GQA-6 group in the flash-attn tile kernel
-11255e1d6 docs: compute-sanitizer cannot run here (driver 580 vs sanitizer 2022.4.1)
-d1818fd04 docs: the inversion's real bug, fixed -- and it still fails the perplexity gate
-02ba4188b docs: decode at true full context is 12.0 t/s, up from 7.32
-7c2b98349 docs: record the V thread-mapping inversion -- 2.35x but not yet correct
-0826d6b62 docs: the first decode-only profile, and what it rules out
-545e28273 docs: record the tile-kernel GQA experiment (reverted) and the decode findings
-9c7a8865b cuda: fold the GQA group into one block in the flash-attention vec kernel
-f98e5b81c docs: profile prefill at depth; the KQ mask upload is not the residual
-c23da3a87 docs: correct the decode ceiling -- 11.4 t/s was too pessimistic
-069a8081d docs: measure the decode budget at depth before touching the vec kernel
-68bf90cc9 docs: correct the KQ mask size to 1024 MiB
-f5ce7a84e docs: lead the handoff with the working full-context + MTP configuration
-c821250a6 docs: measure the full-context MTP config end to end, and reject asymmetric -ts
-0d1ea109c spec: let the draft context use its own ubatch, unblocking MTP at full context
-32e8305ff tests: add nb=1024/512 FA perf cases for the ubatch tradeoff
-69f9bd270 docs: refresh handoff artifacts
-428c483ae docs: reject the two-stream pipeline and correct the harness noise floor
-5e8615334 docs: regenerate handoff artifacts for session 5
-ffca91955 docs: rewrite the handoff head around measured 262144 numbers
-ab3e03480 docs: log the decode hypotheses tested and the GQA-redundancy finding
-f7fb6fca3 tests: add decode-shaped (nb=1) long-context FA perf cases
-6af156412 docs: record the final 262144 numbers, the decode curve, and why 175 is out of reach
-391ef43d7 docs: correct the residual attribution in attempt 93
-100d36c08 docs: log the 262144 measurements, the fast op harness, and the time budget
-2d100c5cc cuda: issue the attention GEMMs as one call instead of a gqa batch, and add a long-context perf shape to test-backend-ops
-6af7418c6 cuda: run the PV GEMM in f16 on the pre-Volta attention path
-74c25a980 docs: record the long-context work and reframe the handoff around it
-98de4588f cuda: alias P onto S in the GEMM attention path
-bdcb3f7bf cuda: cuBLAS-GEMM flash attention for pre-Volta long context
-9183630c8 docs: long-context flash attention is the prefill bottleneck (attempt 89)
-e4fdbb901 docs: price the MTP host round trip properly, drop backend sampling
-747a6618d docs: make HEAD-sha.txt record the last code commit, not HEAD
-a4beffd92 docs: refresh the p100-handoff snapshot artefacts
-836e9fdc4 docs: bring handoff, optlog and verification paper up to final numbers
-f85e154ed optlog: exhaust the MTP flag space
-2005f80fa handoff: lead with the MTP host-sync finding
-14197de6e optlog: MTP is host-sync bound -- the real route to 60 t/s
-2a1f29afd handoff: record the mmvq unpack-redundancy finding and its measured ceiling
-2a5e3524e optlog: price the redundant weight unpack in mmvq (not capturable cheaply)
-8ef141ee3 optlog: close out the GEMM-gap investigation
-c816521cb optlog: retract the thermal-throttling explanation for the GEMM gap
+edc7980bf cuda: bound fp16 accumulation error in the flash-attn tile kernel
+232797c00 tests: add eval coverage for the P100 operating shape and optional error printing
+c41fae17e handoff: final session-7 update
+24e7d4d19 docs: wide loads in the q4_0 dequant rejected (+7%)
+76dce0652 docs: cpw makes no difference; tile-kernel parameter space is closed
+5ea4b2712 cuda: nbatch_K 128 for the narrow gqa-6 tiles (-10.3% on the decode shape)
+444e3a325 docs: occupancy on the nb=1 tile config rejected; tile config space exhausted
+040146900 docs: correct the plain-decode baseline and retract the single-token ceiling
+0b6b11db9 docs: quantify the single-token ceiling at 262144
+b9eab2e43 docs: mmid is inert on this model (dense, no expert tensors); k=3 stands at 23.2
+6c1eab393 docs: correct why n_draft=3 wins -- FA tile-width step, not the mmid threshold
+781f26d68 docs: n_draft=3 is +8.2% at full context (23.216 t/s)
+77db9b7a2 handoff: bring the package up to date through session 7
+67153b89c docs: internal AllReduce on Pascal rejected (-17%)
+2c68d0508 docs: complete 3-rep data for the fused-MoE threshold (+0.75%, still rejected)
+6a88a4c2c docs: fused-MoE batch threshold rejected (~1%, inside noise)
+b302163d6 cuda: allow CUDA graphs on pre-Volta as an opt-in (+6.7% on the MTP path)
+f5ef17d1b docs: n_draft is flat from 3 to 6; +1.9% at 229k, not the projected 10%
+7422c574d docs: full-context 20.3 t/s after exact-fit tiles; reject nbatch_fa=64
+8599fe022 cuda: exact-fit tile width for the MTP verify shape
+f5d136f6b docs: tile kernel runs at 17% of peak, and doubling occupancy changes nothing
+4630c8daa docs: withdraw the per-pass allocation overhead; real full-context MTP is 17.4 t/s
+32193e3dc docs: allocation overhead is linear in n_ctx; eight candidate causes eliminated
+4957532db docs: correct the MTP ceiling -- 30 t/s is reachable; the draft step is host-bound
+b05d340a4 docs: diagnose the 2.2x large-n_ctx penalty in the MTP path
+8c44efca0 docs: plain 12.2 vs MTP 14.3 t/s at 229k, and the draft cost decomposed
+a7ebbf38f docs: MTP at 228958 context measures 14.3 t/s at 76.9% acceptance
+88211649b cuda: dequantize with hfma2 in the tile loader
+b574f0b98 cuda: don't reserve f16 staging when the tile kernel reads q4_0 directly
+3f49203da cuda: dequantize the q4_0 KV tile into shared memory in the tile kernel
+2f50214e1 tests: isolate the tile kernel's full-cache dequantization cost
+76c3893a2 docs: quantify the 262144 ceiling and reject three tile occupancy configs
+da3bddaeb cuda: fold GQA in the 2-column vec path and scale minblocks with ncols
+2127ac5bf cuda: fold the full GQA-6 group in the flash-attn tile kernel
+addd43334 docs: compute-sanitizer cannot run here (driver 580 vs sanitizer 2022.4.1)
+2f29138ca docs: the inversion's real bug, fixed -- and it still fails the perplexity gate
+f38bb1467 docs: decode at true full context is 12.0 t/s, up from 7.32
+96e5cfab1 docs: record the V thread-mapping inversion -- 2.35x but not yet correct
+65ecbf050 docs: the first decode-only profile, and what it rules out
+1f1528db0 docs: record the tile-kernel GQA experiment (reverted) and the decode findings
+5fc820f9d cuda: fold the GQA group into one block in the flash-attention vec kernel
+5f66db06f docs: profile prefill at depth; the KQ mask upload is not the residual
+0031508a9 docs: correct the decode ceiling -- 11.4 t/s was too pessimistic
+ab88af2e0 docs: measure the decode budget at depth before touching the vec kernel
+f05e79180 docs: correct the KQ mask size to 1024 MiB
+00299c7ab docs: lead the handoff with the working full-context + MTP configuration
+88ac9e500 docs: measure the full-context MTP config end to end, and reject asymmetric -ts
+74de4a1bd spec: let the draft context use its own ubatch, unblocking MTP at full context
+cffc2b191 tests: add nb=1024/512 FA perf cases for the ubatch tradeoff
+e12245bb9 docs: refresh handoff artifacts
+18d9041e5 docs: reject the two-stream pipeline and correct the harness noise floor
+632328f9b docs: regenerate handoff artifacts for session 5
+b0684f08e docs: rewrite the handoff head around measured 262144 numbers
+5b90e62b6 docs: log the decode hypotheses tested and the GQA-redundancy finding
+282918f2e tests: add decode-shaped (nb=1) long-context FA perf cases
+358f8c1c4 docs: record the final 262144 numbers, the decode curve, and why 175 is out of reach
+2650e41ff docs: correct the residual attribution in attempt 93
+a76c26db4 docs: log the 262144 measurements, the fast op harness, and the time budget
+0b0e16a03 cuda: issue the attention GEMMs as one call instead of a gqa batch, and add a long-context perf shape to test-backend-ops
+dbbee401a cuda: run the PV GEMM in f16 on the pre-Volta attention path
+f9a6353a1 docs: record the long-context work and reframe the handoff around it
+0f5b88954 cuda: alias P onto S in the GEMM attention path
+738022bda cuda: cuBLAS-GEMM flash attention for pre-Volta long context
+0d88c4e1b docs: long-context flash attention is the prefill bottleneck (attempt 89)
+606a433e8 docs: price the MTP host round trip properly, drop backend sampling
+e0e0c7dff docs: make HEAD-sha.txt record the last code commit, not HEAD
+bfa37e452 docs: refresh the p100-handoff snapshot artefacts
+91e08831c docs: bring handoff, optlog and verification paper up to final numbers
+c4908ecb4 optlog: exhaust the MTP flag space
+d58f2a4db handoff: lead with the MTP host-sync finding
+357abf068 optlog: MTP is host-sync bound -- the real route to 60 t/s
+b2bd3ac51 handoff: record the mmvq unpack-redundancy finding and its measured ceiling
+cba8e254a optlog: price the redundant weight unpack in mmvq (not capturable cheaply)
+a84b973f1 optlog: close out the GEMM-gap investigation
+0566a177f optlog: retract the thermal-throttling explanation for the GEMM gap

@@ -1,4 +1,4 @@
-From f07b913a7f59f7bf386b5aab16a1f46f1f6f239f Mon Sep 17 00:00:00 2001
+From a277ff94f65a120acb108a7a3f686f7233853085 Mon Sep 17 00:00:00 2001
 From: Kaden <kaden@localhost>
 Date: Sat, 29 Aug 2026 19:23:10 -0500
 Subject: [PATCH 04/16] cuda: vdr=2 for Q6_K mmvq and Pascal launch geometry in

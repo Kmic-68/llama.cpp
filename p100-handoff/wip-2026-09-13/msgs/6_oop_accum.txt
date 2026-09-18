@@ -1,7 +1,7 @@
 fix: GEMM attention accumulates its running output out of place
 
 fattn_gemm_accum_O computed O[d] = O[d]*corr + Otmp[d] in place: a load and a store of the same
-device address inside the thread loop, the shape that raced in this path's softmax (8978d3018).
+device address inside the thread loop, the shape that raced in this path's softmax (cb6024e6b).
 At DV=256 the loop runs once per thread and no run-to-run difference had been seen, but perplexity
 cannot see a single-element misread. The running output now alternates between two buffers,
 swapped per chunk; the second costs DV*nt*gqa floats (12 MB per GPU at -ub 2048).

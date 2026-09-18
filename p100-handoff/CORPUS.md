@@ -33,7 +33,7 @@ Same corpus (422,246), three builds, identical to every digit and every chunk:
 |---|---|---|
 | upstream stock | `f280b2698` | 2.7554 +/- 0.02151 |
 | prior session's `build-faq` | ~`b44f8fe6f` | 2.7554 +/- 0.02151 |
-| this work | `134a4f4a5` | 2.7554 +/- 0.02151 |
+| this work | `2c1f89b12` | 2.7554 +/- 0.02151 |
 
 ## The original corpus, reconstructed
 

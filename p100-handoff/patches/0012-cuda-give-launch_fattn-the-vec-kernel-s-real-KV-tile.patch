@@ -1,4 +1,4 @@
-From da56cb516c362a39ee117880876b0c2d66b20483 Mon Sep 17 00:00:00 2001
+From 43543917bc8cc08997a487d192bfe784b6726435 Mon Sep 17 00:00:00 2001
 From: Kaden <kaden@localhost>
 Date: Sun, 30 Aug 2026 12:56:24 -0500
 Subject: [PATCH 12/16] cuda: give launch_fattn the vec kernel's real KV tile

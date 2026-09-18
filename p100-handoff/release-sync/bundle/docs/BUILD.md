@@ -67,7 +67,7 @@ and nowhere near sufficient.
 
 ## `--version` lags, and that is not a stale build
 
-`llama-cli --version` on these binaries reports commit `0b92a60d3`, three commits behind what
+`llama-cli --version` on these binaries reports commit `dce17bf1b`, three commits behind what
 they were actually built from. llama.cpp stamps the build-info string at **cmake configure**
 time, not at each build, so it pins to whatever HEAD was when the build tree was last configured.
 

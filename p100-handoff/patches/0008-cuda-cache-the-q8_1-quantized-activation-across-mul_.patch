@@ -1,4 +1,4 @@
-From 246515a32c52f02a569284dbd4e14be9d46727ee Mon Sep 17 00:00:00 2001
+From 090f53560e8843bc4c618b0efc52bb28129c2938 Mon Sep 17 00:00:00 2001
 From: Kaden <kaden@localhost>
 Date: Sun, 30 Aug 2026 07:22:41 -0500
 Subject: [PATCH 08/16] cuda: cache the q8_1-quantized activation across

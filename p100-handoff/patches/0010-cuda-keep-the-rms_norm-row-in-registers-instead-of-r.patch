@@ -1,4 +1,4 @@
-From 0588f67d2e63eb903913e14fca0f3a3076157f6f Mon Sep 17 00:00:00 2001
+From 43eb74621c18deb1593a3a90917510242014d45f Mon Sep 17 00:00:00 2001
 From: Kaden <kaden@localhost>
 Date: Sun, 30 Aug 2026 11:26:01 -0500
 Subject: [PATCH 10/16] cuda: keep the rms_norm row in registers instead of

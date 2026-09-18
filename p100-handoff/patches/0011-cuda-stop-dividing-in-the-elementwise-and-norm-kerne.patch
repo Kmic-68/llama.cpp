@@ -1,4 +1,4 @@
-From 1ee4ffe85d18337b5412b094c973639b93fd01ec Mon Sep 17 00:00:00 2001
+From 0776173e665f461ce143f924feddc877c6f6c0f0 Mon Sep 17 00:00:00 2001
 From: Kaden <kaden@localhost>
 Date: Sun, 30 Aug 2026 12:38:13 -0500
 Subject: [PATCH 11/16] cuda: stop dividing in the elementwise and norm kernels

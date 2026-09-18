@@ -1,4 +1,4 @@
-From bbdac166e18e648d751971117710df378c02c05f Mon Sep 17 00:00:00 2001
+From c718d1860260960e8cf630959d3d73285268566e Mon Sep 17 00:00:00 2001
 From: Kaden <kaden@localhost>
 Date: Sun, 30 Aug 2026 10:52:36 -0500
 Subject: [PATCH 09/16] cuda: stage the q8_1 activation through shared memory

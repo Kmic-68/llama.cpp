@@ -1,4 +1,4 @@
-From f30fee9a8d1cd7399dc1b27ec694a63ef5d8a193 Mon Sep 17 00:00:00 2001
+From fe0e5c811c3e24d0417cc64f08e2f725aeb9da54 Mon Sep 17 00:00:00 2001
 From: Kaden <kaden@localhost>
 Date: Sun, 30 Aug 2026 13:44:38 -0500
 Subject: [PATCH 13/16] cuda: restore bit-identical output in the norm kernels

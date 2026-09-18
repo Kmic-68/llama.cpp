@@ -1,4 +1,4 @@
-The staged source states that produced commits 72b108c36, d7866f67f, aef09316d, 0b92a60d3 and the
+The staged source states that produced commits 13b24fe27, fccdafca1, b67848c64, dce17bf1b and the
 same-GPU copy guard are in git history; only what git does not carry is kept here:
 
 - `peer-v1-rejected.patch` — the peer-copy fix variant that was measured and **not** kept: it

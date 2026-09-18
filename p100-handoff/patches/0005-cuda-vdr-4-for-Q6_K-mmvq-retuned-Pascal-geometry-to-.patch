@@ -1,4 +1,4 @@
-From 0732c729e59b2b52cdf594c087f913c659801844 Mon Sep 17 00:00:00 2001
+From e97421a3d22b0e4c806a4d4c03b56047f105e592 Mon Sep 17 00:00:00 2001
 From: Kaden <kaden@localhost>
 Date: Sat, 29 Aug 2026 20:10:40 -0500
 Subject: [PATCH 05/16] cuda: vdr=4 for Q6_K mmvq, retuned Pascal geometry to

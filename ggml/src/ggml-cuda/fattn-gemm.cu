@@ -66,7 +66,7 @@ template <> __device__ __forceinline__ float fattn_gemm_store<float>(const float
 // One block per (query token, head). Applies the mask, advances the running softmax
 // statistics, writes the chunk's probabilities, and reports the rescale factor for O.
 //
-// OUT OF PLACE, deliberately: S and P must be separate buffers. From 98de4588f until 2026-09-13 P
+// OUT OF PLACE, deliberately: S and P must be separate buffers. From 0f5b88954 until 2026-09-13 P
 // was written over S (saving 50 MB), and that is not safe here. Pass 2 loads S[j] and then
 // stores P[j] at the same address, and on this toolchain the store can land before the load, so
 // the load reads back a probability as a score: exp(4*P - m) with P <= 1/8 and a very negative

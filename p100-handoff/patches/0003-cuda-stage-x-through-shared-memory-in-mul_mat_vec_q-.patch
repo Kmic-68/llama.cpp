@@ -1,4 +1,4 @@
-From c7e7faf6090f8350a86d92e291c743a510acf128 Mon Sep 17 00:00:00 2001
+From 4d9dbeb346dd9600d838d9bf85141884d0cf2ca0 Mon Sep 17 00:00:00 2001
 From: Kaden <kaden@localhost>
 Date: Sat, 29 Aug 2026 17:22:29 -0500
 Subject: [PATCH 03/16] cuda: stage x through shared memory in mul_mat_vec_q

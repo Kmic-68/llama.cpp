@@ -1,4 +1,4 @@
-From 9fc142d12f8d14ac35698e986a35469946b64c6e Mon Sep 17 00:00:00 2001
+From be811a6d129edf6b99a204238f74194f887e2bf1 Mon Sep 17 00:00:00 2001
 From: Kaden <kaden@localhost>
 Date: Sat, 29 Aug 2026 20:42:41 -0500
 Subject: [PATCH 06/16] cuda: stage x in 16-byte units in mul_mat_vec_q (sm_60)

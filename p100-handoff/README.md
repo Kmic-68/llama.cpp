@@ -49,7 +49,7 @@ Everything below this section is measured at **2048 tokens of context**. The
 machine's actual workload is **262144**, where prefill is a completely different
 number because attention work is O(batch x depth).
 
-| depth | tile kernel | cuBLAS-GEMM path (`bdcb3f7bf`) |
+| depth | tile kernel | cuBLAS-GEMM path (`738022bda`) |
 |---|---|---|
 | 0 | 427 hot | 425 (gated off below KV 4096) |
 | 65536 | 158.43 | **188.99** |
@@ -78,12 +78,12 @@ GPUs that, like Pascal, lack an integer divider and DP4A.
 |------|------|
 | `full-kernel.diff` | every kernel change against upstream `f280b2698` |
 | `session2.diff` | the second session's changes alone (on top of `b44f8fe6f`) |
-| `session3.diff` | the 2026-08-31/09-01 changes alone (on top of `5d1fafb01`) |
-| `session4-longcontext.diff` | the cuBLAS-GEMM attention path alone (on top of `9183630c8`) |
+| `session3.diff` | the 2026-08-31/09-01 changes alone (on top of `17455ce35`) |
+| `session4-longcontext.diff` | the cuBLAS-GEMM attention path alone (on top of `0d88c4e1b`) |
 | `session5-longcontext.diff` | session 5's long-context work alone |
-| `session7-mtp-decode.diff` | **session 7**: exact-fit tile widths, CUDA graphs opt-in, nbatch_K=128 (on top of `428c483ae`) |
+| `session7-mtp-decode.diff` | **session 7**: exact-fit tile widths, CUDA graphs opt-in, nbatch_K=128 (on top of `18d9041e5`) |
 | `RESUME-HERE.md` | **start here** -- current state and ranked next steps |
-| `VERIFICATION.md` | numerical audit (covers up to `134a4f4a5`; later changes noted at the top) |
+| `VERIFICATION.md` | numerical audit (covers up to `2c1f89b12`; later changes noted at the top) |
 | `CORPUS.md` | why the perplexity gate corpus drifted, and which target goes with which file |
 | `patches/` | the same as `git am`-able commits, in order |
 | `commit-log.txt` | commit messages with per-file stats |

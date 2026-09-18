@@ -1,4 +1,4 @@
-From 134a4f4a5e20ae52791da48a889f332cfb9d6732 Mon Sep 17 00:00:00 2001
+From 2c1f89b123c24542d4fbe3f753bfe43b4b6b3ec2 Mon Sep 17 00:00:00 2001
 From: Kaden <kaden@localhost>
 Date: Sun, 30 Aug 2026 20:38:05 -0500
 Subject: [PATCH 16/16] cuda: stage the activation block-wide on the

@@ -15,7 +15,7 @@ index e123b986c..ab5cffe52 100644
 +|---|---|
 +| "the tile kernel likewise keeps KQ in half" | **False.** Tile accumulates KQ in fp32 (`fattn-tile.cuh:604`); it keeps the products in half. |
 +| "PV uses `CUBLAS_COMPUTE_32F`" / "the f16-PV variant has never been tested" | **Stale.** Both GEMMs ship `COMPUTE_16F`. The fp16 PV was measured this session — it is the path's dominant error, and `CUBLAS_GEMM_DEFAULT` made it 10x worse than it needs to be (below). |
-+| "correctness of the new attention path: 3949/3949, re-run after every change including the aliasing" | **Insufficient.** The aliasing change (98de4588f) introduced a data race that `test-backend-ops` cannot see: it compares against CPU with a tolerance, once, on random data. |
++| "correctness of the new attention path: 3949/3949, re-run after every change including the aliasing" | **Insufficient.** The aliasing change (0f5b88954) introduced a data race that `test-backend-ops` cannot see: it compares against CPU with a tolerance, once, on random data. |
 +
 +**The race.** The softmax kernel wrote probabilities over the scores it had just read, in one
 +buffer. On this toolchain the store can land before the load of the same element, with or
@@ -28,7 +28,7 @@ index e123b986c..ab5cffe52 100644
 +probabilities ≤ 1/8. fp16 showed no mismatch in 15360 checked launches but is the same pattern,
 +and there the read-back value overflows half and NaNs the output; one 4k perplexity run did go
 +NaN and did not reproduce. **Fixed: the probabilities get their own buffer** (~1% of the op,
-+50 MB per GPU at `-ub 2048`). Every build since 98de4588f, including the release, has the race.
++50 MB per GPU at `-ub 2048`). Every build since 0f5b88954, including the release, has the race.
 +
 +**Determinism is now a checked property.** fp32 GEMM: 3.3165 on all 10 runs across the
 +out-of-place builds. fp16 GEMM: 3.3185 every run. tile: 3.3134 every run.

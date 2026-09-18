@@ -1,4 +1,4 @@
-From 4ee0990827f790f97a90ef86f2bf2ae59bf78969 Mon Sep 17 00:00:00 2001
+From f3cb02935ab293d488a51548b1f43eaf193d9e6c Mon Sep 17 00:00:00 2001
 From: Kaden <kaden@localhost>
 Date: Sun, 30 Aug 2026 18:39:19 -0500
 Subject: [PATCH 15/16] cuda: widen the multi-column mmvq block to 16 rows

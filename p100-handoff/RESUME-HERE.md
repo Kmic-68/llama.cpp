@@ -26,7 +26,7 @@ binaries that shipped in `/mnt/fast/p100-llamacpp-release/build` (now refreshed;
    fixed the same way in attempt 153, bit-identically.
 2. **An uncompressed tensor-parallel peer copy could overwrite the all-reduce's reduction buffer
    before the destination's ADD had read it** — the copies have been on a dedicated stream since
-   a4d1103c5, ordered against the source only. This one hits **decode, MTP and prompt tails under
+   27961ce6c, ordered against the source only. This one hits **decode, MTP and prompt tails under
    512 tokens**, and it is why a fp32-matmul perplexity run went NaN at chunk 14. Fixed by waiting
    on the destination's work marker (attempt 153, section 5). A test build that delays the
    destination's ADD makes the failure deterministic — MTP decode dropped to 43% draft acceptance
@@ -80,7 +80,7 @@ NMSE vs the fp32 CPU reference, both arms measured in the same session, both GPU
 
 At the real operating context the pre-fix error is within 5x of outright test failure.
 Prior work stopped at 65536 and understated the defect ~4x. **The growth is linear in kv,
-not sqrt** -- `aa22ccee0`'s commit message is wrong on that point.
+not sqrt** -- `edc7980bf`'s commit message is wrong on that point.
 
 End-to-end (KLD of pre-fix against the fixed build's logits, production flags, control =
 fixed vs itself at ~-0.00001): 0.006994 at 4096, 0.008562 at 16384; max KLD 0.223 -> 0.660.
@@ -170,23 +170,23 @@ decode, not the speculative path.**
 
 | commit | change |
 |---|---|
-| `2c5405fef` | exact-fit tile widths — the verify shape was **37% padding** |
-| `e339c6243` | CUDA graphs allowed on pre-Volta, opt-in (+6.7% MTP) |
-| `0f759f41e` | **`nbatch_K` 128 for the narrow gqa-6 tiles, -10.3% on the decode shape** |
-| `e5bd6c5a3` | eval coverage for this shape (there was none) + `GGML_TEST_PRINT_ERR=1` |
-| `aa22ccee0` | **bound the fp16 accumulation error in flash-attn (8.7x accuracy at depth, 2.4% cost)** |
+| `8599fe022` | exact-fit tile widths — the verify shape was **37% padding** |
+| `b302163d6` | CUDA graphs allowed on pre-Volta, opt-in (+6.7% MTP) |
+| `5ea4b2712` | **`nbatch_K` 128 for the narrow gqa-6 tiles, -10.3% on the decode shape** |
+| `232797c00` | eval coverage for this shape (there was none) + `GGML_TEST_PRINT_ERR=1` |
+| `edc7980bf` | **bound the fp16 accumulation error in flash-attn (8.7x accuracy at depth, 2.4% cost)** |
 
-`2c5405fef`: the `ncols2 == 6` ladder offered `cols_per_block` 6/12/24/48 only, so `ncols1`
+`8599fe022`: the `ncols2 == 6` ladder offered `cols_per_block` 6/12/24/48 only, so `ncols1`
 was 1/2/4/8 and a 5-token verify padded into two 4-token tiles. `cols_per_block` must be a
 multiple of `ncols2 == 6` **and** `cpw == ncols/nwarps` must be a power of two (it sizes a
 `memcpy_1`); **36 satisfies both** at 9 warps. 6070 -> 4898 us at kv=262144.
 
-`0f759f41e`: `nbatch_K = 128` halves the K-chunk loop from 4 to 2 at DKQ=256.
+`5ea4b2712`: `nbatch_K = 128` halves the K-chunk loop from 4 to 2 at DKQ=256.
 **1691 -> 1518 us at nb=1**, reproducible to 0.1%. Config-specific: -1.6% at ncols=24 but
 **+17% worse at ncols=36**, so it is applied only to the narrow tiles.
 
 
-### The fp16 accumulation fix (`aa22ccee0`)
+### The fp16 accumulation fix (`edc7980bf`)
 
 `VKQ` accumulated the attention output over the **whole** KV cache in a half2 register — a
 quarter-million adds in an 11-bit mantissa at 262144. NMSE against the fp32 CPU reference grew
@@ -197,7 +197,7 @@ tile. The inner loop keeps its single HMUL2, so it costs 2.4% at nb=1 (17.5% if 
 accumulate in fp32, and extending the sm_61 fp16 exemption to sm_60 does not build here at all
 -- the 36-wide tile would need 50176 B of shared against a 48 KiB limit).
 
-**Measured flat out to the real operating context** (`2dcd8cafd`), NMSE vs the fp32 CPU
+**Measured flat out to the real operating context** (`33ff1a5ba`), NMSE vs the fp32 CPU
 reference, tolerance 5e-4:
 
 | kv | before | after (GPU0 / GPU1) |
@@ -321,7 +321,7 @@ Before this session that combination did not start at all — it aborted with
       --spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min 0.2 \
       -ngld 99 -ubd 256
 
-**`-ubd 256` is the new flag and the whole fix** (commit `0d1ea109c`). The MTP
+**`-ubd 256` is the new flag and the whole fix** (commit `74de4a1bd`). The MTP
 draft context was inheriting the target's `n_ubatch = 2048` and reserving its own
 1296 MiB compute buffer, ~1024 MiB of which was a *second copy of the KQ mask*
 (262144 x 2048 x f16) — for a draft that is one layer and whose prefill loops
@@ -440,7 +440,7 @@ that file for any build, including unmodified llama.cpp. `ppl-orig.txt` reproduc
 ## Decode: what session 6 changed
 
 `ggml/src/ggml-cuda/fattn-vec.cuh` now folds the whole GQA group into one block
-(commit `9c7a8865b`). Upstream only ever folds **powers of two** — the tile dispatch
+(commit `5fc820f9d`). Upstream only ever folds **powers of two** — the tile dispatch
 tries `%8/%4/%2`, its config table stops at `{2,4,8,16,32}`, and `cols_per_block` is
 `{64,32,16,8}` — and this model is **gqa_ratio 6**, so it folded nothing in vec and
 2 of 6 in tile. Nothing in either kernel's arithmetic needs a power of two.
@@ -499,24 +499,24 @@ each is worth.
 
 ## Committed this session
 
-Six code commits (+ eleven docs/log commits), `5d1fafb01..f85e154ed`:
+Six code commits (+ eleven docs/log commits), `17455ce35..c4908ecb4`:
 
 | commit | what | gain |
 |---|---|---|
-| `58c8a73ed` | vectorised q6_K dequant | +0.7% pp |
-| `a4d1103c5` | **concurrent bidirectional peer copies** | **+12.2% pp** |
-| `f8edbf816` | cuBLAS ALGO3 for wide f16 GEMMs | +1.8% pp |
-| `e83a7913a` | **f16 all-reduce** + pipelined delta-net reduction | +3.2% pp |
-| `ed42ad15d` | delta-net addressing walked, not recomputed | below noise here* |
+| `c3aaef65e` | vectorised q6_K dequant | +0.7% pp |
+| `27961ce6c` | **concurrent bidirectional peer copies** | **+12.2% pp** |
+| `22c96afb3` | cuBLAS ALGO3 for wide f16 GEMMs | +1.8% pp |
+| `e5c264b71` | **f16 all-reduce** + pipelined delta-net reduction | +3.2% pp |
+| `1b29f55de` | delta-net addressing walked, not recomputed | below noise here* |
 
-Later session (long context), `9183630c8..98de4588f`:
+Later session (long context), `0d88c4e1b..0f5b88954`:
 
 | commit | what | gain |
 |---|---|---|
-| `bdcb3f7bf` | **cuBLAS-GEMM flash attention for pre-Volta** | **+17.9% @ d=131072, +19.3% @ d=65536**, 0 at short context |
-| `98de4588f` | alias P onto S in that path | -50 MB scratch |
+| `738022bda` | **cuBLAS-GEMM flash attention for pre-Volta** | **+17.9% @ d=131072, +19.3% @ d=65536**, 0 at short context |
+| `0f5b88954` | alias P onto S in that path | -50 MB scratch |
 
-`bdcb3f7bf` adds `ggml/src/ggml-cuda/fattn-gemm.{cu,cuh}` and touches
+`738022bda` adds `ggml/src/ggml-cuda/fattn-gemm.{cu,cuh}` and touches
 `fattn.cu` (dispatch + `get_alloc_size`). On by default for `cc < VOLTA`;
 `GGML_CUDA_FA_GEMM=0` restores upstream behaviour. Gated to KV >= 4096 so short
 context is provably unaffected (425.19 on vs 427.05 off, within noise).
@@ -536,7 +536,7 @@ Code touched, whole session:
 
 Nothing outside `ggml/src/ggml-cuda/` was modified.
 
-**The big one is `a4d1103c5`.** The tensor-parallel all-reduce was serialising
+**The big one is `27961ce6c`.** The tensor-parallel all-reduce was serialising
 its two directions: copy 0->1 went on GPU0's compute stream and GPU1's compute
 stream was then made to wait on it, so copy 1->0 -- issued on GPU1's compute
 stream -- queued behind that wait. nvprof showed it as a 4358us gap after every
@@ -550,7 +550,7 @@ MTP gains, since decode all-reduces are small but latency-dominated.
 **Five of the six kept changes are bit-exact** and were each verified to
 reproduce the previous build digit-for-digit (chunk [1] and all 30 chunks).
 
-Only **ALGO3 (`f8edbf816`) is not**: a different cuBLAS kernel means a different
+Only **ALGO3 (`22c96afb3`) is not**: a different cuBLAS kernel means a different
 f16 k-accumulation order. It moved perplexity 2.6209 -> 2.6214, i.e. 0.03 sigma,
 well inside the required 2.6010-2.6408 band, with mixed per-chunk direction.
 Reverting it is a one-line `if` in `ggml-cuda.cu` if you ever want strict
@@ -668,7 +668,7 @@ split mode, cache types:
 
 **Use `--spec-draft-n-max 4 --spec-draft-p-min 0.2`** -- the old default of
 n-max 3 leaves ~2% on the table. 48.8 -> 54.5 is +11.7%, and the peer-copy fix
-(`a4d1103c5`) is most of it.
+(`27961ce6c`) is most of it.
 
 `--spec-draft-n-min` does nothing. `--spec-draft-backend-sampling` is **inert
 under `-sm tensor`** (54.12 vs 53.59, and the "not supported with

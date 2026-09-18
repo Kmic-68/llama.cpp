@@ -1,6 +1,6 @@
 fix: GEMM attention softmax writes probabilities out of place -- the in-place write raced
 
-Since 98de4588f the softmax wrote P over the scores S it had just read, in one buffer. On this
+Since 0f5b88954 the softmax wrote P over the scores S it had just read, in one buffer. On this
 toolchain the store can land before the load of the same element -- with the two aliased
 __restrict__ parameters of the original, with one restrict pointer, and with no restrict at
 all. A probability (<= 1/8) read back as a score gives exp(4P - m) against a very negative row

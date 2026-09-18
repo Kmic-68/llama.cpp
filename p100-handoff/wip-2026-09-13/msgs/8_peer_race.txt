@@ -3,7 +3,7 @@ fix: an uncompressed peer copy could overwrite the all-reduce buffer before its 
 The tensor-parallel all-reduce (ggml-backend-meta.cpp, allreduce_fallback) lands every exchange in
 the same per-device reduction buffer, bcj.bufs[i_buf], and folds it into the partial with an ADD
 queued on the destination's compute stream. Since the peer copies moved to a dedicated copy stream
-(a4d1103c5, for full-duplex PCIe), a copy is ordered against the source only: it waits on the
+(27961ce6c, for full-duplex PCIe), a copy is ordered against the source only: it waits on the
 source's work marker. A source that had raced ahead to the next layer could therefore overwrite the
 destination's reduction buffer before the destination's ADD of the previous layer had read it --
 that ADD then summed the wrong partial. The compressed (f16) path already guarded exactly this

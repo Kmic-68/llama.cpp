@@ -1,4 +1,4 @@
-From d8984de003177150644196eb2afe680f7926be1f Mon Sep 17 00:00:00 2001
+From 2bb2264ddf227e2cf5bebcbd53febccaaa9bc2ce Mon Sep 17 00:00:00 2001
 From: Kaden <kaden@localhost>
 Date: Sat, 29 Aug 2026 16:04:41 -0500
 Subject: [PATCH 02/16] cuda: remove __vsubss4 from Q6_K/Q3_K mmvq vec_dot

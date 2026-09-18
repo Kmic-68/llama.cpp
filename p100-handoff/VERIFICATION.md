@@ -1,23 +1,23 @@
 # Numerical Verification of the P100 CUDA Patches
 
-Base `f280b2698` → HEAD `134a4f4a5`. Audited 2026-08-31 by three independent
+Base `f280b2698` → HEAD `2c1f89b12`. Audited 2026-08-31 by three independent
 adversarial reviewers, each instructed to *falsify* the bit-exactness claim.
 
 > **Scope note (2026-09-01).** This paper covers the patch set up to
-> `134a4f4a5` only. Six further code changes landed afterwards
-> (`5d1fafb01..f85e154ed`); their numerical status is summarised below and
+> `2c1f89b12` only. Six further code changes landed afterwards
+> (`17455ce35..c4908ecb4`); their numerical status is summarised below and
 > argued in full in `OPTLOG.md` attempts 71-80. They were **not** re-audited by
 > the adversarial-reviewer process described here.
 >
 > | change | commit | status |
 > |---|---|---|
-> | vectorised f32<->f16 convert | `5d1fafb01` | bit-exact, index remap only |
-> | vectorised q6_K dequant | `58c8a73ed` | bit-exact, **machine-proven**: both index mappings replayed over 4096 random superblocks, 1048576 elements, 0 mismatches, 0 unwritten |
-> | concurrent peer copies | `a4d1103c5` | bit-exact, scheduling only -- no arithmetic touched |
-> | cuBLAS ALGO3 | `f8edbf816` | **NOT bit-exact** -- different kernel, different f16 k-accumulation order. PPL 2.6209 -> 2.6214 (0.03 sigma) |
-> | f16 all-reduce | `e83a7913a` | bit-exact *here*, and guarded by a one-time runtime probe that verifies every element of the first exchange is f16-representable before any copy is compressed |
-> | pipelined delta-net reduction | `e83a7913a` | bit-exact -- `warp_reduce_sum(float2)` applies the same per-component offsets in the same order as the scalar form |
-> | delta-net addressing walked | `ed42ad15d` | bit-exact, addressing only |
+> | vectorised f32<->f16 convert | `17455ce35` | bit-exact, index remap only |
+> | vectorised q6_K dequant | `c3aaef65e` | bit-exact, **machine-proven**: both index mappings replayed over 4096 random superblocks, 1048576 elements, 0 mismatches, 0 unwritten |
+> | concurrent peer copies | `27961ce6c` | bit-exact, scheduling only -- no arithmetic touched |
+> | cuBLAS ALGO3 | `22c96afb3` | **NOT bit-exact** -- different kernel, different f16 k-accumulation order. PPL 2.6209 -> 2.6214 (0.03 sigma) |
+> | f16 all-reduce | `e5c264b71` | bit-exact *here*, and guarded by a one-time runtime probe that verifies every element of the first exchange is f16-representable before any copy is compressed |
+> | pipelined delta-net reduction | `e5c264b71` | bit-exact -- `warp_reduce_sum(float2)` applies the same per-component offsets in the same order as the scalar form |
+> | delta-net addressing walked | `1b29f55de` | bit-exact, addressing only |
 >
 > Verification used for these: `test-backend-ops` per-op, a 2-chunk perplexity
 > signature check (chunk [1] must read 4.9738), and the full 30-chunk gate.
@@ -64,7 +64,7 @@ Three techniques, in decreasing order of strength:
 
 ## Empirical result (whole-graph diff)
 
-Stock `f280b2698` vs HEAD `134a4f4a5`, same prompt, `-sm layer -fa 1 -ctk q4_0
+Stock `f280b2698` vs HEAD `2c1f89b12`, same prompt, `-sm layer -fa 1 -ctk q4_0
 -ctv q4_0`. Graph structure identical in both (3847 tensors, same order), so
 the line-for-line comparison is valid.
 
@@ -303,8 +303,8 @@ Exhaustive proofs: `tools/proofs-fastdiv-dp4a/`, `tools/proofs-norm-binbcast/`
 
 ## Long-context work (attempts 89-90) — verification status
 
-**Scope note:** the audit above covers up to `134a4f4a5`. This section covers
-`bdcb3f7bf` (cuBLAS-GEMM flash attention) and `98de4588f` (P/S aliasing).
+**Scope note:** the audit above covers up to `2c1f89b12`. This section covers
+`738022bda` (cuBLAS-GEMM flash attention) and `0f5b88954` (P/S aliasing).
 
 | claim | evidence | status |
 |---|---|---|
@@ -340,7 +340,7 @@ Three statements above are now known to be wrong, and one was hiding a real bug.
 |---|---|
 | "the tile kernel likewise keeps KQ in half" | **False.** Tile accumulates KQ in fp32 (`fattn-tile.cuh:604`); it keeps the products in half. |
 | "PV uses `CUBLAS_COMPUTE_32F`" / "the f16-PV variant has never been tested" | **Stale.** Both GEMMs ship `COMPUTE_16F`. The fp16 PV was measured this session — it is the path's dominant error, and `CUBLAS_GEMM_DEFAULT` made it 10x worse than it needs to be (below). |
-| "correctness of the new attention path: 3949/3949, re-run after every change including the aliasing" | **Insufficient.** The aliasing change (98de4588f) introduced a data race that `test-backend-ops` cannot see: it compares against CPU with a tolerance, once, on random data. |
+| "correctness of the new attention path: 3949/3949, re-run after every change including the aliasing" | **Insufficient.** The aliasing change (0f5b88954) introduced a data race that `test-backend-ops` cannot see: it compares against CPU with a tolerance, once, on random data. |
 
 **The race.** The softmax kernel wrote probabilities over the scores it had just read, in one
 buffer. On this toolchain the store can land before the load of the same element, with or
@@ -353,7 +353,7 @@ affected launch is not a rounding difference — summed |ΔP| of 3954 to 1.6e7 a
 probabilities ≤ 1/8. fp16 showed no mismatch in 15360 checked launches but is the same pattern,
 and there the read-back value overflows half and NaNs the output; one 4k perplexity run did go
 NaN and did not reproduce. **Fixed: the probabilities get their own buffer** (~1% of the op,
-50 MB per GPU at `-ub 2048`). Every build since 98de4588f, including the release, has the race.
+50 MB per GPU at `-ub 2048`). Every build since 0f5b88954, including the release, has the race.
 
 **Determinism is now a checked property.** fp32 GEMM: 3.3165 on all 10 runs across the
 out-of-place builds. fp16 GEMM: 3.3185 every run. tile: 3.3134 every run.
@@ -378,8 +378,8 @@ Perplexity effect: see the paired studies in OPTLOG attempt 152.
 
 | earlier statement | status |
 |---|---|
-| `a4d1103c5` concurrent peer copies: "bit-exact, scheduling only -- no arithmetic touched" | **False.** The scheduling is what broke: a copy could land in the all-reduce's reused buffer before the previous exchange's ADD had read it. Sporadic silent corruption or NaN on every uncompressed exchange — decode, MTP, prompt tails under 512 tokens, fp32 configurations. Fixed; below. |
-| `e83a7913a` f16 all-reduce: "guarded by a one-time runtime probe that verifies every element of the first exchange is f16-representable" | **True but incomplete.** Later exchanges were assumed to be like the first. A matmul with F32/BF16 weights or `GGML_PREC_F32` produces non-f16 partials. Now screened per exchange by compute type. For this model nothing changes — every all-reduced projection (`attn_output`, `ffn_down`, `ssm_out`, `nextn.eh_proj`) is Q6_K. |
+| `27961ce6c` concurrent peer copies: "bit-exact, scheduling only -- no arithmetic touched" | **False.** The scheduling is what broke: a copy could land in the all-reduce's reused buffer before the previous exchange's ADD had read it. Sporadic silent corruption or NaN on every uncompressed exchange — decode, MTP, prompt tails under 512 tokens, fp32 configurations. Fixed; below. |
+| `e5c264b71` f16 all-reduce: "guarded by a one-time runtime probe that verifies every element of the first exchange is f16-representable" | **True but incomplete.** Later exchanges were assumed to be like the first. A matmul with F32/BF16 weights or `GGML_PREC_F32` produces non-f16 partials. Now screened per exchange by compute type. For this model nothing changes — every all-reduced projection (`attn_output`, `ffn_down`, `ssm_out`, `nextn.eh_proj`) is Q6_K. |
 | "The optimized build was first confirmed deterministic across two runs" (Method, 3) | Still true for what it checked. But a determinism check that synchronizes cannot see a race *between* devices: node-by-node hashing of 2026-09-14 found 0 differences in 33254 prefill and 77324 decode nodes, while unhooked runs of the same build were not deterministic. |
 
 **The race.** The tensor-parallel all-reduce (`ggml-backend-meta.cpp`, `allreduce_fallback`)
@@ -416,7 +416,7 @@ inputs and accumulation, not the fp16 GEMM attention; `GGML_CUDA_CUBLAS_COMPUTE_
 back, `GGML_CUDA_FA_GEMM_PREC=32` does not change the model-level number (it is 8x at the op
 level).
 
-**The final build** (HEAD `c2dfae805`): perplexity **2.6097 ± 0.0198** on `ppl-orig.txt` at `-c 4096`
+**The final build** (HEAD `fd560af8d`): perplexity **2.6097 ± 0.0198** on `ppl-orig.txt` at `-c 4096`
 (band 2.6209 ± 0.0199), tg256 **30.64 ± 0.19** on cool cards (baseline 17.51),
 `test-backend-ops -o FLASH_ATTN_EXT` **3961/3961** and the full suite **14593/14593**, 3/3 backends
 on both GPUs. Two further fixes landed with it that no two-device measurement can move, and both

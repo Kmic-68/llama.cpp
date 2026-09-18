@@ -392,11 +392,11 @@ Geometry re-swept afterwards; 2x2 still optimal (2x4 24.69, 4x2 24.76, 1x2 26.00
 | commit | change | t/s |
 |---|---|---|
 | (baseline) | HEAD b44f8fe6f | 17.45 |
-| d8984de0 | remove `__vsubss4` from Q6_K/Q3_K vec_dot | 17.72 |
-| c7e7faf6 | cooperative shared-memory staging of x | 20.35 |
-| f07b913a | vdr=2 for Q6_K + Pascal geometry into source | 23.28 |
-| 0732c729 | vdr=4 for Q6_K + geometry 2x2 | 24.33 |
-| 9fc142d1 | uint4 (16-byte) staging | **26.26** |
+| 2bb2264d | remove `__vsubss4` from Q6_K/Q3_K vec_dot | 17.72 |
+| 4d9dbeb3 | cooperative shared-memory staging of x | 20.35 |
+| a277ff94 | vdr=2 for Q6_K + Pascal geometry into source | 23.28 |
+| e97421a3 | vdr=4 for Q6_K + geometry 2x2 | 24.33 |
+| be811a6d | uint4 (16-byte) staging | **26.26** |
 
 Correctness at every kept step: `test-backend-ops -o MUL_MAT -b CUDA0` 1193/1193, and
 **PPL 2.7554 +/- 0.02151, identical to the stock kernel** (the reference for this repo and
@@ -404,7 +404,7 @@ this `ppl.txt`; see the note above about CLAUDE.md's 2.6209).
 
 ## Effect across quant types (isolated kernel, m=4096 n=1 k=14336, us/run)
 
-| type | staged-only (c7e7faf6) | final | |
+| type | staged-only (4d9dbeb3) | final | |
 |---|---|---|---|
 | q6_K | 164.5 | **116.3** | -29% |
 | q3_K | 151.4 | **142.8** | -6% |
@@ -693,14 +693,14 @@ buffer. Added a per-device cache to `ggml_backend_cuda_context` keyed on
 
 ## Session 2026-08-30 (interrupted, safe stopping point)
 
-State: HEAD = 246515a32, **27.49 t/s**. Working tree has two UNCOMMITTED, NON-KEPT edits:
+State: HEAD = 090f53560, **27.49 t/s**. Working tree has two UNCOMMITTED, NON-KEPT edits:
 - `ggml/src/ggml-cuda/norm.cu` — 4x unroll of both rms_norm loops PLUS temporary `DBG_NORM`
   debug printfs. Neutral (27.46 vs 27.49) and has debug cruft: **`git checkout -- ggml/src/ggml-cuda/norm.cu`**.
 - `ggml/src/ggml-cuda/mmvq.cu` — geometry moved into named constants
   `P100_MMVQ_NWARPS_1 2` / `P100_MMVQ_ROWS_1 2`. Behaviourally identical to HEAD; keep or revert.
 Then rebuild so the binary matches the source.
 
-### Attempt 36: q8_1 activation-quantization cache — KEPT (commit 246515a32)
+### Attempt 36: q8_1 activation-quantization cache — KEPT (commit 090f53560)
 27.03 -> 27.49 t/s. PPL 2.7554 +/- 0.02151 (identical). test-backend-ops MUL_MAT 1193/1193.
 quantize_q8_1 launches dropped from 1-per-mmvq to ~0.52-per-mmvq.
 
@@ -1290,10 +1290,10 @@ the KV cache q4_0 <-> f16 perturbs the model 2.6x *more* (KL 5.14e-03).
 through `mul_mat_vec_q`. Harness in `p100-handoff/tools/`.
 
 **Fixed and committed:**
-- `2c0d39158` MoE OOB *write*: row guards used `stride_col_dst` (== ne0*ne1 for
+- `24290a858` MoE OOB *write*: row guards used `stride_col_dst` (== ne0*ne1 for
   MUL_MAT_ID) instead of `nrows_x`. Upstream immune at 1 row/block; reachable
   here at 2. Odd `nrows_x` wrote into the next expert's dst slot.
-- `7d004be91` fastdiv guards were off by 2x (2^32 vs the true 2^31 domain);
+- `9e99d468f` fastdiv guards were off by 2x (2^32 vs the true 2^31 domain);
   added int64 fallbacks rather than aborting where upstream worked.
 
 Both: MUL_MAT and MUL_MAT_ID 3/3 backends, PPL 2.6209 +/- 0.01994, 29.81 t/s.
@@ -1702,7 +1702,7 @@ is the decode pipeline, not the kernel.
 
 ## Final gate on HEAD
 
-`ed42ad15d` + docs: perplexity **2.6214 +/- 0.01995**, chunk [1] 4.9738 --
+`1b29f55de` + docs: perplexity **2.6214 +/- 0.01995**, chunk [1] 4.9738 --
 identical to the previous gate, so attempt 80 (GDN addressing) is confirmed
 bit-exact end to end. Inside the CLAUDE.md band by 0.03 sigma.
 
@@ -1908,18 +1908,18 @@ vs the 17.51 t/s decode baseline in CLAUDE.md: **1.83x**.
 
 ## The six code changes
 
-`5d1fafb01..f85e154ed`, 417 insertions / 53 deletions, all inside
+`17455ce35..c4908ecb4`, 417 insertions / 53 deletions, all inside
 `ggml/src/ggml-cuda/` (`ggml-cuda.cu`, `common.cuh`, `convert.cu`,
 `gated_delta_net.cu`). Nothing outside that directory was touched.
 
 | commit | change | prefill gain | bit-exact |
 |---|---|---|---|
-| `5d1fafb01` | vectorised f32<->f16 convert | +5.3% (prior session) | yes |
-| `58c8a73ed` | vectorised q6_K dequant | +0.7% | yes, machine-proven |
-| `a4d1103c5` | concurrent bidirectional peer copies | **+12.2%** | yes (scheduling only) |
-| `f8edbf816` | cuBLAS ALGO3 for wide f16 GEMMs | +1.8% | **no** (0.03 sigma) |
-| `e83a7913a` | f16 all-reduce + pipelined delta-net reduction | +3.2% | yes |
-| `ed42ad15d` | delta-net addressing walked | below noise here | yes |
+| `17455ce35` | vectorised f32<->f16 convert | +5.3% (prior session) | yes |
+| `c3aaef65e` | vectorised q6_K dequant | +0.7% | yes, machine-proven |
+| `27961ce6c` | concurrent bidirectional peer copies | **+12.2%** | yes (scheduling only) |
+| `22c96afb3` | cuBLAS ALGO3 for wide f16 GEMMs | +1.8% | **no** (0.03 sigma) |
+| `e5c264b71` | f16 all-reduce + pipelined delta-net reduction | +3.2% | yes |
+| `1b29f55de` | delta-net addressing walked | below noise here | yes |
 
 ## Four corrections I made to my own claims
 
@@ -2212,7 +2212,7 @@ this is a **VRAM** problem, not a speed one.
 ## 90 — cuBLAS-GEMM flash attention: long context fixed (KEPT, default-on pre-Volta)
 
 Attempt 89 showed the tile kernel cannot be tuned out of 18.6% of peak. This
-replaces it at long context instead. Commits `bdcb3f7bf`, `98de4588f`.
+replaces it at long context instead. Commits `738022bda`, `0f5b88954`.
 
 ### The path
 
@@ -4690,7 +4690,7 @@ perplexity gate at `-c 4096` where the bug barely bites (3.31e-06 pre-fix vs 2.8
 That is not evidence about model output. This measures output directly, with the metric the
 community post uses.
 
-Method: build pre-fix (`aa22ccee0^` `fattn-tile.cuh`), write `--kl-divergence-base` at
+Method: build pre-fix (`edc7980bf^` `fattn-tile.cuh`), write `--kl-divergence-base` at
 `-c 65536` over 842 KB of text, restore the fix, rebuild, re-run with `--kl-divergence`.
 
 Chunk 1 (65536 context, ~32k evaluated tokens):
@@ -4733,7 +4733,7 @@ measurement above, so the useful experiment is a **single-chunk** run, not a ful
 
 ## Attempt 141 — the fp16 accumulation fix, measured properly (2026-09-07)
 
-Re-measured `aa22ccee0` from scratch because the prior evidence had a hole: the pre-fix
+Re-measured `edc7980bf` from scratch because the prior evidence had a hole: the pre-fix
 numbers in attempt 138 were never reproduced in the same session as the fixed ones, and the
 first two attempts today were invalid (see the RUNPATH note below).
 
@@ -4754,7 +4754,7 @@ Two things this changes:
 - **At the real 262144 operating context the pre-fix error is 1.01e-04, within 5x of the
   5.000e-04 test tolerance.** Previous work only ever measured to 65536 (2.77e-05) and so
   understated the defect by ~4x.
-- **The growth is linear in kv, not sqrt.** `aa22ccee0`'s commit message says "the error
+- **The growth is linear in kv, not sqrt.** `edc7980bf`'s commit message says "the error
   grows as sqrt(context)"; 65536 -> 131072 -> 262144 doubles the error each time kv doubles.
   The message is wrong on that point; the fix it describes is not.
 
@@ -4914,7 +4914,7 @@ native context is 262144, documented extensible to 1M with YaRN, where the unfix
 kernel would sit at 3.71e-04 = 74% of tolerance. Fixed sits at 0.6% everywhere.
 
 ### Correction
-I recorded in attempt 141 that aa22ccee0's commit message was wrong to call the
+I recorded in attempt 141 that edc7980bf's commit message was wrong to call the
 growth sqrt. It is not wrong. The message describes the growth of the ERROR; 141
 quoted NMSE, which is that error squared. sqrt error and linear NMSE are one law in
 two units. Attempt 141's "the commit message is wrong on that point" is retracted.
@@ -5687,7 +5687,7 @@ fp16 GEMM and the tile kernel repeated exactly every time (fp16 3.3185 on all 5 
 on all 4).
 
 **First diagnosis, wrong.** The softmax kernel took scores `S` and probabilities `P` as two
-`__restrict__` parameters and the caller passed the same buffer for both (98de4588f, "alias P
+`__restrict__` parameters and the caller passed the same buffer for both (0f5b88954, "alias P
 onto S", Sep 1, to save 50 MB). That is undefined behaviour, and dropping `restrict` appeared to
 fix it (2 runs identical). It did not: every run that looked deterministic also had a host
 synchronize in the op, from an early version of the mask skip. With the synchronize removed, the
@@ -5991,12 +5991,12 @@ nothing flags it. A run with a non-finite scan hook (one synchronize per node) s
 for each direction `push_data` — `ggml_backend_tensor_copy_async` of the partial into
 `node_tmp`, which lives in **the same per-device reduction buffer every time**
 (`bcj.bufs[i_buf]`, `i_buf` = 0 for 2 GPUs) — and an ADD graph on the destination that folds
-`node_tmp` into its partial. Since a4d1103c5 (Aug 31) this fork issues peer copies on a dedicated
+`node_tmp` into its partial. Since 27961ce6c (Aug 31) this fork issues peer copies on a dedicated
 copy stream, so the two directions overlap on full-duplex PCIe; the copy is ordered against the
 **source** only (it waits on the source's `work_event`). A source that has raced ahead to the next
 subgraph can therefore land its next copy in the destination's reduction buffer before the
 destination's ADD of the *previous* boundary has read it — that ADD then sums the wrong partial.
-The compressed (f16) path added in e83a7913a already guards exactly this reuse with
+The compressed (f16) path added in e5c264b71 already guards exactly this reuse with
 `peer_stage_free`; the uncompressed path never had an equivalent.
 
 Uncompressed exchanges are every exchange that is not a ≥ 512-row MUL_MAT output shown f16-exact:

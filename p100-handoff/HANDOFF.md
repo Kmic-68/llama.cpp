@@ -18,12 +18,12 @@ q4_0, q5_0, q8_0, q2_K, iq4_nl. `test-backend-ops -o MUL_MAT` 1193/1193 and
 
 | commit | change | t/s |
 |---|---|---|
-| `d8984de0` | remove `__vsubss4` from Q6_K/Q3_K vec_dot | 17.72 |
-| `c7e7faf6` | cooperative shared-memory staging of x | 20.35 |
-| `f07b913a` | vdr=2 for Q6_K; Pascal geometry moved into source | 23.28 |
-| `0732c729` | vdr=4 for Q6_K; geometry retuned to 2×2 | 24.33 |
-| `9fc142d1` | uint4 (16-byte) staging | 26.21 |
-| `560442c8` | integer accumulator across the vdr group | **27.03** |
+| `2bb2264d` | remove `__vsubss4` from Q6_K/Q3_K vec_dot | 17.72 |
+| `4d9dbeb3` | cooperative shared-memory staging of x | 20.35 |
+| `a277ff94` | vdr=2 for Q6_K; Pascal geometry moved into source | 23.28 |
+| `e97421a3` | vdr=4 for Q6_K; geometry retuned to 2×2 | 24.33 |
+| `be811a6d` | uint4 (16-byte) staging | 26.21 |
+| `62d9e35f` | integer accumulator across the vdr group | **27.03** |
 
 ### 1.1 `__vsubss4` removal
 No NVIDIA GPU has had SIMD-video hardware since Kepler; ptxas emulates `__vsubss4` in 9 SASS

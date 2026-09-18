@@ -1,4 +1,4 @@
-From 560442c8961f745578b169368a52a0eb36cd70ca Mon Sep 17 00:00:00 2001
+From 62d9e35f16349b50454edf2d1d7a77b1b86f1b47 Mon Sep 17 00:00:00 2001
 From: Kaden <kaden@localhost>
 Date: Sat, 29 Aug 2026 22:33:10 -0500
 Subject: [PATCH 07/16] cuda: accumulate the whole vdr group in an integer

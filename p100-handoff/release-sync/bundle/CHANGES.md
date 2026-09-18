@@ -18,16 +18,16 @@ This is ~85% of decode time, so it got the most attention. **Decode 17.51 → 30
 | commit | change | effect |
 |---|---|---|
 | `b44f8fe6f` | Pascal launch geometry, warps and rows per block | the initial sm_60 tuning pass |
-| `d8984de00` | drop `__vsubss4` from Q6_K/Q3_K `vec_dot` | sm_60 has no such instruction; it was being emulated |
-| `c7e7faf60` | stage the weight tile `x` through shared memory | first large win |
-| `f07b913a7`, `0732c729e` | `vdr` 2 then 4 for Q6_K, geometry retuned to 2x2 | |
-| `9fc142d12` | stage `x` in 16-byte units | wider loads, fewer instructions |
-| `560442c89` | accumulate a whole `vdr` group as integer before scaling | removes a float multiply per group |
-| `246515a32` | cache the q8_1-quantized activation across calls | the activation was being requantized per call |
-| `bbdac166e` | stage the q8_1 activation through shared memory | **the single largest win.** The activation is re-read by every block, so its cost scales with block count — it is the bottleneck, not the weights |
-| `c9de43286`, `4ee099082`, `134a4f4a5` | multi-column path: per-warp rows, 16-row blocks, block-wide staging | |
-| `58c8a73ed` | vectorized q6_K dequant | |
-| `5d1fafb01` | vectorized contiguous f32↔f16 convert | |
+| `2bb2264dd` | drop `__vsubss4` from Q6_K/Q3_K `vec_dot` | sm_60 has no such instruction; it was being emulated |
+| `4d9dbeb34` | stage the weight tile `x` through shared memory | first large win |
+| `a277ff94f`, `e97421a3d` | `vdr` 2 then 4 for Q6_K, geometry retuned to 2x2 | |
+| `be811a6d1` | stage `x` in 16-byte units | wider loads, fewer instructions |
+| `62d9e35f1` | accumulate a whole `vdr` group as integer before scaling | removes a float multiply per group |
+| `090f53560` | cache the q8_1-quantized activation across calls | the activation was being requantized per call |
+| `c718d1860` | stage the q8_1 activation through shared memory | **the single largest win.** The activation is re-read by every block, so its cost scales with block count — it is the bottleneck, not the weights |
+| `dd0e5289b`, `f3cb02935`, `2c1f89b12` | multi-column path: per-warp rows, 16-row blocks, block-wide staging | |
+| `c3aaef65e` | vectorized q6_K dequant | |
+| `17455ce35` | vectorized contiguous f32↔f16 convert | |
 
 The DP4A emulation (sm_60 has no `__dp4a`) is **8 instructions via PRMT + XMAD.H1 and
 bit-exact**. Do not regress it.
@@ -36,14 +36,14 @@ bit-exact**. Do not regress it.
 
 | commit | change | effect |
 |---|---|---|
-| `3ee12f08c` | **dequantize the q4_0 KV tile straight into shared memory** | `launch_fattn` was converting the *entire* KV cache to f16 on *every call* — 4.15 ms at 262144 context, ~66 ms per forward pass, to re-convert a cache that changed by a few positions. **9242 → 6213 µs**, and it frees 512 MiB per GPU of staging. Bit-exact with `to_fp16`. **The most broadly useful change here** — it applies to any pre-Volta GPU with a quantized KV cache |
-| `2a6907ab8` | stop reserving f16 staging when the tile kernel reads q4_0 directly | the 512 MiB |
-| `f0393db54` | dequantize with `hfma2` in the tile loader | |
-| `9c7a8865b`, `362c6172f`, `ce20ad9a7` | fold the whole GQA-6 group into one block (vec, tile, and 2-column paths) | |
-| `2c5405fef` | **exact-fit tile width for the MTP verify shape** | the ladder had `ncols1` of 1/2/4/8 only, so a 5-token verify was padded into two 4-token tiles — **37% of the attention work was padding**. `cols_per_block` must be a multiple of the GQA fold *and* `ncols/nwarps` a power of two; 36 satisfies both at 9 warps. **1.24x on the verify shape** |
-| `0f759f41e` | `nbatch_K = 128` on the narrow GQA-6 tiles | halves the K-chunk loop at head size 256: **1691 → 1518 µs**. Config-specific — 17% *worse* on the 36-wide tile, so it is applied only to the narrow ones |
-| `aa22ccee0` | **bound fp16 accumulation error** | `VKQ` accumulated over the entire KV cache in a `half2` register — a quarter-million adds in an 11-bit mantissa at 262144 context, and this shape had no eval coverage at all. Now folds into an fp32 running sum once per tile. **8.7x the accuracy at depth for 2.4%** on the decode shape, and the error stops growing with context |
-| `da56cb516` | give `launch_fattn` the vec kernel's real KV tile size | |
+| `3f49203da` | **dequantize the q4_0 KV tile straight into shared memory** | `launch_fattn` was converting the *entire* KV cache to f16 on *every call* — 4.15 ms at 262144 context, ~66 ms per forward pass, to re-convert a cache that changed by a few positions. **9242 → 6213 µs**, and it frees 512 MiB per GPU of staging. Bit-exact with `to_fp16`. **The most broadly useful change here** — it applies to any pre-Volta GPU with a quantized KV cache |
+| `b574f0b98` | stop reserving f16 staging when the tile kernel reads q4_0 directly | the 512 MiB |
+| `88211649b` | dequantize with `hfma2` in the tile loader | |
+| `5fc820f9d`, `2127ac5bf`, `da3bddaeb` | fold the whole GQA-6 group into one block (vec, tile, and 2-column paths) | |
+| `8599fe022` | **exact-fit tile width for the MTP verify shape** | the ladder had `ncols1` of 1/2/4/8 only, so a 5-token verify was padded into two 4-token tiles — **37% of the attention work was padding**. `cols_per_block` must be a multiple of the GQA fold *and* `ncols/nwarps` a power of two; 36 satisfies both at 9 warps. **1.24x on the verify shape** |
+| `5ea4b2712` | `nbatch_K = 128` on the narrow GQA-6 tiles | halves the K-chunk loop at head size 256: **1691 → 1518 µs**. Config-specific — 17% *worse* on the 36-wide tile, so it is applied only to the narrow ones |
+| `edc7980bf` | **bound fp16 accumulation error** | `VKQ` accumulated over the entire KV cache in a `half2` register — a quarter-million adds in an 11-bit mantissa at 262144 context, and this shape had no eval coverage at all. Now folds into an fp32 running sum once per tile. **8.7x the accuracy at depth for 2.4%** on the decode shape, and the error stops growing with context |
+| `43543917b` | give `launch_fattn` the vec kernel's real KV tile size | |
 
 **On the fp16 accumulation fix:** the widely-circulated P100 fix is to extend the sm_61
 `FAST_FP16_AVAILABLE` exemption to sm_60. That is a bigger hammer — it also converts `Q_tmp`,
@@ -63,23 +63,23 @@ A cuBLAS-GEMM attention path for pre-Volta, **on by default** at `Q->ne[1] >= 12
 
 | commit | change | effect |
 |---|---|---|
-| `bdcb3f7bf` | the path itself | |
-| `98de4588f` | alias `P` onto `S` | saves a buffer |
-| `6af7418c6` | run the PV GEMM in f16 | |
-| `2d100c5cc` | issue the attention GEMMs as one call instead of a GQA batch | |
-| `0e15f03c4` | skip all-zero mask chunks, decided on the GPU | |
-| `508b1af17` | PV requests cuBLAS `ALGO4` instead of `GEMM_DEFAULT` | `GEMM_DEFAULT` picks a long-chain fp16 kernel above n ≈ 6000. **3.4x lower op error** at the production batch |
-| `eb56246ec` | decline mask shapes the path cannot honour | |
-| `95db6b009` | restore the fp16 overflow guards (Q pre-scaled by `scale*0.25`, `FATTN_KQ_MAX_OFFSET`); q4_0 tile bias in integer | the q4_0 tile dequant no longer produces ±inf for \|d\| >= 8192 |
+| `738022bda` | the path itself | |
+| `0f5b88954` | alias `P` onto `S` | saves a buffer |
+| `dbbee401a` | run the PV GEMM in f16 | |
+| `0b0e16a03` | issue the attention GEMMs as one call instead of a GQA batch | |
+| `d85d55edd` | skip all-zero mask chunks, decided on the GPU | |
+| `a7cdad458` | PV requests cuBLAS `ALGO4` instead of `GEMM_DEFAULT` | `GEMM_DEFAULT` picks a long-chain fp16 kernel above n ≈ 6000. **3.4x lower op error** at the production batch |
+| `fbf220c10` | decline mask shapes the path cannot honour | |
+| `619b6031e` | restore the fp16 overflow guards (Q pre-scaled by `scale*0.25`, `FATTN_KQ_MAX_OFFSET`); q4_0 tile bias in integer | the q4_0 tile dequant no longer produces ±inf for \|d\| >= 8192 |
 
 ## 4. Tensor-parallel across the two cards
 
 | commit | change | effect |
 |---|---|---|
-| `a4d1103c5` | run peer copies on a dedicated stream so both directions overlap | **also introduced a data race — see §6** |
-| `e83a7913a` | ship tensor-parallel partials as f16; pipeline the delta-net reduction | halves the bytes crossing PCIe |
-| `0b92a60d3` | decide f16 compression **per exchange**, from the matmul's cuBLAS compute type | was probed once from the first exchange only. No change for a model whose row-split projections are all quantized (this one); it matters for mixed-type models and for architectures that force `GGML_PREC_F32` there (GLM4, GLM4_MOE, JAIS2) |
-| `ed42ad15d` | walk `gated_delta_net` addresses instead of recomputing them | |
+| `27961ce6c` | run peer copies on a dedicated stream so both directions overlap | **also introduced a data race — see §6** |
+| `e5c264b71` | ship tensor-parallel partials as f16; pipeline the delta-net reduction | halves the bytes crossing PCIe |
+| `dce17bf1b` | decide f16 compression **per exchange**, from the matmul's cuBLAS compute type | was probed once from the first exchange only. No change for a model whose row-split projections are all quantized (this one); it matters for mixed-type models and for architectures that force `GGML_PREC_F32` there (GLM4, GLM4_MOE, JAIS2) |
+| `1b29f55de` | walk `gated_delta_net` addresses instead of recomputing them | |
 
 Keep `GGML_CUDA_P2P=1`. Without it the exchanges stage through the host, which is slower *and*
 widens the race in §6.
@@ -91,8 +91,8 @@ widens the race in §6.
 
 | commit | change | effect |
 |---|---|---|
-| `d7866f67f` | **Pascal fp16 prefill matmuls request `CUBLAS_GEMM_ALGO6`** | `CUBLAS_GEMM_DEFAULT_TENSOR_OP` picks cuBLAS's long-chain fp16 accumulator from ~256 rows up (NMSE ≈ 2.2e-8·k, up to 2e-4 at these shapes) and is *also* the slower kernel at 512-1024 rows. ALGO6 is **10x more accurate at every shape measured and +63% on pp512, +30% on pp1024**, level at pp2048 |
-| `6707b9be5` | **revert** of `f8edbf816` (ALGO3 for wide f16 GEMMs) | reassociation with no precision argument behind it |
+| `fccdafca1` | **Pascal fp16 prefill matmuls request `CUBLAS_GEMM_ALGO6`** | `CUBLAS_GEMM_DEFAULT_TENSOR_OP` picks cuBLAS's long-chain fp16 accumulator from ~256 rows up (NMSE ≈ 2.2e-8·k, up to 2e-4 at these shapes) and is *also* the slower kernel at 512-1024 rows. ALGO6 is **10x more accurate at every shape measured and +63% on pp512, +30% on pp1024**, level at pp2048 |
+| `55e496262` | **revert** of `22c96afb3` (ALGO3 for wide f16 GEMMs) | reassociation with no precision argument behind it |
 
 ALGO6 is also more accurate than what upstream does: against an all-fp32 reference, upstream's
 `DEFAULT_TENSOR_OP` sits at +0.00414 nats/token and ALGO6 at +0.00343.
@@ -104,27 +104,27 @@ data race — both passed the full suite for weeks.
 
 | commit | bug | how it was proven |
 |---|---|---|
-| `8978d3018` | **The GEMM attention softmax wrote probabilities over the scores it was still reading.** Corrupts a few attention rows per long prompt; in fp16 it can NaN the output | in-op self-check: 3-6 of 2240 launches differ in place, 0 of ~6700 out of place |
-| `72b108c36` | the same path accumulated its running output in place | made out of place |
-| `aef09316d` | **An uncompressed tensor-parallel peer copy could overwrite the all-reduce's reduction buffer before the destination's ADD had read it** (introduced by `a4d1103c5`). Hits **decode, MTP and short prompts**, not just long prefill | with the race forced deterministically, MTP decode produced different text at 43% draft acceptance instead of 79%. Unforced, it appeared in 3 of 10 fp32-matmul perplexity runs — twice as NaN, once silently. The fix costs **0.7% of decode** |
-| `c65d3d8a1` | CUDA graphs captured the q8_1 buffer pointer and graph invalidation did not track it | fixed with a buffer generation counter; MTP output with graphs on is byte-identical to graphs off across 61 replays |
-| `c5b226581` | 16 bytes of slack for the sm_60 mmvq staging over-read | |
-| `2c0d39158` | mmvq row guards bounded by `stride_col_dst` instead of `nrows_x` | |
-| `7d004be91` | fastdiv domain guards were 2^32, should be 2^31 | |
-| `f30fee9a8` | restore bit-identical output in the norm kernels | |
-| `1148b877a` | the same-GPU copy between two virtual devices did not wait for the destination's reader | **fixed on inspection, not measured** — see "Known gaps" |
-| `c2dfae805` | a device whose graph slice came out empty had its output zeroed by multiplying by `0.0f`, under its own `// FIXME 0.0f * NaN == NaN`. Nothing computed that buffer, so it held whatever the allocator left | **fixed on inspection, not measured** — the branch never executes on this model |
+| `cb6024e6b` | **The GEMM attention softmax wrote probabilities over the scores it was still reading.** Corrupts a few attention rows per long prompt; in fp16 it can NaN the output | in-op self-check: 3-6 of 2240 launches differ in place, 0 of ~6700 out of place |
+| `13b24fe27` | the same path accumulated its running output in place | made out of place |
+| `b67848c64` | **An uncompressed tensor-parallel peer copy could overwrite the all-reduce's reduction buffer before the destination's ADD had read it** (introduced by `27961ce6c`). Hits **decode, MTP and short prompts**, not just long prefill | with the race forced deterministically, MTP decode produced different text at 43% draft acceptance instead of 79%. Unforced, it appeared in 3 of 10 fp32-matmul perplexity runs — twice as NaN, once silently. The fix costs **0.7% of decode** |
+| `5d479e6f8` | CUDA graphs captured the q8_1 buffer pointer and graph invalidation did not track it | fixed with a buffer generation counter; MTP output with graphs on is byte-identical to graphs off across 61 replays |
+| `c1f7f4b00` | 16 bytes of slack for the sm_60 mmvq staging over-read | |
+| `24290a858` | mmvq row guards bounded by `stride_col_dst` instead of `nrows_x` | |
+| `9e99d468f` | fastdiv domain guards were 2^32, should be 2^31 | |
+| `fe0e5c811` | restore bit-identical output in the norm kernels | |
+| `194190ef7` | the same-GPU copy between two virtual devices did not wait for the destination's reader | **fixed on inspection, not measured** — see "Known gaps" |
+| `fd560af8d` | a device whose graph slice came out empty had its output zeroed by multiplying by `0.0f`, under its own `// FIXME 0.0f * NaN == NaN`. Nothing computed that buffer, so it held whatever the allocator left | **fixed on inspection, not measured** — the branch never executes on this model |
 
 ## 7. CUDA graphs and speculative decoding
 
 | commit | change | effect |
 |---|---|---|
-| `e339c6243` | allow CUDA graphs on pre-Volta, opt-in via `GGML_CUDA_GRAPHS_PRE_VOLTA=1` | upstream disables them by architecture alone. **+6.7% on the MTP path, -2% on single-token decode** — hence opt-in |
-| `0d1ea109c` | let the draft context use its own ubatch (`-ubd`) | without it the draft inherits `-ub` and reserves a second 1024 MiB copy of the KQ mask; the full-context config OOMs |
+| `b302163d6` | allow CUDA graphs on pre-Volta, opt-in via `GGML_CUDA_GRAPHS_PRE_VOLTA=1` | upstream disables them by architecture alone. **+6.7% on the MTP path, -2% on single-token decode** — hence opt-in |
+| `74de4a1bd` | let the draft context use its own ubatch (`-ubd`) | without it the draft inherits `-ub` and reserves a second 1024 MiB copy of the KQ mask; the full-context config OOMs |
 
 ## 8. Tests
 
-`f7fb6fca3`, `32e8305ff`, `ba6bcac64`, `e5bd6c5a3`, `2dcd8cafd`, `d3446ed2f` add FLASH_ATTN_EXT
+`282918f2e`, `cffc2b191`, `2f50214e1`, `232797c00`, `33ff1a5ba`, `a8f1ee60d` add FLASH_ATTN_EXT
 coverage at the shapes this fork actually runs: decode-shaped long context, the ubatch tradeoff
 at nb=1024/512, the full-cache dequant cost in isolation, the GEMM path's prefill shapes, and an
 eval sweep out to the real 262144 operating context.
@@ -150,10 +150,10 @@ GPU0** (including ~392 MiB of Sunshine) and **15745 MiB on GPU1**, of 16384 each
 
 ## Known gaps
 
-**Two commits ship on inspection, with no experiment behind them.** `1148b877a` guards a copy
+**Two commits ship on inspection, with no experiment behind them.** `194190ef7` guards a copy
 branch that only executes when two virtual devices share one physical GPU — and the only mode
 that produces that, `GGML_CUDA_DEVICES`, is itself unreliable (below), so no configuration that
-exercises it gives a trustworthy number. `c2dfae805` fixes a branch that never executes on this
+exercises it gives a trustworthy number. `fd560af8d` fixes a branch that never executes on this
 model (verbose run: 0 occurrences). Both are correct by reading; neither is proven.
 
 **`GGML_CUDA_DEVICES` above the physical GPU count is not trustworthy.** That flag emulates N
