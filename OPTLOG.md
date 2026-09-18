@@ -6251,3 +6251,67 @@ devices on one card take, and no configuration that exercises it produces a trus
   the harness; ALGO6 is level with the default there in the model.
 - **Peer fix v1** (record the destination's marker at copy time): correct, but it serialises the
   two directions of every uncompressed exchange — see section 5.
+
+---
+
+## Attempt 154 — the depth curve re-measured on the shipping build; MTP at a genuinely full
+## context does not fit on 2x16 GB (2026-09-17)
+
+Re-measured for a public writeup, on the shipped `build/` (`0b92a60d3` stamped, built from
+`4eebbaf99`), cards cooled to 36 C at the start. `-sm tensor -fa 1 -ctk q4_0 -ctv q4_0`,
+`-p 2048 -n 128 -r 2`, default `-ub 512`.
+
+| depth | pp2048 | tg128 | GPU temp during |
+|---|---|---|---|
+| 0 | 380.39 ± 0.08 | 30.43 ± 0.10 | 36 -> 62 C |
+| 65536 | 222.38 ± 0.58 | 21.87 ± 0.84 | 77 C |
+| 131072 | 147.62 ± 12.07 | 18.11 ± 0.76 | 77-78 C |
+| 262144 | **85.44 ± 0.68** | 12.62 ± 0.39 | 77-78 C |
+
+Against attempt 95's curve (pp 427 / 220.60 / 150.66 / 95.14; tg 31.51 / 15.55 / - / 7.32):
+
+- **Prefill at full depth has regressed: 95.14 -> 85.44, -10.2%**, with tight error bars either
+  side. Consistent in sign and shape with the already-documented -3.0% at pp2048 and -2.5% at
+  pp2048@d16384 -- the ALGO3 revert plus the out-of-place softmax and the copy wait, compounding
+  with depth. Some of it may be thermal (77-78 C here; attempt 95's conditions unrecorded), so
+  the honest statement is "-10% at d262144, of which an unknown part is thermal". Not chased.
+- Prefill at 65536 and 131072 is level with attempt 95 (222.38 vs 220.60, 147.62 vs 150.66).
+  The 131072 row scattered 8% (±12.07) against 0.3% one rung up; treat it as "about 150".
+
+### The tg128 column is an artifact, and it is *the* artifact
+
+**12.62 ± 0.39 at d262144 reproduces the 12.2 t/s that attempt 131 retracted, to within 0.4.**
+`tools/MEASURE.md` already says why: `-n 128` amortises a ~2-3 s fixed first-decode cost over ~30
+passes, understating plain decode by ~1.8x, and the real figure at this depth is ~21.5. So the
+whole tg128 column above is deflated, most severely at depth, and **there is no decode cliff
+between 229k and 262k** -- which is what the raw numbers would otherwise have suggested.
+
+Confirmed twice now, on two builds, a month apart. The instrument is `-n >= 512` via the server,
+not `llama-bench -d ... -n 128`.
+
+### MTP at a genuinely full context does not fit on 2x16 GB
+
+Tried the documented production config (`-c 262144 -b 262144 -ub 2048 -np 1`, MTP draft,
+`-ngld 99 -ubd 256`) against a **259118-token** prompt, to get plain and MTP decode off one
+prefill via per-request `speculative.n_max`. It died **57 s into prefill**:
+
+    ggml-cuda.cu:107: CUDA error: the function failed to launch on the GPU
+      #4 ggml_cuda_mul_mat_cublas_impl<(ggml_type)1>      // F16
+
+**16267 MiB on GPU0 and 15873 on GPU1, of 16384 -- 117 MiB free.** Memory exhaustion presenting
+as a launch failure: cuBLAS could not get scratch workspace. `llama-bench -d 262144` survives the
+same depth at 13.7 GB peak because it carries neither a draft context nor a server slot.
+
+**The documented 16137 MiB peak was measured with a 19966-token prompt**, and was read here as
+"~250 MiB of headroom". At a genuinely full prompt the margin is negative. Two consequences worth
+writing into QUICKSTART rather than leaving in a log:
+
+1. MTP + a full 262k prompt is not a supported configuration on 2x16 GB.
+2. **The production config leaves no room for anything else on GPU0.** Sunshine's 392 MiB is not
+   optional on this machine, and starving it took the desktop down -- it had to be restarted.
+   Anyone running these flags on a card that also drives a display is one long prompt away from
+   the same thing.
+
+Untried, for next session: `-ub 512` (the KQ mask at `-ub 2048` reserves 1024 MiB, so this should
+free ~768 MiB) with `-ubd 64`, leaving deliberate headroom for the display. That would also
+confirm the diagnosis was memory pressure rather than a kernel defect.
