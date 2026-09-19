@@ -7097,3 +7097,30 @@ configuration documented as dying partway through a full prefill and starving th
 386 MB.
 
 The `-ub 2048` choice was right all along -- it only ever needed graphs off to fit.
+
+## Attempt 173 — the shipped curve: prefill and decode vs depth, release binaries, real sampling
+
+Run against `/mnt/fast/p100-llamacpp-release/build` after the refresh, with the shipped flags
+(`-c 262144 -b 32768 -ub 2048`, graphs off, MTP, `--temp 0.3 --top-k 20`). Successively longer
+prefixes in one server, so each prefill figure is the incremental rate for that ~31k chunk at
+that depth, not a whole-prompt average.
+
+    depth     prefill      decode    acceptance  mean len
+     33862   332.36 t/s   42.03 t/s    0.90000     4.54
+     66540   207.34 t/s   38.71 t/s    0.86726     4.38
+     98559   157.34 t/s   32.75 t/s    0.78689     4.10
+    130126   133.07 t/s   32.77 t/s    0.87500     4.50
+    160112   116.41 t/s   28.15 t/s    0.80833     4.23
+    191361   102.61 t/s   29.80 t/s    0.91667     4.67
+    222436    91.90 t/s   25.14 t/s    0.90826     4.54
+    259257    81.77 t/s   24.18 t/s    0.94340     4.70
+    min gpu0 free 757 MiB
+
+**Acceptance never collapses** -- 0.79-0.94 at every depth including 259257, against 0.00000
+before the `-b` fix. Decode clears 30 t/s out to ~130k; the crossover is between 130112 and
+160112, and full depth settles at 24.18 t/s. Decode scatter is about +/-2 t/s (160112 reads below
+191361), so individual points are approximate.
+
+For reference, the same machine at the start of this session: 4.85 t/s at full depth with
+acceptance 0.00000, and a config that could not complete a full prefill without starving the
+display.
