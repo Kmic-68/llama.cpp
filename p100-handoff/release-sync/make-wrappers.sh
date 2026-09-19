@@ -42,11 +42,14 @@ cat > "$BIN/qwen-server" <<'EOF'
 # what each flag does and why. Extra arguments are appended and win over the defaults here.
 #
 # Sized for VRAM margin, not for peak shallow prefill. The attention mask is n_kv x ubatch and
-# n_kv is the USED cache, so the footprint grows as the context fills: at -ub 2048 a genuinely
-# full 262144 prompt dies 57 s into prefill and starves anything else on GPU0. -ub 512 costs
-# shallow prefill (411 -> 380 t/s) and is within noise at depth (23.02 vs 22.91). -ubd 64 is
-# strictly faster than 256 (23.03 vs 21.43). -ctkd/-ctvd q4_0 put the draft KV cache at 151 MB
-# instead of 537 for -2.2% decode. See OPTLOG attempts 126, 143 and 155.
+# n_kv is the USED cache, so the footprint grows as the context fills -- steeply at the very end.
+# -ub 512 is NOT safe at -c 262144: two runs with an identical config and no speculative decoding
+# bottomed out at 273 MiB and 193 MiB of free VRAM on GPU0, and the second was killed. The only
+# difference between them was 136 MiB of other GPU use. -ub 128 leaves 1622 MiB free at full
+# depth with MTP on, and costs prefill, which is the cheap direction here.
+# -ubd 64 is strictly faster than 256 (23.03 vs 21.43). -ctkd/-ctvd q4_0 put the draft KV cache
+# at 151 MB instead of 537 and cost nothing measurable: acceptance 0.58170 vs 0.58361 for f16.
+# See OPTLOG attempts 126, 143, 158 and 163.
 BUILD="$(cd "$(dirname "$0")/../build" && pwd)"
 MODEL="${QWEN_MODEL:-/mnt/fast/models/Qwen3.8-27B-Q6_K.gguf}"
 
@@ -59,9 +62,9 @@ LD_LIBRARY_PATH="$BUILD${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" export LD_LIBRARY_
 exec "$BUILD/llama-server" \
   -m "$MODEL" \
   -ngl 99 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 \
-  -c 262144 -b 262144 -ub 512 -np 1 \
+  -c 262144 -b 262144 -ub 128 -np 1 \
   --spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min 0.2 \
-  -ngld 99 -ubd 64 \
+  -ngld 99 -ubd 64 -ctkd q4_0 -ctvd q4_0 \
   --jinja --temp 0.3 --top-k 20 \
   --host 0.0.0.0 --port 8080 \
   --tools all \

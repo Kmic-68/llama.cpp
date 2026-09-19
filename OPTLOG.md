@@ -6608,3 +6608,143 @@ total 3381 -> 2849 (-15.7%).
     262144  1434.92  1198.11    954.54    -33.5%
 
 At 954 us the q4_0 path is now well under f16's 1188.92 us. test-backend-ops 3/3.
+
+## Attempt 160 — nbatch_K 128 -> 256 at ncols=6: REJECTED on shared memory, before measuring
+
+I had claimed in the attempt-158 notes that this fits at occupancy 2, from a hand-derived
+20.7 kiB. That derivation was wrong. Measured from the object file with
+`cuobjdump -res-usage`:
+
+    config (DKQ,DV,ncols,nthreads,occ,nbatch_fa,nbatch_K)   SHARED     REG
+    (256,256,6,192,2,64,128)   -- current, committed         20736     168
+    (256,256,6,192,2,64,256)   -- nbatch_K 256               37120     168   <- 36.25 kiB
+    (256,256,6,192,2,32,256)   -- nbatch_K 256, nbatch_fa 32 20096     162
+
+P100 has 64 kiB of shared per SM, so 2 blocks need <= 32 kiB each. At 37120 only one block
+fits and occupancy falls to 1, which attempt 132 measured at -31.6%. **Not measured on the
+GPU -- rejected from the object file, which is cheaper and just as decisive.**
+
+The one form that keeps occupancy 2 is nbatch_K 256 paired with nbatch_fa 32, which comes in
+*under* the current config on both shared (20096 vs 20736) and registers (162 vs 168). That
+trades a single-pass K loop against twice the number of KV row iterations, so the sign is not
+obvious. Queued to measure; the tree is reverted to the committed config meanwhile.
+
+Lesson for the config table: derive shared from `cuobjdump -res-usage` on the actual object,
+not by hand from the __shared__ declarations. The hand derivation missed that KV_tmp is
+nbatch_fa*(nbatch_K/2 + cpy_ne) *half2*, i.e. 4 bytes per element, not 2.
+
+## Attempt 161 — RETRACTION: the MTP collapse is NOT VRAM
+
+Attempt 158 concluded "the draft is being squeezed into no memory". **That is wrong.** Tested it
+directly by buying back headroom with `-ub 128` (the n_kv x ubatch mask is allocated for the
+target AND draft contexts, so halving it twice is worth ~400 MB):
+
+    -ub 512:  breached the 200 MiB floor at ~205k depth, killed
+    -ub 128:  2536 MiB free at load, 1622 MiB free at full depth -- never close to the floor
+
+And at full depth, with all that headroom:
+
+    FULLDEPTH prompt_n=259229  prefill 103.05 t/s  decode 5.41 t/s  184.76 ms/tok
+    draft acceptance = 0.00000 (0 accepted / 498 generated), mean len = 1.00
+
+**Zero acceptance with 1622 MiB free.** Memory is not the cause. What attempt 158 actually
+established is narrower and still useful: acceptance is healthy (75-89%) at every depth up to
+130126, and `-ub 128` genuinely fixes the VRAM exhaustion. It does not fix MTP.
+
+The `-ub 128` run is not wasted: prefill at full depth went 85.4 -> **103.05 t/s** (the kernel
+work plus the smaller mask), and the run completed at 262144 with 1.6 GB to spare, which the
+`-ub 512` configuration could not do.
+
+**New evidence, pointing somewhere else entirely:** `mean len = 1.00`. At healthy depths the mean
+accepted-draft length is 4.32-4.52, i.e. the draft proposes its full n_max=4 and most land. At
+259229 it proposes exactly one token per round and that token is always rejected. With
+`--spec-draft-p-min 0.2`, a mean length of 1 means the draft's own probability for its second
+token is below 0.2 -- **the draft model's output distribution has collapsed**, it is not being
+starved of anything. Whatever is wrong is numerical or positional inside the draft path, not
+a resource limit.
+
+Known good/bad points, which bracket it between 130126 and 259229:
+
+    130126   acceptance 0.83908, mean len 4.32   (this session)
+    228958   acceptance ~0.79                    (attempt 131, earlier session)
+    259229   acceptance 0.00000, mean len 1.00   (this run, and attempt 154/156)
+
+## Attempt 162 — is the trigger cache fullness or absolute position?
+
+`mean len = 1.00` was me misreading the field: 498 drafts over 128 output tokens is ~3.9 per
+round, so the draft IS proposing its full n_max=4 and having **every one** rejected. mean len 1.00
+is the accepted run length (1 = only the target's own token). Zero out of 498 is not low
+confidence -- random tokens would land sometimes -- so the draft's state is systematically
+corrupt, not merely uncertain.
+
+One clean discriminator, using a point already measured. `-c 262144` with the first half of
+p262.txt (130126 tokens) gave acceptance 0.83908. Re-run the **same prompt at the same depth**
+with `-c 131072`, so the cache is 99% full instead of 50%:
+
+    collapses -> the trigger is cache fullness as a fraction of n_ctx
+    healthy   -> the trigger is absolute position (RoPE, an index width, a wrap)
+
+This costs one 130k prefill (~21 min at the 103 t/s this build now does) instead of another
+259k one, and it rules out half the hypothesis space either way.
+
+Ruled out already by reading the code, so not worth a run:
+  - draft context is undersized -- `common/speculative.cpp:2401` sets
+    `cparams.n_ctx = llama_n_ctx(ctx_tgt)`, so it matches the target exactly.
+  - draft uses different rope/model params -- the MTP context is built from the same
+    `common_context_params_to_llama(params)` and, for spec_mtp, the same model.
+  - n_ctx exceeds the training context and gets capped -- n_ctx_train is 262144 from the gguf,
+    equal to our -c, so the capping branch at server-context.cpp:1160 does not fire.
+
+### Attempt 162b — nbatch_K 256 with nbatch_fa 32: REJECTED on measurement
+
+The one shared-memory-legal form of the single-pass K loop (20096 B shared, 162 reg -- both
+*under* the committed config) is slower at every depth:
+
+    kv          B (committed)   nbatch_K 256 / nbatch_fa 32   delta
+    32768          136.60              150.74                +10.4%
+    65536          250.68              279.87                +11.6%
+    131072         481.50              544.20                +13.0%
+    262144         954.54             1091.80                +14.4%
+
+Collapsing the K-chunk loop to one pass does not pay for halving the number of KV rows per
+iteration. Same sign as attempt 155. Reverted. **The ncols=6 config is now exhausted from both
+directions**: cpw is pinned to {1,2} by two static asserts, occupancy 2 pins shared to <= 32 kiB,
+and within that the only free knob (nbatch_fa vs nbatch_K trade) is worse in both directions from
+(64, 128).
+
+### Attempt 162 — RESULT: the MTP trigger is absolute position, not cache fullness
+
+    -c 262144, 130126 tokens (cache 50% full):  acceptance 0.83908 (73/87), mean len 4.32
+    -c 131072, 130114 tokens (cache 99% full):  acceptance 0.83908 (73/87), mean len 4.32
+
+Identical to the token. Filling the cache to 99% at a depth that works changes nothing, so
+fragmentation, eviction pressure and n_kv-fullness are all ruled out. With attempt 131's 228958
+tokens at ~79%, the collapse is bracketed to **between ~229k and 259229, and it is positional** --
+a RoPE or index-width issue in the draft path, not a resource one. Narrowing further needs
+several ~40 min bisection runs and is the first thing to pick up next session.
+
+## Attempt 163 — CORRECTION: -ub 512 at full context is marginal even WITHOUT MTP
+
+run163 was meant to be a clean kernel A/B against run157: identical config
+(`-c 262144 -b 262144 -ub 512 -np 1 --spec-type none`), only the kernel changed. It never
+produced a number -- the watchdog killed it at 193 MiB free, right at the end of prefill.
+
+Comparing the two guard logs, which I should have done before claiming anything:
+
+    run157  min gpu0 free 273 MiB   (start 16125)  -- survived by 73 MiB
+    run163  min gpu0 free 193 MiB   (start 15989)  -- breached the 200 MiB floor
+
+**I had recorded that run157 "never came close to the floor".** That was from eyeballing the
+first few guard samples (2748, 2722, 2666 MiB) during early prefill and extrapolating a trend
+that does not hold -- the footprint climbs steeply at the end. The real minimum was 273 MiB.
+run157 did not demonstrate that `-ub 512` fits at 262144; it demonstrated that it *barely* fits,
+on a day when Sunshine happened to hold 136 MiB less.
+
+Consequence for the shipped config: **`-ub 512` is not safe at `-c 262144`, with or without MTP.**
+The qwen-server wrapper still carries `-ub 512` with a comment claiming it is the VRAM-safe
+choice; that comment is based on the same mistake. `-ub 128` measured 2536 MiB free at load and
+1622 MiB at full depth with MTP *on*, so it has real margin.
+
+Method note, the actual lesson: a peak-memory claim must come from `min` over the whole guard
+log, never from the samples that happen to be on screen. FINDINGS item 9 already says a peak-VRAM
+number is only valid at the fill it was measured at -- this is the same trap, one level down.
