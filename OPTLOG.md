@@ -7045,3 +7045,23 @@ of a long document gets less predictable; that is content, not a defect.
 
 **Steady-state long-context serving is therefore ~23-26 t/s at 262144**, not a one-request
 artifact.
+
+## Attempt 171 — -ub 2048 serves a full context, now that graphs are off
+
+The old warning that `-ub 2048` "cannot serve a full context" was true only with CUDA graphs on.
+Full depth, single-shot, MTP on, `-b 32768`, graphs off:
+
+    ub     prefill      decode     acceptance   min gpu0 free
+    256   119.46 t/s  26.13 t/s     0.98058       2205 MiB
+    2048  137.43 t/s  25.53 t/s     0.98058        757 MiB
+
+**+15% prefill at identical acceptance and identical decode**, which also retires the `-ub 512`
+decode dip from attempt 169 (21.78 t/s) as run-to-run noise -- 2048 decodes the same as 256, and
+there is no mechanism for ubatch to affect a 1-5 token decode step anyway.
+
+Load-time free memory came in at 988 MiB against a predicted ~1000 (2500 - 1792*0.84), so the
+0.84 MiB-per-unit model from attempt 169 holds to within noise.
+
+Shipped `-ub 2048`. The margin is the thing to watch: 757 MiB is 3.8x the watchdog floor, but
+run163 died from a 136 MiB swing in other GPU use, so anything else sharing GPU0 argues for
+`-ub 1024` (~1560 MiB) or `-ub 256` (~2205 MiB). Both cost only prefill.

@@ -34,7 +34,7 @@ Arguments are appended and override the defaults, so `qwen-server --port 9000` m
     llama-server \
       -m /mnt/fast/models/Qwen3.8-27B-Q6_K.gguf \
       -ngl 99 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 \
-      -c 262144 -b 262144 -ub 256 -np 1 \
+      -c 262144 -b 32768 -ub 2048 -np 1 \
       --spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min 0.2 \
       -ngld 99 -ubd 64 -ctkd q4_0 -ctvd q4_0 \
       --jinja --temp 0.3 --top-k 20 \
@@ -92,24 +92,30 @@ Both fail identically: `CUDA error: the function failed to launch on the GPU` in
 `ggml_cuda_mul_mat_cublas_impl<F16>`. It is memory exhaustion presenting as a launch failure —
 cuBLAS could not get scratch workspace — not a kernel defect.
 
-Both of those runs predate `-ctkd q4_0 -ctvd q4_0`, which is now in the configuration above.
-`-ub 512` ran out with **165 MiB** left at ~95% of the prompt, and quantizing the draft KV cache
-returns **368 MiB** — so the shipping configuration should clear it, with roughly 200 MiB spare.
-**That is an argument, not a measurement: as of 2026-09-18 no run has served a genuinely full
-262144-token prompt with the MTP draft on 2x16 GB.** If it still comes up short, the next levers
-are `-c 245760` (caps `n_kv` outright) and, if you must keep a big ubatch, finding the
-unexplained `n_kv*ubatch` allocation described in OPTLOG attempt 165.
+**This is now measured, and the explanation above is only half right.** A genuinely full
+262144-token prompt with the MTP draft has since been served many times on 2x16 GB. What was
+missing was the identity of the growth: **it was CUDA graph instantiation**, not the mask. With
+`GGML_CUDA_GRAPHS_PRE_VOLTA=1` the cost is 10.67 MiB per ubatch unit at full depth and `-ub 512`
+dies at 193 MiB free; with graphs off it is 0.84 MiB per unit, which is exactly the f16 mask over
+the target and draft contexts. Turning graphs off costs 1.4% on tg256 — inside the noise — so the
+shipping configuration disables them, and `-ub 2048` then serves a full context comfortably:
 
-Note also that the mask explains the scaling law and the lever, but not the full 1504 MiB of
-growth observed above; the remainder is unaccounted for. Do not treat this as a closed
-explanation.
+| `-ub` | prefill | decode | acceptance | min free |
+|---|---|---|---|---|
+| 256 | 119.46 t/s | 26.13 t/s | 0.98058 | 2205 MiB |
+| 2048 | 137.43 t/s | 25.53 t/s | 0.98058 | 757 MiB |
+
+The other half of the old advice — that a big ubatch is what kills a full-context prompt — was
+wrong for a different reason too. What actually broke long-context MTP was **`-b 262144`**: with
+the whole prompt as one logical batch, draft acceptance at full depth is 0.00000 and decode is
+5.41 t/s. `-b 32768` makes the same prompt give 0.98058 and 26.13 t/s. See OPTLOG attempt 168.
 
 In practice this bites only at extreme depth: a prompt in the tens of thousands of tokens against
 `-c 262144` is comfortable, which is why this went unnoticed for so long.
 
 **If the GPU also drives a display, leave it real headroom.** GPU0 here carries ~392 MiB of
-Sunshine, and the `-ub 2048` failure above starved it badly enough to require restarting the
-desktop session. Budget that process explicitly rather than counting it as slack, and consider
+Sunshine, and an early `-ub 2048` run (with CUDA graphs on) starved it badly enough to require
+restarting the desktop session. Budget that process explicitly rather than counting it as slack, and consider
 capping yourself with a watchdog that kills the *server* — by PID — before free memory reaches
 zero.
 

@@ -43,14 +43,17 @@ cat > "$BIN/qwen-server" <<'EOF'
 #
 # Sized for VRAM margin, not for peak shallow prefill. The attention mask is n_kv x ubatch and
 # n_kv is the USED cache, so the footprint grows as the context fills -- steeply at the very end.
-# -ub 512 is NOT safe at -c 262144: two runs with an identical config and no speculative decoding
-# bottomed out at 273 MiB and 193 MiB of free VRAM on GPU0, and the second was killed. The only
-# difference between them was 136 MiB of other GPU use. -ub 256 is the measured sweet spot: at
-# full depth it holds 2925 MiB free -- 2732 MiB more headroom than -ub 512 -- for 14.6% of
-# prefill (148.95 -> 127.21 t/s on the same 259229-token prompt). -ub 128 costs 31% of prefill
-# and buys nothing over 256. NOTE the headroom gain is ~20x what the f16 attention mask alone
-# explains, so something else scales with n_kv*ubatch during prefill; finding it would make
-# -ub 512 affordable again. See OPTLOG attempt 165.
+# ubatch only costs real VRAM when CUDA graphs are ON, which they are not here. With graphs on
+# the scaling was 10.67 MiB per ubatch unit at full depth and -ub 512 got killed at 193 MiB free;
+# with graphs off it is 0.84 MiB per unit, which is just the f16 mask over the target and draft
+# contexts. Measured at full depth, single-shot, MTP on, graphs off:
+#     ub    prefill      decode     acceptance   min gpu0 free
+#     256  119.46 t/s  26.13 t/s     0.98058       2205 MiB
+#     2048 137.43 t/s  25.53 t/s     0.98058        757 MiB
+# +15% prefill for identical acceptance and decode. The margin is the thing to watch: 757 MiB is
+# 3.8x the watchdog floor, but run163 died from a 136 MiB swing in other GPU use. If anything
+# else shares GPU0, drop to -ub 1024 (~1560 MiB) or -ub 256 (~2205 MiB); both cost only prefill.
+# See OPTLOG attempts 165, 169 and 171.
 # -ubd 64 is strictly faster than 256 (23.03 vs 21.43). -ctkd/-ctvd q4_0 put the draft KV cache
 # at 151 MB instead of 537 and cost nothing measurable: acceptance 0.58170 vs 0.58361 for f16.
 # See OPTLOG attempts 126, 143, 158 and 163.
@@ -80,7 +83,7 @@ LD_LIBRARY_PATH="$BUILD${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" export LD_LIBRARY_
 exec "$BUILD/llama-server" \
   -m "$MODEL" \
   -ngl 99 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 \
-  -c 262144 -b 32768 -ub 256 -np 1 \
+  -c 262144 -b 32768 -ub 2048 -np 1 \
   --spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min 0.2 \
   -ngld 99 -ubd 64 -ctkd q4_0 -ctvd q4_0 \
   --jinja --temp 0.3 --top-k 20 \
