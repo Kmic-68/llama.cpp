@@ -3,7 +3,7 @@
 Kernel work targeting Pascal, which upstream llama.cpp largely leaves on generic paths.
 Measured on **2x Tesla P100-PCIE-16GB**, tensor-split, **Qwen3.8-27B Q6_K**, q4_0 KV cache.
 
-Built from upstream `f280b2698` (2026-08-25) plus 165 commits, 59 of which touch code.
+Built from upstream `f280b2698` (2026-08-25) plus 194 commits, 62 of which touch code.
 
 ## Results
 
@@ -38,10 +38,10 @@ been misread here as a correctness failure.
 |---|---|
 | **`bin/`** | **wrappers to put on PATH** — same 91 programs, with `LD_LIBRARY_PATH` set for you, plus `qwen-server` for the tuned configuration |
 | `build/` | the real binaries and libraries. Prefer `bin/`; see QUICKSTART |
-| `patches/` | 165 `git am`-able commits against upstream `f280b2698`, one per commit in apply order |
+| `patches/` | 194 `git am`-able commits against upstream `f280b2698`, one per commit in apply order |
 | `diffs/` | `all-code.diff` (the same delta squashed into one file), `everything.diff` (incl. docs), and the base/HEAD SHAs |
 | `docs/` | the documentation above, plus `ENVIRONMENT.md`, `COMMUNITY-NOTES.md`, the numerical audit, and `handoff/` |
-| `logs/OPTLOG.md` | every attempt, kept and reverted, with numbers — 153 attempts |
+| `logs/OPTLOG.md` | every attempt, kept and reverted, with numbers — 172 attempts |
 | `tools/` | `gate.sh` and the gate corpus — use these, not a hand-typed perplexity command |
 | `archive/` | the superseded 2026-09-06 release. **Those binaries carry two data races**; see `archive/README.md` |
 

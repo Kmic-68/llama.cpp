@@ -1,6 +1,6 @@
 # Change log
 
-Every code change in this fork, grouped by what it touches. 59 code commits on top of upstream
+Every code change in this fork, grouped by what it touches. 62 code commits on top of upstream
 `f280b2698` (2026-08-25); the other 106 of the 165 are documentation and logs.
 
 Each patch file in `patches/` is one commit, numbered in apply order. `diffs/all-code.diff` is
