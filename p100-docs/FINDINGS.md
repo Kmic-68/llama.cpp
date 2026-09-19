@@ -1,6 +1,6 @@
 # Findings — what worked, what failed, and how the measurements lied
 
-The distillation. The full record with numbers is `../logs/OPTLOG.md` (153 attempts); the change
+The distillation. The full record with numbers is `../logs/OPTLOG.md` (174 attempts); the change
 list is `../CHANGES.md`.
 
 ---
@@ -28,7 +28,7 @@ the same exact real `d*(q-8)` once — so perplexity is unchanged to the last di
 differ in the sign of a zero (`q == 8` with `d < 0` gives `-0.0` where upstream's `8d + (-8d)`
 gives `+0.0`, and a KV value of either zero sign contributes nothing to the dot product) and 30
 differ at `d == ±inf`, where this form gives the correctly signed infinity and upstream gives NaN
-from `inf - inf`. Zero cases differ for any finite scale.
+from `inf - inf`. Not one finite scale produces a numerically different value.
 
 **This is the most broadly useful change here** — it applies to any pre-Volta GPU with a
 quantized KV cache, and the cost it removes scales with context length.
