@@ -6548,3 +6548,63 @@ straightest line to 30.
 **Full-depth testing is now cheap.** The run saved the filled slot via `/slots/0?action=save`:
 4.94 GB, written in 2.25 s, at `scratchpad/slots/full262.bin`. Restoring it replaces a 29-minute
 prefill, so full-depth decode can now be measured per build instead of once per session.
+
+## Attempt 158 — the MTP acceptance collapse is VRAM exhaustion, measured directly
+
+Two hypotheses died and one was confirmed.
+
+**Dead: quantized draft KV degrades the draft.** Measured at shallow depth, where a run costs
+2 minutes instead of 30 (`-c 16384`, 256 tokens generated):
+
+    draft KV f16    acceptance 0.58361   41.87 t/s
+    draft KV q4_0   acceptance 0.58170   41.32 t/s
+
+Identical. `-ctkd/-ctvd q4_0` is free, and is safe to keep for the VRAM it buys.
+
+**Confirmed: it is VRAM.** Acceptance vs depth, all in ONE server session by sending successively
+longer prefixes of the same prompt with `cache_prompt` so prefill is incremental:
+
+    depth     acceptance   mean len   decode t/s    gpu0 free
+     17090      0.75532      3.96       17.74        ~2200 MiB
+     33866      0.86905      4.48       47.29         1135
+     66544      0.89157      4.52       39.14          685
+    130126      0.83908      4.32       30.59          364
+    ~205000        --         --          --           181  <- guard floor breach, killed
+
+**Acceptance never degrades.** It sits between 75% and 89% at every depth that fits, including
+130126. What happens between 131k and 205k is that GPU0 free memory walks down to nothing: the
+watchdog killed the server at 181 MiB, and the previous full-depth run survived only by ending at
+205 MiB. The `draft acceptance = 0.00000` at 259229 is a memory failure, not a model-quality one --
+the draft is being squeezed into no memory and stops producing usable tokens, while still costing
+a full draft forward pass per token. That is the 4.4x.
+
+Note 130126 already decodes at **30.59 t/s with MTP working**. The target is not a kernel problem
+at that depth; it is a memory problem at 262144.
+
+## Attempt 159 — half2 accumulation for the KQ dot product
+
+`ggml_cuda_mad(float&, half2, half2)` (common.cuh:775) is the only mad site in the tile kernel,
+and on sm_60 it emits 5-6 instructions per 2 MACs:
+
+    HMUL2     R36, R41, R40.H0_H0    ; the 2 products
+    HADD2.F32 R44, R36.H0_H0, -RZ    ; widen low  -> float
+    HADD2.F32 R45, R36.H1_H1, -RZ    ; widen high -> float
+    FADD.FTZ  R44, R44, R45          ; tmp.x + tmp.y
+    FADD.FTZ  R44, RZ,  R44          ; adds zero -- pure waste
+    FADD.FTZ  R42, R44, R42          ; acc += ...
+
+The products are ALREADY rounded to fp16 by that HMUL2, so keeping the running sum of the group
+in float buys nothing. Accumulate the cpy_ne group with `__hfma2` (one instruction per 2 MACs)
+and widen once. The fold stays inside the group, so only cpy_ne*2 == 8 terms are summed in fp16
+before returning to the float accumulator.
+
+SASS, A -> B: HFMA2 256 -> 512, HMUL2 360 -> 104, FADD 532 -> 276, HADD2 522 -> 266,
+total 3381 -> 2849 (-15.7%).
+
+    kv        156       +A        +B       total
+    32768    209.05   173.81    136.60    -34.7%
+    65536    382.72   311.95    250.68    -34.5%
+    131072   728.24   600.61    481.50    -33.9%
+    262144  1434.92  1198.11    954.54    -33.5%
+
+At 954 us the q4_0 path is now well under f16's 1188.92 us. test-backend-ops 3/3.

@@ -727,10 +727,26 @@ static __device__ __forceinline__ void flash_attn_tile_iter_KQ(
         for (int i_KQ_0 = 0; i_KQ_0 < nbatch_fa; i_KQ_0 += np*warp_size) {
 #pragma unroll
             for (int jc0 = 0; jc0 < cpw; ++jc0) {
+#ifdef FAST_FP16_AVAILABLE
+                // ggml_cuda_mad(float&, half2, half2) costs 5-6 instructions per 2 MACs on
+                // sm_60: HMUL2, two HADD2.F32 to widen each half, then FADD to fold and FADD
+                // to accumulate. The products are ALREADY rounded to fp16 by that HMUL2, so
+                // nothing is gained by keeping the running sum of this group in float --
+                // accumulate the group with HFMA2 (one instruction per 2 MACs) and widen once.
+                // The fold stays inside the cpy_ne group, so only cpy_ne*2 == 8 terms are
+                // summed in fp16 before returning to the float accumulator.
+                half2 s = make_half2(0.0f, 0.0f);
+#pragma unroll
+                for (int k = 0; k < cpy_ne; ++k) {
+                    s = __hfma2(K_k[i_KQ_0/(np*warp_size)][k], Q_k[jc0][k], s);
+                }
+                KQ_acc[i_KQ_0/(np*warp_size)*cpw + jc0] += __low2float(s) + __high2float(s);
+#else
 #pragma unroll
                 for (int k = 0; k < cpy_ne; ++k) {
                     ggml_cuda_mad(KQ_acc[i_KQ_0/(np*warp_size)*cpw + jc0], K_k[i_KQ_0/(np*warp_size)][k], Q_k[jc0][k]);
                 }
+#endif // FAST_FP16_AVAILABLE
             }
         }
     }
