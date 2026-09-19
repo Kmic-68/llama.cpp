@@ -6748,3 +6748,94 @@ choice; that comment is based on the same mistake. `-ub 128` measured 2536 MiB f
 Method note, the actual lesson: a peak-memory claim must come from `min` over the whole guard
 log, never from the samples that happen to be on screen. FINDINGS item 9 already says a peak-VRAM
 number is only valid at the fill it was measured at -- this is the same trap, one level down.
+
+## Attempt 164 — full-depth checkpointing actually works; the trap is truncation
+
+**The 33-minute prefill was avoidable all along and I did not check.** run158 restored a slot,
+saw the server compute anyway, and I concluded restore was useless and abandoned it -- then paid
+four more full prefills. Worse, that script did not use `python3 -u`, so the RESTORE response was
+still in a block-buffered pipe when I killed it: I threw away the one piece of evidence that would
+have settled it.
+
+Restore works, and it is fast:
+
+    RESTORE status=200  n_restored=259292  n_read=4.94 GB  restore_ms=2331
+
+2.3 seconds for the full 259k state. What fails is the *query after* it. The saved state held
+259292 tokens (the 259229-token prompt plus 63 generated), and the query sent only the prompt --
+a **shorter** sequence. Matching that requires truncating the cache, and this model is a hybrid
+with 48 recurrent SSM layers, so `common_context_can_seq_rm` returns FULL (whole sequences only,
+server-context.cpp:1171): a recurrent state cannot be rewound. The server therefore drops
+everything and reprocesses. The log shows `f_sim_best = 1.000` -- a perfect match -- and still
+259229 tokens processed. **The match was never the problem; the 63-token rewind was.**
+
+The fix is to make the query strictly EXTEND the saved state, verified at 4k where a cycle costs
+seconds:
+
+    PREFILL-ONLY n_predict=0 -> prompt_n=4639     (saved tokens == the prompt, no generated tail)
+    SAVE  n_saved=4639
+    RESTORE n_restored=4639
+    EXTEND-QUERY prompt_n=9 processed, prompt_ms=377     <- only the tail
+
+`n_predict=0` is the key: it leaves no generated tokens after the prompt, so a longer prompt with
+the same prefix appends instead of rewinding. Recipe for full depth: prefill p262.txt with
+n_predict=0, save, and afterwards restore + query with `p262.txt + <tail>`.
+
+## Attempt 165 — what -ub actually costs, and why -ub 128 was an overcorrection
+
+Load-time reservation at `-c 65536`, sweeping ubatch:
+
+    ub=128  4860 MiB free     ub=256  4814     ub=512  4720     ub=1024  4534
+    deltas            -46 MiB           -94 MiB          -186 MiB
+
+That is **0.36 MiB per unit of ubatch at n_kv=65536 = 5.76 bytes per (token x ubatch)**. Scaled
+to 262144 it is 1.44 MiB per ubatch unit, so at full depth `-ub 512` costs ~737 MiB and `-ub 128`
+~184 MiB. run163 breached the floor by only 7 MiB (193 vs 200), so it needed a few hundred MiB,
+not 550: **`-ub 256` returns ~368 MiB and is the right setting.** `-ub 128` was an overcorrection
+made from a wrong model of where the memory went.
+
+**The 5.76 B/token/ubatch is itself unexplained and is the open lead.** The mask is F16 --
+`build_attn_inp_kq_mask` (llama-graph.cpp:39) picks F16 whenever flash_attn is on -- so the
+tensor accounts for 2 bytes, and it is allocated once per GPU. Something is spending ~2.9x that.
+Ruled out by reading the code, not guessed: `GGML_SCHED_MAX_COPIES=4` is **not** it, because
+pipeline parallelism requires `LLAMA_SPLIT_MODE_LAYER` (llama-context.cpp:431) and we run
+`-sm tensor`, so n_copies is 1. If the remaining ~3.8 B/token/ubatch can be found and removed,
+`-ub 512` or higher becomes affordable at 262144 and the prefill penalty disappears entirely.
+
+## Attempt 165 — RESULT: -ub 256 verified at full depth, and the checkpoint works
+
+One prefill, three deliverables.
+
+**1. -ub 256 is the setting.** Full 259229-token prefill, `--spec-type none`:
+
+    ub     prefill      min gpu0 free      outcome
+    512    148.95 t/s     193 MiB          killed at the floor
+    256    127.21 t/s    2925 MiB          comfortable
+    128    103.05 t/s   (1622 with MTP on) no better than 256, 2x the prefill cost
+
+**The headroom gain is 2732 MiB, not the ~368 MiB I predicted from load-time scaling.** That
+prediction came from `-c 65536` load reservations (5.76 B per token*ubatch); the real cost during
+a full-depth prefill is ~42 B per token*ubatch, about **21x** what the f16 mask explains. So the
+load-time reservation is not a good proxy for the prefill peak, and there is a large
+n_kv*ubatch-scaled allocation during prefill that nobody has accounted for. Finding it would make
+`-ub 512` -- or more -- affordable at 262144 and remove the prefill penalty entirely. **This is
+the open lead for the -ub problem, and it is worth more than another config tweak.**
+
+**2. Full-depth decode, committed kernel:** 17.62 t/s / 56.76 ms per token at 259239 tokens,
+against 14.08 t/s at the start of the session -- **+25%**, from the two tile-kernel commits.
+
+**3. A reusable full-depth checkpoint now exists:** `scratchpad/slots/full262_exact.bin`,
+4.94 GB, `n_saved = 259229` -- exactly the prompt, no generated tail. Restoring it and issuing a
+query that EXTENDS it processed **10 tokens instead of 259229**:
+
+    EXTEND-DECODE processed=10  decode=17.62 t/s
+
+Recipe for any future full-depth experiment (seconds, not 34 minutes):
+
+    POST /slots/0?action=restore  {"filename":"full262_exact.bin"}
+    POST /completion  {"prompt": <contents of p262.txt> + "<any tail>", "cache_prompt": true}
+
+The prompt must START with the exact p262.txt text. Anything shorter truncates, and truncation
+on this hybrid model means a full reprocess (48 recurrent layers, seq_rm is FULL-only).
+This makes the MTP positional bisection between 229k and 259229 -- previously written off as
+unaffordable at ~40 min per point -- cost about a minute per point.

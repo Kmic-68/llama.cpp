@@ -45,8 +45,12 @@ cat > "$BIN/qwen-server" <<'EOF'
 # n_kv is the USED cache, so the footprint grows as the context fills -- steeply at the very end.
 # -ub 512 is NOT safe at -c 262144: two runs with an identical config and no speculative decoding
 # bottomed out at 273 MiB and 193 MiB of free VRAM on GPU0, and the second was killed. The only
-# difference between them was 136 MiB of other GPU use. -ub 128 leaves 1622 MiB free at full
-# depth with MTP on, and costs prefill, which is the cheap direction here.
+# difference between them was 136 MiB of other GPU use. -ub 256 is the measured sweet spot: at
+# full depth it holds 2925 MiB free -- 2732 MiB more headroom than -ub 512 -- for 14.6% of
+# prefill (148.95 -> 127.21 t/s on the same 259229-token prompt). -ub 128 costs 31% of prefill
+# and buys nothing over 256. NOTE the headroom gain is ~20x what the f16 attention mask alone
+# explains, so something else scales with n_kv*ubatch during prefill; finding it would make
+# -ub 512 affordable again. See OPTLOG attempt 165.
 # -ubd 64 is strictly faster than 256 (23.03 vs 21.43). -ctkd/-ctvd q4_0 put the draft KV cache
 # at 151 MB instead of 537 and cost nothing measurable: acceptance 0.58170 vs 0.58361 for f16.
 # See OPTLOG attempts 126, 143, 158 and 163.
@@ -62,7 +66,7 @@ LD_LIBRARY_PATH="$BUILD${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" export LD_LIBRARY_
 exec "$BUILD/llama-server" \
   -m "$MODEL" \
   -ngl 99 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 \
-  -c 262144 -b 262144 -ub 128 -np 1 \
+  -c 262144 -b 262144 -ub 256 -np 1 \
   --spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min 0.2 \
   -ngld 99 -ubd 64 -ctkd q4_0 -ctvd q4_0 \
   --jinja --temp 0.3 --top-k 20 \
