@@ -6986,3 +6986,26 @@ a much smaller problem than the one above.
 ### Shipped
 
 `qwen-server` now carries `-b 32768`, `-ub 256`, `GGML_CUDA_GRAPHS_PRE_VOLTA=0`.
+
+## Attempt 169 — GAP 2 CLOSED: the unexplained n_kv*ubatch allocation was the CUDA graph
+
+Attempt 165 recorded a headroom gain of 2732 MiB going from `-ub 512` to `-ub 256` and flagged
+it as ~21x what the f16 mask explains, unexplained. It was CUDA graphs. Every `-ub` scaling
+number in this log was taken with `GGML_CUDA_GRAPHS_PRE_VOLTA=1`, and the OOM that killed two
+runs landed exactly at `cudaGraphInstantiate`. Same `-ub 512`, full-depth, graphs off:
+
+    -ub 512, graphs ON  (run163)   min gpu0 free   193 MiB  -> killed at the floor
+    -ub 512, graphs OFF (this)     min gpu0 free  1991 MiB  -> comfortable
+
+~1800 MiB recovered, which is the missing term. Graph instantiation duplicates graph memory
+that scales with ubatch; nothing else was hiding.
+
+**And `-ub 512` still is not worth taking**, which settles the setting on measurement instead of
+on OOM-avoidance. Full depth, single-shot, MTP on, graphs off:
+
+    ub     prefill      decode      acceptance   min gpu0 free
+    256   119.46 t/s   26.13 t/s     0.98058       2205 MiB
+    512   125.48 t/s   21.78 t/s     0.94340       1991 MiB
+
++5% prefill for -17% decode. `-ub 256` stays. The FINDINGS note that a load-time reservation
+underestimates the prefill peak still holds, but the size of the gap is now accounted for.
