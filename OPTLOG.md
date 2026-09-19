@@ -6895,3 +6895,44 @@ Incidental, and the reason for the repeated "system low on memory" task kills th
 `batch = llama_batch_init(llama_n_batch(ctx_dft), n_embd, 1)` sizes the draft batch to the
 draft context's n_batch, which inherits `-b 262144`. That is 262144 * 5120 * 4 = **5.37 GB of
 host RAM** for `batch.embd`, allocated whether or not a batch that large is ever used.
+
+## Attempt 167 — THERE IS NO DEPTH COLLAPSE. It is the single-shot prefill.
+
+Bisection with `-ub 256` (which finally has the VRAM headroom the `-ub 512` curve lacked),
+one server, successively longer prefixes so prefill is incremental:
+
+    depth      acceptance   mean len   decode
+    130114      0.83908       4.32     16.31 t/s   (cold-start warmup, see below)
+    166303      0.79121       4.13     27.61 t/s
+    203934      0.81818       4.27     26.80 t/s
+    230362      0.90244       4.52     27.17 t/s
+    259245     *0.97403*      4.75     27.49 t/s   <- FULL DEPTH
+    min gpu0 free over the whole run: 315 MiB
+
+**MTP is perfectly healthy at 259245 -- 0.97403 acceptance and 27.49 t/s.** Every previous
+conclusion about a positional collapse was wrong, including the bracket "between 229k and 259k"
+in attempts 158/162 and the retraction in 161 that replaced VRAM with "absolute position".
+Position was never the variable.
+
+The variable is **how the prompt is submitted**:
+
+    259229 tokens in ONE request, -b 262144   -> acceptance 0.00000, 5.41 t/s   (run160)
+    same depth reached in chunks of <=36k     -> acceptance 0.97403, 27.49 t/s  (this run)
+
+Every healthy measurement this session was incremental; every dead one sent the whole prompt in
+a single request. With `-b 262144` that is one logical batch of 259229 tokens, and the MTP
+catch-up in `common_speculative_impl_draft_mtp::process()` then does a single
+`memcpy(batch.embd + n_embd, h_tgt, row_bytes*(n_tokens-1))` of about **5.3 GB**. The draft
+batch is sized for it -- `llama_batch_init(llama_n_batch(ctx_dft), n_embd, 1)` with n_batch
+inherited from `-b` -- so this is not an overflow, but something in that path does not survive a
+batch that large.
+
+Consistent with the earlier oddity that a draft cache left EMPTY by restore (0.41-0.45) beat one
+FILLED by a single-shot prefill (0.00000): the single-shot catch-up writes garbage rows, and
+garbage is worse than nothing.
+
+Note also the cold-start warmup: the first request after a server start decodes at roughly half
+speed (16.31 vs 27.61 t/s here; 12.46 vs 23.39 in the decay test). Do not read a first-request
+number as the steady-state rate.
+
+**27.49 t/s at full depth against a 30 t/s target, from 4.85 t/s at the start of the session.**
