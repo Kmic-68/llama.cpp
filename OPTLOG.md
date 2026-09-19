@@ -7125,6 +7125,13 @@ For reference, the same machine at the start of this session: 4.85 t/s at full d
 acceptance 0.00000, and a config that could not complete a full prefill without starving the
 display.
 
+**Superseded by attempt 174 at depth.** This curve was measured on release binaries that carried
+the half2 KQ accumulation, which 174 reverted for rounding. The attention kernel is ~27% slower
+without it at 262144, so the decode column above overstates the shipping build by roughly 8-9% at
+the deep end -- 24.18 t/s here is about 22 t/s on what ships now. Prefill and acceptance are
+unaffected. The shallow end moves very little, since attention is a small share of the pass
+there.
+
 ## Attempt 174 — audit: is everything since the last public push bit-identical or better?
 
 23 commits sit on top of `0dacb39a8`, and exactly one file in them can move a number:

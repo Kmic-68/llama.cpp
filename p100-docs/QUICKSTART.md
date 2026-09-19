@@ -30,7 +30,7 @@ With `bin/` on PATH, the whole thing is:
 Arguments are appended and override the defaults, so `qwen-server --port 9000` moves the port and
 `QWEN_MODEL=/path/to.gguf qwen-server` swaps the model. What it runs:
 
-    GGML_CUDA_P2P=1 GGML_CUDA_GRAPHS_PRE_VOLTA=1 \
+    GGML_CUDA_P2P=1 GGML_CUDA_GRAPHS_PRE_VOLTA=0 \
     llama-server \
       -m /mnt/fast/models/Qwen3.8-27B-Q6_K.gguf \
       -ngl 99 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 \
@@ -50,12 +50,12 @@ Arguments are appended and override the defaults, so `qwen-server --port 9000` m
 | `-fa 1` | flash attention; **required** by `SPLIT_MODE_TENSOR` |
 | `-ctk q4_0 -ctv q4_0` | q4_0 KV cache. f16 will not fit at this context |
 | **`-np 1`** | **required.** The server auto-sizes its slot count and each slot allocates its own 262144 KV cache. Without this, startup dies with `cudaMalloc failed` on 512 MiB while the GPUs are nearly empty |
-| `-b 262144` | admission limit; must exceed the prompt. Separate from `-ub` |
-| **`-ub 256`** | sets the compute shape, prefill speed **and the VRAM ceiling**, and it is the main lever on how full a context you can actually serve. Measured on the same 259229-token prompt: `-ub 512` prefills at 148.95 t/s but bottoms out at **193 MiB** free and gets killed; `-ub 256` prefills at 127.21 t/s and holds **2925 MiB** free; `-ub 128` costs 31% of prefill and buys nothing over 256. Note the 512 -> 256 headroom gain is ~20x what the mask alone explains, so something else scales with `n_kv*ubatch` -- see OPTLOG attempt 165 |
+| **`-b 32768`** | logical batch: the most tokens one `llama_decode()` call may carry. It is **not** the context limit and does not cap prompt length — `-c` does that. **This value is load-bearing for MTP.** At `-b 262144` the whole prompt becomes one logical batch and the MTP catch-up in `common_speculative`'s `process()` does a single ~5.3 GB memcpy over it. Changing only `-b`, same 259229-token prompt in one request: `-b 262144` → acceptance **0.00000**, decode **5.41 t/s**; `-b 32768` → **0.98058**, **26.13 t/s**. See OPTLOG attempt 168 |
+| **`-ub 2048`** | physical/micro batch: tokens per GPU forward pass. Sets prefill speed, and — only when CUDA graphs are on — the VRAM ceiling. With graphs **off**, as shipped, ubatch costs 0.84 MiB per unit instead of 10.67, which is just the f16 mask over the target and draft contexts. At full depth `-ub 2048` prefills **137.43 t/s** holding **757 MiB** free, against `-ub 256` at 119.46 t/s and 2205 MiB — same acceptance, same decode, 15% more prefill. If anything else shares GPU0, drop to `-ub 1024` (~1560 MiB) or `-ub 256` (~2205 MiB); both cost only prefill |
 | **`-ubd 64`** | draft context ubatch. Without it the draft inherits `-ub`, reserves a second copy of the mask, and the whole config OOMs. 64 is also **faster** than 256 (23.03 vs 21.43), not a tradeoff |
 | **`-ctkd q4_0 -ctvd q4_0`** | q4_0 for the *draft* KV cache: **151 MB instead of 537**, for -2.2% decode. The draft cache is f16 by default even when the target cache is quantized. This is the margin lever that makes a full context fit |
 | `GGML_CUDA_P2P=1` | peer-to-peer between the two cards. Keep it on — without it the exchanges stage through the host, which is slower |
-| `GGML_CUDA_GRAPHS_PRE_VOLTA=1` | CUDA graphs on Pascal: **+6.7% on the speculative path, -2% on single-token decode**. Set it for MTP workloads, leave it off otherwise |
+| **`GGML_CUDA_GRAPHS_PRE_VOLTA=0`** | CUDA graphs do work on Pascal (**+6.7% on the speculative path, -2% on single-token decode**), but at `-ub 2048` and a full context their *instantiation* is what exhausts VRAM — `CUDA error: out of memory` at `cudaGraphInstantiate`. Off costs **1.4% on tg256, inside the noise**, and is what makes `-ub 2048` viable at depth. Turn them on only at small `-ub` and shallow context. See OPTLOG attempts 167-168 |
 
 ### Serving flags (these do not touch the CUDA path)
 
