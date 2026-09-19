@@ -7065,3 +7065,35 @@ Load-time free memory came in at 988 MiB against a predicted ~1000 (2500 - 1792*
 Shipped `-ub 2048`. The margin is the thing to watch: 757 MiB is 3.8x the watchdog floor, but
 run163 died from a 136 MiB swing in other GPU use, so anything else sharing GPU0 argues for
 `-ub 1024` (~1560 MiB) or `-ub 256` (~2205 MiB). Both cost only prefill.
+
+## Attempt 172 — validated under the REAL serving flags, not greedy
+
+Every acceptance figure above was measured at `temperature 0`. The shipped config serves at
+`--temp 0.3 --top-k 20`, and speculative acceptance depends on the target's sampling
+distribution, so the greedy numbers are an upper bound. Re-measured with the actual serving
+flags (`-c 262144 -b 32768 -ub 2048`, graphs off, `--jinja --temp 0.3 --top-k 20`), full-depth
+prefill then three turns each extending the last, no `ignore_eos`:
+
+    TURN 0  greedy        acceptance 0.98058  prefill 136.14 t/s  decode 24.14 t/s
+    TURN 1  temp0.3/k20   acceptance 0.83621                      decode 23.73 t/s
+    TURN 2  temp0.3/k20   acceptance 0.89189                      decode 25.40 t/s
+    TURN 3  temp0.3/k20   acceptance 0.79339                      decode 23.12 t/s
+    min gpu0 free 757 MiB
+
+**Sampling costs acceptance but not throughput.** 0.98 -> 0.79-0.89, yet decode is flat at
+23-25 t/s, because mean accepted length only falls 4.88 -> 4.10. The honest real-world figure at
+262144 is **~23-25 t/s sustained**, against the 25-26 greedy figure quoted earlier -- close
+enough that the greedy measurements were not misleading, but they were not the shipping number.
+
+### What the user's actual pre-session flags were doing
+
+    -c 262144 -b 262144 -ub 2048, GGML_CUDA_GRAPHS_PRE_VOLTA=1, -ubd 256, no -ctkd/-ctvd
+
+Both failure modes at once. `-b 262144` is the MTP killer: at full depth that config gets
+acceptance 0.00000 and 5.41 t/s, i.e. the draft model runs four times per token and every token
+is thrown away. And `-ub 2048` with graphs ON costs 10.67 MiB per ubatch unit, which is the
+configuration documented as dying partway through a full prefill and starving the display.
+`-ubd 256` is also slower than 64 (21.43 vs 23.03), and no draft-KV quantization spends a further
+386 MB.
+
+The `-ub 2048` choice was right all along -- it only ever needed graphs off to fit.
