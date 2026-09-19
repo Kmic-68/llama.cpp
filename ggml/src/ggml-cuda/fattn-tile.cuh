@@ -453,9 +453,19 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile(
 // Dequantizing into the shared tile the kernel already stages reads the q4_0 blocks once
 // and keeps the cheap f16 inner loop.
 //
-// A copy covers 2*cpy_ne == 8 contiguous values at an 8-aligned offset, so it never
-// straddles the 16-element split of a q4_0 block: values m and m+16 share byte qs[m], and
-// a run is therefore entirely low nibbles or entirely high ones.
+// A copy covers 2*cpy_ne contiguous values (4 on sm_60, 8 where cpy_ne is 4) at a
+// 2*cpy_ne-aligned offset, so it never straddles the 16-element split of a q4_0 block:
+// values m and m+16 share byte qs[m], and a run is therefore entirely low nibbles or
+// entirely high ones.
+//
+// The slot indexing below also assumes each tile starts on a q4_0 block boundary: byte m of
+// a block is taken to hold head dimension k_dim_0 + (s/SPB)*QK4_0 + m. k_dim_0 is always a
+// multiple of J, so the J % QK4_0 assert is what enforces that. The pre-restructure loader
+// derived block and nibble from the absolute head dim and needed only 2*cpy_ne alignment, so
+// this is a narrower contract than the code it replaced -- nbatch_K of 40, 48, 56 and 72 all
+// appear in the config table for head sizes 40..112. Only DKQ == DV == 256 is instantiated
+// today (see ggml_cuda_fattn_tile_q4_0_direct), where nbatch_K is 64 or 128; the assert is
+// there so extending that gate fails to build instead of silently mis-indexing.
 template<int warp_size, int nwarps, int I, int J, int J_padding, bool oob_check>
 static __device__ __forceinline__ void flash_attn_tile_load_tile_q4_0(
         const char * const __restrict__ KV, half2 * const __restrict__ tile_KV,
@@ -480,6 +490,7 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile_q4_0(
     static_assert(J % VPS == 0, "bad J");
     static_assert((QK4_0/2) % (2*cpy_ne) == 0, "bad cpy_ne");
     static_assert(QK4_0 == 32, "bad QK4_0");
+    static_assert(J % QK4_0 == 0, "q4_0 tile must start on a block boundary; see comment above");
 
     const int tid = threadIdx.y*warp_size + threadIdx.x;
 
@@ -507,8 +518,18 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile_q4_0(
                 // Magic-number dequant instead of __int2half_rn: OR the nibble into the mantissa
                 // of 1024.0h (0x6400), whose ulp is exactly 1, giving 1024+q with no conversion
                 // instruction, then subtract 1032 to land on q-8. Both steps are exact in fp16
-                // (1024+q and q-8 are representable), so the value handed to the hmul2 below is
-                // bit-identical to the __int2half_rn form -- and to upstream to_fp16.
+                // (every integer in [1024,2048) and in [-8,7] is representable), so the value
+                // handed to the hmul2 below is bit-identical to the __int2half_rn form it
+                // replaced: verified exhaustively, 0 differences over all 65536 scales x 256
+                // byte values.
+                //
+                // Against upstream to_fp16, which evaluates d*q + (-8*d) in fp32 and then
+                // rounds: identical for every finite d, since both round the same exact real
+                // d*(q-8) exactly once. Over the whole 1048576-case domain the only
+                // disagreements are 31759 signs of zero (q == 8 with d < 0 gives -0.0 where
+                // 8d + (-8d) gives +0.0; a KV value of either zero sign contributes nothing to
+                // the dot product) and 30 cases at d == +-inf, where this form yields the
+                // correctly signed infinity and upstream yields NaN from inf - inf.
                 const half2 k1032 = __float2half2_rn(1032.0f);
 #pragma unroll
                 for (int l = 0; l < cpy_ne; ++l) {
@@ -727,26 +748,24 @@ static __device__ __forceinline__ void flash_attn_tile_iter_KQ(
         for (int i_KQ_0 = 0; i_KQ_0 < nbatch_fa; i_KQ_0 += np*warp_size) {
 #pragma unroll
             for (int jc0 = 0; jc0 < cpw; ++jc0) {
-#ifdef FAST_FP16_AVAILABLE
-                // ggml_cuda_mad(float&, half2, half2) costs 5-6 instructions per 2 MACs on
-                // sm_60: HMUL2, two HADD2.F32 to widen each half, then FADD to fold and FADD
-                // to accumulate. The products are ALREADY rounded to fp16 by that HMUL2, so
-                // nothing is gained by keeping the running sum of this group in float --
-                // accumulate the group with HFMA2 (one instruction per 2 MACs) and widen once.
-                // The fold stays inside the cpy_ne group, so only cpy_ne*2 == 8 terms are
-                // summed in fp16 before returning to the float accumulator.
-                half2 s = make_half2(0.0f, 0.0f);
-#pragma unroll
-                for (int k = 0; k < cpy_ne; ++k) {
-                    s = __hfma2(K_k[i_KQ_0/(np*warp_size)][k], Q_k[jc0][k], s);
-                }
-                KQ_acc[i_KQ_0/(np*warp_size)*cpw + jc0] += __low2float(s) + __high2float(s);
-#else
+                // Deliberately upstream's ggml_cuda_mad, not an HFMA2 chain. Accumulating the
+                // cpy_ne group in half2 and widening once is genuinely faster here -- it
+                // replaces 5 instructions per 2 MACs (HMUL2, two widens, fold, accumulate)
+                // with about 3, and measured -20.3% on this kernel at kv=262144 -- but it is
+                // less accurate, so it was reverted. Per lane the two forms are
+                //     upstream: fl16(a) + fl16(b)   summed in fp32
+                //     hfma2   : fl16(b + fl16(a))
+                // Both round twice, but the second rounding moves off a product and onto the
+                // pair's sum, whose magnitude is ~sqrt(2) larger, so its error variance is
+                // ~2x a product's: total variance 3 units against upstream's 2. Predicted RMS
+                // ratio sqrt(3/2) = 1.2247; measured over 2^20 random 256-dim dot products,
+                // 1.2251 / 1.2247 / 1.2249 across three input distributions. Perplexity does
+                // not resolve it (2.6097 either way) and it is far below the q4_0 cache's own
+                // error, but it is still strictly more rounding than the code it replaces.
 #pragma unroll
                 for (int k = 0; k < cpy_ne; ++k) {
                     ggml_cuda_mad(KQ_acc[i_KQ_0/(np*warp_size)*cpw + jc0], K_k[i_KQ_0/(np*warp_size)][k], Q_k[jc0][k]);
                 }
-#endif // FAST_FP16_AVAILABLE
             }
         }
     }
