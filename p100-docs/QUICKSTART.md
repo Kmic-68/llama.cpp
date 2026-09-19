@@ -34,7 +34,7 @@ Arguments are appended and override the defaults, so `qwen-server --port 9000` m
     llama-server \
       -m /mnt/fast/models/Qwen3.8-27B-Q6_K.gguf \
       -ngl 99 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 \
-      -c 262144 -b 262144 -ub 512 -np 1 \
+      -c 262144 -b 262144 -ub 256 -np 1 \
       --spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min 0.2 \
       -ngld 99 -ubd 64 -ctkd q4_0 -ctvd q4_0 \
       --jinja --temp 0.3 --top-k 20 \
@@ -51,7 +51,7 @@ Arguments are appended and override the defaults, so `qwen-server --port 9000` m
 | `-ctk q4_0 -ctv q4_0` | q4_0 KV cache. f16 will not fit at this context |
 | **`-np 1`** | **required.** The server auto-sizes its slot count and each slot allocates its own 262144 KV cache. Without this, startup dies with `cudaMalloc failed` on 512 MiB while the GPUs are nearly empty |
 | `-b 262144` | admission limit; must exceed the prompt. Separate from `-ub` |
-| **`-ub 512`** | sets the compute shape, prefill speed **and the VRAM ceiling**. The attention mask is `n_kv x ubatch`, so this is the main lever on how full a context you can actually serve. Costs shallow prefill (411 -> 380 t/s) and is within noise at depth (23.02 vs 22.91). `-ub 2048` is faster on short prompts and **cannot serve a full context** -- see "Watch VRAM" |
+| **`-ub 256`** | sets the compute shape, prefill speed **and the VRAM ceiling**, and it is the main lever on how full a context you can actually serve. Measured on the same 259229-token prompt: `-ub 512` prefills at 148.95 t/s but bottoms out at **193 MiB** free and gets killed; `-ub 256` prefills at 127.21 t/s and holds **2925 MiB** free; `-ub 128` costs 31% of prefill and buys nothing over 256. Note the 512 -> 256 headroom gain is ~20x what the mask alone explains, so something else scales with `n_kv*ubatch` -- see OPTLOG attempt 165 |
 | **`-ubd 64`** | draft context ubatch. Without it the draft inherits `-ub`, reserves a second copy of the mask, and the whole config OOMs. 64 is also **faster** than 256 (23.03 vs 21.43), not a tradeoff |
 | **`-ctkd q4_0 -ctvd q4_0`** | q4_0 for the *draft* KV cache: **151 MB instead of 537**, for -2.2% decode. The draft cache is f16 by default even when the target cache is quantized. This is the margin lever that makes a full context fit |
 | `GGML_CUDA_P2P=1` | peer-to-peer between the two cards. Keep it on — without it the exchanges stage through the host, which is slower |
@@ -97,7 +97,8 @@ Both of those runs predate `-ctkd q4_0 -ctvd q4_0`, which is now in the configur
 returns **368 MiB** — so the shipping configuration should clear it, with roughly 200 MiB spare.
 **That is an argument, not a measurement: as of 2026-09-18 no run has served a genuinely full
 262144-token prompt with the MTP draft on 2x16 GB.** If it still comes up short, the next levers
-are `-ub 256` (halves the mask again) and `-c 245760` (caps `n_kv` outright).
+are `-c 245760` (caps `n_kv` outright) and, if you must keep a big ubatch, finding the
+unexplained `n_kv*ubatch` allocation described in OPTLOG attempt 165.
 
 Note also that the mask explains the scaling law and the lever, but not the full 1504 MiB of
 growth observed above; the remainder is unaccounted for. Do not treat this as a closed

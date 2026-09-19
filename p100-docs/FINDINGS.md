@@ -115,6 +115,41 @@ with no precision argument behind it.
 
 ---
 
+### 10. A peak-VRAM number must be `min` over the whole watchdog log, never the samples on screen
+
+Two runs, identical config (`-c 262144 -b 262144 -ub 512`, `--spec-type none`, same
+259229-token prompt). I watched the first one's guard log go 2748 -> 2722 -> 2666 MiB during
+early prefill, concluded it "never came close to the floor", and wrote that into the shipped
+config comment as the justification for `-ub 512`. The actual minimum over the full log was
+**273 MiB**. The footprint climbs steeply only at the very end of prefill, so early samples look
+reassuring and mean nothing. The second run, differing only by 136 MiB of other GPU use, bottomed
+out at 193 MiB and was killed.
+
+Always: `grep -oE "gpu0_free=[0-9]+" guard.log | cut -d= -f2 | sort -n | head -1`.
+
+And do not use the load-time reservation as a proxy for the prefill peak: at `-c 65536` the
+ubatch scaling suggested 5.76 bytes per `token*ubatch`, while the measured full-depth prefill
+peak implies ~42 bytes -- a factor of 7 the wrong way.
+
+### 11. On a hybrid model you cannot rewind the KV cache, so a checkpoint only helps if the query EXTENDS it
+
+`/slots/{id}?action=save` and `restore` work and are fast -- 4.94 GB of 259k-token state in
+2.3 s, against a 34-minute prefill. But restoring and then sending the *original prompt* still
+reprocessed all 259229 tokens, with `f_sim_best = 1.000` in the log: a perfect prefix match.
+
+The reason is that the saved state held prompt + 63 generated tokens, so matching the shorter
+prompt required *truncating* the cache. This model has 48 recurrent gated-delta-net layers among
+its 65 blocks, so `common_context_can_seq_rm` returns FULL (whole sequences only) -- a recurrent
+state cannot be rewound, and the server's only option is to discard everything and start over.
+
+The working recipe:
+  1. prefill with `"n_predict": 0`, so the saved tokens are exactly the prompt with no tail
+  2. `action=save`
+  3. afterwards: `action=restore`, then query with `<the exact same text> + <any suffix>`
+
+Verified at full depth: the extending query processed **10 tokens instead of 259229**.
+`scratchpad/slots/full262_exact.bin` (`n_saved = 259229`) is such a checkpoint.
+
 ## What failed (do not repeat without new information)
 
 | attempt | result | why it is interesting |
