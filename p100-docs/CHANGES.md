@@ -36,7 +36,7 @@ bit-exact**. Do not regress it.
 
 | commit | change | effect |
 |---|---|---|
-| `3f49203da` | **dequantize the q4_0 KV tile straight into shared memory** | `launch_fattn` was converting the *entire* KV cache to f16 on *every call* — 4.15 ms at 262144 context, ~66 ms per forward pass, to re-convert a cache that changed by a few positions. **9242 → 6213 µs**, and it frees 512 MiB per GPU of staging. Bit-exact with `to_fp16`. **The most broadly useful change here** — it applies to any pre-Volta GPU with a quantized KV cache |
+| `3f49203da` | **dequantize the q4_0 KV tile straight into shared memory** | `launch_fattn` was converting the *entire* KV cache to f16 on *every call* — 4.15 ms at 262144 context, ~66 ms per forward pass, to re-convert a cache that changed by a few positions. **9242 → 6213 µs**, and it frees 512 MiB per GPU of staging. Numerically identical to `to_fp16` for every finite block scale (not bit-identical: zero signs differ, and `d == ±inf` gives a signed infinity here against upstream's NaN). **The most broadly useful change here** — it applies to any pre-Volta GPU with a quantized KV cache |
 | `b574f0b98` | stop reserving f16 staging when the tile kernel reads q4_0 directly | the 512 MiB |
 | `88211649b` | dequantize with `hfma2` in the tile loader | |
 | `5fc820f9d`, `2127ac5bf`, `da3bddaeb` | fold the whole GQA-6 group into one block (vec, tile, and 2-column paths) | |
@@ -44,6 +44,20 @@ bit-exact**. Do not regress it.
 | `5ea4b2712` | `nbatch_K = 128` on the narrow GQA-6 tiles | halves the K-chunk loop at head size 256: **1691 → 1518 µs**. Config-specific — 17% *worse* on the 36-wide tile, so it is applied only to the narrow ones |
 | `edc7980bf` | **bound fp16 accumulation error** | `VKQ` accumulated over the entire KV cache in a `half2` register — a quarter-million adds in an 11-bit mantissa at 262144 context, and this shape had no eval coverage at all. Now folds into an fp32 running sum once per tile. **8.7x the accuracy at depth for 2.4%** on the decode shape, and the error stops growing with context |
 | `43543917b` | give `launch_fattn` the vec kernel's real KV tile size | |
+| `961e63c18` | **read each q4_0 byte once in the tile loader** | one read of `qs[m]` carries both values it encodes — `m` in the low nibble, `m+16` in the high — but the old loader handed those to different threads, each loading the same bytes and discarding half of each. q4_0's real DRAM traffic was 2× its useful bytes, which is why it was no faster than an f16 cache moving 2.8× the data. **−13.1% decode at 262144.** Same value into the same slot as before: verified by simulating both index schemes for every thread across 304 configurations |
+| `c6f5211f4` | **magic-number dequant** | OR the nibble into the mantissa of `1024.0h` (`0x6400`, ulp exactly 1) to get `1024+q` with no convert instruction, then subtract 1032 to land on `q-8`. Both steps exact in fp16. **−16.5% at 262144**, and **bit-identical** to the `__int2half_rn` form — 0 differences over all 65536 scales × 256 byte values |
+
+**A change that was reverted on accuracy grounds.** `7c77a2b80` accumulated the KQ dot product
+in `half2` with `__hfma2` and widened once per group instead of once per product. It is worth
+**−20.3%** on this kernel at 262144 and perplexity cannot tell the difference (2.6097 either
+way), but it rounds measurably more, so it is not in this build. Per lane, upstream computes
+`fl16(a) + fl16(b)` and sums in fp32 while the `hfma2` form computes `fl16(b + fl16(a))`; both
+round twice, but the second rounding moves off a product and onto the pair's *sum*, about √2
+larger in magnitude and so about twice the error variance. That predicts an RMS ratio of
+√(3/2) = 1.2247, and measurement over 2^20 random 256-dimension dot products gives 1.2247–1.2251
+across four input distributions. There is no cheap way to have both on Pascal: any scheme that
+keeps the accumulation in fp32 costs at least HMUL2 + two widens + two adds per 2 MACs, which is
+what upstream already costs. See `FINDINGS.md`.
 
 **On the fp16 accumulation fix:** the widely-circulated P100 fix is to extend the sm_61
 `FAST_FP16_AVAILABLE` exemption to sm_60. That is a bigger hammer — it also converts `Q_tmp`,

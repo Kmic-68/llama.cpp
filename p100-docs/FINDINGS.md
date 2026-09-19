@@ -22,7 +22,13 @@ is bit-exact. Everything in the matvec inner loop is measured against that budge
 **4.15 ms** at 262144 context, ~66 ms per forward pass across 16 attention layers, to re-convert
 a cache that changed by a few positions. Dequantizing each tile directly into the shared memory
 the kernel already stages removed it: **nb=6 9242 → 6213 µs**, and it frees 512 MiB per GPU of
-staging. The dequant is bit-exact with `to_fp16`, so perplexity is unchanged to the last digit.
+staging. The dequant agrees with `to_fp16` numerically for every finite block scale — both round
+the same exact real `d*(q-8)` once — so perplexity is unchanged to the last digit. It is not
+*bit*-exact with it: swept over the complete domain of 65536 scales x 16 nibbles, 31759 cases
+differ in the sign of a zero (`q == 8` with `d < 0` gives `-0.0` where upstream's `8d + (-8d)`
+gives `+0.0`, and a KV value of either zero sign contributes nothing to the dot product) and 30
+differ at `d == ±inf`, where this form gives the correctly signed infinity and upstream gives NaN
+from `inf - inf`. Zero cases differ for any finite scale.
 
 **This is the most broadly useful change here** — it applies to any pre-Volta GPU with a
 quantized KV cache, and the cost it removes scales with context length.
@@ -161,6 +167,7 @@ Verified at full depth: the extending query processed **10 tokens instead of 259
 | **`nbatch_K = 256`** | +44% (worse) | Halving the K loop once pays; twice does not |
 | **Fused-MoE `mmid` threshold** | **inert** | Spent real time on it before checking: this model has **no `ffn_*_exps` tensors**. It is dense, there are no `MUL_MAT_ID` nodes, and the code path never executes |
 | **`n_draft` 4 → 6 at depth** | +1.9% | Acceptance falls 81% → 70% and cancels the amortization |
+| **half2 accumulation of the KQ dot product** | **−20.3%, reverted** | The only change here that traded accuracy for speed, and perplexity cannot see it (2.6097 either way). Per lane `fl16(b + fl16(a))` rounds exactly as many times as upstream's `fl16(a) + fl16(b)`, but the second rounding lands on the pair's **sum** rather than on a second product — about √2 the magnitude, so about twice the error variance. Predicted RMS ratio √(3/2) = 1.2247; measured 1.2247–1.2251 over 2^20 dot products across four distributions. **Same rounding count is not the same rounding** — where the rounding sits matters as much as how many there are |
 | **Thread-mapping inversion (vec kernel)** | abandoned | Passed 3949/3949 op tests and still NaN'd real inference — an out-of-bounds write the op suite cannot see. **The op suite is not sufficient validation for this kernel; run perplexity first, not last** |
 
 ---

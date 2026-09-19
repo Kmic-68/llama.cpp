@@ -7124,3 +7124,136 @@ before the `-b` fix. Decode clears 30 t/s out to ~130k; the crossover is between
 For reference, the same machine at the start of this session: 4.85 t/s at full depth with
 acceptance 0.00000, and a config that could not complete a full prefill without starving the
 display.
+
+## Attempt 174 — audit: is everything since the last public push bit-identical or better?
+
+23 commits sit on top of `0dacb39a8`, and exactly one file in them can move a number:
+`ggml/src/ggml-cuda/fattn-tile.cuh`. `tests/test-backend-ops.cpp` gains five *perf-only* cases
+and changes no tolerance; `make-wrappers.sh` changes runtime flags; the rest is prose. Three
+changes to audit, answered by exhaustive measurement rather than by reading the code.
+
+### 1. Magic-number dequant (`c6f5211f4`) — bit-identical, proven over the complete domain
+
+A CUDA program evaluates the real expression, `__byte_perm` and all, over every one of the
+65536 fp16 bit patterns for the block scale `d` (normals, subnormals, ±0, ±inf, every NaN
+payload) crossed with every one of the 256 byte values, which covers all 16 nibbles in both
+positions. The two bytes packed into the `uint16_t` are made different so the lane routing is
+exercised and not just the mask.
+
+    NEW vs the pushed __int2half_rn form : 0 bitwise differences in 67108864 cases
+    NEW vs upstream to_fp16              : 0 numeric differences for any finite d
+
+Against upstream there are two classes of *non*-numeric disagreement over the 1048576 unique
+`(d, q)` pairs: 31759 signs of zero (31743 of them `q == 8` with `d < 0`, where this form gives
+`-0.0` and upstream's `8d + (-8d)` gives `+0.0`; 16 with `d == ±0`), and 30 cases at `d == ±inf`
+where this form gives the correctly signed infinity and upstream gives NaN from `inf - inf`.
+No underflow case differs. A KV value of either zero sign contributes nothing to a dot product,
+so nothing propagates.
+
+Why they agree exactly: `d` carries at most 11 significant bits and `q - 8 ∈ [-8,7]` at most 4,
+so the exact product needs at most 15 and is exactly representable in fp32. Upstream's `d*q`
+and `-8*d` are each exact and so is their sum, so upstream rounds the exact real `d*(q-8)` to
+fp16 exactly once — and so does one `hmul2` of an exact `q-8`. Same value, same single rounding.
+
+This corrects a claim: the docs said "bit-exact with `to_fp16`". It is not bit-exact; it is
+numerically identical on every finite scale and better defined at ±inf.
+
+### 2. Loader restructure (`961e63c18`) — same value into the same slot, and a new precondition
+
+Both index schemes were simulated on the host exactly as written, every thread, for 304
+`(nwarps, I, J, k_dim_0)` configurations. For all 304: every tile slot is written exactly once
+by each scheme, both put the same `(block, byte, nibble)` in the same slot, and that source is
+the one the q4_0 layout assigns to that head dimension. The restructure is pure data movement.
+
+It does narrow the contract. The new indexing maps byte `m` of a block to head dimension
+`k_dim_0 + (s/SPB)*QK4_0 + m`, which assumes every tile starts on a q4_0 block boundary; the old
+loader derived block and nibble from the absolute head dimension and needed only `2*cpy_ne`
+alignment. `nbatch_K` of 40, 48, 56 and 72 all appear in the config table for head sizes 40-112,
+and for DKQ 80/96/112 the second tile's `k_dim_0` is then not a multiple of 32. Probed directly,
+the new scheme mis-indexes there and the old one does not.
+
+Unreachable as built: `ggml_cuda_fattn_tile_q4_0_direct` returns false unless DKQ == DV == 256,
+where `nbatch_K` is 64/128/192/288 — all multiples of 32 — and the V tile passes `k_dim_0 = 0`
+as a literal. Added a `static_assert` so that extending that gate fails to build instead of
+silently mis-indexing. The dkq40, dkq72, dkq112 and dkq256 instance TUs all still compile.
+
+### 3. half2 KQ accumulation (attempt 159, `7c77a2b80`) — REVERTED, it rounds more
+
+First, a fact attempt 159 got wrong: `ggml_cuda_get_max_cpy_bytes()` returns 8 below Volta, so
+`cpy_ne` is **2** on sm_60, not 4. The fp16 group is two terms per lane, not the "cpy_ne*2 == 8
+terms" the comment claimed.
+
+Per lane, with `a` and `b` the two exact products:
+
+    upstream : fl16(a) + fl16(b)   summed in fp32
+    hfma2    : fl16(b + fl16(a))
+
+Both round twice. But the second rounding moves off a product and onto the pair's *sum*, whose
+magnitude is about √2 larger, so its error variance is about twice a product's: 3 units against
+upstream's 2. That predicts an RMS error ratio of √(3/2) = 1.2247.
+
+Measured over 2^20 random 256-dimension dot products against a double-precision reference, the
+identical fp16 inputs fed to both schemes:
+
+    distribution                RMS err upstream   RMS err hfma2    ratio
+    iid gaussian                     1.659e-4         2.032e-4      1.2251
+    iid gaussian (larger)            3.316e-3         4.061e-3      1.2247
+    gaussian + 2% outliers           6.003e-3         7.253e-3      1.2082
+    stress, near fp16 range          5.309e-1         6.503e-1      1.2249
+
+Upstream is closer on ~57% of trials. Overflow is not the issue — the largest fp16 partial sum
+seen was 3002 against a 65504 limit, and upstream already scales Q by 0.25 precisely because the
+KQ product has no `v_dot2_f32_f16` on this path.
+
+The error in attempt 159 was the sentence "the products are ALREADY rounded to fp16 by that
+HMUL2, so keeping the running sum of the group in float buys nothing." Keeping the sum in float
+buys not rounding the sum.
+
+There is no cheap fix on Pascal. Any scheme that keeps the accumulation in fp32 costs at least
+HMUL2 + two widens + two adds per 2 MACs, which *is* upstream; the speed came from not widening
+between the two terms, and that is exactly what costs the accuracy. An fp32 variant with hoisted
+conversions was costed out at 20 instructions per 8 MACs for the decode shape — identical to
+upstream — so it buys accuracy over upstream but returns the entire 20.3%.
+
+Reverted. `flash_attn_tile_iter_KQ` is now code-identical to the last public push and to
+upstream. This also restores the fork's own position: `edc7980bf` deliberately spent 2.4% to take
+fp16 accumulation *out* of `VKQ`, and `p100-docs/README.md` claims accuracy is better than
+upstream rather than traded for speed. Attempt 159 put fp16 accumulation back into `KQ`.
+
+### What the revert costs, measured
+
+Both builds gated on cold cards, metric first. `test-backend-ops perf -o FLASH_ATTN_EXT`,
+the q4_0 decode shape `hsk=256,hsv=256,nh=2,nr23=[6,1],nb=1`:
+
+    kv        with hfma2    reverted     cost
+     32768      137.60 us   177.82 us   +29.2%
+     65536      254.11 us   323.16 us   +27.2%
+    262144      962.74 us  1226.29 us   +27.4%
+
+Equivalently the hfma2 form was worth -21.5% on the kernel at full depth, against the -20.3%
+attempt 159 claimed from 1198.11 -> 954.54. Consistent.
+
+    tg256   31.70 +/- 0.59  ->  30.66 +/- 0.17   (-3.3%, and back on the 30.64 the docs quote)
+    PPL     2.6097 +/- 0.01981 -> 2.6097 +/- 0.01982   (unchanged)
+    FLASH_ATTN_EXT eval   3/3 backends passed, both builds
+
+At full depth the attention kernel runs once per full-attention layer, 16 of the 65, so
++263 us per call is about +4.2 ms per token against ~41 ms at 24.18 t/s -- roughly 24.2 -> 22 t/s
+at 262144. That is the price of the accuracy, and it is a real price; it is recorded here so the
+decision can be reversed knowingly rather than rediscovered.
+
+Confirmed in the binary, not just the source: SASS for
+`fattn-tile-instance-dkq256-dv256.cu.o` goes from HFMA2-dominant to HMUL2 36792 / HFMA2 34816
+with HADD2 71288, i.e. 1.94 HADD2 per HMUL2 -- upstream's "two widens per product" signature.
+The release bundle's library still carried the other signature (HFMA2 187240 / HMUL2 4736),
+which is what flagged that it needed rebuilding.
+
+### Net position after the audit
+
+The entire executable delta since `0dacb39a8` is now one function body,
+`flash_attn_tile_load_tile_q4_0`, whose dequant is bit-identical and whose data movement is
+proven equivalent. Everything else in `fattn-tile.cuh` is code-identical to the last public push.
+`tests/test-backend-ops.cpp` adds perf-only cases and changes no tolerance. `make-wrappers.sh`
+changes runtime flags only, and `-ctkd/-ctvd q4_0` cannot change output: every emitted token is
+sampled and accepted against `ctx_tgt` in `common_sampler_sample_and_accept_n`, so a quantized
+draft cache moves the acceptance rate and nothing else.
