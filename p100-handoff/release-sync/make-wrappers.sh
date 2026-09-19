@@ -54,6 +54,20 @@ cat > "$BIN/qwen-server" <<'EOF'
 # -ubd 64 is strictly faster than 256 (23.03 vs 21.43). -ctkd/-ctvd q4_0 put the draft KV cache
 # at 151 MB instead of 537 and cost nothing measurable: acceptance 0.58170 vs 0.58361 for f16.
 # See OPTLOG attempts 126, 143, 158 and 163.
+#
+# -b 32768 IS LOAD-BEARING FOR MTP, and is the whole reason long-context speculation works.
+# With -b 262144 the entire prompt is one logical batch, and the MTP catch-up in
+# common_speculative's process() then does a single ~5.3 GB memcpy over it. Changing only -b,
+# same 259229-token prompt sent as ONE request:
+#     -b 262144  ->  draft acceptance 0.00000, decode  5.41 t/s
+#     -b  32768  ->  draft acceptance 0.98058, decode 26.13 t/s
+# This was misdiagnosed for two sessions as a depth/VRAM/position problem. It is neither: a
+# context taken to 259245 tokens incrementally holds 0.97403 acceptance at 27.49 t/s.
+#
+# GGML_CUDA_GRAPHS_PRE_VOLTA=0 goes with it. At -b 32768 and full context, CUDA graph
+# instantiation is what exhausts VRAM (CUDA error out of memory at cudaGraphInstantiate),
+# and turning graphs off costs 1.4% on tg256 -- 29.86 -> 29.44, inside the noise.
+# See OPTLOG attempts 167 and 168.
 BUILD="$(cd "$(dirname "$0")/../build" && pwd)"
 MODEL="${QWEN_MODEL:-/mnt/fast/models/Qwen3.8-27B-Q6_K.gguf}"
 
@@ -61,12 +75,12 @@ MODEL="${QWEN_MODEL:-/mnt/fast/models/Qwen3.8-27B-Q6_K.gguf}"
 
 LD_LIBRARY_PATH="$BUILD${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" export LD_LIBRARY_PATH
 : "${GGML_CUDA_P2P:=1}"              ; export GGML_CUDA_P2P
-: "${GGML_CUDA_GRAPHS_PRE_VOLTA:=1}" ; export GGML_CUDA_GRAPHS_PRE_VOLTA
+: "${GGML_CUDA_GRAPHS_PRE_VOLTA:=0}" ; export GGML_CUDA_GRAPHS_PRE_VOLTA
 
 exec "$BUILD/llama-server" \
   -m "$MODEL" \
   -ngl 99 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 \
-  -c 262144 -b 262144 -ub 256 -np 1 \
+  -c 262144 -b 32768 -ub 256 -np 1 \
   --spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min 0.2 \
   -ngld 99 -ubd 64 -ctkd q4_0 -ctvd q4_0 \
   --jinja --temp 0.3 --top-k 20 \

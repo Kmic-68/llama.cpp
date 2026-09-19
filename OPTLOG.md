@@ -6936,3 +6936,53 @@ speed (16.31 vs 27.61 t/s here; 12.46 vs 23.39 in the decay test). Do not read a
 number as the steady-state rate.
 
 **27.49 t/s at full depth against a 30 t/s target, from 4.85 t/s at the start of the session.**
+
+## Attempt 168 — THE FIX: cap the logical batch. MTP at full depth, single-shot, 98% acceptance
+
+Only `-b` differs between these. Same 259229-token prompt, sent as ONE request, full 262144
+context:
+
+    -b 262144 (run160)   draft acceptance 0.00000 (  0/498)   decode  5.41 t/s
+    -b  32768 (this)     draft acceptance 0.98058 (101/103)   decode 26.13 t/s
+                         mean len 4.88, prefill 119.46 t/s, min gpu0 free 2205 MiB
+
+**That is the whole bug.** With `-b 262144` the entire prompt is a single logical batch, and the
+MTP catch-up in `common_speculative_impl_draft_mtp::process()` does one
+`memcpy(batch.embd + n_embd, h_tgt, row_bytes*(n_tokens-1))` spanning ~5.3 GB. Cap the batch so
+the server chunks the prefill and acceptance goes from zero to 98%.
+
+`GGML_CUDA_GRAPHS_PRE_VOLTA=0` is required alongside it: at `-b 32768` and full context, CUDA
+**graph instantiation** is what exhausts VRAM --
+
+    ggml-cuda.cu:4435  CUDA error: out of memory
+    cudaGraphInstantiate(&graph->instance, graph->graph, NULL, NULL, 0)
+
+-- which killed two attempts at `-ub 256` and `-ub 128` (117 and 125 MiB free). Cost of turning
+graphs off, measured: tg256 29.86 +/- 0.09 -> 29.44 +/- 0.24, i.e. **1.4%, inside the noise**.
+
+### What this retracts
+
+Two sessions of diagnosis pointed at the wrong variable, three times:
+
+  - attempt 158: "the collapse is VRAM exhaustion starving the draft" -- retracted in 161 when
+    0% acceptance reproduced with 1622 MiB free.
+  - attempt 161: "the trigger is absolute position, bracketed 229k-259k" -- retracted here;
+    a context taken to 259245 incrementally holds **0.97403** acceptance at 27.49 t/s.
+  - attempt 162: cache fullness -- correctly ruled out, and correctly so.
+
+The variable was never depth, memory, position, or draft-KV quantization. It was **how the
+prompt was submitted**, which no measurement varied until attempt 167 reached full depth
+incrementally and found MTP perfectly healthy there.
+
+### Second-order issue, not fixed
+
+A follow-up request on the same slot dropped to 0.46857 acceptance and 16.62 t/s. It processed
+only 9 tokens, so the server rolled the 128 generated tokens back through a **context
+checkpoint**. Context checkpoints do not capture the draft context's KV, so the restore leaves
+the MTP cache stale -- the same mechanism that made a file-based restore give 0.41-0.45 instead
+of 0.84+. Worth fixing (it costs ~40% of the acceptance on any turn after the first), but it is
+a much smaller problem than the one above.
+
+### Shipped
+
+`qwen-server` now carries `-b 32768`, `-ub 256`, `GGML_CUDA_GRAPHS_PRE_VOLTA=0`.
