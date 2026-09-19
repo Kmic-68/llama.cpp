@@ -6839,3 +6839,59 @@ The prompt must START with the exact p262.txt text. Anything shorter truncates, 
 on this hybrid model means a full reprocess (48 recurrent layers, seq_rm is FULL-only).
 This makes the MTP positional bisection between 229k and 259229 -- previously written off as
 unaffordable at ~40 min per point -- cost about a minute per point.
+
+## Attempt 166 — MTP: the collapse is the cumulative prefill, not depth
+
+The checkpoint turned a 34-minute experiment into a 13-second one, and three tests in a row
+moved this from "positional, unexplained" to a localized path.
+
+**1. The same depth, reached by restore, is not broken.** Restore `full262_exact.bin` into an
+MTP server and query at 259239:
+
+    draft acceptance = 0.38776 (57/147), mean len 2.50, decode 10.74 t/s
+
+**0.39 against 0.00000 for a normally-prefilled context at the same depth.** Caveat: that
+checkpoint was saved from a `--spec-type none` server, so if the draft shares the target memory
+the MTP layer's own KV rows were never written -- which is probably why 0.39 and not the 0.84 of
+shallow depth. The number is confounded, but 0.39 >> 0.00 is not.
+
+**2. It does not decay during generation.** Five successive rounds, each extending the last:
+
+    ROUND 0  accept 0.427  12.46 t/s
+    ROUND 1  accept 0.610  23.39 t/s
+    ROUND 2  accept 0.427  18.57 t/s
+    ROUND 3  accept 0.414  18.57 t/s
+    ROUND 4  accept 0.491  20.03 t/s
+
+Stable, no trend. **And 23.39 t/s at full depth beats the 17.62 t/s that the same build gets
+with MTP off** -- so a working MTP is worth having at 262144, which was not obvious before.
+
+**3. MTP prefill AT depth is fine.** Restore to 259229, then force 1301 more tokens of prefill
+with MTP active at that position:
+
+    A  baseline, 8 tokens prefilled at depth    accept 0.41429   10.82 t/s
+    B  after 1301 tokens prefilled at depth     accept 0.45113   19.09 t/s
+
+Acceptance went slightly UP. Prefilling with MTP at position ~259k does not corrupt anything.
+
+**So the damage is cumulative over a long from-zero MTP prefill.** And note the direction: a
+draft cache left EMPTY by restore gives 0.41-0.45, while one FILLED by the prefill catch-up gives
+0.00000. Having the draft cache populated is worse than not having it at all, which points at the
+catch-up decode writing bad rows.
+
+The suspect, `common_speculative_impl_draft_mtp::process()` (common/speculative.cpp:1469):
+
+    const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+    std::memcpy(batch.embd + 1*n_embd, h_tgt, row_bytes * (n_tokens-1));
+
+It copies n_tokens-1 rows of target hidden state per prefill ubatch, and `begin()` carries a
+warning for exactly this -- "process() hook may not have run on every prefill ubatch
+(need_embd / logits=1 on every prompt position?) ... Drafts may degrade." That warning never
+appeared in any log, but it is gated on `!is_mem_shared`, and `is_mem_shared` is
+`llama_get_ctx_other(ctx_dft) == ctx_tgt`, which speculative.cpp:2405 sets unconditionally --
+so the guard may simply never be reachable here. Not yet proven; this is the next thing to check.
+
+Incidental, and the reason for the repeated "system low on memory" task kills this session:
+`batch = llama_batch_init(llama_n_batch(ctx_dft), n_embd, 1)` sizes the draft batch to the
+draft context's n_batch, which inherits `-b 262144`. That is 262144 * 5120 * 4 = **5.37 GB of
+host RAM** for `batch.embd`, allocated whether or not a batch that large is ever used.
