@@ -498,14 +498,29 @@ static __device__ __forceinline__ void flash_attn_tile_load_tile_q4_0(
             if (!oob_check || i < i_sup) {
                 const block_q4_0 * blk = (const block_q4_0 *) (KV + i*stride_KV) + a_lo/QK4_0;
                 const half2 dh = __half2half2(blk->d);
+
+                // qs sits at offset 2 in an 18-byte block, so it is only 2-byte aligned and the
+                // compiler cannot widen the byte reads. m is even, so read it as uint16_t and
+                // halve the load count.
+                const uint16_t * qs16 = (const uint16_t *) (blk->qs + m);
+
+                // Magic-number dequant instead of __int2half_rn: OR the nibble into the mantissa
+                // of 1024.0h (0x6400), whose ulp is exactly 1, giving 1024+q with no conversion
+                // instruction, then subtract 1032 to land on q-8. Both steps are exact in fp16
+                // (1024+q and q-8 are representable), so the value handed to the hmul2 below is
+                // bit-identical to the __int2half_rn form -- and to upstream to_fp16.
+                const half2 k1032 = __float2half2_rn(1032.0f);
 #pragma unroll
                 for (int l = 0; l < cpy_ne; ++l) {
-                    const int b0 = blk->qs[m + 2*l + 0];
-                    const int b1 = blk->qs[m + 2*l + 1];
-                    lo[l] = __hmul2(__halves2half2(__int2half_rn((b0 & 0x0F) - 8),
-                                                   __int2half_rn((b1 & 0x0F) - 8)), dh);
-                    hi[l] = __hmul2(__halves2half2(__int2half_rn(((b0 >> 4) & 0x0F) - 8),
-                                                   __int2half_rn(((b1 >> 4) & 0x0F) - 8)), dh);
+                    // spread the two bytes into the two 16-bit lanes: lane0 = b0, lane1 = b1
+                    const uint32_t s = __byte_perm((uint32_t) qs16[l], 0, 0x4140);
+                    const uint32_t lo_b = ((s >> 0) & 0x000F000F) | 0x64006400;
+                    const uint32_t hi_b = ((s >> 4) & 0x000F000F) | 0x64006400;
+                    half2 lo_h, hi_h;
+                    memcpy(&lo_h, &lo_b, sizeof(lo_h));
+                    memcpy(&hi_h, &hi_b, sizeof(hi_h));
+                    lo[l] = __hmul2(__hsub2(lo_h, k1032), dh);
+                    hi[l] = __hmul2(__hsub2(hi_h, k1032), dh);
                 }
             } else {
 #pragma unroll

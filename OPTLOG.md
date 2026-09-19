@@ -6461,3 +6461,90 @@ needs a different explanation.
 
 **This is the 4.4x. The whole kernel programme above is the 1.4x.** Priority order for next
 session is this, not more kernel work.
+
+### Confirmations gathered while attempt 157's prefill ran
+
+Two numbers the budget above rests on were taken on trust; both now check out against the file.
+
+**The 16 is real.** Reading the tensor names straight out of the gguf: 65 blocks, of which
+**16 carry `attn_k`/`attn_q`/`attn_v`** (blocks 3, 7, 11, ... 63), 48 carry `ssm_*` (gated
+delta-net, recurrent -- O(1) in depth during decode), and block 64 is the MTP head. So only
+16 layers run `FLASH_ATTN_EXT`, and `16 x (op us)` is the right way to price attention.
+`qwen35`: head_count 24, head_count_kv 4, key_length = value_length = 256 -- under `-sm tensor`
+that is 12 Q heads / 2 KV heads per GPU, which is exactly the benchmark shape
+`hsk=256,hsv=256,nh=2,nr23=[6,1]`. The isolated case really is one layer on one GPU.
+
+**Non-attention is weight bandwidth and is near-irreducible.** Q6_K 27B is ~22 GB, ~11 GB per
+GPU per token at 490 GB/s = 22.4 ms, against the 22.9 ms the budget assigns it. There is no
+slack there short of a smaller quant, which is off the table for accuracy.
+
+So the ceiling arithmetic at 262144, both GPUs working concurrently:
+
+    weights                     22.4 ms   (irreducible)
+    attention, q4_0 DRAM floor   4.9 ms   (16 x 308 us)
+                                -------
+    perfect-kernel ceiling      27.3 ms = 36.6 t/s
+    30 t/s needs               33.3 ms -> attention budget 10.9 ms -> 680 us/layer
+
+**The kernel is dequant-bound, not bandwidth-bound -- proof from the quant sweep.** At
+kv=262144, nb=1:
+
+    f16  1188.92 us   537 MB moved  ->  452 GB/s   (92% of ceiling: saturated)
+    q4_0 1434.92 us   151 MB moved  ->  105 GB/s   (23% of ceiling: not the bottleneck)
+
+q4_0 moves **4x fewer bytes than f16 and is still 1.21x slower**. Nothing about the memory
+system explains that; the difference is the per-value dequant chain. That is the lever, and
+680 us/layer sits between q4_0's 334 us bandwidth floor and f16's saturated 1189 us, so the
+target is not excluded by either bound.
+
+## Attempt 158 — magic-number dequant in the tile loader (queued, not yet built)
+
+Two defects in the half2 loader's inner loop, both independent of attempt 156's fix:
+
+1. `blk->qs` sits at offset 2 in an 18-byte block, so it is only 2-byte aligned and nvcc cannot
+   widen the byte reads. `m` is even, so reading through `const uint16_t *` halves the load count.
+2. Every nibble goes through `__int2half_rn`, a conversion instruction per value.
+
+Replaced (2) with the standard magic-number trick: `0x6400 | q` is 1024+q as an fp16 (ulp is
+exactly 1 in [1024, 2048)), and subtracting 1032 lands on q-8. Both steps are exact, so the
+half2 handed to the `hmul2` by `d` is **bit-identical** to the `__int2half_rn` form -- this is
+deliberately not the fused-bias `hfma2` variant, which is one instruction cheaper but reorders
+the rounding and is what overflowed fp16 in an earlier attempt. Per 2 bytes: one `__byte_perm`,
+two AND, two OR, two `hsub2`, two `hmul2` -- all full-rate integer/half2 ops, no conversions.
+
+Queued behind it, if that lands: `nbatch_K` 128 -> 256 at ncols=6, which collapses the K-chunk
+loop to a single pass. Shared memory then is Q_tmp 3.0 + KV_tmp 16.5 + KQ 0.8 = 20.7 kiB, still
+under the 32 kiB that keeps occupancy 2. `nbatch_fa` 64 -> 128 is **not** available: it lands at
+38 kiB, which drops occupancy to 1, and attempt 132 measured that as -31.6%.
+
+## Attempt 157 — RESULT: the cliff is MTP, not VRAM starvation
+
+Same binary, same 259118-token prompt, same `-c 262144 -b 262144 -ub 512`, only change
+`--spec-type none`:
+
+    config                              prefill      decode        ms/token
+    MTP on  (attempt 154/156)           85.4 t/s     4.85 t/s      206.2
+    --spec-type none (this)            148.95 t/s   14.08 t/s       71.0
+
+**2.9x on decode and 1.7x on prefill from removing speculative decoding at full depth.**
+
+The allocator-starvation hypothesis is **not** what carried it. VRAM free never came close to
+the floor this run -- 2748 MiB at load, drifting only to ~2660 by the end of prefill, against the
+205 MiB the 4.85 t/s run ended at. The pool was never under pressure, so "every decode falls back
+to cudaMalloc/cudaFree" cannot be what the extra 135 ms/token was.
+
+What it actually was is the thing already measured and written off as a curiosity:
+**`draft acceptance = 0.00000 (0 accepted / 2034 generated)` at full depth.** With acceptance at
+zero, MTP is not a speedup, it is a tax: every single token runs the draft model n_max=4 times and
+then a 5-token target batch, and throws all of it away. That is the 4.4x. The draft KV cache and
+draft context also explain the VRAM growth that the mask alone did not account for, and their
+absence is why prefill nearly doubled too.
+
+Open question, now the top one for the server path: **why does MTP acceptance go to zero at
+259k when it is 79% at 229k?** That is a correctness-shaped bug, not a performance one, and
+fixing it is worth more than the kernel work -- a working MTP on top of 14.08 t/s is the
+straightest line to 30.
+
+**Full-depth testing is now cheap.** The run saved the filled slot via `/slots/0?action=save`:
+4.94 GB, written in 2.25 s, at `scratchpad/slots/full262.bin`. Restoring it replaces a 29-minute
+prefill, so full-depth decode can now be measured per build instead of once per session.
