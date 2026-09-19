@@ -7009,3 +7009,39 @@ on OOM-avoidance. Full depth, single-shot, MTP on, graphs off:
 
 +5% prefill for -17% decode. `-ub 256` stays. The FINDINGS note that a load-time reservation
 underestimates the prefill peak still holds, but the size of the gap is now accounted for.
+
+## Attempt 170 — GAP 1 CLOSED: not a bug. Acceptance holds across turns.
+
+Attempt 168 flagged a drop from 0.98058 to 0.46857 on the second request and blamed context
+checkpoints for not restoring the draft KV. **Both halves of that were wrong.**
+
+The mechanism is not checkpoints. Save and restore are symmetric -- `create_checkpoint` calls
+`update_tgt` + `update_dft` + `common_speculative_get_state`, and the restore path calls
+`load_tgt` + `load_dft` + `common_speculative_set_state`. A controlled A/B asking for the
+IDENTICAL continuation twice, so only the rollback differs:
+
+    A  no rollback      acceptance 0.35238 (74/210)   15.99 t/s
+    B  after rollback   acceptance 0.39487 (77/195)   17.62 t/s
+    checkpoint restores: 0
+
+B is not worse than B's baseline, and no checkpoint restore even happened. (That test could not
+see the real effect anyway: it restored `full262_exact.bin`, saved from a `--spec-type none`
+server, so the draft KV began empty and acceptance was already 0.35 -- the same 0.35-0.61 band
+as every other restore-based measurement here.)
+
+Measured properly -- fresh full-depth MTP prefill, then four turns each EXTENDING the last:
+
+    TURN 0  acceptance 0.94340  25.48 t/s   (259229 prefilled, wall 2274 s)
+    TURN 1  acceptance 0.87500  26.21 t/s   (1 token processed, 6 s)
+    TURN 2  acceptance 0.89189  25.63 t/s
+    TURN 3  acceptance 0.76000  22.74 t/s
+    checkpoint restores: 0,  min gpu0 free 2205 MiB
+
+**Acceptance holds.** The 0.46857 came from my own test appending "Continue the analysis."
+*without* the 128 generated tokens, which discards cached content and forces a rollback. A real
+conversation carries the assistant's reply forward, which extends the cache -- the case measured
+above. There is a mild drift over turns (0.943 -> 0.760) as the forced `ignore_eos` continuation
+of a long document gets less predictable; that is content, not a defect.
+
+**Steady-state long-context serving is therefore ~23-26 t/s at 262144**, not a one-request
+artifact.
