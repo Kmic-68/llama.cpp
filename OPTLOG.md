@@ -7264,3 +7264,50 @@ proven equivalent. Everything else in `fattn-tile.cuh` is code-identical to the 
 changes runtime flags only, and `-ctkd/-ctvd q4_0` cannot change output: every emitted token is
 sampled and accepted against `ctx_tgt` in `common_sampler_sample_and_accept_n`, so a quantized
 draft cache moves the acceptance rate and nothing else.
+
+## Attempt 175 — vision at full context: it fits, and the lever is `-ub`, not `-c`
+
+The standing assumption was that the mmproj forces the context down (`-c 163840` was the working
+guess). It does not. Model + MTP + vision all fit at the full 262144 with `-ub 1024`.
+
+Starting point, `-ub 2048` with `--mmproj` at `-c 262144`: it does not merely run tight, it **dies
+during load**, before any prompt, with 127 MiB free on GPU0 -- the watchdog tripped its 200 MiB
+floor and killed the server. GPU1 had 1380 MiB free at the same moment. That asymmetry is the
+whole finding: the mmproj is ~600 MiB and lands on GPU0 **whole**, not split across the pair, so
+it stacks on Sunshine's 392 MiB. GPU0 runs ~1240 MiB below GPU1 at every setting, and GPU0 is the
+only card that matters.
+
+Load-time free on GPU0 with the mmproj loaded:
+
+    -ub    free at load   recovered vs 2048
+    2048      136 MiB     dies at load
+    1024      892 MiB     +756
+     512     1272 MiB     +1136
+     256     1462 MiB     +1326
+
+756/1024, 380/512, 190/256 -- **0.742 MiB of GPU0 per ubatch unit**, linear to three digits. That
+is the sizing rule: vision costs ~600 MiB, bought back at 0.742 MiB per unit of `-ub` surrendered.
+It is also close to but under the 0.84 MiB/unit measured without the mmproj in attempt 169.
+
+A load probe is only a filter -- FINDINGS item 10 exists because the peak comes during deep
+prefill -- so `-ub 1024` got the real thing, the full 259229-token prompt:
+
+    prefill 129.54 t/s   decode 20.11 t/s   draft acceptance 0.96154 (mean len 4.85)
+    GPU0 892 MiB at load, minimum 731 MiB over the whole run, 0 breaches, wall 2005 s
+
+**731 MiB is the number**, and it is the same margin the shipped text-only `-ub 2048` config lives
+at (757 MiB). So vision at full context is no riskier than the default; the headroom is simply
+spent on the mmproj instead of on ubatch.
+
+Free fell only 892 -> 731 across the entire prefill, 161 MiB. So on *this* config the load-time
+reservation does cover most of the worst case -- worth recording, but it is a conclusion drawn
+from the full run and not a licence to trust load probes next time. Attempt 157 made exactly that
+mistake in the other direction.
+
+Decode at 20.11 t/s sits a little under the ~22 expected for the post-174 build at this depth.
+Acceptance was 0.96154 but off only 52 drafted tokens, so this is inside the +/-2 t/s scatter the
+attempt 173 curve already showed, not a vision penalty. Not worth chasing on one sample.
+
+`-ub 512` should give ~1111 MiB by the rate above and is the right choice if GPU0 also drives a
+browser or a second display client; run163 died from a 136 MiB swing in other GPU0 consumers.
+Not measured at full depth.

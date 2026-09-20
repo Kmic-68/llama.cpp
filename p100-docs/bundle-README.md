@@ -41,7 +41,7 @@ been misread here as a correctness failure.
 | `patches/` | 198 `git am`-able commits against upstream `f280b2698`, one per commit in apply order |
 | `diffs/` | `all-code.diff` (the same delta squashed into one file), `everything.diff` (incl. docs), and the base/HEAD SHAs |
 | `docs/` | the documentation above, plus `ENVIRONMENT.md`, `COMMUNITY-NOTES.md`, the numerical audit, and `handoff/` |
-| `logs/OPTLOG.md` | every attempt, kept and reverted, with numbers — 174 attempts |
+| `logs/OPTLOG.md` | every attempt, kept and reverted, with numbers — 175 attempts |
 | `tools/` | `gate.sh` and the gate corpus — use these, not a hand-typed perplexity command |
 | `archive/` | the superseded 2026-09-06 release. **Those binaries carry two data races**; see `archive/README.md` |
 

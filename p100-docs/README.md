@@ -28,7 +28,7 @@ and slower than `ALGO6` at 512-1024 rows.
 | [FINDINGS.md](FINDINGS.md) | what worked, what failed, and how the measurements lied |
 | [BUILD.md](BUILD.md) | building it |
 | [COMMUNITY-NOTES.md](COMMUNITY-NOTES.md) | what generalizes to other Pascal cards, what does not |
-| [`../OPTLOG.md`](../OPTLOG.md) | the full record — 174 attempts, kept and reverted, with numbers |
+| [`../OPTLOG.md`](../OPTLOG.md) | the full record — 175 attempts, kept and reverted, with numbers |
 | [`../p100-handoff/`](../p100-handoff/) | the raw engineering record: harnesses, logs, per-session notes |
 
 ## Reproducing the numbers

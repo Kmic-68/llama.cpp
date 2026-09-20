@@ -119,6 +119,46 @@ restarting the desktop session. Budget that process explicitly rather than count
 capping yourself with a watchdog that kills the *server* — by PID — before free memory reaches
 zero.
 
+## Vision at full context: drop `-ub`, not `-c`
+
+Model + MTP + vision **do** fit at the full 262144 together. The instinct is to cut context; the
+cheaper lever is `-ub`, which costs only prefill throughput instead of 100k tokens of headroom.
+
+Add `--mmproj /mnt/fast/models/mmproj-Qwen3.8-27B-Q8_0.gguf` and take `-ub` from 2048 to **1024**:
+
+    -c 262144 -b 32768 -ub 1024 -np 1 --mmproj <path>
+
+At `-ub 2048` this does not merely run tight, it **dies during load** with 127 MiB free on GPU0 --
+before any prompt is sent. The mmproj is ~600 MiB and it lands on GPU0 **whole**, rather than
+splitting across the pair, so it stacks on top of whatever else that card carries (here Sunshine's
+392 MiB). GPU0 sits ~1240 MiB below GPU1 at every setting, and GPU0 is the only one that matters.
+
+Load-time free on GPU0, measured with the mmproj loaded:
+
+| `-ub` | free at load | recovered vs 2048 |
+|---|---|---|
+| 2048 | 136 MiB | **dies at load** |
+| 1024 | 892 MiB | +756 |
+| 512 | 1272 MiB | +1136 |
+| 256 | 1462 MiB | +1326 |
+
+That is **0.742 MiB of GPU0 per ubatch unit**, linear to three digits across every step, and it is
+the number to size with: vision costs ~600 MiB, so it buys back at 0.742 MiB per unit of `-ub`.
+
+A load probe is only a filter, though -- the peak comes during deep prefill, see the `min` rule in
+FINDINGS. The full 259229-token prefill at `-ub 1024` with MTP and vision:
+
+    prefill 129.54 t/s   decode 20.11 t/s   draft acceptance 0.96154 (mean len 4.85)
+    GPU0 free 892 MiB at load, minimum 731 MiB over the whole run, 0 watchdog breaches
+
+**731 MiB is the number**, and it is the same margin the text-only `-ub 2048` configuration lives
+at (757 MiB) -- so this is no riskier than the default, just spent differently. Free fell only
+892 -> 731 across the entire prefill, so here the load reservation does cover most of the worst
+case; that is a conclusion *from* the full run, not licence to trust load probes next time.
+
+If GPU0 also drives a browser or a second display client, use `-ub 512` (~1111 MiB by the rate
+above) for the extra cushion. run163 died from a 136 MiB swing in other GPU0 consumers.
+
 ## `--spec-draft-n-max`: 3 or 4 depends on your depth
 
 Both are right at their own operating point.

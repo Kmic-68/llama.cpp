@@ -1,6 +1,6 @@
 # Findings — what worked, what failed, and how the measurements lied
 
-The distillation. The full record with numbers is `../logs/OPTLOG.md` (174 attempts); the change
+The distillation. The full record with numbers is `../logs/OPTLOG.md` (175 attempts); the change
 list is `../CHANGES.md`.
 
 ---
