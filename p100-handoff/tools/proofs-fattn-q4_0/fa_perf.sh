@@ -3,7 +3,7 @@
 # $1 = label written into the output filename.
 set -u
 ulimit -c 0
-S=/tmp/claude-1000/-home-kaden-llama-opt/f73b5a33-7d91-4dd3-a3b7-19ecb9e11747/scratchpad
+S=${S:-$(cd "$(dirname "$0")" && pwd)/run}; mkdir -p "$S"
 B=/home/kaden/llama-opt/build-opt/bin
 LABEL=${1:-run}
 

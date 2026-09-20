@@ -94,3 +94,20 @@ line.
 Read these numbers cold. The same binary reads 30.75 +/- 0.19 t/s cold and 24.9 +/- 2.6 hot: the
 P100's 175 W cap is enforced and it clocks down off its 1328 MHz ceiling under sustained load, so
 a hot run silently measures the cooler, not the kernel.
+
+## Running these later
+
+The three shell scripts wrote into the session scratchpad, which is gone. They now default `S` to
+a `run/` directory beside the script; override with `S=/somewhere ./vision_fit.sh 262144 1024`.
+
+`vision_fit.sh` wants `$S/p262.txt`, a ~792 KB prompt that fills the 262144-token context
+(259229 tokens, ~3.06 chars/token). It was a line-numbered concatenation of this repo's own
+sources and is **not** committed -- for a VRAM test only the token count matters, not the text,
+so any ~790 KB of prose or code does the job:
+
+    find tools common src -name '*.cpp' -o -name '*.h' | sort | xargs cat \
+      | awk '{printf "%06d %s\n", NR, $0}' | head -c 792713 > run/p262.txt
+
+Do not reuse that file as a perplexity corpus. PPL numbers are only comparable against the exact
+corpus they were calibrated on, which is `p100-handoff/ppl-orig.txt` and nothing else -- see
+CORPUS.md for how that went wrong once already.

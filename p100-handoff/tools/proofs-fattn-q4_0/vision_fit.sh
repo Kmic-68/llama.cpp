@@ -10,7 +10,7 @@
 # $1 = context size (default 262144)
 set -u
 ulimit -c 0
-S=/tmp/claude-1000/-home-kaden-llama-opt/f73b5a33-7d91-4dd3-a3b7-19ecb9e11747/scratchpad
+S=${S:-$(cd "$(dirname "$0")" && pwd)/run}; mkdir -p "$S"; export S
 REL=/mnt/fast/p100-llamacpp-release
 CTX=${1:-262144}
 UB=${2:-2048}
@@ -44,7 +44,7 @@ grep -iE "mmproj|clip|vision" $S/vis${CTX}_ub${UB}.log | head -4
 
 python3 -u - "$CTX" <<'PY' 2>&1 | tee $S/vis_results_${CTX}_ub${UB}.txt
 import json,urllib.request,sys,time
-S="/tmp/claude-1000/-home-kaden-llama-opt/f73b5a33-7d91-4dd3-a3b7-19ecb9e11747/scratchpad"
+import os; S=os.environ["S"]  # exported by the shell above; no __file__ on a piped heredoc
 U="http://127.0.0.1:8091"; CTX=int(sys.argv[1])
 def post(p,b,t=21600):
     try:

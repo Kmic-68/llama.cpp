@@ -8,7 +8,7 @@
 # back roughly 860 / 1290 / 1505 MiB against 2048.
 set -u
 ulimit -c 0
-S=/tmp/claude-1000/-home-kaden-llama-opt/f73b5a33-7d91-4dd3-a3b7-19ecb9e11747/scratchpad
+S=${S:-$(cd "$(dirname "$0")" && pwd)/run}; mkdir -p "$S"
 REL=/mnt/fast/p100-llamacpp-release
 export LD_LIBRARY_PATH=$REL/build:${LD_LIBRARY_PATH:-}
 export GGML_CUDA_P2P=1
