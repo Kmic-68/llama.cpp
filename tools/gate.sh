@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
 # Run the correctness + metric gates with the RIGHT inputs.
 #
-# Why this exists: CLAUDE.md's workflow step 4 names `./ppl.txt` and demands
-# 2.6209 +/- 0.0199. That file yields 2.7566 on ANY build, stock included, so
-# following the instruction literally reports a correctness failure every time.
-# The corpus the 2.6209 band belongs to is p100-handoff/ppl-orig.txt. Two
-# separate sessions have reverted good work over this. Use this script.
+# Why this exists: the 2.6209 +/- 0.0199 perplexity band belongs to one corpus,
+# p100-handoff/ppl-orig.txt. ./ppl.txt is a different file and reads 2.7566 on
+# ANY build, stock included, and two sessions reverted good work after gating
+# on it by hand. Keeping the corpus next to the number, in a script, stops that.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
@@ -27,7 +26,7 @@ fi
 # The metric runs FIRST, on cold cards. This is not cosmetic: the same build measures
 # 30.75 +/- 0.19 cold and 24.9 +/- 2.6 straight after a perplexity run. A hot-card reading
 # looks exactly like a 20% regression.
-echo "== tg256 (CLAUDE.md metric; baseline 17.51) =="
+echo "== tg256 (upstream at the fork point: 17.51) =="
 nvidia-smi --query-gpu=index,temperature.gpu --format=csv,noheader | sed 's/^/   GPU temp before: /'
 ulimit -c 0
 GGML_CUDA_P2P=1 "$BIN/llama-bench" -m "$MODEL" \
@@ -40,14 +39,14 @@ ulimit -c 0
 
 # NOTE: this is FLASH_ATTN_EXT ONLY, roughly 1% of the op suite. Its "3/3 backends" has
 # been quoted in handoffs as if it meant the whole suite passed. It does not. The full
-# suite (~25 min, 14587 tests) caught an intermittent CUDA1 failure that this never would.
+# suite (~25 min, ~16k tests) caught an intermittent CUDA1 failure that this never would.
 # Run `./tools/gate.sh --full` before claiming a build is clean.
 if [ "${1:-}" = "--full" ]; then
-    echo "== FULL op suite (14587 tests, ~25 min) =="
+    echo "== FULL op suite (~16k tests, ~25 min) =="
     "$BIN/test-backend-ops" test 2>&1 | tee /tmp/gate-ops-full.log | grep -E "backends passed|FAIL"
     echo "   (full log: /tmp/gate-ops-full.log)"
 else
     echo "== flash-attn eval ONLY (-o FLASH_ATTN_EXT; NOT the full suite) =="
     "$BIN/test-backend-ops" test -o FLASH_ATTN_EXT 2>&1 | grep -E "backends passed|FAIL"
-    echo "   run './tools/gate.sh --full' for all 14587 tests"
+    echo "   run './tools/gate.sh --full' for the whole suite"
 fi

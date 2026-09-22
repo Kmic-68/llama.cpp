@@ -7311,3 +7311,38 @@ attempt 173 curve already showed, not a vision penalty. Not worth chasing on one
 `-ub 512` should give ~1111 MiB by the rate above and is the right choice if GPU0 also drives a
 browser or a second display client; run163 died from a 136 MiB swing in other GPU0 consumers.
 Not measured at full depth.
+
+## Attempt 176 — merge upstream `f46bc30cb` (2026-09-22): kept
+
+The fork had not seen upstream since `f280b2698` (2026-08-24), so it lacked the architectures
+added since. Merged 502 upstream commits (merge `c2e6a7d99`); CHANGES §9 has the per-file
+resolutions. Four textual conflicts (`convert.cu`, `fattn-vec.cuh`, `ggml-cuda.cu`,
+`test-backend-ops.cpp`). One more bug merged cleanly: upstream inserted `use_sparse` before
+`warp_size` in `launch_fattn`, and the GQA-6 tile launch's positional `warp_size` bound to it.
+
+Build: `-DGGML_CUDA_FA_QUANTS=all` (replaces the deprecated `GGML_CUDA_FA_ALL_QUANTS`).
+Reference: the shipped release build (same code as `16e802962`).
+
+    gate                                   before              after
+    tg256, cold, back to back (42/44 C)    30.76 +/- 0.18      30.57 +/- 0.20
+    perplexity, ppl-orig.txt               2.6097 +/- 0.0198   2.6101 +/- 0.0198
+    FLASH_ATTN_EXT                         pass                3/3 backends
+    full op suite                          14593/14593         16180/16180, both GPUs
+    KLD vs before (8 chunks)               -                   0.001544, top-1 same 98.62%
+
+Speed, rotated steady-state A/B (A = release, M = merged, D = merged with the GDN change
+reverted), first two rounds before the cards throttled at 77 C:
+
+    A 30.71 (56 C)  M 30.27 (61 C)  D 30.23 (64 C)  M 29.87 (67 C)  D 29.81 (69 C)  A 29.71 (71 C)
+
+On A's slope (-0.067 t/s per C), M and D both land within 0.1 t/s of A. No measurable decode
+change. An earlier fixed-order A-then-B run read B 1.5% slow; that was B always running hotter.
+
+KLD attribution: the whole 0.0015 comes from upstream `5fdfa6282`, which changes the gated
+delta-net q/k norm from `x/max(|x|,eps)` to the reference `x*rsqrt(sum x^2 + eps)` (FLA,
+transformers, vLLM). With it reverted as a diagnostic, KLD vs before is -6e-6 (max 4e-6), with
+100.000% identical top tokens. Every kernel the fork adds computes exactly what it did before.
+Kept upstream's form, since it matches the reference model. Its extra SCALE per call costs nothing
+measurable (D = M above), so no fusion was needed.
+
+Kept.

@@ -1,34 +1,25 @@
-# Quickstart — the flags that matter
+# Quickstart
 
-Binaries are built for **sm_60 only** and expect the driver in `ENVIRONMENT.md` (580.173.02).
+The binaries are built for sm_60 only.
 
 ## Put it on PATH
 
-Add this one line to `~/.bashrc`:
-
     export PATH="/mnt/fast/p100-llamacpp-release/bin:$PATH"
 
-Then `llama-server`, `llama-bench`, `llama-cli` and the other 88 tools just work from anywhere,
-and `qwen-server` starts the tuned configuration below.
-
-**Use `bin/`, not `build/`.** They hold the same 91 programs, but `bin/` are one-line wrappers
-that set `LD_LIBRARY_PATH` to this bundle before exec'ing. The real binaries carry a RUNPATH
-pointing at the tree they were compiled in, so run directly from `build/` they load *that* tree's
-`libggml-cuda.so` if it still exists — a different build, silently, with no error. Check any time with:
+`bin/` holds a small wrapper for every program in `build/`, plus `qwen-server`. Use the
+wrappers, not `build/` directly. Each wrapper sets `LD_LIBRARY_PATH` to the bundle. The real
+binaries carry a RUNPATH back to the tree they were compiled in, so run from `build/` they can
+quietly load a different build's `libggml-cuda.so`. To check which one is live:
 
     LD_DEBUG=libs llama-cli --version 2>&1 | grep -m1 "trying file=.*ggml-cuda"
 
-It should name `/mnt/fast/p100-llamacpp-release/build`. (Plain `ldd $(which llama-server)` tells
-you nothing here — the thing on PATH is the wrapper, which is a shell script.)
+## Serving
 
-## Serving (the configuration in daily use)
+`qwen-server` runs the configuration below. Extra arguments are appended and override the
+defaults, so `qwen-server --port 9000` works, and `QWEN_MODEL=/path/to.gguf qwen-server` swaps
+the model.
 
-With `bin/` on PATH, the whole thing is:
-
-    qwen-server
-
-Arguments are appended and override the defaults, so `qwen-server --port 9000` moves the port and
-`QWEN_MODEL=/path/to.gguf qwen-server` swaps the model. What it runs:
+**Text only:**
 
     GGML_CUDA_P2P=1 GGML_CUDA_GRAPHS_PRE_VOLTA=0 \
     llama-server \
@@ -37,201 +28,97 @@ Arguments are appended and override the defaults, so `qwen-server --port 9000` m
       -c 262144 -b 32768 -ub 2048 -np 1 \
       --spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min 0.2 \
       -ngld 99 -ubd 64 -ctkd q4_0 -ctvd q4_0 \
-      --jinja --temp 0.3 --top-k 20 \
+      --jinja \
       --host 0.0.0.0 --port 8080 \
       --tools all \
       --mcp-servers-config ~/mcp-servers.json
 
-### Performance flags
+**With vision:** add the projector and halve the ubatch.
+
+      --mmproj /mnt/fast/models/mmproj-Qwen3.8-27B-Q8_0.gguf
+      -ub 1024                     # instead of 2048
+
+`qwen-server` also passes `--temp 0.3 --top-k 20`.
+
+### What the flags do
 
 | flag | why |
 |---|---|
-| `-sm tensor` | tensor-split across both cards; required for this model to fit at 262144 |
-| `-fa 1` | flash attention; **required** by `SPLIT_MODE_TENSOR` |
-| `-ctk q4_0 -ctv q4_0` | q4_0 KV cache. f16 will not fit at this context |
-| **`-np 1`** | **required.** The server auto-sizes its slot count and each slot allocates its own 262144 KV cache. Without this, startup dies with `cudaMalloc failed` on 512 MiB while the GPUs are nearly empty |
-| **`-b 32768`** | logical batch: the most tokens one `llama_decode()` call may carry. It is **not** the context limit and does not cap prompt length — `-c` does that. **This value is load-bearing for MTP.** At `-b 262144` the whole prompt becomes one logical batch and the MTP catch-up in `common_speculative`'s `process()` does a single ~5.3 GB memcpy over it. Changing only `-b`, same 259229-token prompt in one request: `-b 262144` → acceptance **0.00000**, decode **5.41 t/s**; `-b 32768` → **0.98058**, **26.13 t/s**. See OPTLOG attempt 168 |
-| **`-ub 2048`** | physical/micro batch: tokens per GPU forward pass. Sets prefill speed, and — only when CUDA graphs are on — the VRAM ceiling. With graphs **off**, as shipped, ubatch costs 0.84 MiB per unit instead of 10.67, which is just the f16 mask over the target and draft contexts. At full depth `-ub 2048` prefills **137.43 t/s** holding **757 MiB** free, against `-ub 256` at 119.46 t/s and 2205 MiB — same acceptance, same decode, 15% more prefill. If anything else shares GPU0, drop to `-ub 1024` (~1560 MiB) or `-ub 256` (~2205 MiB); both cost only prefill |
-| **`-ubd 64`** | draft context ubatch. Without it the draft inherits `-ub`, reserves a second copy of the mask, and the whole config OOMs. 64 is also **faster** than 256 (23.03 vs 21.43), not a tradeoff |
-| **`-ctkd q4_0 -ctvd q4_0`** | q4_0 for the *draft* KV cache: **151 MB instead of 537**, for -2.2% decode. The draft cache is f16 by default even when the target cache is quantized. This is the margin lever that makes a full context fit |
-| `GGML_CUDA_P2P=1` | peer-to-peer between the two cards. Keep it on — without it the exchanges stage through the host, which is slower |
-| **`GGML_CUDA_GRAPHS_PRE_VOLTA=0`** | CUDA graphs do work on Pascal (**+6.7% on the speculative path, -2% on single-token decode**), but at `-ub 2048` and a full context their *instantiation* is what exhausts VRAM — `CUDA error: out of memory` at `cudaGraphInstantiate`. Off costs **1.4% on tg256, inside the noise**, and is what makes `-ub 2048` viable at depth. Turn them on only at small `-ub` and shallow context. See OPTLOG attempts 167-168 |
+| `-sm tensor` | splits every layer across both cards. The model doesn't fit at 262144 context otherwise |
+| `-fa 1` | flash attention. Tensor split requires it |
+| `-ctk q4_0 -ctv q4_0` | q4_0 KV cache. An f16 cache doesn't fit at this context |
+| `-c 262144` | the model's full context. Allocating it costs nothing on decode. Only filling it does |
+| `-np 1` | one server slot. Each slot allocates its own full KV cache, and without this the server sizes several and fails at startup |
+| `-b 32768` | the most tokens one decode call may take. **Needed for MTP at long context:** with `-b 262144` the whole prompt becomes one batch, and on a 259k-token prompt draft acceptance falls to 0 and decode to 5.4 t/s. At 32768 the same prompt gives 0.98 acceptance and 26.1 t/s |
+| `-ub 2048` | tokens per GPU pass. It sets prefill speed and VRAM use; see below |
+| `--spec-type draft-mtp` | speculative decoding with the model's built-in MTP head. MTP isn't a separate model: the `*-MTP-ONLY` gguf doesn't load on its own |
+| `--spec-draft-n-max 4 --spec-draft-p-min 0.2` | draft up to 4 tokens, and stop drafting below 20% confidence. See below for 3 vs 4 |
+| `-ngld 99` | the draft layer on the GPU |
+| `-ubd 64` | the draft context's own ubatch. Without it the draft inherits `-ub` and reserves a second copy of the attention mask, which runs out of memory at full context. 64 is also faster than 256 (23.0 against 21.4 t/s) |
+| `-ctkd q4_0 -ctvd q4_0` | q4_0 for the *draft's* KV cache, which is otherwise f16. 151 MB instead of 537, at no measurable cost to acceptance |
+| `GGML_CUDA_P2P=1` | direct copies between the cards. Without it they go through host memory |
+| `GGML_CUDA_GRAPHS_PRE_VOLTA=0` | keeps CUDA graphs off. They work on Pascal, but at full context and `-ub 2048` their instantiation runs VRAM out. Off costs ~1.4% of decode |
+| `--jinja` | use the chat template stored in the gguf. Tool calls need it |
+| `--tools all`, `--mcp-servers-config` | the server's built-in tools, plus MCP servers from that file |
+| `--host 0.0.0.0 --port 8080` | listen on the LAN |
 
-### Serving flags (these do not touch the CUDA path)
+### VRAM
 
-| flag | why |
+All figures are **per card**. GPU0 is the one to watch: it also carries the desktop (Sunshine
+holds ~392 MiB there), and the vision projector loads onto it whole.
+
+VRAM use grows as the context fills. The attention mask is sized to the *used* part of the cache
+times the ubatch, so a short prompt says nothing about a full one. At full depth these
+configurations bottom out at:
+
+| configuration | GPU0 free at the low point of a 259k-token prefill |
 |---|---|
-| `--jinja` | use the model's own chat template from the gguf. Required for tool calls to be formatted as the model was trained; Qwen3.8's template is not the built-in default |
-| `--temp 0.3 --top-k 20` | sampling. Low but non-zero — a deliberate choice for reliable tool-call formatting, not a tuned value |
-| `--tools all` | enable the server's built-in tool handlers |
-| `--mcp-servers-config` | MCP servers exposed as tools |
-| `--host 0.0.0.0 --port 8080` | listen on the LAN rather than loopback |
+| text, `-ub 2048` | 757 MiB |
+| vision, `-ub 1024` | 731 MiB |
 
-### Watch VRAM — and do not size it against a short prompt
+`-ub` is the lever. Each unit costs ~0.74 MiB on GPU0, and lowering it costs only prefill speed:
 
-This configuration peaks at **16137 MiB on GPU0** of 16384 against a **19966-token** prompt. That
-prompt is 8% of the allocated context, and **the budget is not fixed — it grows with how full the
-context actually is.** Sizing against a short prompt is the trap; the figure above has ~250 MiB of
-headroom and still cannot serve a full one.
-
-The growing allocation is the **attention mask**, and it is stock llama.cpp behaviour rather than
-anything this fork added. `llama_kv_cache::get_n_kv()` returns the *used* portion of the cache
-padded to 256 — not the allocated `-c` — and the mask tensor is `n_kv x n_tokens`. So it starts
-small and grows as the prompt fills the cache, which means **it scales with `n_kv x ubatch`**.
-That is why `-ub` is the effective lever. (This fork's GEMM attention path is *not* the cause: it
-chunks K/V at a fixed 2048 and is constant in depth. `GGML_CUDA_FA_GEMM=0` does not help here.)
-
-Measured on a **259118-token** prompt, sampling free VRAM on GPU0 every 5 s:
-
-| `-ub` | free at load | behaviour during prefill | outcome |
-|---|---|---|---|
-| 2048 | 117 MiB | — | **dies 57 s in**, ~4% of the prompt |
-| 512 | 1669 MiB | flat for 20 min, then climbs 1669 → 165 MiB in 7 | **dies at ~95%** |
-
-Both fail identically: `CUDA error: the function failed to launch on the GPU` in
-`ggml_cuda_mul_mat_cublas_impl<F16>`. It is memory exhaustion presenting as a launch failure —
-cuBLAS could not get scratch workspace — not a kernel defect.
-
-**This is now measured, and the explanation above is only half right.** A genuinely full
-262144-token prompt with the MTP draft has since been served many times on 2x16 GB. What was
-missing was the identity of the growth: **it was CUDA graph instantiation**, not the mask. With
-`GGML_CUDA_GRAPHS_PRE_VOLTA=1` the cost is 10.67 MiB per ubatch unit at full depth and `-ub 512`
-dies at 193 MiB free; with graphs off it is 0.84 MiB per unit, which is exactly the f16 mask over
-the target and draft contexts. Turning graphs off costs 1.4% on tg256 — inside the noise — so the
-shipping configuration disables them, and `-ub 2048` then serves a full context comfortably:
-
-| `-ub` | prefill | decode | acceptance | min free |
-|---|---|---|---|---|
-| 256 | 119.46 t/s | 26.13 t/s | 0.98058 | 2205 MiB |
-| 2048 | 137.43 t/s | 25.53 t/s | 0.98058 | 757 MiB |
-
-The other half of the old advice — that a big ubatch is what kills a full-context prompt — was
-wrong for a different reason too. What actually broke long-context MTP was **`-b 262144`**: with
-the whole prompt as one logical batch, draft acceptance at full depth is 0.00000 and decode is
-5.41 t/s. `-b 32768` makes the same prompt give 0.98058 and 26.13 t/s. See OPTLOG attempt 168.
-
-In practice this bites only at extreme depth: a prompt in the tens of thousands of tokens against
-`-c 262144` is comfortable, which is why this went unnoticed for so long.
-
-**If the GPU also drives a display, leave it real headroom.** GPU0 here carries ~392 MiB of
-Sunshine, and an early `-ub 2048` run (with CUDA graphs on) starved it badly enough to require
-restarting the desktop session. Budget that process explicitly rather than counting it as slack, and consider
-capping yourself with a watchdog that kills the *server* — by PID — before free memory reaches
-zero.
-
-## Vision at full context: drop `-ub`, not `-c`
-
-Model + MTP + vision **do** fit at the full 262144 together. The instinct is to cut context; the
-cheaper lever is `-ub`, which costs only prefill throughput instead of 100k tokens of headroom.
-
-Add `--mmproj /mnt/fast/models/mmproj-Qwen3.8-27B-Q8_0.gguf` and take `-ub` from 2048 to **1024**:
-
-    -c 262144 -b 32768 -ub 1024 -np 1 --mmproj <path>
-
-At `-ub 2048` this does not merely run tight, it **dies during load** with 127 MiB free on GPU0 --
-before any prompt is sent. The mmproj is ~600 MiB and it lands on GPU0 **whole**, rather than
-splitting across the pair, so it stacks on top of whatever else that card carries (here Sunshine's
-392 MiB). GPU0 sits ~1240 MiB below GPU1 at every setting, and GPU0 is the only one that matters.
-
-Load-time free on GPU0, measured with the mmproj loaded:
-
-| `-ub` | free at load | recovered vs 2048 |
+| text `-ub` | prefill at full depth | GPU0 low point |
 |---|---|---|
-| 2048 | 136 MiB | **dies at load** |
-| 1024 | 892 MiB | +756 |
-| 512 | 1272 MiB | +1136 |
-| 256 | 1462 MiB | +1326 |
+| 2048 | 137.4 t/s | 757 MiB |
+| 256 | 119.5 t/s | 2205 MiB |
 
-That is **0.742 MiB of GPU0 per ubatch unit**, linear to three digits across every step, and it is
-the number to size with: vision costs ~600 MiB, so it buys back at 0.742 MiB per unit of `-ub`.
+If anything else shares GPU0, like a browser or a second display client, drop one step: text to
+`-ub 1024`, vision to `-ub 512`. Vision at `-ub 2048` fails during load.
 
-A load probe is only a filter, though -- the peak comes during deep prefill, see the `min` rule in
-FINDINGS. The full 259229-token prefill at `-ub 1024` with MTP and vision:
+### Draft length: 3 or 4
 
-    prefill 129.54 t/s   decode 20.11 t/s   draft acceptance 0.96154 (mean len 4.85)
-    GPU0 free 892 MiB at load, minimum 731 MiB over the whole run, 0 watchdog breaches
+At full depth, `--spec-draft-n-max 3` is better. The verify batch (draft + 1) is then 4, which
+fills one attention tile exactly, while 5 needs a wider tile: 50.5 ms against 78.4 ms of
+attention per pass at 262144. At mixed, shallower depths, 4 measured better, because an accepted
+extra token saves a whole forward pass. Compare over several runs at your own depth. Acceptance
+depends on sampled tokens, so single runs are noisy.
 
-**731 MiB is the number**, and it is the same margin the text-only `-ub 2048` configuration lives
-at (757 MiB) -- so this is no riskier than the default, just spent differently. Free fell only
-892 -> 731 across the entire prefill, so here the load reservation does cover most of the worst
-case; that is a conclusion *from* the full run, not licence to trust load probes next time.
+MTP is worth ~1.7x at short context, and little at 229k (23.2 t/s against 21.5 plain), where the
+verify pass pays nearly the full attention cost.
 
-If GPU0 also drives a browser or a second display client, use `-ub 512` (~1111 MiB by the rate
-above) for the extra cushion. run163 died from a 136 MiB swing in other GPU0 consumers.
-
-## `--spec-draft-n-max`: 3 or 4 depends on your depth
-
-Both are right at their own operating point.
-
-**3** comes from tile geometry: the draft plus the token being verified is `nb = n_draft+1`, the
-flash-attn tile ladder has fixed widths, and `nb = 4` fills one exactly while `nb = 5` does not.
-At 262144 context that boundary is worth **50.5 ms against 78.4 ms** of attention per verify pass.
-
-**4** wins when attention does not dominate the pass — shallower contexts, and a real acceptance
-rate rather than greedy. The extra draft token, when accepted, saves an entire forward pass. In
-day-to-day agent use with mixed prompt depths, 4 measured better.
-
-**No single benchmark settles it**, because speculative decoding is not deterministic in real
-use: acceptance depends on the sampled tokens, so two runs of one prompt at `--temp 0.3` do not
-do the same amount of work. Compare distributions over several runs at the depth you operate at.
-
-(That is sampler variance. It is separate from numerical determinism: with a fixed seed and
-greedy sampling this build is bit-reproducible run to run on two physical GPUs.)
-
-## Short context / plain decode
+## Benchmarking decode
 
     GGML_CUDA_P2P=1 llama-bench -m /mnt/fast/models/Qwen3.8-27B-Q6_K.gguf \
-      -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -p 0 -n 256 -r 3
+      -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -p 0 -n 256 -r 5
 
-Leave `GGML_CUDA_GRAPHS_PRE_VOLTA` **unset** here — it costs ~2% on this workload.
+Leave `GGML_CUDA_GRAPHS_PRE_VOLTA` unset here. At long context, time at least 512 generated
+tokens: `-n 128` is dominated by a 2-3 s first-token cost and reads far too low.
 
-## Is speculative decoding worth it?
+## Precision switches
 
-**At short context, yes** — MTP is worth ~1.7x. **At 229k context it is worth almost nothing**
-(23.2 t/s against 21.5-23.7 plain), because the verify pass pays nearly the same attention cost
-as the token it saves. If your workload is long-context, the simpler plain-decode config is
-within noise of the speculative one.
-
-## The accuracy mode, in one flag
-
-    GGML_CUDA_CUBLAS_COMPUTE_TYPE=f32
-
-On this card that is the whole accuracy/speed trade. Prefill matmuls stop rounding their inputs
-and accumulation to fp16, which is **the entire measurable distance between this fork and an
-all-fp32 run**: paired per-chunk perplexity over 4096 × 30 tokens moves from +0.00343 nats/token
-to -0.00026 — from "measurably worse than fp32" (t 7.4) to "indistinguishable from it" (t -1.4);
-perplexity 2.6191 → 2.6095.
-
-It costs **~40% of prefill throughput** (pp512 391 → 217 t/s, pp2048 414 → 255) and **nothing on
-decode** (tg256 30.78 → 30.77), because decode never takes the cuBLAS path.
-
-Use it when the output matters more than the wait; leave it off for interactive work.
-
-## Other precision flags
-
-| flag | what it does |
+| variable | effect |
 |---|---|
-| `GGML_CUDA_FA_GEMM=0` | The cuBLAS-GEMM attention path is **on by default** at `Q->ne[1] >= 128 && K->ne[1] >= 4096`; `=0` falls back to the tile kernel, which is ~5x more accurate per op but slower at depth. A plain precision/speed choice |
-| `GGML_CUDA_FA_GEMM_PREC=32` | fp32 accumulation in the GEMM attention path. -11% pp2048 at 16k depth, -27% at 65k, and **buys nothing measurable at the model level** — the fp16 default is not distinguishable from it in perplexity |
+| `GGML_CUDA_CUBLAS_COMPUTE_TYPE=f32` | **The accuracy mode.** Prefill matmuls in fp32 instead of fp16. That removes the only measurable gap to an all-fp32 run: perplexity 2.6191 → 2.6095, paired per-token difference from +0.0034 nats (t 7.4) to indistinguishable. Costs ~40% of prefill; decode is unchanged |
+| `GGML_CUDA_FA_GEMM=0` | turns off the cuBLAS-GEMM attention path used for long prefill (on by default at batch ≥ 128 and KV ≥ 4096). The tile kernel is more accurate per op but slower at depth. Perplexity can't tell them apart |
+| `GGML_CUDA_FA_GEMM_PREC=32` | fp32 accumulation inside the GEMM attention path. Slower (-11% to -27% prefill) and buys nothing measurable |
+| `GGML_CUDA_FA_TILE_Q4_0=0` | turns off direct q4_0 dequant in the tile kernel. For A/B testing only |
 
-## Correctness check
+## Checking a build
 
     /mnt/fast/p100-llamacpp-release/tools/gate.sh
 
-Use the script. It carries the right corpus, and the corpus is the part that drifts — see
-`FINDINGS.md`, "How the measurements lied", item 7.
-
-If you run it by hand anyway:
-
-    llama-perplexity -m /mnt/fast/models/Qwen3.8-27B-Q6_K.gguf \
-      -f /mnt/fast/p100-llamacpp-release/tools/perplexity-gate-corpus.txt \
-      -sm tensor -ngl 99 -c 4096 -ctk q4_0 -ctv q4_0
-
-Expect **2.6097 ± 0.0198** (gate band 2.6209 ± 0.0199). Use *that* corpus — a different wiki dump
-gives ~2.7566 on any build including stock, which looks like a regression and is not.
-
-## Build flags that no longer exist
-
-`-DP100_NWARPS`, `-DP100_ROWS`, `-DP100_MC_NWARPS`, `-DP100_MC_ROWS` are **no longer read**. The
-mmvq geometry lives in `mmvq.cu`, gated on `__CUDA_ARCH_LIST__ == 600` — building for any second
-architecture silently disables the whole Pascal geometry block.
+It runs the decode benchmark, then perplexity on the right corpus, then the flash-attention op
+tests. Expect perplexity near 2.6101 ± 0.0198. The gate band is 2.6209 ± 0.0199. Use the script rather
+than typing the command: a different text file reads ~2.7566 on *any* build, which looks like a
+regression and isn't.

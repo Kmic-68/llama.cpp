@@ -1,87 +1,63 @@
-# Building from source
+# Building
 
-## Reapply onto upstream
+## Get the source
 
-The patch series applies to upstream llama.cpp at the SHA in `../diffs/UPSTREAM-BASE-SHA.txt`:
-
-    git clone https://github.com/ggml-org/llama.cpp
+    git clone -b p100-optimizations https://github.com/Kmic-68/llama.cpp
     cd llama.cpp
-    git checkout f280b26983ad0fdb705a0d9ebf0503e76f2899b0
-    git am /mnt/fast/p100-llamacpp-release/patches/*.patch
 
-Or apply the whole delta at once:
+The release bundle also carries the fork as one diff against the upstream commit it last merged:
+`diffs/all-code.diff`, with the base SHA in `diffs/UPSTREAM-BASE-SHA.txt`. To apply it to a
+clean upstream checkout:
 
+    git checkout $(cat /mnt/fast/p100-llamacpp-release/diffs/UPSTREAM-BASE-SHA.txt)
     git apply /mnt/fast/p100-llamacpp-release/diffs/all-code.diff
-
-(`all-code.diff` is kernel and test changes only. `everything.diff` includes the documentation
-and logs as well.)
 
 ## Configure and build
 
     cmake -B build-opt -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=60 \
-      -DGGML_CUDA_NCCL=OFF -DGGML_CUDA_FA_ALL_QUANTS=ON -DCMAKE_BUILD_TYPE=Release
+      -DGGML_CUDA_NCCL=OFF -DGGML_CUDA_FA_QUANTS=all -DCMAKE_BUILD_TYPE=Release
     cmake --build build-opt --config Release -j 14
 
-Notes:
+A full build is ~1.3 GB and takes ~25 minutes.
 
-- **`-DCMAKE_CUDA_ARCHITECTURES=60` matters.** Some tuning is guarded on
-  `__CUDA_ARCH_LIST__ == 600` so it applies only to an sm_60-exclusive build; a multi-arch build
-  silently takes generic paths.
-- **`-DGGML_CUDA_FA_ALL_QUANTS=ON`** is needed for the q4_0 KV cache paths. It also multiplies
-  flash-attn template instantiations, which matters below.
-- `-DGGML_CUDA_NCCL=OFF` — NCCL is not used here. The internal AllReduce was tested on Pascal and
-  is **slower** than the fallback (see FINDINGS).
-- Earlier `-DP100_*` tuning flags are **gone**. The values live in the source now, so a plain
-  build cannot silently miss them.
+- **Build for sm_60 alone.** The Pascal tuning in `mmvq.cu` is gated on
+  `__CUDA_ARCH_LIST__ == 600`, so adding any second architecture silently switches it all off.
+- **`GGML_CUDA_FA_QUANTS=all`** compiles flash attention for every K/V type pair. It replaces
+  `GGML_CUDA_FA_ALL_QUANTS`, which upstream deprecated. Upstream's default set
+  (`q4_0-q4_0;q8_0-q8_0;f16-f16;bf16-bf16`) covers the serving configuration too, and builds a
+  smaller library.
+- **`GGML_CUDA_NCCL=OFF`.** NCCL isn't used, and the internal AllReduce is slower on PCIe Pascal.
+- The old `-DP100_NWARPS`, `-DP100_ROWS`, `-DP100_MC_NWARPS` and `-DP100_MC_ROWS` flags are no
+  longer read. The values live in `mmvq.cu`.
 
-## Watch the library size
+**Watch the library size.** The flash-attention template instances multiply by head size and KV
+type, and the CUDA library is loaded into VRAM on each card. Growing `libggml-cuda.so` from 374 to
+530 MB once pushed the 262144 context back into `cudaMalloc` failure. If the long-context
+configuration stops starting after a change, check this first.
 
-Flash-attn instantiations are multiplied by head size and KV type. Adding shapes carelessly grew
-`libggml-cuda.so` from **374 MB to 530 MB**, which was enough to push the 262144-token context
-back into `cudaMalloc` failure at load. New tile configs here are scoped to `DKQ == DV == 256` for
-that reason. If the long-context config stops starting, check this first.
+**After editing a `.cuh`,** touch the files that include it. The build doesn't always rebuild the
+template instances:
+
+    grep -rl "fattn-vec.cuh" ggml/src/ggml-cuda/ | xargs touch
 
 ## Verify
 
-    # correctness
-    ./build-opt/bin/test-backend-ops                 # expect 3/3 backends
+    ./tools/gate.sh           # decode benchmark, perplexity, flash-attention op tests
+    ./tools/gate.sh --full    # the same, plus the full op suite (~25 minutes)
 
-    /mnt/fast/p100-llamacpp-release/tools/gate.sh    # perplexity + metric, with the right corpus
+Expect `tg256` around 30.6 t/s on cold cards, and perplexity 2.6101 ± 0.0198, inside the band
+2.6209 ± 0.0199.
 
-`gate.sh` expects **2.6097 ± 0.0198** against a band of 2.6209 ± 0.0199, and `tg256` around
-**30.6 t/s**.
+Two cautions about what a pass means:
 
-Run it by hand only if you must, and mind the corpus:
+- **Run perplexity early.** One change passed 3949/3949 op tests and still produced NaN in real
+  inference.
+- **The op suite can't see races.** It runs ops one at a time with host syncs between them. Two
+  races in this fork passed it for weeks.
 
-    ./build-opt/bin/llama-perplexity -m <model> \
-      -f /mnt/fast/p100-llamacpp-release/tools/perplexity-gate-corpus.txt \
-      -sm tensor -ngl 99 -c 4096 -ctk q4_0 -ctv q4_0
+## Which build is running
 
-**Run perplexity before trusting a kernel change, not after.** One change in this series passed
-3949/3949 operation tests and still produced NaNs in real inference.
-
-**And note what the op suite cannot do.** Two data races in this fork passed the full 14593-case
-suite for weeks. It runs ops one at a time with host synchronization between them, which is
-exactly the condition under which a cross-stream race does not occur. A green suite is necessary
-and nowhere near sufficient.
-
-## `--version` lags, and that is not a stale build
-
-`llama-cli --version` on these binaries reports commit `dce17bf1b`, three commits behind what
-they were actually built from. llama.cpp stamps the build-info string at **cmake configure**
-time, not at each build, so it pins to whatever HEAD was when the build tree was last configured.
-
-Verify by content instead. The shipped `libggml-base.so` and `libggml-cuda.so` are byte-identical
-to the build tree they came from, and the last two fixes are present in them — for example the
-zero-slice fix adds a log string you can grep for:
-
-    strings -a build/libggml-base.so | grep "has a zero-sized slice of"
-
-`diffs/HEAD-SHA.txt` is the authoritative record of what `build/` was built from.
-
-## Reproducibility note
-
-A rebuild of identical source is not byte-identical to a previous one: `build-opt` and a snapshot
-of the same tree differ in exactly 8 bytes, an nvcc temp-derived symbol in `.symtab`. The
-build-id and the `.text`, `.rodata` and `.nv_fatbin` hashes match. Compare sections, not whole
-files.
+`--version` reports the commit that was HEAD when the build tree was last *configured*, not
+built, so it can lag. `diffs/HEAD-SHA.txt` in the bundle is the authoritative record. Rebuilds of
+identical source differ in a few bytes of `.symtab`; compare the `.text`, `.rodata` and
+`.nv_fatbin` sections, not whole files.

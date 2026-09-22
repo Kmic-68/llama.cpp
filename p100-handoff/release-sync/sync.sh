@@ -14,7 +14,7 @@
 #      (used on 2026-09-15; ntfsfix clears the dirty flag and drops the hibernation state, so
 #      any Windows fast-startup session that was suspended on that volume is lost.)
 #
-# Run ./refresh-build.sh first if the binaries, patches and diffs also need rebuilding.
+# Run ./refresh-build.sh first if the binaries and diffs also need rebuilding.
 #
 # Usage:  ./sync.sh [/mnt/fast/p100-llamacpp-release]
 set -euo pipefail
@@ -34,7 +34,7 @@ echo "==> authored documentation"
 DOCS="$REPO/p100-docs"
 install -Dm644 "$DOCS/bundle-README.md" "$REL/README.md"
 install -Dm644 "$DOCS/CHANGES.md"       "$REL/CHANGES.md"
-for f in BUILD COMMUNITY-NOTES FINDINGS QUICKSTART; do
+for f in BUILD FINDINGS QUICKSTART; do
     install -Dm644 "$DOCS/$f.md" "$REL/docs/$f.md"
     echo "    docs/$f.md"
 done
@@ -65,7 +65,7 @@ echo "==> captured environment"
 echo "==> logs and handoff"
 install -Dm644 "$REPO/OPTLOG.md"                    "$REL/logs/OPTLOG.md"
 install -Dm644 "$REPO/p100-handoff/VERIFICATION.md" "$REL/docs/handoff/VERIFICATION.md"
-install -Dm644 "$REPO/p100-handoff/RESUME-HERE.md"  "$REL/docs/handoff/RESUME-HERE.md"
+install -Dm644 "$REPO/HANDOFF.md"                  "$REL/docs/handoff/HANDOFF.md"
 # Two shas, because they can legitimately differ: docs-only commits move HEAD without
 # invalidating build/. diffs/HEAD-SHA.txt is written by refresh-build.sh and describes the binaries.
 {
@@ -82,64 +82,25 @@ done
 echo "==> bin/ wrappers"
 "$HERE/make-wrappers.sh" "$REL"
 
-echo "==> archive the superseded 2026-09-06 release"
-# Kept, not deleted: the before/after numbers in OPTLOG are against these binaries. One tarball
-# instead of three top-level directories that look like part of the current release.
-ARCH="$REL/archive"
-install -Dm644 "$REPO/p100-docs/archive-README.md" "$ARCH/README.md"
-OLD=()
-for d in build-2026-09-06 patches-2026-09-06 diffs-2026-09-06; do
-    [ -d "$REL/$d" ] && OLD+=("$d")
-done
-if [ ${#OLD[@]} -gt 0 ]; then
-    if [ -f "$ARCH/2026-09-06-bundle.tar.zst" ]; then
-        echo "    archive already exists; leaving ${OLD[*]} in place -- remove by hand if intended"
-    else
-        want=$(cd "$REL" && find "${OLD[@]}" ! -type d | wc -l)
-        tar --zstd -cf "$ARCH/2026-09-06-bundle.tar.zst" -C "$REL" "${OLD[@]}"
-        got=$(tar --zstd -tf "$ARCH/2026-09-06-bundle.tar.zst" | grep -vc '/$')
-        echo "    packed ${OLD[*]} -> archive/2026-09-06-bundle.tar.zst ($(du -h "$ARCH/2026-09-06-bundle.tar.zst" | cut -f1))"
-        if [ "$want" -ne "$got" ]; then
-            echo "    ARCHIVE INCOMPLETE: $want files on disk, $got in the tarball. Originals kept."
-            exit 1
-        fi
-        echo "    verified $got files; removing the loose copies"
-        for d in "${OLD[@]}"; do rm -rf "${REL:?}/$d"; done
-    fi
-else
-    echo "    already archived"
-fi
+echo "==> archive README"
+# refresh-build.sh packs each outgoing release into archive/; this only installs the index.
+install -Dm644 "$REPO/p100-docs/archive-README.md" "$REL/archive/README.md"
 
 echo "==> removing superseded files"
-# logs/commit-log.txt froze at session 7 and is replaced by docs/handoff/commit-log.txt, which is
-# regenerated above. OPTLOG-README.md is a tombstone pointing at ../OPTLOG.md, a path that exists
-# in the repo but not in the bundle, where the log is at logs/OPTLOG.md.
-for stale in docs/handoff/OPTLOG-README.md logs/commit-log.txt; do
+# Files earlier syncs installed that no longer exist in the repo: the pre-merge handoff notes, the
+# community notes (folded into FINDINGS), and the per-commit patch series.
+for stale in docs/handoff/OPTLOG-README.md docs/handoff/RESUME-HERE.md docs/COMMUNITY-NOTES.md logs/commit-log.txt; do
     if [ -e "$REL/$stale" ]; then rm -f "$REL/$stale"; echo "    removed $stale"; fi
 done
 
-echo "==> checking the counts the prose claims"
-# These drifted badly once (README said 48 patches when there were 165, and 139 OPTLOG entries
-# when the highest attempt was 153). Assert them instead of trusting prose.
-check() {   # $1 = what, $2 = actual, $3 = file, $4 = regex capturing the claimed number
-    claimed=$(grep -oE "$4" "$3" | head -1 | grep -oE '[0-9]+' | head -1)
-    if [ "$claimed" = "$2" ]; then
-        echo "    ok: $1 = $2"
-    else
-        echo "    MISMATCH: $1 is $2 but $(basename "$3") says $claimed"
-        MISMATCH=1
-    fi
-}
-MISMATCH=0
-n_patch=$(ls "$REL"/patches/*.patch 2>/dev/null | wc -l)
-n_attempt=$(grep -oE '^## Attempt [0-9]+' "$REL/logs/OPTLOG.md" | awk '{print $3}' | sort -n | tail -1)
-n_code=$(cd "$REPO" && git log --format='%s' "$(tr -d '[:space:]' < "$REL/diffs/UPSTREAM-BASE-SHA.txt")..$(tr -d '[:space:]' < "$REL/diffs/HEAD-SHA.txt")" \
-         | grep -cE '^(cuda|fix|perf|precision|revert|spec|tests?):')
-check "patch files"   "$n_patch"   "$REL/README.md" '[0-9]+ `git am`-able commits'
-check "OPTLOG attempts" "$n_attempt" "$REL/README.md" '[0-9]+ attempts'
-check "code commits"  "$n_code"    "$REL/CHANGES.md"  '[0-9]+ code commits'
-[ "$MISMATCH" = 0 ] || { echo "    fix p100-docs/*.md and re-run"; exit 1; }
+echo "==> checking the docs"
+# Placeholders like @@TG@@ are filled from measured results before a release. Refuse to ship one.
+if grep -rl '@@[A-Z_]*@@' "$REL"/*.md "$REL"/docs/*.md "$REL"/archive/README.md 2>/dev/null; then
+    echo "    unfilled placeholders in the files above -- fill p100-docs/*.md and re-run"
+    exit 1
+fi
+echo "    ok"
 
 echo
 echo "done. HEAD $(cd "$REPO" && git rev-parse --short HEAD)."
-echo "Binaries, patches and diffs are refreshed separately by ./refresh-build.sh"
+echo "Binaries and diffs are refreshed separately by ./refresh-build.sh"
