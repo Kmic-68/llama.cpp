@@ -501,6 +501,29 @@ static __global__ void convert_unary(
     }
 }
 
+template <typename T> struct alignas(sizeof(T)*4) cvt_vec4 { T v[4]; };
+
+// four elements per thread, so a warp moves 512B (RDNA) / 1k (CDNA) per load
+template <typename src_t, typename dst_t>
+static __global__ void convert_unary_cont_vec4(
+        const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t k4) {
+    const int64_t i = (int64_t)blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i >= k4) {
+        return;
+    }
+
+    const cvt_vec4<src_t> xv = ((const cvt_vec4<src_t> *) vx)[i];
+
+    cvt_vec4<dst_t> yv;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        yv.v[j] = ggml_cuda_cast<dst_t>(xv.v[j]);
+    }
+
+    ((cvt_vec4<dst_t> *) y)[i] = yv;
+}
+
 template <typename src_t, typename dst_t>
 static void convert_unary_cuda(const void * vx, dst_t * y,
         const int64_t ne00, const int64_t ne01, const int64_t ne02, const int64_t ne03,
@@ -512,48 +535,14 @@ static void convert_unary_cuda(const void * vx, dst_t * y,
         (vx, y, ne00, ne01, ne0203, ne02_fdv, s01, s02, s03);
 }
 
-// Vectorised contiguous cast. The scalar convert_unary moves one element per
-// thread, which on sm_60 leaves ~4x of the achievable bandwidth on the table --
-// a 2-byte store per thread cannot saturate the memory pipe. This handles 4
-// elements per thread with one aligned vector load and one aligned vector store.
-// The per-element cast is unchanged, so the result is bit-identical.
-template <typename src_t, typename dst_t>
-static __global__ void convert_unary_vec4(
-        const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t k4) {
-    const int64_t i = (int64_t)blockDim.x*blockIdx.x + threadIdx.x;
-
-    if (i >= k4) {
-        return;
-    }
-
-    using src_v = typename convert_vec4<src_t>::type;
-    using dst_v = typename convert_vec4<dst_t>::type;
-
-    const src_v   xv = ((const src_v *) vx)[i];
-    const src_t * xs = (const src_t *) &xv;
-
-    dst_v   yv;
-    dst_t * ys = (dst_t *) &yv;
-
-#pragma unroll
-    for (int j = 0; j < 4; ++j) {
-        ys[j] = ggml_cuda_cast<dst_t>(xs[j]);
-    }
-
-    ((dst_v *) y)[i] = yv;
-}
-
 template <typename src_t, typename dst_t>
 static void convert_unary_cont_cuda(const void * vx, dst_t * y, const int64_t k, cudaStream_t stream) {
-    // Both vector types are at most 16 bytes; require that alignment for each end.
-    const bool vec_ok = k % 4 == 0
-        && ((uintptr_t) vx % 16) == 0
-        && ((uintptr_t) y  % 16) == 0;
-
-    if (vec_ok) {
-        const int64_t k4 = k / 4;
+    if (k % 4 == 0 &&
+        (uintptr_t) vx % alignof(cvt_vec4<src_t>) == 0 &&
+        (uintptr_t) y  % alignof(cvt_vec4<dst_t>) == 0) {
+        const int64_t k4 = k/4;
         const int64_t num_blocks = (k4 + CUDA_DEQUANTIZE_BLOCK_SIZE - 1) / CUDA_DEQUANTIZE_BLOCK_SIZE;
-        convert_unary_vec4<src_t, dst_t><<<num_blocks, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>(vx, y, k4);
+        convert_unary_cont_vec4<src_t, dst_t><<<num_blocks, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>(vx, y, k4);
         return;
     }
 
