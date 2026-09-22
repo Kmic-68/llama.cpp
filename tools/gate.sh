@@ -9,11 +9,16 @@ set -uo pipefail
 cd "$(dirname "$0")/.."
 
 MODEL=${MODEL:-/mnt/fast/models/Qwen3.8-27B-Q6_K.gguf}
-CORPUS=p100-handoff/ppl-orig.txt
+# the repo keeps the corpus in p100-handoff/; the release bundle ships it beside this script
+if   [ -f p100-handoff/ppl-orig.txt ];           then CORPUS=p100-handoff/ppl-orig.txt
+else CORPUS=tools/perplexity-gate-corpus.txt; fi
 # repo layout uses build-opt/bin; the release package ships binaries in build/
 if   [ -x ./build-opt/bin/llama-perplexity ]; then BIN=./build-opt/bin
 elif [ -x ./build/llama-perplexity ];        then BIN=./build
 else echo "no llama-perplexity found in ./build-opt/bin or ./build" >&2; exit 2; fi
+# The binaries' RUNPATH points at the tree they were built in; without this, a copied build
+# (the release bundle included) silently runs build-opt's libggml-cuda instead of its own.
+export LD_LIBRARY_PATH="$(cd "$BIN" && pwd)${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 
 if [ ! -f "$CORPUS" ]; then echo "missing gate corpus: $CORPUS" >&2; exit 2; fi
 

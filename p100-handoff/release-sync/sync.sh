@@ -40,6 +40,10 @@ for f in BUILD FINDINGS QUICKSTART; do
 done
 install -Dm644 "$HERE/docs/AUDIT-2026-09-12.md" "$REL/docs/AUDIT-2026-09-12.md"
 
+echo "==> gate script and corpus"
+install -Dm755 "$REPO/tools/gate.sh"                "$REL/tools/gate.sh"
+install -Dm644 "$REPO/p100-handoff/ppl-orig.txt"    "$REL/tools/perplexity-gate-corpus.txt"
+
 echo "==> captured environment"
 {
     echo "# Environment (captured $(date -u '+%Y-%m-%d %H:%M UTC'))"
