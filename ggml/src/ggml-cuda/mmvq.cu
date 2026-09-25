@@ -140,6 +140,30 @@ static constexpr __host__ __device__ int get_block_byte_size(ggml_type type) {
 // output rows per block on the multi-column path: the activation is re-read by every block,
 // so its total traffic scales as 1/rows
 #define P100_MMVQ_ROWS_N   16
+// Q4_K gets its own geometry: the values above were tuned against a Q6_K model and cost Q4_K
+// ~2% (OPTLOG attempt 5). Defaults equal the shared ones; override with -D to sweep.
+#ifndef P100_Q4K_NWARPS_1
+#define P100_Q4K_NWARPS_1  2
+#endif
+#ifndef P100_Q4K_ROWS_1
+#define P100_Q4K_ROWS_1    4
+#endif
+#ifndef P100_Q4K_NWARPS_N
+#define P100_Q4K_NWARPS_N  P100_MMVQ_NWARPS_N
+#endif
+#ifndef P100_Q4K_ROWS_N
+#define P100_Q4K_ROWS_N    P100_MMVQ_ROWS_N
+#endif
+// ncols_dst == 5 separately -- the full MTP verify batch at --spec-draft-n-max 4 -- where the
+// shared 4x16 geometry falls off a step (m4096 k14336: n=4 193 us, n=5 270). 2x8 takes n=5 to
+// 248 but loses at n=3 (171 vs 162), n=4 (209 vs 193) and n=8 (419 vs 386), so it is n=5 only.
+// n=1 at 2x4 rather than the shared 2x2: 89.2 -> 80.2 us (2x8 96.6, 1x8 104.0, 4x4 83.4).
+#ifndef P100_Q4K_NWARPS_N_LO
+#define P100_Q4K_NWARPS_N_LO 2
+#endif
+#ifndef P100_Q4K_ROWS_N_LO
+#define P100_Q4K_ROWS_N_LO   8
+#endif
 // whether the multi-column path also stages the activation (it costs shared memory that rows want)
 #endif
 
@@ -502,11 +526,12 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
 static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool small_k = false, bool halve_iters = false) {
 #ifdef GGML_CUDA_MMVQ_PASCAL
     if (table_id == MMVQ_PARAMETERS_GENERIC) {
+        const bool q4k = type == GGML_TYPE_Q4_K;
         if (ncols_dst == 1) {
-            return 2;
+            return q4k ? P100_Q4K_NWARPS_1 : 2;
         }
         if (ncols_dst <= 8) {
-            return P100_MMVQ_NWARPS_N;
+            return q4k ? (ncols_dst == 5 ? P100_Q4K_NWARPS_N_LO : P100_Q4K_NWARPS_N) : P100_MMVQ_NWARPS_N;
         }
     }
 #endif
@@ -636,12 +661,12 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
     return 1;
 }
 
-static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
+static constexpr __host__ __device__ int calc_rows_per_block(ggml_type type, int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_GB10) {
         switch (ncols_dst) {
             case 1:
 #ifdef GGML_CUDA_MMVQ_PASCAL
-                return 2;
+                return type == GGML_TYPE_Q4_K ? P100_Q4K_ROWS_1 : 2;
 #else
                 return small_k ? nwarps : 1;
 #endif
@@ -653,7 +678,7 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
             case 7:
             case 8:
 #ifdef GGML_CUDA_MMVQ_PASCAL
-                return P100_MMVQ_ROWS_N;
+                return type == GGML_TYPE_Q4_K ? (ncols_dst == 5 ? P100_Q4K_ROWS_N_LO : P100_Q4K_ROWS_N) : P100_MMVQ_ROWS_N;
 #else
                 return 2;
 #endif
@@ -683,7 +708,7 @@ static __global__ void mul_mat_vec_q(
     constexpr int vdr = get_vdr_mmvq(type);
     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
     constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
-    constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+    constexpr int rows_per_cuda_block = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
     // Give each warp its own output rows and let every warp walk the whole of K, instead of the
     // warps splitting K and sharing every row. The activation is re-read by every block of the
     // grid, so letting a block cover more rows divides that traffic -- and doing it this way keeps
@@ -1241,7 +1266,7 @@ static std::pair<dim3, dim3> calc_launch_params(
         const int ncols_dst, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
         const int warp_size, const mmvq_parameter_table_id table_id, const bool small_k = false, const bool halve_iters = false) {
     const int nwarps = calc_nwarps(type, ncols_dst, table_id, small_k, halve_iters);
-    const int rpb = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+    const int rpb = calc_rows_per_block(type, ncols_dst, table_id, small_k, nwarps);
     const int64_t nblocks = (nrows_x + rpb - 1) / rpb;
     const dim3 block_nums(nblocks, nchannels_dst, nsamples_or_ntokens);
     const dim3 block_dims(warp_size, nwarps, 1);
