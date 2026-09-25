@@ -511,7 +511,17 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1_impl_mmq(
     return d3*d8 * sumi;
 }
 
-#define VDR_Q4_K_Q8_1_MMVQ 2
+// Q4_K mmvq width. 4 is the Pascal layout (see vec_dot_q4_K_q8_1); 2 is upstream's.
+#ifndef P100_Q4K_VDR
+#define P100_Q4K_VDR 4
+#endif
+#define VDR_Q4_K_Q8_1_MMVQ P100_Q4K_VDR
+
+// vdr 2 only: 0 = upstream arithmetic, 1 = min term from ds.y on the lead lane (NOT exact: ds.y is
+// the unquantized sum, KLD 0.019 on gemma-4-31B), 2 = exact min-term sum without dp4a.
+#ifndef P100_Q4K_DSMIN
+#define P100_Q4K_DSMIN 0
+#endif
 #define VDR_Q4_K_Q8_1_MMQ  8
 
 // contiguous v/x values
@@ -944,6 +954,82 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
 
     const block_q4_K * bq4_K = (const block_q4_K *) vbq + kbx;
 
+#if VDR_Q4_K_Q8_1_MMVQ == 4
+    // Pascal layout: each lane takes 4 of the 8 quant ints of one 32-value sub-block pair, so a
+    // block is 8 lanes instead of 16. The scale/min unpack, the dm load and the two ds loads are
+    // then paid once per 32 values instead of once per 16 -- on sm_60 this kernel is bound by the
+    // number of memory instructions it issues, not by bytes (the same reasoning as vdr 4 for Q6_K).
+    //
+    // iqs in 0,4..28. g = iqs/8 picks the sub-block pair (q8_1 blocks 2g and 2g+1: low nibbles go
+    // with 2g, high with 2g+1) and h = (iqs/4)%2 picks which half of the pair's ints this lane
+    // takes: quant ints 8g + 2h + {0,1,4,5}, each paired with the q8_1 int of the same index
+    // within the group, exactly the pairing the vdr 2 path uses.
+    const int g = iqs / 8;
+    const int h = (iqs / 4) % 2;
+
+    // qs sits 16 bytes into the 144-byte block and 2h ints further, so these are 8-byte aligned
+    // whether x comes from global memory or from mmvq's staged copy (Q4_K runs stage with zero
+    // misalignment, 144 being a multiple of 16).
+    const int2 q4a = *(const int2 *) (bq4_K->qs + 32*g + 8*h);
+    const int2 q4b = *(const int2 *) (bq4_K->qs + 32*g + 8*h + 16);
+
+    const uint16_t * scales = (const uint16_t *)bq4_K->scales;
+    const int jm = g & 1;
+
+    const uint32_t s0 = scales[jm + 0];
+    const uint32_t s2 = scales[jm + 2];
+    const uint32_t s4 = scales[jm + 4];
+
+    const uint32_t hi = (uint32_t) -(int32_t) (g >= 2);
+
+    uint16_t aux[2];
+    aux[0] = (uint16_t) (((s0 & 0x3f3f) & ~hi) | ((((s4 >> 0) & 0x0f0f) | ((s0 & 0xc0c0) >> 2)) & hi));
+    aux[1] = (uint16_t) (((s2 & 0x3f3f) & ~hi) | ((((s4 >> 4) & 0x0f0f) | ((s2 & 0xc0c0) >> 2)) & hi));
+    const uint8_t * sc = (const uint8_t *)aux;
+    const uint8_t * m  = sc + 2;
+
+    float sumf_d = 0.0f;
+    float sumf_m = 0.0f;
+
+#pragma unroll
+    for (int i = 0; i < QR4_K; ++i) {
+        const block_q8_1 * bq8i = bq8_1 + 2*g + i;
+        const float d8 = __low2float(bq8i->ds);
+
+        // q8_1 quants are only 4-byte aligned (36-byte blocks), so these stay 32-bit loads.
+        const int * q8 = (const int *) bq8i->qs + 2*h;
+        const int u0 = q8[0], u1 = q8[1], u4 = q8[4], u5 = q8[5];
+
+        const int v0 = (q4a.x >> (4*i)) & 0x0F0F0F0F;
+        const int v1 = (q4a.y >> (4*i)) & 0x0F0F0F0F;
+        const int v4 = (q4b.x >> (4*i)) & 0x0F0F0F0F;
+        const int v5 = (q4b.y >> (4*i)) & 0x0F0F0F0F;
+
+        // Whole group accumulated as an integer before any float work: 16 products of at most
+        // 15*127, far inside int range and inside float's exact-integer range after the scale.
+        int dot = ggml_cuda_dp4a(v0, u0, 0);
+        dot = ggml_cuda_dp4a(v1, u1, dot);
+        dot = ggml_cuda_dp4a(v4, u4, dot);
+        dot = ggml_cuda_dp4a(v5, u5, dot);
+
+        // Exact sum of the 16 q8 values for the min term, without dp4a: bias each signed byte to
+        // unsigned (x ^ 0x80 == x + 128), add bytes pairwise into 16-bit lanes (each lane <= 2040,
+        // no carry across), fold the lanes and remove the 16*128 bias.
+        const uint32_t a0 = (uint32_t) u0 ^ 0x80808080u, a1 = (uint32_t) u1 ^ 0x80808080u;
+        const uint32_t a4 = (uint32_t) u4 ^ 0x80808080u, a5 = (uint32_t) u5 ^ 0x80808080u;
+        const uint32_t t = (a0 & 0x00FF00FFu) + ((a0 >> 8) & 0x00FF00FFu)
+                         + (a1 & 0x00FF00FFu) + ((a1 >> 8) & 0x00FF00FFu)
+                         + (a4 & 0x00FF00FFu) + ((a4 >> 8) & 0x00FF00FFu)
+                         + (a5 & 0x00FF00FFu) + ((a5 >> 8) & 0x00FF00FFu);
+        const int sum_u = (int) ((t & 0xFFFFu) + (t >> 16)) - 16*128;
+
+        sumf_d += d8 * (float) (dot   * sc[i]);
+        sumf_m += d8 * (float) (sum_u * m[i]);
+    }
+
+    const float2 dm4f = __half22float2(bq4_K->dm);
+    return dm4f.x*sumf_d - dm4f.y*sumf_m;
+#else
     int    v[2];
     int    u[2*QR4_K];
     float d8[QR4_K];
@@ -977,6 +1063,50 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
     const uint8_t * sc = (const uint8_t *)aux;
     const uint8_t * m  = sc + 2;
 
+#if P100_Q4K_DSMIN
+    // The min term needs sum(q8) over each 32-value sub-block. Upstream computes this lane's share
+    // with two dp4a against 0x01010101 per sub-block, and sm_60 has no dp4a: each one is an
+    // 8-instruction emulation, so that is half the kernel's dp4a work spent on a constant. The q8_1
+    // block already carries the sub-block sum in ds.y (sum of the unquantized activations, which is
+    // what the Q4_K MMQ path uses too), so the sub-block's lead lane adds it once instead. The four
+    // lanes sharing a sub-block are (iqs/2)%4 == 0..3 and their partials are summed by the warp
+    // reduction, so one lane carrying the whole term is the same sum.
+    const bool lead = (iqs % 8) == 0;
+
+    float sumf_d = 0.0f;
+    float sumf_m = 0.0f;
+
+#pragma unroll
+    for (int i = 0; i < QR4_K; ++i) {
+        const block_q8_1 * bq8i = bq8_1 + bq8_offset + i;
+        const float2 ds8 = __half22float2(bq8i->ds);
+
+        const int * q8 = (const int *)bq8i->qs + ((iqs/2)%4);
+        const int v0i = (v[0] >> (4*i)) & 0x0F0F0F0F;
+        const int v1i = (v[1] >> (4*i)) & 0x0F0F0F0F;
+
+        const int dot = ggml_cuda_dp4a(v1i, q8[4], ggml_cuda_dp4a(v0i, q8[0], 0));
+
+        sumf_d += ds8.x * (float) (dot * sc[i]);
+#if P100_Q4K_DSMIN == 2
+        // Exact integer sum of this lane's 8 q8 values without dp4a: bias each signed byte to
+        // unsigned (x ^ 0x80 == x + 128), add bytes pairwise into 16-bit lanes (each <= 1020, no
+        // carry across lanes), fold the two lanes, remove the 8*128 bias. Bit-identical to the two
+        // dp4a against 0x01010101 it replaces, in plain integer ops.
+        const uint32_t a = (uint32_t) q8[0] ^ 0x80808080u;
+        const uint32_t b = (uint32_t) q8[4] ^ 0x80808080u;
+        const uint32_t t = (a & 0x00FF00FFu) + ((a >> 8) & 0x00FF00FFu)
+                         + (b & 0x00FF00FFu) + ((b >> 8) & 0x00FF00FFu);
+        const int sum_u = (int) ((t & 0xFFFFu) + (t >> 16)) - 8*128;
+        sumf_m += ds8.x * (float) (sum_u * m[i]);
+#else
+        sumf_m += lead ? ds8.y * (float) m[i] : 0.0f;
+#endif
+    }
+
+    const float2 dm4f = __half22float2(bq4_K->dm);
+    return dm4f.x*sumf_d - dm4f.y*sumf_m;
+#else
     for (int i = 0; i < QR4_K; ++i) {
         const block_q8_1 * bq8i = bq8_1 + bq8_offset + i;
         d8[i] = __low2float(bq8i->ds);
@@ -987,6 +1117,8 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
     }
 
     return vec_dot_q4_K_q8_1_impl_vmmq(v, u, sc, m, bq4_K->dm, d8);
+#endif // P100_Q4K_DSMIN
+#endif // VDR_Q4_K_Q8_1_MMVQ == 4
 }
 
 static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
