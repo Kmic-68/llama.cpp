@@ -9207,6 +9207,8 @@ static const ggml_type other_types[] = {
 #endif
 
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
+struct ggml_type_pair { ggml_type a, b; };
+
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     std::default_random_engine rng(0);
@@ -11172,6 +11174,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int kv : {4096, 16384, 65536}) {
         for (int nb : {512, 2048}) {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
+        }
+    }
+
+    // Same prefill shapes for the fold path's other K/V types (q8_0, and f16 with GGML_CUDA_FA_FOLD=2),
+    // at both head sizes the fold kernels run (256: Qwen3.5/3.8 hybrids, 128: Qwen3-8B)
+    for (int kv : {4096, 16384}) {
+        for (int nb : {512, 2048}) {
+            for (ggml_type_pair tp : { ggml_type_pair{GGML_TYPE_Q8_0, GGML_TYPE_Q8_0}, ggml_type_pair{GGML_TYPE_Q8_0, GGML_TYPE_F16},
+                                       ggml_type_pair{GGML_TYPE_F16,  GGML_TYPE_Q8_0}, ggml_type_pair{GGML_TYPE_Q4_0, GGML_TYPE_Q8_0} }) {
+                test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, tp.a, tp.b));
+                test_cases.emplace_back(new test_flash_attn_ext(128, 128, 8, {4, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, tp.a, tp.b));
+            }
         }
     }
 

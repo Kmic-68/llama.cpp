@@ -332,7 +332,7 @@ static __global__ void fattn_gemm_q_to_f16(
 }
 
 // ---------------------------------------------------------------------------------------------
-// Fold path (GGML_CUDA_FA_FOLD, default on for a q4_0 K/V cache): two hand-written GEMM kernels in
+// Fold path (GGML_CUDA_FA_FOLD, default on for a q4_0 / q8_0 K/V cache; 2 also takes f16): two hand-written GEMM kernels in
 // the style of gemm-fold.cu (fp16 HFMA2 products, half2 chains folded into fp32) replace
 // dequant + cuBLAS QK + softmax + cuBLAS PV + rescale.
 //
@@ -374,12 +374,49 @@ static __device__ __forceinline__ float fold_h(const half2 p) {
     return __int_as_float(v & 0x8FFFE000);                 // = (lo + hi) * 2^-112
 }
 
-// Dequantize one chunk of a q4_0 K and V cache for all KV heads:
+// 32 consecutive values (block b of a row) of a q4_0, q8_0 or f16 K/V row as exact fp32:
+// q4_0 d*(q-8) needs 15 significant bits, q8_0 d*q 19, f16 is f16; all fit the 24 of a float.
+static_assert(QK4_0 == QK8_0, "fold dequant works on 32-value blocks");
+template <ggml_type T>
+static __device__ __forceinline__ void fa_fold_row32(const char * __restrict__ row, const int b, float * __restrict__ v) {
+    if constexpr (T == GGML_TYPE_Q4_0) {
+        const block_q4_0 * blk = (const block_q4_0 *) row + b;
+        const float d = __half2float(blk->d);
+#pragma unroll
+        for (int j = 0; j < QK4_0/2; j++) {
+            const int q = blk->qs[j];
+            v[j]           = d*(float) ((q & 0xF) - 8);
+            v[j + QK4_0/2] = d*(float) ((q >> 4)  - 8);
+        }
+    } else if constexpr (T == GGML_TYPE_Q8_0) {
+        const block_q8_0 * blk = (const block_q8_0 *) row + b;
+        const float d = __half2float(blk->d);
+        const uint16_t * q2 = (const uint16_t *) blk->qs;   // 34-byte blocks: qs is only 2-byte aligned
+#pragma unroll
+        for (int j = 0; j < QK8_0/2; j++) {
+            const int w = q2[j];
+            v[2*j + 0] = d*(float) (int8_t) (w & 0xFF);
+            v[2*j + 1] = d*(float) (int8_t) (w >> 8);
+        }
+    } else {
+        static_assert(T == GGML_TYPE_F16, "unsupported fold KV type");
+        const half2 * p = (const half2 *) row + b*(QK4_0/2);
+#pragma unroll
+        for (int j = 0; j < QK4_0/2; j++) {
+            const float2 f = __half22float2(p[j]);
+            v[2*j + 0] = f.x;
+            v[2*j + 1] = f.y;
+        }
+    }
+}
+
+// Dequantize one chunk of a q4_0 / q8_0 / f16 K and V cache for all KV heads:
 //   K16[h][key][D]              (row per key, D contiguous)
 //   Vp [h][key/2][DV] as half2  (lo lane = even key, hi lane = odd key: the PV A operand)
 // Keys from nkv_c up to the padded chunk are written as zeros (P is zero there too, and 0*garbage
-// could be NaN). Exact nibble values times the block scale, rounded once to half: identical to
+// could be NaN). Exact values (times the block scale) rounded once to half: identical to
 // the generic dequantizer.
+template <ggml_type TK, ggml_type TV>
 static __global__ void fa_fold_dequant(
         const char * __restrict__ K, const char * __restrict__ V,
         half * __restrict__ K16, half2 * __restrict__ Vp,
@@ -403,19 +440,13 @@ static __global__ void fa_fold_dequant(
         const int key = 2*kp + r;
         float * vv = r == 0 ? vlo : vhi;
         if (key < nkv_c) {
-            const block_q4_0 * bk = (const block_q4_0 *) (K + h*nbk2 + (int64_t) (kv_off + key)*nbk1) + b;
-            const block_q4_0 * bv = (const block_q4_0 *) (V + h*nbv2 + (int64_t) (kv_off + key)*nbv1) + b;
-            const float dk = __half2float(bk->d);
-            const float dv = __half2float(bv->d);
+            float kf[QK4_0];
+            fa_fold_row32<TK>(K + h*nbk2 + (int64_t) (kv_off + key)*nbk1, b, kf);
+            fa_fold_row32<TV>(V + h*nbv2 + (int64_t) (kv_off + key)*nbv1, b, vv);
             half kk[QK4_0];
 #pragma unroll
-            for (int j = 0; j < QK4_0/2; j++) {
-                const int qk = bk->qs[j];
-                const int qv = bv->qs[j];
-                kk[j]           = __float2half(dk*(float) ((qk & 0xF) - 8));
-                kk[j + QK4_0/2] = __float2half(dk*(float) ((qk >> 4)  - 8));
-                vv[j]           = dv*(float) ((qv & 0xF) - 8);
-                vv[j + QK4_0/2] = dv*(float) ((qv >> 4)  - 8);
+            for (int j = 0; j < QK4_0; j++) {
+                kk[j] = __float2half(kf[j]);
             }
 #pragma unroll
             for (int j = 0; j < QK4_0; j += 8) {
@@ -440,6 +471,26 @@ static __global__ void fa_fold_dequant(
 #pragma unroll
     for (int j = 0; j < QK4_0; j += 4) {
         *(uint4 *) (vp + j) = *(const uint4 *) (pv + j);
+    }
+}
+
+template <ggml_type TK, typename... A>
+static void fa_fold_dequant_v(const ggml_type tv, const dim3 grid, const int thr, cudaStream_t st, A... a) {
+    switch (tv) {
+        case GGML_TYPE_Q4_0: fa_fold_dequant<TK, GGML_TYPE_Q4_0><<<grid, thr, 0, st>>>(a...); break;
+        case GGML_TYPE_Q8_0: fa_fold_dequant<TK, GGML_TYPE_Q8_0><<<grid, thr, 0, st>>>(a...); break;
+        case GGML_TYPE_F16:  fa_fold_dequant<TK, GGML_TYPE_F16> <<<grid, thr, 0, st>>>(a...); break;
+        default: GGML_ABORT("fold attention: unsupported V type");
+    }
+}
+
+template <typename... A>
+static void fa_fold_dequant_launch(const ggml_type tk, const ggml_type tv, const dim3 grid, const int thr, cudaStream_t st, A... a) {
+    switch (tk) {
+        case GGML_TYPE_Q4_0: fa_fold_dequant_v<GGML_TYPE_Q4_0>(tv, grid, thr, st, a...); break;
+        case GGML_TYPE_Q8_0: fa_fold_dequant_v<GGML_TYPE_Q8_0>(tv, grid, thr, st, a...); break;
+        case GGML_TYPE_F16:  fa_fold_dequant_v<GGML_TYPE_F16> (tv, grid, thr, st, a...); break;
+        default: GGML_ABORT("fold attention: unsupported K type");
     }
 }
 
@@ -1299,13 +1350,24 @@ static bool fa_fold_sass_launch(const int which, const dim3 grid, cudaStream_t s
     return true;
 }
 
+// GGML_CUDA_FA_FOLD: 0 off, 1 (default) q4_0 and q8_0 K/V in any combination, 2 additionally f16 K and/or V.
+static bool fa_fold_type_ok(const ggml_tensor * t, const int mode) {
+    switch (t->type) {
+        case GGML_TYPE_Q4_0:
+        case GGML_TYPE_Q8_0: return true;
+        case GGML_TYPE_F16:  // half2 loads
+            return mode >= 2 && t->nb[1] % 4 == 0 && t->nb[2] % 4 == 0 && (uintptr_t) t->data % 4 == 0;
+        default: return false;
+    }
+}
+
 static bool ggml_cuda_fa_fold_usable(const ggml_tensor * dst) {
     static const int mode = ggml_cuda_fa_fold_env("GGML_CUDA_FA_FOLD", 1);
     const ggml_tensor * Q = dst->src[0];
     const ggml_tensor * K = dst->src[1];
     const ggml_tensor * V = dst->src[2];
     return mode != 0 && !ggml_cuda_fa_gemm_prec32() &&
-        K->type == GGML_TYPE_Q4_0 && V->type == GGML_TYPE_Q4_0 &&
+        fa_fold_type_ok(K, mode) && fa_fold_type_ok(V, mode) &&
         K->ne[0] == V->ne[0] && K->ne[0] % 128 == 0 && K->ne[0] <= 512 &&
         K->ne[2] == V->ne[2] && Q->ne[1]*(Q->ne[2]/K->ne[2]) <= 65535*fa_fold::BN;
 }
@@ -1538,7 +1600,7 @@ static void ggml_cuda_flash_attn_ext_fold(ggml_backend_cuda_context & ctx, ggml_
                 const int nb  = (int) (D/QK4_0);
                 const int kpb = 256/nb;
                 const int npairs = ntile*TK/2;
-                fa_fold_dequant<<<dim3((npairs + kpb - 1)/kpb, nz, 1), kpb*nb, 0, stream>>>(
+                fa_fold_dequant_launch(K->type, V->type, dim3((npairs + kpb - 1)/kpb, nz, 1), kpb*nb, stream,
                     (const char *) K->data + s*K->nb[3], (const char *) V->data + s*V->nb[3],
                     K16.ptr, Vp.ptr, K->nb[1], K->nb[2], V->nb[1], V->nb[2], (int) D, g, (int) C);
                 fa_fold_qk2<<<dim3(ntile, (N + BN - 1)/BN, nz), 256, 0, stream>>>(K16.ptr, Qf16.ptr, mview.data,
@@ -1556,7 +1618,7 @@ static void ggml_cuda_flash_attn_ext_fold(ggml_backend_cuda_context & ctx, ggml_
                 const int nb  = (int) (D/QK4_0);
                 const int kpb = 256/nb;   // key pairs per block
                 const int npairs = ntile*TK/2;
-                fa_fold_dequant<<<dim3((npairs + kpb - 1)/kpb, nz, 1), kpb*nb, 0, stream>>>(
+                fa_fold_dequant_launch(K->type, V->type, dim3((npairs + kpb - 1)/kpb, nz, 1), kpb*nb, stream,
                     (const char *) K->data + s*K->nb[3], (const char *) V->data + s*V->nb[3],
                     K16.ptr, Vp.ptr, K->nb[1], K->nb[2], V->nb[1], V->nb[2], (int) D, g, (int) C);
                 CUDA_CHECK(cudaGetLastError());
