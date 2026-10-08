@@ -1,0 +1,12 @@
+14.32.162.251 I slot print_timing: id  0 | task 804 | prompt processing, n_tokens =  61948, progress = 0.97, t = 156.95 s / 394.71 tokens per second
+14.38.747.098 I slot print_timing: id  0 | task 804 | prompt processing, n_tokens =  63996, progress = 1.00, t = 164.08 s / 390.03 tokens per second
+14.38.913.781 W srv          stop: cancel task, id_task = 804
+14.38.991.141 I slot      release: id  0 | task 804 | stop processing: n_tokens = 64002, truncated = 0
+14.39.135.741 I slot get_availabl: id  0 | task -1 | selected slot by LRU, t_last = 24335579847
+14.39.135.810 I slot launch_slot_: id  0 | task 1227 | processing task, is_child = 0
+14.40.744.718 I slot print_timing: id  0 | task 1227 | prompt eval time =     958.61 ms /    65 tokens (   14.75 ms per token,    67.81 tokens per second)
+14.40.744.723 I slot print_timing: id  0 | task 1227 |        eval time =     649.62 ms /    32 tokens (   20.96 ms per token,    47.72 tokens per second)
+14.40.744.724 I slot print_timing: id  0 | task 1227 |       total time =    1608.23 ms /    97 tokens
+14.40.744.725 I slot print_timing: id  0 | task 1227 |    graphs reused =        712
+14.40.744.730 I slot print_timing: id  0 | task 1227 | draft acceptance = 0.75000 (   21 accepted /    28 generated), mean len =  3.10
+14.40.744.773 I slot      release: id  0 | task 1227 | stop processing: n_tokens = 96, truncated = 0

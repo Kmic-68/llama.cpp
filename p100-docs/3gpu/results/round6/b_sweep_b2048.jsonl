@@ -1,0 +1,8 @@
+{"sc": "a", "rep": 0, "prompt_n": 64000, "prompt_tps": 385.4375131022406, "prompt_s": 166.045073, "total": 166.8383481502533, "error": null}
+{"sc": "b", "rep": 0, "c2_ttft": 164.40196299552917, "c2_total": 167.40385389328003, "c2_tps": 41.31788044604651, "c2_n": 125, "c1_total": 168.44710683822632, "c1_prompt_n": 64000, "c1_prompt_tps": 382.67226500245687, "c1_prompt_s": 167.24494, "c1_error": null, "c2_error": null}
+{"sc": "b", "rep": 1, "c2_ttft": 163.70887279510498, "c2_total": 166.72734832763672, "c2_tps": 42.075912898222015, "c2_n": 128, "c1_total": 167.75483679771423, "c1_prompt_n": 64000, "c1_prompt_tps": 383.621806442119, "c1_prompt_s": 166.830975, "c1_error": null, "c2_error": null}
+{"sc": "c", "rep": 0, "cancel_at_s": 83.0225365, "next_ttft": 84.93152403831482, "next_total": 85.59213662147522, "next_error": null, "slots_idle_s": 85.68899965286255, "close_error": null}
+{"sc": "c", "rep": 1, "cancel_at_s": 83.0225365, "next_ttft": 84.9932701587677, "next_total": 85.64618444442749, "next_error": null, "slots_idle_s": 85.71969223022461, "close_error": null}
+{"sc": "d", "rep": 0, "tps": 36.426395264597126, "n": 512, "ttft": 0.6465327739715576, "draft_n": 664, "draft_acc": 288, "error": null}
+{"sc": "d", "rep": 1, "tps": 36.484262252875354, "n": 512, "ttft": 0.23035454750061035, "draft_n": 662, "draft_acc": 289, "error": null}
+{"sc": "d", "rep": 2, "tps": 38.493223083519595, "n": 512, "ttft": 0.23126459121704102, "draft_n": 631, "draft_acc": 300, "error": null}

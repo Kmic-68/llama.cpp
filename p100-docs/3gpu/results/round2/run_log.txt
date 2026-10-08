@@ -1,0 +1,335 @@
+[02:27:38] P15 QUEUE START (deadline 2026-10-03 11:00:00 EDT)
+[02:27:38] === Item 1: per-token decode budget (XL, -sm tensor, tg512)
+[02:27:38] COOL i1_tg512_graphsunset_k1 waited=0s start_temps=0,35 1,43 2,42  fan3=1225rpm
+[02:27:38] RUN i1_tg512_graphsunset_k1 ::  :: ./build-opt/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -r 3 -o csv
+[02:30:27] END i1_tg512_graphsunset_k1 exit=0
+[02:33:03] COOL i1_tg512_graphs3_k2 waited=156s start_temps=0,37 1,45 2,44  fan3=1406rpm
+[02:33:03] RUN i1_tg512_graphs3_k2 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 :: ./build-opt/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -r 3 -o csv
+[02:35:36] END i1_tg512_graphs3_k2 exit=0
+[02:38:08] COOL i1_tg512_graphs3_k3 waited=152s start_temps=0,38 1,45 2,44  fan3=1415rpm
+[02:38:08] RUN i1_tg512_graphs3_k3 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 :: ./build-opt/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -r 3 -o csv
+[02:40:30] END i1_tg512_graphs3_k3 exit=0
+[02:43:17] COOL i1_tg512_graphsunset_k4 waited=167s start_temps=0,37 1,45 2,44  fan3=1350rpm
+[02:43:17] RUN i1_tg512_graphsunset_k4 ::  :: ./build-opt/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -r 3 -o csv
+[02:46:20] END i1_tg512_graphsunset_k4 exit=0
+[02:49:12] COOL i1_nvprof_graphsunset_n36 waited=172s start_temps=0,38 1,45 2,44  fan3=1384rpm
+[02:49:12] RUN i1_nvprof_graphsunset_n36 :: -e GGML_CUDA_GRAPH_DEBUG=1 :: /usr/local/cuda/bin/nvprof --print-gpu-trace --print-api-trace --csv --normalized-time-unit us --log-file /phase1/results/i1_nvprof_graphsunset_n36.csv ./build-opt/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 36 -r 1 -o csv
+[02:51:21] END i1_nvprof_graphsunset_n36 exit=0
+[02:51:21] COOL i1_nvprof_graphs3_n36 waited=0s start_temps=0,37 1,45 2,43  fan3=1343rpm
+[02:51:21] RUN i1_nvprof_graphs3_n36 :: -e GGML_CUDA_GRAPH_DEBUG=1 -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 :: /usr/local/cuda/bin/nvprof --print-gpu-trace --print-api-trace --csv --normalized-time-unit us --log-file /phase1/results/i1_nvprof_graphs3_n36.csv ./build-opt/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 36 -r 1 -o csv
+[02:53:39] END i1_nvprof_graphs3_n36 exit=0
+[02:53:39] COOL i1_tl_graphsunset waited=0s start_temps=0,36 1,44 2,43  fan3=1291rpm
+[02:53:39] RUN(server) i1_tl_graphsunset :: -e LLAMA_TL=1 :: ./build-opt/bin/llama-server -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -np 1 -fit off --no-mmap --host 127.0.0.1 --port 18080 -c 4096 :: client: python3 $BENCH_DIR/p15client.py tl $BENCH_DIR/prompts/chat.txt 512
+[02:53:42] SERVER DID NOT COME UP i1_tl_graphsunset
+[02:53:42] END i1_tl_graphsunset exit=1 (client rc=1)
+[02:53:42] ALERT: 02:53:42 LOGERROR i1_tl_graphsunset: 
+[02:53:42] P15 QUEUE HALTED (later resumed): ALERT: 02:53:42 LOGERROR i1_tl_graphsunset: 
+[02:54:33] P15 RESUME after flag fix (--no-mmap -> -lm none)
+[02:54:33] P15 QUEUE START (deadline 2026-10-03 11:00:00 EDT)
+[02:54:33] === Item 1: per-token decode budget (XL, -sm tensor, tg512)
+[02:54:33] SKIP i1_tg512_graphsunset_k1 (already done)
+[02:54:33] SKIP i1_tg512_graphs3_k2 (already done)
+[02:54:33] SKIP i1_tg512_graphs3_k3 (already done)
+[02:54:33] SKIP i1_tg512_graphsunset_k4 (already done)
+[02:54:33] SKIP i1_nvprof_graphsunset_n36 (already done)
+[02:54:34] SKIP i1_nvprof_graphs3_n36 (already done)
+[02:54:34] COOL i1_tl_graphsunset waited=0s start_temps=0,36 1,43 2,42  fan3=1300rpm
+[02:54:34] RUN(server) i1_tl_graphsunset :: -e LLAMA_TL=1 :: ./build-opt/bin/llama-server -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -np 1 -fit off -lm none --host 127.0.0.1 --port 18080 -c 4096 :: client: python3 $BENCH_DIR/p15client.py tl $BENCH_DIR/prompts/chat.txt 512
+[02:56:19] SERVER UP i1_tl_graphsunset after 100s
+[02:56:48] END i1_tl_graphsunset exit=0 (client rc=0)
+[02:57:59] COOL i1_tl_graphs3 waited=71s start_temps=0,38 1,45 2,44  fan3=1409rpm
+[02:57:59] RUN(server) i1_tl_graphs3 :: -e LLAMA_TL=1 -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 :: ./build-opt/bin/llama-server -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -np 1 -fit off -lm none --host 127.0.0.1 --port 18080 -c 4096 :: client: python3 $BENCH_DIR/p15client.py tl $BENCH_DIR/prompts/chat.txt 512
+[02:59:36] SERVER UP i1_tl_graphs3 after 90s
+[02:59:58] END i1_tl_graphs3 exit=0 (client rc=0)
+[02:59:58] === Item 2: out-of-tree AllReduce shootout (p2pbench3, 3 GPUs)
+[03:01:14] COOL i2_shootout waited=76s start_temps=0,37 1,45 2,44  fan3=1366rpm
+[03:01:14] RUN i2_shootout ::  :: /phase1/bin/p2pbench3
+[03:03:59] END i2_shootout exit=0
+[03:03:59] === Item 3: decode noise (XL tg512, 5 rounds x 3 variants, -r 3 each)
+[03:03:59] COOL i3_tg512_base_r1 waited=0s start_temps=0,39 1,45 2,44  fan3=1391rpm
+[03:03:59] RUN i3_tg512_base_r1 ::  :: ./build-opt/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -r 3 -o csv
+[03:07:11] END i3_tg512_base_r1 exit=0
+[03:09:43] COOL i3_tg512_pin_r1 waited=152s start_temps=0,38 1,45 2,44  fan3=1403rpm
+[03:09:43] RUN i3_tg512_pin_r1 ::  :: taskset -c 0-5 ./build-opt/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -r 3 -o csv
+[03:12:41] END i3_tg512_pin_r1 exit=0
+[03:15:28] COOL i3_tg512_t1_r1 waited=167s start_temps=0,38 1,45 2,44  fan3=1348rpm
+[03:15:28] RUN i3_tg512_t1_r1 ::  :: ./build-opt/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -r 3 -t 1 -o csv
+[03:18:31] END i3_tg512_t1_r1 exit=0
+[03:21:07] COOL i3_tg512_pin_r2 waited=156s start_temps=0,38 1,45 2,44  fan3=1400rpm
+[03:21:07] RUN i3_tg512_pin_r2 ::  :: taskset -c 0-5 ./build-opt/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -r 3 -o csv
+[03:23:47] END i3_tg512_pin_r2 exit=0
+[03:26:39] COOL i3_tg512_t1_r2 waited=172s start_temps=0,38 1,45 2,44  fan3=1348rpm
+[03:26:39] RUN i3_tg512_t1_r2 ::  :: ./build-opt/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -r 3 -t 1 -o csv
+[03:29:47] END i3_tg512_t1_r2 exit=0
+[03:32:34] COOL i3_tg512_base_r2 waited=167s start_temps=0,38 1,45 2,44  fan3=1380rpm
+[03:32:34] RUN i3_tg512_base_r2 ::  :: ./build-opt/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -r 3 -o csv
+[03:35:15] END i3_tg512_base_r2 exit=0
+[03:37:57] COOL i3_tg512_t1_r3 waited=162s start_temps=0,38 1,45 2,44  fan3=1416rpm
+[03:37:57] RUN i3_tg512_t1_r3 ::  :: ./build-opt/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -r 3 -t 1 -o csv
+[03:40:50] END i3_tg512_t1_r3 exit=0
+[03:43:37] COOL i3_tg512_base_r3 waited=167s start_temps=0,38 1,45 2,44  fan3=1394rpm
+[03:43:37] RUN i3_tg512_base_r3 ::  :: ./build-opt/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -r 3 -o csv
+[03:46:39] END i3_tg512_base_r3 exit=0
+[03:48:55] COOL i3_tg512_pin_r3 waited=136s start_temps=0,38 1,45 2,44  fan3=1336rpm
+[03:48:55] RUN i3_tg512_pin_r3 ::  :: taskset -c 0-5 ./build-opt/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -r 3 -o csv
+[03:51:48] END i3_tg512_pin_r3 exit=0
+[03:53:44] COOL i3_tg512_base_r4 waited=116s start_temps=0,37 1,45 2,44  fan3=1409rpm
+[03:53:44] RUN i3_tg512_base_r4 ::  :: ./build-opt/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -r 3 -o csv
+[03:56:34] END i3_tg512_base_r4 exit=0
+[03:58:41] COOL i3_tg512_pin_r4 waited=127s start_temps=0,38 1,45 2,44  fan3=1367rpm
+[03:58:41] RUN i3_tg512_pin_r4 ::  :: taskset -c 0-5 ./build-opt/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -r 3 -o csv
+[04:01:39] END i3_tg512_pin_r4 exit=0
+[04:03:55] COOL i3_tg512_t1_r4 waited=136s start_temps=0,38 1,45 2,44  fan3=1409rpm
+[04:03:55] RUN i3_tg512_t1_r4 ::  :: ./build-opt/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -r 3 -t 1 -o csv
+[04:06:27] END i3_tg512_t1_r4 exit=0
+[04:08:53] COOL i3_tg512_pin_r5 waited=146s start_temps=0,38 1,45 2,44  fan3=1410rpm
+[04:08:53] RUN i3_tg512_pin_r5 ::  :: taskset -c 0-5 ./build-opt/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -r 3 -o csv
+[04:12:00] END i3_tg512_pin_r5 exit=0
+[04:14:27] COOL i3_tg512_t1_r5 waited=147s start_temps=0,38 1,45 2,44  fan3=1394rpm
+[04:14:27] RUN i3_tg512_t1_r5 ::  :: ./build-opt/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -r 3 -t 1 -o csv
+[04:17:23] END i3_tg512_t1_r5 exit=0
+[04:19:59] COOL i3_tg512_base_r5 waited=156s start_temps=0,38 1,45 2,44  fan3=1400rpm
+[04:19:59] RUN i3_tg512_base_r5 ::  :: ./build-opt/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -r 3 -o csv
+[04:23:35] END i3_tg512_base_r5 exit=0
+[04:23:36] === Item 4: layer split pp65536 + pp16384 nvprof timeline (XL)
+[04:26:02] COOL i4_pp65536_layer_XL waited=146s start_temps=0,38 1,45 2,44  fan3=1373rpm
+[04:26:02] RUN i4_pp65536_layer_XL ::  :: ./build-opt/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm layer -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 65536 -n 0 -r 3 -o csv
+[04:39:21] END i4_pp65536_layer_XL exit=0
+[04:43:03] COOL i4_nvprof_pp16384_layer_XL waited=222s start_temps=0,37 1,45 2,43  fan3=1343rpm
+[04:43:03] RUN i4_nvprof_pp16384_layer_XL ::  :: /usr/local/cuda/bin/nvprof --print-gpu-trace --csv --normalized-time-unit us --log-file /phase1/results/i4_nvprof_pp16384_layer_XL.csv ./build-opt/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm layer -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 16384 -n 0 -r 1 -o csv
+[04:46:10] END i4_nvprof_pp16384_layer_XL exit=0
+[04:46:10] === Item 5: decode at depth (XL tg512, -d 16384 / 65536, tensor vs layer, -r 3)
+[04:48:36] COOL i5_tg512_d16384_tensor waited=146s start_temps=0,37 1,45 2,43  fan3=1404rpm
+[04:48:36] RUN i5_tg512_d16384_tensor ::  :: ./build-opt/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -d 16384 -r 3 -o csv
+[04:53:19] END i5_tg512_d16384_tensor exit=0
+[04:55:40] COOL i5_tg512_d16384_layer waited=141s start_temps=0,37 1,45 2,44  fan3=1398rpm
+[04:55:40] RUN i5_tg512_d16384_layer ::  :: ./build-opt/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm layer -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -d 16384 -r 3 -o csv
+[04:59:34] END i5_tg512_d16384_layer exit=0
+[05:01:10] COOL i5_tg512_d65536_layer waited=96s start_temps=0,37 1,45 2,45  fan3=1393rpm
+[05:01:10] RUN i5_tg512_d65536_layer ::  :: ./build-opt/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm layer -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -d 65536 -r 3 -o csv
+[05:07:52] END i5_tg512_d65536_layer exit=0
+[05:10:24] COOL i5_tg512_d65536_tensor waited=152s start_temps=0,37 1,45 2,44  fan3=1356rpm
+[05:10:24] RUN i5_tg512_d65536_tensor ::  :: ./build-opt/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -d 65536 -r 3 -o csv
+[05:18:35] END i5_tg512_d65536_tensor exit=0
+[05:18:35] === Item 6: MTP grid (XL, -sm tensor, llama-speculative-simple)
+[05:21:47] COOL i6_mtp_n3_p0.0_chat waited=192s start_temps=0,38 1,45 2,44  fan3=1396rpm
+[05:21:47] RUN i6_mtp_n3_p0.0_chat :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 :: ./build-opt/bin/llama-speculative-simple -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.0 -ngld 99 -f /phase1/prompts/chat.txt -n 256 --temp 0 --top-k 1 --seed 42 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -c 16384 -b 32768 -ub 2048 -fit off -lm none
+[05:23:52] END i6_mtp_n3_p0.0_chat exit=0
+[05:24:07] COOL i6_mtp_n3_p0.0_code waited=15s start_temps=0,38 1,45 2,44  fan3=1393rpm
+[05:24:07] RUN i6_mtp_n3_p0.0_code :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 :: ./build-opt/bin/llama-speculative-simple -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.0 -ngld 99 -f /phase1/prompts/code.txt -n 256 --temp 0 --top-k 1 --seed 42 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -c 16384 -b 32768 -ub 2048 -fit off -lm none
+[05:26:36] END i6_mtp_n3_p0.0_code exit=0
+[05:26:41] COOL i6_mtp_n3_p0.0_summ waited=5s start_temps=0,38 1,45 2,44  fan3=1391rpm
+[05:26:41] RUN i6_mtp_n3_p0.0_summ :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 :: ./build-opt/bin/llama-speculative-simple -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.0 -ngld 99 -f /phase1/prompts/summ.txt -n 256 --temp 0 --top-k 1 --seed 42 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -c 16384 -b 32768 -ub 2048 -fit off -lm none
+[05:29:41] END i6_mtp_n3_p0.0_summ exit=0
+[05:30:37] COOL i6_mtp_n4_p0.5_chat waited=56s start_temps=0,38 1,45 2,44  fan3=1337rpm
+[05:30:37] RUN i6_mtp_n4_p0.5_chat :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 :: ./build-opt/bin/llama-speculative-simple -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf --spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min 0.5 -ngld 99 -f /phase1/prompts/chat.txt -n 256 --temp 0 --top-k 1 --seed 42 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -c 16384 -b 32768 -ub 2048 -fit off -lm none
+[05:32:49] END i6_mtp_n4_p0.5_chat exit=0
+[05:32:55] COOL i6_mtp_n4_p0.5_code waited=5s start_temps=0,38 1,45 2,44  fan3=1433rpm
+[05:32:55] RUN i6_mtp_n4_p0.5_code :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 :: ./build-opt/bin/llama-speculative-simple -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf --spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min 0.5 -ngld 99 -f /phase1/prompts/code.txt -n 256 --temp 0 --top-k 1 --seed 42 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -c 16384 -b 32768 -ub 2048 -fit off -lm none
+[05:35:30] END i6_mtp_n4_p0.5_code exit=0
+[05:35:30] COOL i6_mtp_n4_p0.5_summ waited=0s start_temps=0,38 1,45 2,44  fan3=1586rpm
+[05:35:30] RUN i6_mtp_n4_p0.5_summ :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 :: ./build-opt/bin/llama-speculative-simple -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf --spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min 0.5 -ngld 99 -f /phase1/prompts/summ.txt -n 256 --temp 0 --top-k 1 --seed 42 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -c 16384 -b 32768 -ub 2048 -fit off -lm none
+[05:38:38] END i6_mtp_n4_p0.5_summ exit=0
+[05:39:34] COOL i6_mtp_n5_p0.75_chat waited=56s start_temps=0,38 1,45 2,44  fan3=1409rpm
+[05:39:34] RUN i6_mtp_n5_p0.75_chat :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 :: ./build-opt/bin/llama-speculative-simple -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf --spec-type draft-mtp --spec-draft-n-max 5 --spec-draft-p-min 0.75 -ngld 99 -f /phase1/prompts/chat.txt -n 256 --temp 0 --top-k 1 --seed 42 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -c 16384 -b 32768 -ub 2048 -fit off -lm none
+[05:41:38] END i6_mtp_n5_p0.75_chat exit=0
+[05:41:43] COOL i6_mtp_n5_p0.75_code waited=5s start_temps=0,38 1,45 2,44  fan3=1369rpm
+[05:41:43] RUN i6_mtp_n5_p0.75_code :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 :: ./build-opt/bin/llama-speculative-simple -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf --spec-type draft-mtp --spec-draft-n-max 5 --spec-draft-p-min 0.75 -ngld 99 -f /phase1/prompts/code.txt -n 256 --temp 0 --top-k 1 --seed 42 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -c 16384 -b 32768 -ub 2048 -fit off -lm none
+[05:44:04] END i6_mtp_n5_p0.75_code exit=0
+[05:44:09] COOL i6_mtp_n5_p0.75_summ waited=5s start_temps=0,37 1,45 2,44  fan3=1396rpm
+[05:44:09] RUN i6_mtp_n5_p0.75_summ :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 :: ./build-opt/bin/llama-speculative-simple -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf --spec-type draft-mtp --spec-draft-n-max 5 --spec-draft-p-min 0.75 -ngld 99 -f /phase1/prompts/summ.txt -n 256 --temp 0 --top-k 1 --seed 42 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -c 16384 -b 32768 -ub 2048 -fit off -lm none
+[05:47:02] END i6_mtp_n5_p0.75_summ exit=0
+[05:48:03] COOL i6_mtp_n3_p0.9_chat waited=61s start_temps=0,38 1,45 2,44  fan3=1351rpm
+[05:48:03] RUN i6_mtp_n3_p0.9_chat :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 :: ./build-opt/bin/llama-speculative-simple -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.9 -ngld 99 -f /phase1/prompts/chat.txt -n 256 --temp 0 --top-k 1 --seed 42 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -c 16384 -b 32768 -ub 2048 -fit off -lm none
+[05:50:20] END i6_mtp_n3_p0.9_chat exit=0
+[05:50:25] COOL i6_mtp_n3_p0.9_code waited=5s start_temps=0,38 1,45 2,44  fan3=1354rpm
+[05:50:26] RUN i6_mtp_n3_p0.9_code :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 :: ./build-opt/bin/llama-speculative-simple -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.9 -ngld 99 -f /phase1/prompts/code.txt -n 256 --temp 0 --top-k 1 --seed 42 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -c 16384 -b 32768 -ub 2048 -fit off -lm none
+[05:52:27] END i6_mtp_n3_p0.9_code exit=0
+[05:52:32] COOL i6_mtp_n3_p0.9_summ waited=5s start_temps=0,38 1,45 2,44  fan3=1386rpm
+[05:52:32] RUN i6_mtp_n3_p0.9_summ :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 :: ./build-opt/bin/llama-speculative-simple -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.9 -ngld 99 -f /phase1/prompts/summ.txt -n 256 --temp 0 --top-k 1 --seed 42 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -c 16384 -b 32768 -ub 2048 -fit off -lm none
+[05:55:10] END i6_mtp_n3_p0.9_summ exit=0
+[05:56:11] COOL i6_mtp_n4_p0.0_chat waited=61s start_temps=0,38 1,45 2,44  fan3=1400rpm
+[05:56:11] RUN i6_mtp_n4_p0.0_chat :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 :: ./build-opt/bin/llama-speculative-simple -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf --spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min 0.0 -ngld 99 -f /phase1/prompts/chat.txt -n 256 --temp 0 --top-k 1 --seed 42 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -c 16384 -b 32768 -ub 2048 -fit off -lm none
+[05:58:17] END i6_mtp_n4_p0.0_chat exit=0
+[05:58:22] COOL i6_mtp_n4_p0.0_code waited=5s start_temps=0,38 1,45 2,44  fan3=1453rpm
+[05:58:22] RUN i6_mtp_n4_p0.0_code :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 :: ./build-opt/bin/llama-speculative-simple -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf --spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min 0.0 -ngld 99 -f /phase1/prompts/code.txt -n 256 --temp 0 --top-k 1 --seed 42 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -c 16384 -b 32768 -ub 2048 -fit off -lm none
+[06:00:02] END i6_mtp_n4_p0.0_code exit=0
+[06:00:13] COOL i6_mtp_n4_p0.0_summ waited=11s start_temps=0,38 1,45 2,44  fan3=1383rpm
+[06:00:13] RUN i6_mtp_n4_p0.0_summ :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 :: ./build-opt/bin/llama-speculative-simple -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf --spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min 0.0 -ngld 99 -f /phase1/prompts/summ.txt -n 256 --temp 0 --top-k 1 --seed 42 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -c 16384 -b 32768 -ub 2048 -fit off -lm none
+[06:02:45] END i6_mtp_n4_p0.0_summ exit=0
+[06:03:51] COOL i6_mtp_n5_p0.5_chat waited=65s start_temps=0,38 1,45 2,44  fan3=1344rpm
+[06:03:51] RUN i6_mtp_n5_p0.5_chat :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 :: ./build-opt/bin/llama-speculative-simple -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf --spec-type draft-mtp --spec-draft-n-max 5 --spec-draft-p-min 0.5 -ngld 99 -f /phase1/prompts/chat.txt -n 256 --temp 0 --top-k 1 --seed 42 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -c 16384 -b 32768 -ub 2048 -fit off -lm none
+[06:06:13] END i6_mtp_n5_p0.5_chat exit=0
+[06:06:18] COOL i6_mtp_n5_p0.5_code waited=5s start_temps=0,38 1,45 2,44  fan3=1386rpm
+[06:06:18] RUN i6_mtp_n5_p0.5_code :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 :: ./build-opt/bin/llama-speculative-simple -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf --spec-type draft-mtp --spec-draft-n-max 5 --spec-draft-p-min 0.5 -ngld 99 -f /phase1/prompts/code.txt -n 256 --temp 0 --top-k 1 --seed 42 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -c 16384 -b 32768 -ub 2048 -fit off -lm none
+[06:08:28] END i6_mtp_n5_p0.5_code exit=0
+[06:08:34] COOL i6_mtp_n5_p0.5_summ waited=5s start_temps=0,38 1,45 2,44  fan3=1393rpm
+[06:08:34] RUN i6_mtp_n5_p0.5_summ :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 :: ./build-opt/bin/llama-speculative-simple -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf --spec-type draft-mtp --spec-draft-n-max 5 --spec-draft-p-min 0.5 -ngld 99 -f /phase1/prompts/summ.txt -n 256 --temp 0 --top-k 1 --seed 42 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -c 16384 -b 32768 -ub 2048 -fit off -lm none
+[06:11:11] END i6_mtp_n5_p0.5_summ exit=0
+[06:11:56] COOL i6_mtp_n3_p0.75_chat waited=45s start_temps=0,38 1,45 2,44  fan3=1394rpm
+[06:11:56] RUN i6_mtp_n3_p0.75_chat :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 :: ./build-opt/bin/llama-speculative-simple -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.75 -ngld 99 -f /phase1/prompts/chat.txt -n 256 --temp 0 --top-k 1 --seed 42 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -c 16384 -b 32768 -ub 2048 -fit off -lm none
+[06:14:27] END i6_mtp_n3_p0.75_chat exit=0
+[06:14:27] COOL i6_mtp_n3_p0.75_code waited=0s start_temps=0,38 1,45 2,44  fan3=1483rpm
+[06:14:27] RUN i6_mtp_n3_p0.75_code :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 :: ./build-opt/bin/llama-speculative-simple -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.75 -ngld 99 -f /phase1/prompts/code.txt -n 256 --temp 0 --top-k 1 --seed 42 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -c 16384 -b 32768 -ub 2048 -fit off -lm none
+[06:16:56] END i6_mtp_n3_p0.75_code exit=0
+[06:16:56] COOL i6_mtp_n3_p0.75_summ waited=0s start_temps=0,37 1,45 2,44  fan3=1456rpm
+[06:16:56] RUN i6_mtp_n3_p0.75_summ :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 :: ./build-opt/bin/llama-speculative-simple -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.75 -ngld 99 -f /phase1/prompts/summ.txt -n 256 --temp 0 --top-k 1 --seed 42 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -c 16384 -b 32768 -ub 2048 -fit off -lm none
+[06:20:03] END i6_mtp_n3_p0.75_summ exit=0
+[06:20:28] COOL i6_mtp_n4_p0.9_chat waited=25s start_temps=0,38 1,45 2,44  fan3=1381rpm
+[06:20:28] RUN i6_mtp_n4_p0.9_chat :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 :: ./build-opt/bin/llama-speculative-simple -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf --spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min 0.9 -ngld 99 -f /phase1/prompts/chat.txt -n 256 --temp 0 --top-k 1 --seed 42 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -c 16384 -b 32768 -ub 2048 -fit off -lm none
+[06:22:53] END i6_mtp_n4_p0.9_chat exit=0
+[06:22:53] COOL i6_mtp_n4_p0.9_code waited=0s start_temps=0,38 1,45 2,44  fan3=1472rpm
+[06:22:53] RUN i6_mtp_n4_p0.9_code :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 :: ./build-opt/bin/llama-speculative-simple -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf --spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min 0.9 -ngld 99 -f /phase1/prompts/code.txt -n 256 --temp 0 --top-k 1 --seed 42 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -c 16384 -b 32768 -ub 2048 -fit off -lm none
+[06:25:47] END i6_mtp_n4_p0.9_code exit=0
+[06:25:47] COOL i6_mtp_n4_p0.9_summ waited=0s start_temps=0,38 1,45 2,44  fan3=1443rpm
+[06:25:47] RUN i6_mtp_n4_p0.9_summ :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 :: ./build-opt/bin/llama-speculative-simple -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf --spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min 0.9 -ngld 99 -f /phase1/prompts/summ.txt -n 256 --temp 0 --top-k 1 --seed 42 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -c 16384 -b 32768 -ub 2048 -fit off -lm none
+[06:28:53] END i6_mtp_n4_p0.9_summ exit=0
+[06:29:34] COOL i6_mtp_n5_p0.0_chat waited=40s start_temps=0,38 1,45 2,44  fan3=1407rpm
+[06:29:34] RUN i6_mtp_n5_p0.0_chat :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 :: ./build-opt/bin/llama-speculative-simple -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf --spec-type draft-mtp --spec-draft-n-max 5 --spec-draft-p-min 0.0 -ngld 99 -f /phase1/prompts/chat.txt -n 256 --temp 0 --top-k 1 --seed 42 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -c 16384 -b 32768 -ub 2048 -fit off -lm none
+[06:31:40] END i6_mtp_n5_p0.0_chat exit=0
+[06:31:51] COOL i6_mtp_n5_p0.0_code waited=11s start_temps=0,37 1,45 2,43  fan3=1362rpm
+[06:31:51] RUN i6_mtp_n5_p0.0_code :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 :: ./build-opt/bin/llama-speculative-simple -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf --spec-type draft-mtp --spec-draft-n-max 5 --spec-draft-p-min 0.0 -ngld 99 -f /phase1/prompts/code.txt -n 256 --temp 0 --top-k 1 --seed 42 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -c 16384 -b 32768 -ub 2048 -fit off -lm none
+[06:34:53] END i6_mtp_n5_p0.0_code exit=0
+[06:34:58] COOL i6_mtp_n5_p0.0_summ waited=5s start_temps=0,37 1,45 2,43  fan3=1359rpm
+[06:34:58] RUN i6_mtp_n5_p0.0_summ :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 :: ./build-opt/bin/llama-speculative-simple -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf --spec-type draft-mtp --spec-draft-n-max 5 --spec-draft-p-min 0.0 -ngld 99 -f /phase1/prompts/summ.txt -n 256 --temp 0 --top-k 1 --seed 42 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -c 16384 -b 32768 -ub 2048 -fit off -lm none
+[06:38:02] END i6_mtp_n5_p0.0_summ exit=0
+[06:38:48] COOL i6_mtp_n3_p0.5_chat waited=46s start_temps=0,38 1,45 2,44  fan3=1412rpm
+[06:38:48] RUN i6_mtp_n3_p0.5_chat :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 :: ./build-opt/bin/llama-speculative-simple -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.5 -ngld 99 -f /phase1/prompts/chat.txt -n 256 --temp 0 --top-k 1 --seed 42 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -c 16384 -b 32768 -ub 2048 -fit off -lm none
+[06:40:43] END i6_mtp_n3_p0.5_chat exit=0
+[06:40:48] COOL i6_mtp_n3_p0.5_code waited=5s start_temps=0,38 1,45 2,44  fan3=1376rpm
+[06:40:48] RUN i6_mtp_n3_p0.5_code :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 :: ./build-opt/bin/llama-speculative-simple -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.5 -ngld 99 -f /phase1/prompts/code.txt -n 256 --temp 0 --top-k 1 --seed 42 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -c 16384 -b 32768 -ub 2048 -fit off -lm none
+[06:43:33] END i6_mtp_n3_p0.5_code exit=0
+[06:43:38] COOL i6_mtp_n3_p0.5_summ waited=5s start_temps=0,37 1,45 2,43  fan3=1330rpm
+[06:43:38] RUN i6_mtp_n3_p0.5_summ :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 :: ./build-opt/bin/llama-speculative-simple -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.5 -ngld 99 -f /phase1/prompts/summ.txt -n 256 --temp 0 --top-k 1 --seed 42 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -c 16384 -b 32768 -ub 2048 -fit off -lm none
+[06:46:28] END i6_mtp_n3_p0.5_summ exit=0
+[06:47:19] COOL i6_mtp_n4_p0.75_chat waited=51s start_temps=0,38 1,45 2,44  fan3=1401rpm
+[06:47:19] RUN i6_mtp_n4_p0.75_chat :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 :: ./build-opt/bin/llama-speculative-simple -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf --spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min 0.75 -ngld 99 -f /phase1/prompts/chat.txt -n 256 --temp 0 --top-k 1 --seed 42 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -c 16384 -b 32768 -ub 2048 -fit off -lm none
+[06:49:43] END i6_mtp_n4_p0.75_chat exit=0
+[06:49:48] COOL i6_mtp_n4_p0.75_code waited=5s start_temps=0,38 1,45 2,44  fan3=1390rpm
+[06:49:48] RUN i6_mtp_n4_p0.75_code :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 :: ./build-opt/bin/llama-speculative-simple -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf --spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min 0.75 -ngld 99 -f /phase1/prompts/code.txt -n 256 --temp 0 --top-k 1 --seed 42 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -c 16384 -b 32768 -ub 2048 -fit off -lm none
+[06:52:34] END i6_mtp_n4_p0.75_code exit=0
+[06:52:34] COOL i6_mtp_n4_p0.75_summ waited=0s start_temps=0,38 1,45 2,44  fan3=1532rpm
+[06:52:34] RUN i6_mtp_n4_p0.75_summ :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 :: ./build-opt/bin/llama-speculative-simple -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf --spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min 0.75 -ngld 99 -f /phase1/prompts/summ.txt -n 256 --temp 0 --top-k 1 --seed 42 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -c 16384 -b 32768 -ub 2048 -fit off -lm none
+[06:55:21] END i6_mtp_n4_p0.75_summ exit=0
+[06:56:11] COOL i6_mtp_n5_p0.9_chat waited=50s start_temps=0,38 1,45 2,44  fan3=1397rpm
+[06:56:11] RUN i6_mtp_n5_p0.9_chat :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 :: ./build-opt/bin/llama-speculative-simple -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf --spec-type draft-mtp --spec-draft-n-max 5 --spec-draft-p-min 0.9 -ngld 99 -f /phase1/prompts/chat.txt -n 256 --temp 0 --top-k 1 --seed 42 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -c 16384 -b 32768 -ub 2048 -fit off -lm none
+[06:58:17] END i6_mtp_n5_p0.9_chat exit=0
+[06:58:22] COOL i6_mtp_n5_p0.9_code waited=5s start_temps=0,38 1,45 2,44  fan3=1404rpm
+[06:58:22] RUN i6_mtp_n5_p0.9_code :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 :: ./build-opt/bin/llama-speculative-simple -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf --spec-type draft-mtp --spec-draft-n-max 5 --spec-draft-p-min 0.9 -ngld 99 -f /phase1/prompts/code.txt -n 256 --temp 0 --top-k 1 --seed 42 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -c 16384 -b 32768 -ub 2048 -fit off -lm none
+[07:01:07] END i6_mtp_n5_p0.9_code exit=0
+[07:01:12] COOL i6_mtp_n5_p0.9_summ waited=5s start_temps=0,37 1,45 2,43  fan3=1397rpm
+[07:01:12] RUN i6_mtp_n5_p0.9_summ :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 :: ./build-opt/bin/llama-speculative-simple -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf --spec-type draft-mtp --spec-draft-n-max 5 --spec-draft-p-min 0.9 -ngld 99 -f /phase1/prompts/summ.txt -n 256 --temp 0 --top-k 1 --seed 42 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -c 16384 -b 32768 -ub 2048 -fit off -lm none
+[07:04:00] END i6_mtp_n5_p0.9_summ exit=0
+[07:04:00] === Item 7: prefill -ub sweep (XL, -sm tensor, -b 32768, pp2048, -r 3)
+[07:04:51] COOL i7_pp2048_d0_ub512 waited=51s start_temps=0,38 1,45 2,44  fan3=1404rpm
+[07:04:51] RUN i7_pp2048_d0_ub512 ::  :: ./build-opt/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 512 -p 2048 -n 0 -d 0 -r 3 -o csv
+[07:07:44] END i7_pp2048_d0_ub512 exit=0
+[07:08:44] COOL i7_pp2048_d0_ub1024 waited=60s start_temps=0,38 1,45 2,44  fan3=1363rpm
+[07:08:44] RUN i7_pp2048_d0_ub1024 ::  :: ./build-opt/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 1024 -p 2048 -n 0 -d 0 -r 3 -o csv
+[07:11:21] END i7_pp2048_d0_ub1024 exit=0
+[07:12:12] COOL i7_pp2048_d0_ub2048 waited=51s start_temps=0,38 1,45 2,44  fan3=1370rpm
+[07:12:12] RUN i7_pp2048_d0_ub2048 ::  :: ./build-opt/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -d 0 -r 3 -o csv
+[07:15:24] END i7_pp2048_d0_ub2048 exit=0
+[07:16:00] COOL i7_pp2048_d0_ub4096 waited=36s start_temps=0,38 1,45 2,44  fan3=1397rpm
+[07:16:00] RUN i7_pp2048_d0_ub4096 ::  :: ./build-opt/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 4096 -p 2048 -n 0 -d 0 -r 3 -o csv
+[07:18:37] END i7_pp2048_d0_ub4096 exit=0
+[07:19:12] COOL i7_pp2048_d16384_ub4096 waited=35s start_temps=0,38 1,45 2,44  fan3=1396rpm
+[07:19:12] RUN i7_pp2048_d16384_ub4096 ::  :: ./build-opt/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 4096 -p 2048 -n 0 -d 16384 -r 3 -o csv
+[07:23:10] END i7_pp2048_d16384_ub4096 exit=0
+[07:24:26] COOL i7_pp2048_d16384_ub2048 waited=76s start_temps=0,38 1,45 2,44  fan3=1410rpm
+[07:24:26] RUN i7_pp2048_d16384_ub2048 ::  :: ./build-opt/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -d 16384 -r 3 -o csv
+[07:28:29] END i7_pp2048_d16384_ub2048 exit=0
+[07:29:35] COOL i7_pp2048_d16384_ub1024 waited=66s start_temps=0,38 1,45 2,44  fan3=1397rpm
+[07:29:35] RUN i7_pp2048_d16384_ub1024 ::  :: ./build-opt/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 1024 -p 2048 -n 0 -d 16384 -r 3 -o csv
+[07:33:27] END i7_pp2048_d16384_ub1024 exit=0
+[07:35:08] COOL i7_pp2048_d16384_ub512 waited=101s start_temps=0,38 1,45 2,44  fan3=1404rpm
+[07:35:08] RUN i7_pp2048_d16384_ub512 ::  :: ./build-opt/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 512 -p 2048 -n 0 -d 16384 -r 3 -o csv
+[07:38:27] END i7_pp2048_d16384_ub512 exit=0
+[07:38:27] === Item 8: pure Q6_K reference (requantized from the unsloth Q8_0)
+[07:40:28] COOL i8_quantize waited=121s start_temps=0,38 1,45 2,44  fan3=1398rpm
+[07:40:28] RUN i8_quantize ::  :: ./build-opt/bin/llama-quantize --allow-requantize --pure /models/Qwen3.8-27B-Q8_0.gguf /quant/Qwen3.8-27B-pure-Q6_K.gguf Q6_K
+[07:51:01] END i8_quantize exit=0
+[07:51:03] COOL i8_tg512_Q6K waited=0s start_temps=0,35 1,42 2,41  fan3=1175rpm
+[07:51:03] RUN i8_tg512_Q6K ::  :: ./build-opt/bin/llama-bench -lm none -m /quant/Qwen3.8-27B-pure-Q6_K.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -r 3 -o csv
+[07:55:35] END i8_tg512_Q6K exit=0
+[07:57:31] COOL i8_tg512_XL waited=116s start_temps=0,38 1,45 2,44  fan3=1393rpm
+[07:57:31] RUN i8_tg512_XL ::  :: ./build-opt/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -r 3 -o csv
+[08:01:17] END i8_tg512_XL exit=0
+[08:03:33] COOL i8_pp512_XL waited=136s start_temps=0,37 1,45 2,44  fan3=1406rpm
+[08:03:33] RUN i8_pp512_XL ::  :: ./build-opt/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 512 -n 0 -r 3 -o csv
+[08:06:01] END i8_pp512_XL exit=0
+[08:06:06] COOL i8_pp512_Q6K waited=5s start_temps=0,38 1,45 2,44  fan3=1409rpm
+[08:06:06] RUN i8_pp512_Q6K ::  :: ./build-opt/bin/llama-bench -lm none -m /quant/Qwen3.8-27B-pure-Q6_K.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 512 -n 0 -r 3 -o csv
+[08:09:53] END i8_pp512_Q6K exit=0
+[08:09:58] COOL i8_pp2048_Q6K waited=5s start_temps=0,37 1,45 2,43  fan3=1390rpm
+[08:09:58] RUN i8_pp2048_Q6K ::  :: ./build-opt/bin/llama-bench -lm none -m /quant/Qwen3.8-27B-pure-Q6_K.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -r 3 -o csv
+[08:13:44] END i8_pp2048_Q6K exit=0
+[08:14:14] COOL i8_pp2048_XL waited=30s start_temps=0,38 1,45 2,44  fan3=1341rpm
+[08:14:14] RUN i8_pp2048_XL ::  :: ./build-opt/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -r 3 -o csv
+[08:17:23] END i8_pp2048_XL exit=0
+[08:17:23] === Item 9: thermal soak (30 min, XL, -sm tensor, server: pp2048 + tg512 per request, back to back)
+[08:17:48] COOL i9_soak waited=25s start_temps=0,38 1,45 2,44  fan3=1400rpm
+[08:17:48] RUN(server) i9_soak ::  :: ./build-opt/bin/llama-server -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -np 1 -fit off -lm none --host 127.0.0.1 --port 18080 -c 8192 :: client: python3 $BENCH_DIR/p15client.py soak $BENCH_DIR/prompts/soak.txt 1800 2048 512
+[08:19:24] SERVER UP i9_soak after 90s
+[08:49:57] END i9_soak exit=0 (client rc=0)
+[08:49:57] === Item 10 (optional): NCCL build (-DGGML_CUDA_NCCL=ON, separate build dir), tg512 / pp2048 / pp2048@16384
+[08:53:29] COOL i10_tg512_nccl waited=212s start_temps=0,37 1,45 2,44  fan3=1396rpm
+[08:53:29] RUN i10_tg512_nccl :: -e NCCL_DEBUG=INFO -e NCCL_DEBUG_FILE=/phase1/results/i10_tg512_nccl.nccl.%p.log :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -r 3 -o csv
+[08:56:46] END i10_tg512_nccl exit=0
+[08:58:52] COOL i10_tg512_ncclp2p waited=126s start_temps=0,38 1,45 2,44  fan3=1403rpm
+[08:58:52] RUN i10_tg512_ncclp2p :: -e NCCL_DEBUG=INFO -e NCCL_DEBUG_FILE=/phase1/results/i10_tg512_ncclp2p.nccl.%p.log -e NCCL_P2P_LEVEL=SYS :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -r 3 -o csv
+[09:01:53] END i10_tg512_ncclp2p exit=0
+[09:03:39] COOL i10_tg512_opt waited=106s start_temps=0,38 1,45 2,44  fan3=1394rpm
+[09:03:39] RUN i10_tg512_opt ::  :: ./build-opt/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -r 3 -o csv
+[09:06:32] END i10_tg512_opt exit=0
+[09:08:18] COOL i10_pp2048_opt waited=106s start_temps=0,37 1,45 2,44  fan3=1363rpm
+[09:08:18] RUN i10_pp2048_opt ::  :: ./build-opt/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -r 3 -o csv
+[09:10:57] END i10_pp2048_opt exit=0
+[09:11:17] COOL i10_pp2048_nccl waited=20s start_temps=0,38 1,45 2,44  fan3=1410rpm
+[09:11:17] RUN i10_pp2048_nccl :: -e NCCL_DEBUG=INFO -e NCCL_DEBUG_FILE=/phase1/results/i10_pp2048_nccl.nccl.%p.log :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -r 3 -o csv
+[09:13:39] END i10_pp2048_nccl exit=0
+[09:14:00] COOL i10_pp2048_ncclp2p waited=21s start_temps=0,38 1,45 2,44  fan3=1381rpm
+[09:14:00] RUN i10_pp2048_ncclp2p :: -e NCCL_DEBUG=INFO -e NCCL_DEBUG_FILE=/phase1/results/i10_pp2048_ncclp2p.nccl.%p.log -e NCCL_P2P_LEVEL=SYS :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -r 3 -o csv
+[09:16:08] END i10_pp2048_ncclp2p exit=0
+[09:16:33] COOL i10_pp2048d16384_ncclp2p waited=25s start_temps=0,38 1,45 2,44  fan3=1410rpm
+[09:16:33] RUN i10_pp2048d16384_ncclp2p :: -e NCCL_DEBUG=INFO -e NCCL_DEBUG_FILE=/phase1/results/i10_pp2048d16384_ncclp2p.nccl.%p.log -e NCCL_P2P_LEVEL=SYS :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -d 16384 -r 3 -o csv
+[09:19:39] END i10_pp2048d16384_ncclp2p exit=0
+[09:21:05] COOL i10_pp2048d16384_opt waited=86s start_temps=0,38 1,45 2,44  fan3=1409rpm
+[09:21:05] RUN i10_pp2048d16384_opt ::  :: ./build-opt/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -d 16384 -r 3 -o csv
+[09:24:57] END i10_pp2048d16384_opt exit=0
+[09:26:18] COOL i10_pp2048d16384_nccl waited=81s start_temps=0,38 1,45 2,44  fan3=1393rpm
+[09:26:18] RUN i10_pp2048d16384_nccl :: -e NCCL_DEBUG=INFO -e NCCL_DEBUG_FILE=/phase1/results/i10_pp2048d16384_nccl.nccl.%p.log :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -d 16384 -r 3 -o csv
+[09:29:24] END i10_pp2048d16384_nccl exit=0
+[09:29:24] P15 QUEUE DONE
+[09:29:53] === Extra: decode noise vs load mode (mmap vs none)
+[09:31:04] COOL x_tg512_lmmmap_r1 waited=71s start_temps=0,38 1,45 2,44  fan3=1394rpm
+[09:31:04] RUN x_tg512_lmmmap_r1 ::  :: ./build-opt/bin/llama-bench -lm mmap -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -r 3 -o csv
+[09:35:31] END x_tg512_lmmmap_r1 exit=0
+[09:37:37] COOL x_tg512_lmnone_r1 waited=126s start_temps=0,38 1,45 2,44  fan3=1362rpm
+[09:37:37] RUN x_tg512_lmnone_r1 ::  :: ./build-opt/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -r 3 -o csv
+[09:40:19] END x_tg512_lmnone_r1 exit=0
+[09:42:25] COOL x_tg512_lmnone_r2 waited=126s start_temps=0,38 1,45 2,44  fan3=1344rpm
+[09:42:25] RUN x_tg512_lmnone_r2 ::  :: ./build-opt/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -r 3 -o csv
+[09:45:20] END x_tg512_lmnone_r2 exit=0
+[09:47:32] COOL x_tg512_lmmmap_r2 waited=131s start_temps=0,38 1,45 2,44  fan3=1343rpm
+[09:47:32] RUN x_tg512_lmmmap_r2 ::  :: ./build-opt/bin/llama-bench -lm mmap -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -r 3 -o csv
+[09:51:55] END x_tg512_lmmmap_r2 exit=0
+[09:54:06] COOL x_tg512_lmmmap_r3 waited=131s start_temps=0,38 1,45 2,44  fan3=1394rpm
+[09:54:06] RUN x_tg512_lmmmap_r3 ::  :: ./build-opt/bin/llama-bench -lm mmap -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -r 3 -o csv
+[09:58:33] END x_tg512_lmmmap_r3 exit=0
+[10:00:40] COOL x_tg512_lmnone_r3 waited=126s start_temps=0,38 1,45 2,44  fan3=1400rpm
+[10:00:40] RUN x_tg512_lmnone_r3 ::  :: ./build-opt/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -r 3 -o csv
+[10:03:42] END x_tg512_lmnone_r3 exit=0
+[10:05:58] COOL x_tg512_lmnone_r4 waited=136s start_temps=0,38 1,45 2,44  fan3=1404rpm
+[10:05:58] RUN x_tg512_lmnone_r4 ::  :: ./build-opt/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -r 3 -o csv
+[10:09:04] END x_tg512_lmnone_r4 exit=0
+[10:11:21] COOL x_tg512_lmmmap_r4 waited=137s start_temps=0,38 1,45 2,44  fan3=1396rpm
+[10:11:21] RUN x_tg512_lmmmap_r4 ::  :: ./build-opt/bin/llama-bench -lm mmap -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -r 3 -o csv
+[10:15:59] END x_tg512_lmmmap_r4 exit=0
+[10:18:05] COOL x_tg512_lmmmap_r5 waited=126s start_temps=0,38 1,45 2,44  fan3=1401rpm
+[10:18:05] RUN x_tg512_lmmmap_r5 ::  :: ./build-opt/bin/llama-bench -lm mmap -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -r 3 -o csv
+[10:22:55] END x_tg512_lmmmap_r5 exit=0
+[10:24:31] COOL x_tg512_lmnone_r5 waited=95s start_temps=0,38 1,45 2,44  fan3=1390rpm
+[10:24:31] RUN x_tg512_lmnone_r5 ::  :: ./build-opt/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -r 3 -o csv
+[10:27:48] END x_tg512_lmnone_r5 exit=0
+[10:27:48] P15B DONE

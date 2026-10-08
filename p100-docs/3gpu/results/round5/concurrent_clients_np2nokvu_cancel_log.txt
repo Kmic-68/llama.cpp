@@ -1,0 +1,12 @@
+14.43.935.900 I slot print_timing: id  0 | task 531 | prompt processing, n_tokens =  61948, progress = 0.97, t = 159.00 s / 389.61 tokens per second
+14.50.569.048 I slot print_timing: id  0 | task 531 | prompt processing, n_tokens =  63996, progress = 1.00, t = 166.42 s / 384.56 tokens per second
+14.50.750.346 W srv          stop: cancel task, id_task = 531
+14.50.845.028 I slot      release: id  0 | task 531 | stop processing: n_tokens = 64001, truncated = 0
+14.50.867.404 I slot get_availabl: id  1 | task -1 | selected slot by LCP similarity, f_sim_best = 0.692 (> 0.100 thold), f_keep = 0.174
+14.50.867.474 I slot launch_slot_: id  1 | task 957 | processing task, is_child = 0
+14.52.116.402 I slot print_timing: id  1 | task 957 | prompt eval time =     608.28 ms /    23 tokens (   26.45 ms per token,    37.81 tokens per second)
+14.52.116.407 I slot print_timing: id  1 | task 957 |        eval time =     640.28 ms /    32 tokens (   20.65 ms per token,    48.42 tokens per second)
+14.52.116.408 I slot print_timing: id  1 | task 957 |       total time =    1248.56 ms /    55 tokens
+14.52.116.409 I slot print_timing: id  1 | task 957 |    graphs reused =        459
+14.52.116.414 I slot print_timing: id  1 | task 957 | draft acceptance = 0.70000 (   21 accepted /    30 generated), mean len =  3.10
+14.52.116.458 I slot      release: id  1 | task 957 | stop processing: n_tokens = 96, truncated = 0

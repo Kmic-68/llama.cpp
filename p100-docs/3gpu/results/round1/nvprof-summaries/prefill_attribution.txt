@@ -1,0 +1,27 @@
+== g2_nvprof_d16384_p12_XL.csv: 2 GPUs, window 45971.7 ms, 9 ubatches -> 5108.0 ms/ubatch under nvprof; 9210 peer copies
+  dev0: busy 98.3%, idle 1.7% | gemm 84.6%, xchg 23.7%, other 6.1%, attn 0.4%, hostcopy 0.3%, matvec 0.0%
+  dev1: busy 98.3%, idle 1.7% | gemm 84.1%, xchg 23.8%, other 6.1%, attn 0.4%, hostcopy 0.3%, matvec 0.0%
+== g2_nvprof_d16384_tp3_Q8.csv: 3 GPUs, window 68924.0 ms, 9 ubatches -> 7658.2 ms/ubatch under nvprof; 4608 peer copies
+  dev0: busy 95.6%, idle 4.4% | xchg 59.3%, gemm 34.1%, other 2.9%, hostcopy 0.2%, attn 0.2%, matvec 0.0%
+  dev1: busy 63.6%, idle 36.4% | gemm 34.6%, xchg 25.8%, other 2.9%, hostcopy 0.2%, attn 0.2%, matvec 0.0%
+  dev2: busy 71.1%, idle 28.9% | gemm 34.5%, xchg 33.3%, other 2.9%, hostcopy 0.2%, attn 0.2%, matvec 0.0%
+  exchanges 1152: imbalance wait 4153.0 ms (6.0% of window), exchange latency after last-ready 35752.1 ms (51.9%), per exchange 3605 + 31035 us
+  s_pp (imbalance + exchange latency) = 57.9% of prefill time
+== g2_nvprof_d16384_tp3_XL.csv: 3 GPUs, window 69533.6 ms, 9 ubatches -> 7726.0 ms/ubatch under nvprof; 4608 peer copies
+  dev0: busy 94.8%, idle 5.2% | xchg 58.8%, gemm 34.0%, other 3.0%, hostcopy 0.2%, attn 0.2%, matvec 0.0%
+  dev1: busy 63.3%, idle 36.7% | gemm 34.4%, xchg 25.5%, other 3.0%, hostcopy 0.2%, attn 0.2%, matvec 0.0%
+  dev2: busy 70.7%, idle 29.3% | gemm 34.2%, xchg 33.1%, other 3.0%, hostcopy 0.2%, attn 0.2%, matvec 0.0%
+  exchanges 1152: imbalance wait 4138.0 ms (6.0% of window), exchange latency after last-ready 35758.7 ms (51.4%), per exchange 3592 + 31041 us
+  s_pp (imbalance + exchange latency) = 57.4% of prefill time
+== g2_nvprof_d65536_tp3_Q8.csv: 3 GPUs, window 281000.0 ms, 34 ubatches -> 8264.7 ms/ubatch under nvprof; 16896 peer copies
+  dev0: busy 92.8%, idle 7.2% | xchg 53.3%, gemm 37.4%, other 2.6%, hostcopy 0.2%, attn 0.1%, matvec 0.0%
+  dev1: busy 64.2%, idle 35.8% | gemm 38.0%, xchg 23.2%, other 2.6%, hostcopy 0.2%, attn 0.1%, matvec 0.0%
+  dev2: busy 71.1%, idle 28.9% | gemm 38.3%, xchg 29.9%, other 2.6%, hostcopy 0.2%, attn 0.1%, matvec 0.0%
+  exchanges 4224: imbalance wait 21327.1 ms (7.6% of window), exchange latency after last-ready 131430.1 ms (46.8%), per exchange 5049 + 31115 us
+  s_pp (imbalance + exchange latency) = 54.4% of prefill time
+== g2_nvprof_d65536_tp3_XL.csv: 3 GPUs, window 281910.4 ms, 34 ubatches -> 8291.5 ms/ubatch under nvprof; 16896 peer copies
+  dev0: busy 92.5%, idle 7.5% | xchg 53.2%, gemm 37.5%, other 2.7%, hostcopy 0.2%, attn 0.1%, matvec 0.0%
+  dev1: busy 64.2%, idle 35.8% | gemm 38.0%, xchg 23.2%, other 2.8%, hostcopy 0.2%, attn 0.1%, matvec 0.0%
+  dev2: busy 71.1%, idle 28.9% | gemm 38.3%, xchg 29.8%, other 2.7%, hostcopy 0.2%, attn 0.1%, matvec 0.0%
+  exchanges 4224: imbalance wait 21387.7 ms (7.6% of window), exchange latency after last-ready 131514.6 ms (46.7%), per exchange 5063 + 31135 us
+  s_pp (imbalance + exchange latency) = 54.2% of prefill time

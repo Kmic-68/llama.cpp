@@ -1,0 +1,6 @@
+i4_nvprof_pp16384_layer_XL.csv: split at a 52.6 ms all-idle gap; measured pass 38.06 s
+  GPU0: busy 67.5% of the pass, first activity +0 ms, last activity end +31535 ms
+  GPU1: busy 68.3% of the pass, first activity +3076 ms, last activity end +34973 ms
+  GPU2: busy 61.5% of the pass, first activity +6160 ms, last activity end +38063 ms
+  share of the pass with N GPUs busy at once: 0: 0.0%, 1: 18.1%, 2: 66.4%, 3: 15.4%
+  overlap: 81.9% of the time any GPU is busy, two or more are busy (pure serial layer pipeline would be ~0%)

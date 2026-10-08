@@ -1,0 +1,67 @@
+stack,block,task,rep,exit_code,wall_s,timed_out,passed,note
+A,i5_srv_A_b1,err_python_env,0,0,105.6,0,1,
+A,i5_srv_A_b1,err_replay_patch,0,0,104.5,0,1,
+A,i5_srv_A_b1,err_ambiguous_edit,0,0,111.0,0,1,
+A,i5_srv_A_b1,err_case_search,0,0,136.9,0,1,
+A,i5_srv_A_b1,err_hidden_search,0,0,116.9,0,1,
+A,i5_srv_A_b1,err_big_output,0,0,103.8,0,1,
+A,i5_srv_A_b1,err_multi_dir,0,0,95.9,0,1,
+A,i5_srv_A_b1,err_inline_script,0,0,240.1,0,1,
+A,i5_srv_A_b1,err_big_file_read,0,-9,600.1,1,0,killed at the 600 s task timeout
+A,i5_srv_A_b2,err_python_env,1,0,111.1,0,1,
+A,i5_srv_A_b2,err_replay_patch,1,0,102.5,0,1,
+A,i5_srv_A_b2,err_ambiguous_edit,1,0,128.6,0,1,
+A,i5_srv_A_b2,err_case_search,1,0,116.9,0,1,
+A,i5_srv_A_b2,err_hidden_search,1,0,101.3,0,1,
+A,i5_srv_A_b2,err_big_output,1,0,118.0,0,1,
+A,i5_srv_A_b2,err_multi_dir,1,0,104.6,0,1,
+A,i5_srv_A_b2,err_inline_script,1,0,447.5,0,1,
+A,i5_srv_A_b2,err_big_file_read,1,-9,600.1,1,0,killed at the 600 s task timeout
+A,i5_srv_A_b3,err_python_env,2,0,110.2,0,1,
+A,i5_srv_A_b3,err_replay_patch,2,0,104.3,0,1,
+A,i5_srv_A_b3,err_ambiguous_edit,2,0,118.4,0,1,
+A,i5_srv_A_b3,err_case_search,2,0,145.1,0,1,
+A,i5_srv_A_b3,err_hidden_search,2,0,93.3,0,0,wrong answer: listed 1 of 2 files (missed the one in a hidden directory)
+A,i5_srv_A_b3,err_big_output,2,0,106.5,0,1,
+A,i5_srv_A_b3,err_multi_dir,2,0,107.7,0,1,
+A,i5_srv_A_b3,err_inline_script,2,0,111.0,0,1,
+A,i5_srv_A_b3,err_big_file_read,2,-9,600.1,1,0,killed at the 600 s task timeout
+A,i5_srv_A_b4,err_inline_script,3,0,161.3,0,1,
+A,i5_srv_A_b4,err_big_file_read,3,-9,600.1,1,0,killed at the 600 s task timeout
+A,i5_srv_A_b5,err_inline_script,4,0,108.2,0,1,
+A,i5_srv_A_b5,err_big_file_read,4,-9,600.1,1,0,killed at the 600 s task timeout
+A,i5_srv_A_b6,err_inline_script,5,0,351.2,0,1,
+A,i5_srv_A_b6,err_big_file_read,5,-9,600.1,1,0,killed at the 600 s task timeout
+B,i5_srv_B_b1,err_python_env,0,0,110.4,0,1,
+B,i5_srv_B_b1,err_replay_patch,0,0,71.9,0,1,
+B,i5_srv_B_b1,err_ambiguous_edit,0,0,80.1,0,1,
+B,i5_srv_B_b1,err_case_search,0,0,86.4,0,1,
+B,i5_srv_B_b1,err_hidden_search,0,0,64.1,0,0,wrong answer: listed 1 of 2 files (missed the one in a hidden directory)
+B,i5_srv_B_b1,err_big_output,0,0,73.1,0,1,
+B,i5_srv_B_b1,err_multi_dir,0,0,73.1,0,1,
+B,i5_srv_B_b1,err_inline_script,0,0,140.0,0,1,
+B,i5_srv_B_b1,err_big_file_read,0,-9,600.0,1,0,killed at the 600 s task timeout
+B,i5_srv_B_b2,err_python_env,1,0,88.2,0,1,
+B,i5_srv_B_b2,err_replay_patch,1,0,68.4,0,1,
+B,i5_srv_B_b2,err_ambiguous_edit,1,0,88.8,0,1,
+B,i5_srv_B_b2,err_case_search,1,0,93.3,0,1,
+B,i5_srv_B_b2,err_hidden_search,1,0,73.1,0,1,
+B,i5_srv_B_b2,err_big_output,1,0,64.6,0,1,
+B,i5_srv_B_b2,err_multi_dir,1,0,71.1,0,1,
+B,i5_srv_B_b2,err_inline_script,1,0,177.6,0,1,
+B,i5_srv_B_b2,err_big_file_read,1,-9,600.0,1,0,killed at the 600 s task timeout
+B,i5_srv_B_b3,err_python_env,2,0,81.9,0,1,
+B,i5_srv_B_b3,err_replay_patch,2,0,67.6,0,1,
+B,i5_srv_B_b3,err_ambiguous_edit,2,0,80.3,0,1,
+B,i5_srv_B_b3,err_case_search,2,0,78.2,0,1,
+B,i5_srv_B_b3,err_hidden_search,2,0,70.7,0,1,
+B,i5_srv_B_b3,err_big_output,2,0,61.8,0,1,
+B,i5_srv_B_b3,err_multi_dir,2,0,78.9,0,1,
+B,i5_srv_B_b3,err_inline_script,2,0,83.9,0,1,
+B,i5_srv_B_b3,err_big_file_read,2,0,118.8,0,1,
+B,i5_srv_B_b4,err_inline_script,3,0,83.1,0,1,
+B,i5_srv_B_b4,err_big_file_read,3,0,81.1,0,1,
+B,i5_srv_B_b5,err_inline_script,4,0,252.9,0,1,
+B,i5_srv_B_b5,err_big_file_read,4,-9,600.1,1,0,killed at the 600 s task timeout
+B,i5_srv_B_b6,err_inline_script,5,0,499.2,0,1,
+B,i5_srv_B_b6,err_big_file_read,5,-9,600.1,1,0,killed at the 600 s task timeout

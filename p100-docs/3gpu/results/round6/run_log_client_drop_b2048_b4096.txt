@@ -1,0 +1,36 @@
+[11:14:35] P21 START; power limit 150.00 150.00 150.00 
+[11:14:37] serving service stopped; running containers: []
+[11:14:37] COOL i2_b2048_r1 waited=0s start_temps=0,38 1,40 2,34  fan3=2866rpm
+[11:14:37] RUN(server) i2_b2048_r1 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e LLAMA_SPEC_SAMPLE_TEMP=1.0 -e LLAMA_SPEC_DRAFT_TOPK=20 :: /workspace/build-nccl/bin/llama-server -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf --jinja --cache-ram 0 --no-cache-idle-slots --parallel 1 -c 262144 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 2048 -ub 2048 -fit off -lm none --host 127.0.0.1 --port $PORT --temp 1.0 --top-k 20 --top-p 0.95 --min-p 0.0 --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.0 -ngld 99 -ubd 64 -ctkd q4_0 -ctvd q4_0 :: client: python3 $P1/p21client.py cancel $P1/corpus/wiki.test.raw 1,2 0
+[11:16:14] SERVER UP i2_b2048_r1 after 91s
+[11:20:57] END i2_b2048_r1 exit=0 (client rc=0)
+[11:21:58] COOL i2_b4096_r1 waited=61s start_temps=0,46 1,48 2,44  fan3=3033rpm
+[11:21:58] RUN(server) i2_b4096_r1 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e LLAMA_SPEC_SAMPLE_TEMP=1.0 -e LLAMA_SPEC_DRAFT_TOPK=20 :: /workspace/build-nccl/bin/llama-server -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf --jinja --cache-ram 0 --no-cache-idle-slots --parallel 1 -c 262144 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 4096 -ub 2048 -fit off -lm none --host 127.0.0.1 --port $PORT --temp 1.0 --top-k 20 --top-p 0.95 --min-p 0.0 --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.0 -ngld 99 -ubd 64 -ctkd q4_0 -ctvd q4_0 :: client: python3 $P1/p21client.py cancel $P1/corpus/wiki.test.raw 1,2 2
+[11:24:00] SERVER UP i2_b4096_r1 after 115s
+[11:28:55] END i2_b4096_r1 exit=0 (client rc=0)
+[11:29:56] COOL i2_b4096_r2 waited=61s start_temps=0,46 1,48 2,44  fan3=2866rpm
+[11:29:56] RUN(server) i2_b4096_r2 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e LLAMA_SPEC_SAMPLE_TEMP=1.0 -e LLAMA_SPEC_DRAFT_TOPK=20 :: /workspace/build-nccl/bin/llama-server -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf --jinja --cache-ram 0 --no-cache-idle-slots --parallel 1 -c 262144 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 4096 -ub 2048 -fit off -lm none --host 127.0.0.1 --port $PORT --temp 1.0 --top-k 20 --top-p 0.95 --min-p 0.0 --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.0 -ngld 99 -ubd 64 -ctkd q4_0 -ctvd q4_0 :: client: python3 $P1/p21client.py cancel $P1/corpus/wiki.test.raw 2,1 4
+[11:32:06] SERVER UP i2_b4096_r2 after 125s
+[11:37:26] END i2_b4096_r2 exit=0 (client rc=0)
+[11:38:22] COOL i2_b2048_r2 waited=56s start_temps=0,45 1,48 2,43  fan3=3040rpm
+[11:38:22] RUN(server) i2_b2048_r2 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e LLAMA_SPEC_SAMPLE_TEMP=1.0 -e LLAMA_SPEC_DRAFT_TOPK=20 :: /workspace/build-nccl/bin/llama-server -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf --jinja --cache-ram 0 --no-cache-idle-slots --parallel 1 -c 262144 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 2048 -ub 2048 -fit off -lm none --host 127.0.0.1 --port $PORT --temp 1.0 --top-k 20 --top-p 0.95 --min-p 0.0 --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.0 -ngld 99 -ubd 64 -ctkd q4_0 -ctvd q4_0 :: client: python3 $P1/p21client.py cancel $P1/corpus/wiki.test.raw 2,1 6
+[11:40:14] SERVER UP i2_b2048_r2 after 108s
+[11:45:39] END i2_b2048_r2 exit=0 (client rc=0)
+[11:46:29] COOL i2_b2048_r3 waited=50s start_temps=0,46 1,48 2,44  fan3=2872rpm
+[11:46:29] RUN(server) i2_b2048_r3 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e LLAMA_SPEC_SAMPLE_TEMP=1.0 -e LLAMA_SPEC_DRAFT_TOPK=20 :: /workspace/build-nccl/bin/llama-server -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf --jinja --cache-ram 0 --no-cache-idle-slots --parallel 1 -c 262144 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 2048 -ub 2048 -fit off -lm none --host 127.0.0.1 --port $PORT --temp 1.0 --top-k 20 --top-p 0.95 --min-p 0.0 --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.0 -ngld 99 -ubd 64 -ctkd q4_0 -ctvd q4_0 :: client: python3 $P1/p21client.py cancel $P1/corpus/wiki.test.raw 1,2 8
+[11:48:57] SERVER UP i2_b2048_r3 after 140s
+[11:53:56] END i2_b2048_r3 exit=0 (client rc=0)
+[11:55:02] COOL i2_b4096_r3 waited=66s start_temps=0,46 1,48 2,44  fan3=2866rpm
+[11:55:02] RUN(server) i2_b4096_r3 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e LLAMA_SPEC_SAMPLE_TEMP=1.0 -e LLAMA_SPEC_DRAFT_TOPK=20 :: /workspace/build-nccl/bin/llama-server -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf --jinja --cache-ram 0 --no-cache-idle-slots --parallel 1 -c 262144 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 4096 -ub 2048 -fit off -lm none --host 127.0.0.1 --port $PORT --temp 1.0 --top-k 20 --top-p 0.95 --min-p 0.0 --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.0 -ngld 99 -ubd 64 -ctkd q4_0 -ctvd q4_0 :: client: python3 $P1/p21client.py cancel $P1/corpus/wiki.test.raw 1,2 10
+[11:56:51] SERVER UP i2_b4096_r3 after 105s
+[12:01:56] END i2_b4096_r3 exit=0 (client rc=0)
+[12:03:01] COOL i3_cost_b2048 waited=65s start_temps=0,46 1,48 2,44  fan3=3040rpm
+[12:03:01] RUN(server) i3_cost_b2048 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e LLAMA_SPEC_SAMPLE_TEMP=1.0 -e LLAMA_SPEC_DRAFT_TOPK=20 :: /workspace/build-nccl/bin/llama-server -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf --jinja --cache-ram 0 --no-cache-idle-slots --parallel 1 -c 262144 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 2048 -ub 2048 -fit off -lm none --host 127.0.0.1 --port $PORT --temp 1.0 --top-k 20 --top-p 0.95 --min-p 0.0 --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.0 -ngld 99 -ubd 64 -ctkd q4_0 -ctvd q4_0 :: client: python3 $P1/p21client.py cost $P1/corpus/wiki.test.raw
+[12:05:20] SERVER UP i3_cost_b2048 after 127s
+[12:14:06] END i3_cost_b2048 exit=0 (client rc=0)
+[12:15:37] COOL i3_cost_b32768 waited=91s start_temps=0,45 1,48 2,44  fan3=2866rpm
+[12:15:37] RUN(server) i3_cost_b32768 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e LLAMA_SPEC_SAMPLE_TEMP=1.0 -e LLAMA_SPEC_DRAFT_TOPK=20 :: /workspace/build-nccl/bin/llama-server -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf --jinja --cache-ram 0 --no-cache-idle-slots --parallel 1 -c 262144 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -fit off -lm none --host 127.0.0.1 --port $PORT --temp 1.0 --top-k 20 --top-p 0.95 --min-p 0.0 --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.0 -ngld 99 -ubd 64 -ctkd q4_0 -ctvd q4_0 :: client: python3 $P1/p21client.py cost $P1/corpus/wiki.test.raw
+[12:17:16] SERVER UP i3_cost_b32768 after 85s
+[12:25:59] END i3_cost_b32768 exit=0 (client rc=0)
+[12:25:59] P21 DONE
+[12:26:02] EXIT: serving service started again; power limit 150.00 150.00 150.00 

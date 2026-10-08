@@ -1,0 +1,371 @@
+[18:41:09] P18 QUEUE START (no cutoff)
+[18:41:09] === Item 1: NCCL tuning (stack B, NCCL_P2P_LEVEL=SYS kept)
+[18:41:09] COOL i1_debug waited=0s start_temps=0,41 1,43 2,38  fan3=2866rpm
+[18:41:09] RUN i1_debug :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=INIT,COLL,TUNING -e NCCL_DEBUG_FILE=/phase1/results/i1_debug.nccl.%p :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 32 -r 1 -o csv
+[18:43:10] END i1_debug exit=0
+[18:43:11] COOL i1_tg512_def1 waited=0s start_temps=0,41 1,43 2,38  fan3=3047rpm
+[18:43:11] RUN i1_tg512_def1 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=INIT -e NCCL_DEBUG_FILE=/phase1/results/i1_tg512_def1.nccl.%p :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -r 3 -o csv
+[18:46:09] END i1_tg512_def1 exit=0
+[18:46:19] COOL i1_tg512_algoRing waited=10s start_temps=0,46 1,48 2,43  fan3=2872rpm
+[18:46:19] RUN i1_tg512_algoRing :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e NCCL_ALGO=Ring -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=INIT -e NCCL_DEBUG_FILE=/phase1/results/i1_tg512_algoRing.nccl.%p :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -r 3 -o csv
+[18:49:39] END i1_tg512_algoRing exit=0
+[18:49:49] COOL i1_tg512_algoTree waited=10s start_temps=0,46 1,48 2,43  fan3=2866rpm
+[18:49:49] RUN i1_tg512_algoTree :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e NCCL_ALGO=Tree -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=INIT -e NCCL_DEBUG_FILE=/phase1/results/i1_tg512_algoTree.nccl.%p :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -r 3 -o csv
+[18:52:27] END i1_tg512_algoTree exit=0
+[18:52:47] COOL i1_tg512_protoLL waited=20s start_temps=0,45 1,48 2,43  fan3=2860rpm
+[18:52:47] RUN i1_tg512_protoLL :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e NCCL_PROTO=LL -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=INIT -e NCCL_DEBUG_FILE=/phase1/results/i1_tg512_protoLL.nccl.%p :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -r 3 -o csv
+[18:55:38] END i1_tg512_protoLL exit=0
+[18:55:53] COOL i1_tg512_def2 waited=15s start_temps=0,46 1,48 2,43  fan3=2878rpm
+[18:55:53] RUN i1_tg512_def2 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=INIT -e NCCL_DEBUG_FILE=/phase1/results/i1_tg512_def2.nccl.%p :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -r 3 -o csv
+[18:59:01] END i1_tg512_def2 exit=0
+[18:59:17] COOL i1_tg512_protoLL128 waited=16s start_temps=0,46 1,48 2,43  fan3=3033rpm
+[18:59:17] RUN i1_tg512_protoLL128 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e NCCL_PROTO=LL128 -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=INIT -e NCCL_DEBUG_FILE=/phase1/results/i1_tg512_protoLL128.nccl.%p :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -r 3 -o csv
+[19:02:35] END i1_tg512_protoLL128 exit=0
+[19:02:50] COOL i1_tg512_protoSimple waited=15s start_temps=0,46 1,48 2,43  fan3=2878rpm
+[19:02:50] RUN i1_tg512_protoSimple :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e NCCL_PROTO=Simple -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=INIT -e NCCL_DEBUG_FILE=/phase1/results/i1_tg512_protoSimple.nccl.%p :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -r 3 -o csv
+[19:05:30] END i1_tg512_protoSimple exit=0
+[19:05:45] COOL i1_tg512_bufA1x waited=15s start_temps=0,46 1,48 2,43  fan3=3040rpm
+[19:05:45] RUN i1_tg512_bufA1x :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e NCCL_BUFFSIZE=4194304 -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=INIT -e NCCL_DEBUG_FILE=/phase1/results/i1_tg512_bufA1x.nccl.%p :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -r 3 -o csv
+[19:08:48] END i1_tg512_bufA1x exit=0
+[19:09:03] COOL i1_tg512_def3 waited=15s start_temps=0,46 1,48 2,43  fan3=2872rpm
+[19:09:03] RUN i1_tg512_def3 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=INIT -e NCCL_DEBUG_FILE=/phase1/results/i1_tg512_def3.nccl.%p :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -r 3 -o csv
+[19:12:20] END i1_tg512_def3 exit=0
+[19:12:35] COOL i1_tg512_bufB4x waited=15s start_temps=0,46 1,48 2,43  fan3=2872rpm
+[19:12:35] RUN i1_tg512_bufB4x :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e NCCL_BUFFSIZE=16777216 -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=INIT -e NCCL_DEBUG_FILE=/phase1/results/i1_tg512_bufB4x.nccl.%p :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -r 3 -o csv
+[19:15:04] END i1_tg512_bufB4x exit=0
+[19:15:19] COOL i1_tg512_nchA1 waited=15s start_temps=0,46 1,48 2,43  fan3=2872rpm
+[19:15:19] RUN i1_tg512_nchA1 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e NCCL_MIN_NCHANNELS=1 -e NCCL_MAX_NCHANNELS=1 -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=INIT -e NCCL_DEBUG_FILE=/phase1/results/i1_tg512_nchA1.nccl.%p :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -r 3 -o csv
+[19:18:18] END i1_tg512_nchA1 exit=0
+[19:18:33] COOL i1_tg512_nchB2 waited=15s start_temps=0,46 1,48 2,43  fan3=3047rpm
+[19:18:33] RUN i1_tg512_nchB2 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e NCCL_MIN_NCHANNELS=2 -e NCCL_MAX_NCHANNELS=2 -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=INIT -e NCCL_DEBUG_FILE=/phase1/results/i1_tg512_nchB2.nccl.%p :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -r 3 -o csv
+[19:21:55] END i1_tg512_nchB2 exit=0
+[19:22:11] COOL i1_tg512_def4 waited=15s start_temps=0,46 1,48 2,43  fan3=3047rpm
+[19:22:11] RUN i1_tg512_def4 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=INIT -e NCCL_DEBUG_FILE=/phase1/results/i1_tg512_def4.nccl.%p :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -r 3 -o csv
+[19:25:14] END i1_tg512_def4 exit=0
+[19:25:24] COOL i1_tg512_nchC4 waited=10s start_temps=0,46 1,48 2,43  fan3=3047rpm
+[19:25:24] RUN i1_tg512_nchC4 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e NCCL_MIN_NCHANNELS=4 -e NCCL_MAX_NCHANNELS=4 -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=INIT -e NCCL_DEBUG_FILE=/phase1/results/i1_tg512_nchC4.nccl.%p :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -r 3 -o csv
+[19:27:56] END i1_tg512_nchC4 exit=0
+[19:28:06] COOL i1_tg512_def5 waited=10s start_temps=0,46 1,48 2,43  fan3=2872rpm
+[19:28:06] RUN i1_tg512_def5 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=INIT -e NCCL_DEBUG_FILE=/phase1/results/i1_tg512_def5.nccl.%p :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -r 3 -o csv
+[19:31:21] END i1_tg512_def5 exit=0
+[19:31:26] COOL i1_pp2048_d0_def1 waited=5s start_temps=0,46 1,48 2,44  fan3=2872rpm
+[19:31:26] RUN i1_pp2048_d0_def1 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=INIT -e NCCL_DEBUG_FILE=/phase1/results/i1_pp2048_d0_def1.nccl.%p :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -r 3 -o csv
+[19:33:58] END i1_pp2048_d0_def1 exit=0
+[19:33:58] COOL i1_pp2048_d0_algoRing waited=0s start_temps=0,43 1,45 2,40  fan3=2866rpm
+[19:33:58] RUN i1_pp2048_d0_algoRing :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e NCCL_ALGO=Ring -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=INIT -e NCCL_DEBUG_FILE=/phase1/results/i1_pp2048_d0_algoRing.nccl.%p :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -r 3 -o csv
+[19:36:52] END i1_pp2048_d0_algoRing exit=0
+[19:36:52] COOL i1_pp2048_d0_algoTree waited=0s start_temps=0,41 1,43 2,38  fan3=3047rpm
+[19:36:52] RUN i1_pp2048_d0_algoTree :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e NCCL_ALGO=Tree -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=INIT -e NCCL_DEBUG_FILE=/phase1/results/i1_pp2048_d0_algoTree.nccl.%p :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -r 3 -o csv
+[19:39:21] END i1_pp2048_d0_algoTree exit=0
+[19:39:21] COOL i1_pp2048_d0_protoLL waited=0s start_temps=0,41 1,43 2,38  fan3=2878rpm
+[19:39:21] RUN i1_pp2048_d0_protoLL :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e NCCL_PROTO=LL -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=INIT -e NCCL_DEBUG_FILE=/phase1/results/i1_pp2048_d0_protoLL.nccl.%p :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -r 3 -o csv
+[19:42:14] END i1_pp2048_d0_protoLL exit=0
+[19:42:14] COOL i1_pp2048_d0_def2 waited=0s start_temps=0,41 1,43 2,37  fan3=2872rpm
+[19:42:14] RUN i1_pp2048_d0_def2 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=INIT -e NCCL_DEBUG_FILE=/phase1/results/i1_pp2048_d0_def2.nccl.%p :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -r 3 -o csv
+[19:44:43] END i1_pp2048_d0_def2 exit=0
+[19:44:43] COOL i1_pp2048_d0_protoLL128 waited=0s start_temps=0,41 1,43 2,38  fan3=3040rpm
+[19:44:43] RUN i1_pp2048_d0_protoLL128 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e NCCL_PROTO=LL128 -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=INIT -e NCCL_DEBUG_FILE=/phase1/results/i1_pp2048_d0_protoLL128.nccl.%p :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -r 3 -o csv
+[19:47:24] END i1_pp2048_d0_protoLL128 exit=0
+[19:47:25] COOL i1_pp2048_d0_protoSimple waited=0s start_temps=0,41 1,43 2,38  fan3=3040rpm
+[19:47:25] RUN i1_pp2048_d0_protoSimple :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e NCCL_PROTO=Simple -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=INIT -e NCCL_DEBUG_FILE=/phase1/results/i1_pp2048_d0_protoSimple.nccl.%p :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -r 3 -o csv
+[19:49:20] END i1_pp2048_d0_protoSimple exit=0
+[19:49:20] COOL i1_pp2048_d0_bufA1x waited=0s start_temps=0,41 1,43 2,38  fan3=3033rpm
+[19:49:20] RUN i1_pp2048_d0_bufA1x :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e NCCL_BUFFSIZE=4194304 -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=INIT -e NCCL_DEBUG_FILE=/phase1/results/i1_pp2048_d0_bufA1x.nccl.%p :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -r 3 -o csv
+[19:51:53] END i1_pp2048_d0_bufA1x exit=0
+[19:51:54] COOL i1_pp2048_d0_def3 waited=0s start_temps=0,41 1,43 2,38  fan3=3047rpm
+[19:51:54] RUN i1_pp2048_d0_def3 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=INIT -e NCCL_DEBUG_FILE=/phase1/results/i1_pp2048_d0_def3.nccl.%p :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -r 3 -o csv
+[19:54:39] END i1_pp2048_d0_def3 exit=0
+[19:54:39] COOL i1_pp2048_d0_bufB4x waited=0s start_temps=0,41 1,43 2,38  fan3=2878rpm
+[19:54:39] RUN i1_pp2048_d0_bufB4x :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e NCCL_BUFFSIZE=16777216 -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=INIT -e NCCL_DEBUG_FILE=/phase1/results/i1_pp2048_d0_bufB4x.nccl.%p :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -r 3 -o csv
+[19:57:05] END i1_pp2048_d0_bufB4x exit=0
+[19:57:05] COOL i1_pp2048_d0_nchA1 waited=0s start_temps=0,41 1,43 2,38  fan3=3026rpm
+[19:57:05] RUN i1_pp2048_d0_nchA1 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e NCCL_MIN_NCHANNELS=1 -e NCCL_MAX_NCHANNELS=1 -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=INIT -e NCCL_DEBUG_FILE=/phase1/results/i1_pp2048_d0_nchA1.nccl.%p :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -r 3 -o csv
+[19:59:47] END i1_pp2048_d0_nchA1 exit=0
+[19:59:47] COOL i1_pp2048_d0_nchB2 waited=0s start_temps=0,41 1,42 2,37  fan3=3033rpm
+[19:59:47] RUN i1_pp2048_d0_nchB2 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e NCCL_MIN_NCHANNELS=2 -e NCCL_MAX_NCHANNELS=2 -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=INIT -e NCCL_DEBUG_FILE=/phase1/results/i1_pp2048_d0_nchB2.nccl.%p :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -r 3 -o csv
+[20:02:14] END i1_pp2048_d0_nchB2 exit=0
+[20:02:14] COOL i1_pp2048_d0_def4 waited=0s start_temps=0,41 1,43 2,37  fan3=2878rpm
+[20:02:14] RUN i1_pp2048_d0_def4 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=INIT -e NCCL_DEBUG_FILE=/phase1/results/i1_pp2048_d0_def4.nccl.%p :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -r 3 -o csv
+[20:04:24] END i1_pp2048_d0_def4 exit=0
+[20:04:25] COOL i1_pp2048_d0_nchC4 waited=0s start_temps=0,41 1,43 2,38  fan3=2872rpm
+[20:04:25] RUN i1_pp2048_d0_nchC4 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e NCCL_MIN_NCHANNELS=4 -e NCCL_MAX_NCHANNELS=4 -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=INIT -e NCCL_DEBUG_FILE=/phase1/results/i1_pp2048_d0_nchC4.nccl.%p :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -r 3 -o csv
+[20:06:49] END i1_pp2048_d0_nchC4 exit=0
+[20:06:49] COOL i1_pp2048_d0_def5 waited=0s start_temps=0,41 1,42 2,37  fan3=2866rpm
+[20:06:49] RUN i1_pp2048_d0_def5 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=INIT -e NCCL_DEBUG_FILE=/phase1/results/i1_pp2048_d0_def5.nccl.%p :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -r 3 -o csv
+[20:09:05] END i1_pp2048_d0_def5 exit=0
+[20:09:05] COOL i1_pp2048_d16384_def1 waited=0s start_temps=0,41 1,43 2,38  fan3=3040rpm
+[20:09:05] RUN i1_pp2048_d16384_def1 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=INIT -e NCCL_DEBUG_FILE=/phase1/results/i1_pp2048_d16384_def1.nccl.%p :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -d 16384 -r 3 -o csv
+[20:12:17] END i1_pp2048_d16384_def1 exit=0
+[20:12:17] COOL i1_pp2048_d16384_algoRing waited=0s start_temps=0,46 1,48 2,42  fan3=2872rpm
+[20:12:17] RUN i1_pp2048_d16384_algoRing :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e NCCL_ALGO=Ring -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=INIT -e NCCL_DEBUG_FILE=/phase1/results/i1_pp2048_d16384_algoRing.nccl.%p :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -d 16384 -r 3 -o csv
+[20:15:28] END i1_pp2048_d16384_algoRing exit=0
+[20:15:34] COOL i1_pp2048_d16384_algoTree waited=5s start_temps=0,45 1,47 2,42  fan3=2866rpm
+[20:15:34] RUN i1_pp2048_d16384_algoTree :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e NCCL_ALGO=Tree -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=INIT -e NCCL_DEBUG_FILE=/phase1/results/i1_pp2048_d16384_algoTree.nccl.%p :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -d 16384 -r 3 -o csv
+[20:18:15] END i1_pp2048_d16384_algoTree exit=0
+[20:18:20] COOL i1_pp2048_d16384_protoLL waited=5s start_temps=0,45 1,47 2,42  fan3=2872rpm
+[20:18:20] RUN i1_pp2048_d16384_protoLL :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e NCCL_PROTO=LL -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=INIT -e NCCL_DEBUG_FILE=/phase1/results/i1_pp2048_d16384_protoLL.nccl.%p :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -d 16384 -r 3 -o csv
+[20:21:37] END i1_pp2048_d16384_protoLL exit=0
+[20:21:43] COOL i1_pp2048_d16384_def2 waited=6s start_temps=0,45 1,47 2,42  fan3=3040rpm
+[20:21:43] RUN i1_pp2048_d16384_def2 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=INIT -e NCCL_DEBUG_FILE=/phase1/results/i1_pp2048_d16384_def2.nccl.%p :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -d 16384 -r 3 -o csv
+[20:24:59] END i1_pp2048_d16384_def2 exit=0
+[20:25:04] COOL i1_pp2048_d16384_protoLL128 waited=5s start_temps=0,45 1,48 2,43  fan3=3040rpm
+[20:25:04] RUN i1_pp2048_d16384_protoLL128 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e NCCL_PROTO=LL128 -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=INIT -e NCCL_DEBUG_FILE=/phase1/results/i1_pp2048_d16384_protoLL128.nccl.%p :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -d 16384 -r 3 -o csv
+[20:27:42] END i1_pp2048_d16384_protoLL128 exit=0
+[20:27:47] COOL i1_pp2048_d16384_protoSimple waited=5s start_temps=0,46 1,48 2,43  fan3=2872rpm
+[20:27:47] RUN i1_pp2048_d16384_protoSimple :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e NCCL_PROTO=Simple -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=INIT -e NCCL_DEBUG_FILE=/phase1/results/i1_pp2048_d16384_protoSimple.nccl.%p :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -d 16384 -r 3 -o csv
+[20:30:59] END i1_pp2048_d16384_protoSimple exit=0
+[20:31:04] COOL i1_pp2048_d16384_bufA1x waited=5s start_temps=0,46 1,48 2,43  fan3=3040rpm
+[20:31:04] RUN i1_pp2048_d16384_bufA1x :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e NCCL_BUFFSIZE=4194304 -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=INIT -e NCCL_DEBUG_FILE=/phase1/results/i1_pp2048_d16384_bufA1x.nccl.%p :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -d 16384 -r 3 -o csv
+[20:34:25] END i1_pp2048_d16384_bufA1x exit=0
+[20:34:30] COOL i1_pp2048_d16384_def3 waited=5s start_temps=0,45 1,48 2,43  fan3=3047rpm
+[20:34:30] RUN i1_pp2048_d16384_def3 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=INIT -e NCCL_DEBUG_FILE=/phase1/results/i1_pp2048_d16384_def3.nccl.%p :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -d 16384 -r 3 -o csv
+[20:37:27] END i1_pp2048_d16384_def3 exit=0
+[20:37:33] COOL i1_pp2048_d16384_bufB4x waited=6s start_temps=0,46 1,48 2,43  fan3=2878rpm
+[20:37:33] RUN i1_pp2048_d16384_bufB4x :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e NCCL_BUFFSIZE=16777216 -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=INIT -e NCCL_DEBUG_FILE=/phase1/results/i1_pp2048_d16384_bufB4x.nccl.%p :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -d 16384 -r 3 -o csv
+[20:40:20] END i1_pp2048_d16384_bufB4x exit=0
+[20:40:25] COOL i1_pp2048_d16384_nchA1 waited=5s start_temps=0,46 1,48 2,43  fan3=2872rpm
+[20:40:25] RUN i1_pp2048_d16384_nchA1 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e NCCL_MIN_NCHANNELS=1 -e NCCL_MAX_NCHANNELS=1 -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=INIT -e NCCL_DEBUG_FILE=/phase1/results/i1_pp2048_d16384_nchA1.nccl.%p :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -d 16384 -r 3 -o csv
+[20:43:48] END i1_pp2048_d16384_nchA1 exit=0
+[20:43:53] COOL i1_pp2048_d16384_nchB2 waited=5s start_temps=0,46 1,48 2,43  fan3=3040rpm
+[20:43:53] RUN i1_pp2048_d16384_nchB2 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e NCCL_MIN_NCHANNELS=2 -e NCCL_MAX_NCHANNELS=2 -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=INIT -e NCCL_DEBUG_FILE=/phase1/results/i1_pp2048_d16384_nchB2.nccl.%p :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -d 16384 -r 3 -o csv
+[20:46:36] END i1_pp2048_d16384_nchB2 exit=0
+[20:46:41] COOL i1_pp2048_d16384_def4 waited=5s start_temps=0,46 1,48 2,44  fan3=3040rpm
+[20:46:41] RUN i1_pp2048_d16384_def4 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=INIT -e NCCL_DEBUG_FILE=/phase1/results/i1_pp2048_d16384_def4.nccl.%p :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -d 16384 -r 3 -o csv
+[20:49:44] END i1_pp2048_d16384_def4 exit=0
+[20:49:50] COOL i1_pp2048_d16384_nchC4 waited=5s start_temps=0,46 1,48 2,43  fan3=2866rpm
+[20:49:50] RUN i1_pp2048_d16384_nchC4 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e NCCL_MIN_NCHANNELS=4 -e NCCL_MAX_NCHANNELS=4 -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=INIT -e NCCL_DEBUG_FILE=/phase1/results/i1_pp2048_d16384_nchC4.nccl.%p :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -d 16384 -r 3 -o csv
+[20:53:12] END i1_pp2048_d16384_nchC4 exit=0
+[20:53:17] COOL i1_pp2048_d16384_def5 waited=5s start_temps=0,46 1,48 2,43  fan3=2866rpm
+[20:53:17] RUN i1_pp2048_d16384_def5 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=INIT -e NCCL_DEBUG_FILE=/phase1/results/i1_pp2048_d16384_def5.nccl.%p :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -d 16384 -r 3 -o csv
+[20:56:15] END i1_pp2048_d16384_def5 exit=0
+[20:56:20] COOL i1_tg512_def8 waited=5s start_temps=0,46 1,48 2,43  fan3=3040rpm
+[20:56:20] RUN i1_tg512_def8 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=INIT -e NCCL_DEBUG_FILE=/phase1/results/i1_tg512_def8.nccl.%p :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -r 3 -o csv
+[20:59:38] END i1_tg512_def8 exit=0
+[20:59:48] COOL i1_tg512_combo waited=10s start_temps=0,46 1,48 2,43  fan3=3040rpm
+[20:59:48] RUN i1_tg512_combo :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e NCCL_MIN_NCHANNELS=1 -e NCCL_MAX_NCHANNELS=1 -e NCCL_BUFFSIZE=16777216 -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=INIT -e NCCL_DEBUG_FILE=/phase1/results/i1_tg512_combo.nccl.%p :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -r 3 -o csv
+[21:02:22] END i1_tg512_combo exit=0
+[21:02:37] COOL i1_pp2048_d0_combo waited=15s start_temps=0,45 1,48 2,43  fan3=3047rpm
+[21:02:37] RUN i1_pp2048_d0_combo :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e NCCL_MIN_NCHANNELS=1 -e NCCL_MAX_NCHANNELS=1 -e NCCL_BUFFSIZE=16777216 -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=INIT -e NCCL_DEBUG_FILE=/phase1/results/i1_pp2048_d0_combo.nccl.%p :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -r 3 -o csv
+[21:05:06] END i1_pp2048_d0_combo exit=0
+[21:05:07] COOL i1_pp2048_d0_def8 waited=0s start_temps=0,43 1,45 2,40  fan3=2866rpm
+[21:05:07] RUN i1_pp2048_d0_def8 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=INIT -e NCCL_DEBUG_FILE=/phase1/results/i1_pp2048_d0_def8.nccl.%p :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -r 3 -o csv
+[21:07:45] END i1_pp2048_d0_def8 exit=0
+[21:07:45] COOL i1_pp2048_d16384_def8 waited=0s start_temps=0,42 1,44 2,39  fan3=3040rpm
+[21:07:45] RUN i1_pp2048_d16384_def8 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=INIT -e NCCL_DEBUG_FILE=/phase1/results/i1_pp2048_d16384_def8.nccl.%p :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -d 16384 -r 3 -o csv
+[21:10:50] END i1_pp2048_d16384_def8 exit=0
+[21:10:56] COOL i1_pp2048_d16384_combo waited=5s start_temps=0,45 1,48 2,43  fan3=2872rpm
+[21:10:56] RUN i1_pp2048_d16384_combo :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e NCCL_MIN_NCHANNELS=1 -e NCCL_MAX_NCHANNELS=1 -e NCCL_BUFFSIZE=16777216 -e NCCL_DEBUG=INFO -e NCCL_DEBUG_SUBSYS=INIT -e NCCL_DEBUG_FILE=/phase1/results/i1_pp2048_d16384_combo.nccl.%p :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -d 16384 -r 3 -o csv
+[21:14:11] END i1_pp2048_d16384_combo exit=0
+[21:14:11] === Item 2: power cap (stack B)
+[21:14:12] POWER LIMIT requested 125 W; readback: 125.00 125.00 125.00 
+[21:14:17] COOL i2_tg512_pl125_r1 waited=5s start_temps=0,46 1,48 2,43  fan3=3047rpm
+[21:14:17] RUN i2_tg512_pl125_r1 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -r 3 -o csv
+[21:17:20] END i2_tg512_pl125_r1 exit=0
+[21:17:30] COOL i2_pp2048_d0_pl125_r1 waited=10s start_temps=0,46 1,48 2,43  fan3=3040rpm
+[21:17:30] RUN i2_pp2048_d0_pl125_r1 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -r 3 -o csv
+[21:20:17] END i2_pp2048_d0_pl125_r1 exit=0
+[21:20:17] COOL i2_pp2048_d16384_pl125_r1 waited=0s start_temps=0,43 1,45 2,40  fan3=2878rpm
+[21:20:17] RUN i2_pp2048_d16384_pl125_r1 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -d 16384 -r 3 -o csv
+[21:23:17] END i2_pp2048_d16384_pl125_r1 exit=0
+[21:23:17] POWER LIMIT requested 150 W; readback: 150.00 150.00 150.00 
+[21:23:22] COOL i2_tg512_pl150_r1 waited=5s start_temps=0,46 1,48 2,43  fan3=2872rpm
+[21:23:22] RUN i2_tg512_pl150_r1 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -r 3 -o csv
+[21:26:08] END i2_tg512_pl150_r1 exit=0
+[21:26:33] COOL i2__pl150_r2 waited=25s start_temps=0,45 1,48 2,43  fan3=3047rpm
+[21:26:33] RUN i2__pl150_r2 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -r 3 -o csv
+[21:29:20] END i2__pl150_r2 exit=0
+[21:29:20] POWER LIMIT requested 125 W; readback: 125.00 125.00 125.00 
+[21:29:20] COOL i2__pl125_r2 waited=0s start_temps=0,44 1,46 2,41  fan3=3033rpm
+[21:29:20] RUN i2__pl125_r2 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -r 3 -o csv
+[21:31:55] END i2__pl125_r2 exit=0
+[21:31:55] POWER LIMIT requested 150 W; readback: 150.00 150.00 150.00 
+[21:31:55] COOL i2_pp2048_d0_pl150_r1 waited=0s start_temps=0,43 1,45 2,40  fan3=3033rpm
+[21:31:55] RUN i2_pp2048_d0_pl150_r1 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -r 3 -o csv
+[21:34:30] END i2_pp2048_d0_pl150_r1 exit=0
+[21:34:31] SKIP i2__pl150_r2 (already done)
+[21:34:31] POWER LIMIT requested 125 W; readback: 125.00 125.00 125.00 
+[21:34:31] SKIP i2__pl125_r2 (already done)
+[21:34:31] POWER LIMIT requested 150 W; readback: 150.00 150.00 150.00 
+[21:34:31] COOL i2_pp2048_d16384_pl150_r1 waited=0s start_temps=0,43 1,45 2,39  fan3=2860rpm
+[21:34:31] RUN i2_pp2048_d16384_pl150_r1 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -d 16384 -r 3 -o csv
+[21:37:11] END i2_pp2048_d16384_pl150_r1 exit=0
+[21:37:11] SKIP i2__pl150_r2 (already done)
+[21:37:11] POWER LIMIT requested 125 W; readback: 125.00 125.00 125.00 
+[21:37:11] SKIP i2__pl125_r2 (already done)
+[21:37:11] POWER LIMIT requested 175 W; readback: 175.00 175.00 175.00 
+[21:37:21] COOL i2_tg512_pl175_r1 waited=10s start_temps=0,46 1,48 2,43  fan3=2878rpm
+[21:37:21] RUN i2_tg512_pl175_r1 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -r 3 -o csv
+[21:40:35] END i2_tg512_pl175_r1 exit=0
+[21:40:35] POWER LIMIT requested 125 W; readback: 125.00 125.00 125.00 
+[21:41:06] COOL i2__pl125_r3 waited=31s start_temps=0,46 1,48 2,43  fan3=2878rpm
+[21:41:06] RUN i2__pl125_r3 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -r 3 -o csv
+[21:43:33] END i2__pl125_r3 exit=0
+[21:43:33] POWER LIMIT requested 175 W; readback: 175.00 175.00 175.00 
+[21:43:33] COOL i2__pl175_r2 waited=0s start_temps=0,44 1,46 2,41  fan3=2866rpm
+[21:43:33] RUN i2__pl175_r2 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -r 3 -o csv
+[21:46:18] END i2__pl175_r2 exit=0
+[21:46:18] POWER LIMIT requested 175 W; readback: 175.00 175.00 175.00 
+[21:46:18] COOL i2_pp2048_d0_pl175_r1 waited=0s start_temps=0,45 1,47 2,41  fan3=3040rpm
+[21:46:18] RUN i2_pp2048_d0_pl175_r1 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -r 3 -o csv
+[21:48:46] END i2_pp2048_d0_pl175_r1 exit=0
+[21:48:46] POWER LIMIT requested 125 W; readback: 125.00 125.00 125.00 
+[21:48:46] SKIP i2__pl125_r3 (already done)
+[21:48:47] POWER LIMIT requested 175 W; readback: 175.00 175.00 175.00 
+[21:48:47] SKIP i2__pl175_r2 (already done)
+[21:48:47] POWER LIMIT requested 175 W; readback: 175.00 175.00 175.00 
+[21:48:47] COOL i2_pp2048_d16384_pl175_r1 waited=0s start_temps=0,44 1,46 2,40  fan3=2872rpm
+[21:48:47] RUN i2_pp2048_d16384_pl175_r1 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -d 16384 -r 3 -o csv
+[21:51:30] END i2_pp2048_d16384_pl175_r1 exit=0
+[21:51:30] POWER LIMIT requested 125 W; readback: 125.00 125.00 125.00 
+[21:51:30] SKIP i2__pl125_r3 (already done)
+[21:51:31] POWER LIMIT requested 175 W; readback: 175.00 175.00 175.00 
+[21:51:31] SKIP i2__pl175_r2 (already done)
+[21:51:31] POWER LIMIT requested 125 W; readback: 125.00 125.00 125.00 
+[21:51:31] POWER LIMIT requested 125 W; readback: 125.00 125.00 125.00 
+[21:51:31] === Item 3: concurrent clients (stack B server, -c 262144, MTP n-max 3 / p-min 0.0, serving sampler)
+[21:51:46] COOL i3_conc_np1 waited=15s start_temps=0,46 1,48 2,43  fan3=2866rpm
+[21:51:46] RUN(server) i3_conc_np1 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e LLAMA_SPEC_SAMPLE_TEMP=1.0 -e LLAMA_SPEC_DRAFT_TOPK=20 :: /workspace/build-nccl/bin/llama-server -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf --jinja --cache-ram 0 --no-cache-idle-slots --parallel 1 -c 262144 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -fit off -lm none --host 127.0.0.1 --port $PORT --temp 1.0 --top-k 20 --top-p 0.95 --min-p 0.0 --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.0 -ngld 99 -ubd 64 -ctkd q4_0 -ctvd q4_0 :: client: python3 $P1/p18client.py conc $P1/corpus/wiki.test.raw $P1/results/i3_conc_np1
+[21:54:12] SERVER UP i3_conc_np1 after 134s
+[22:06:48] EXIT TRAP: power limit set to 125 W; readback: 125.00 125.00 125.00 
+[22:06:53] GUARD: orchestrator gone; power limit readback: 125.00 125.00 125.00 
+[22:07:02] P18 QUEUE START (no cutoff)
+[22:07:02] P18 QUEUE RESTART (corrected script; items 1 and the first part of 2 are kept)
+[22:07:02] === Item 2, completion: second run per cap and test
+[22:07:02] POWER LIMIT requested 125 W; readback: 125.00 125.00 125.00 
+[22:07:02] POWER LIMIT requested 150 W; readback: 150.00 150.00 150.00 
+[22:07:53] COOL i2_tg512_pl150_r2 waited=51s start_temps=0,45 1,48 2,44  fan3=3040rpm
+[22:07:53] RUN i2_tg512_pl150_r2 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -r 3 -o csv
+[22:10:29] END i2_tg512_pl150_r2 exit=0
+[22:10:29] POWER LIMIT requested 125 W; readback: 125.00 125.00 125.00 
+[22:11:00] COOL i2_tg512_pl125_r2 waited=31s start_temps=0,46 1,48 2,43  fan3=3040rpm
+[22:11:00] RUN i2_tg512_pl125_r2 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -r 3 -o csv
+[22:14:01] END i2_tg512_pl125_r2 exit=0
+[22:14:01] POWER LIMIT requested 175 W; readback: 175.00 175.00 175.00 
+[22:14:16] COOL i2_tg512_pl175_r2 waited=15s start_temps=0,46 1,48 2,43  fan3=2878rpm
+[22:14:16] RUN i2_tg512_pl175_r2 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -r 3 -o csv
+[22:16:50] END i2_tg512_pl175_r2 exit=0
+[22:16:51] POWER LIMIT requested 125 W; readback: 125.00 125.00 125.00 
+[22:17:26] COOL i2_tg512_pl125_r3 waited=35s start_temps=0,46 1,48 2,43  fan3=3040rpm
+[22:17:26] RUN i2_tg512_pl125_r3 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 0 -n 512 -r 3 -o csv
+[22:20:26] END i2_tg512_pl125_r3 exit=0
+[22:20:26] POWER LIMIT requested 150 W; readback: 150.00 150.00 150.00 
+[22:20:41] COOL i2_pp2048_d0_pl150_r2 waited=15s start_temps=0,46 1,48 2,43  fan3=2878rpm
+[22:20:41] RUN i2_pp2048_d0_pl150_r2 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -r 3 -o csv
+[22:22:51] END i2_pp2048_d0_pl150_r2 exit=0
+[22:22:52] POWER LIMIT requested 125 W; readback: 125.00 125.00 125.00 
+[22:22:52] COOL i2_pp2048_d0_pl125_r2 waited=0s start_temps=0,44 1,46 2,41  fan3=3040rpm
+[22:22:52] RUN i2_pp2048_d0_pl125_r2 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -r 3 -o csv
+[22:25:25] END i2_pp2048_d0_pl125_r2 exit=0
+[22:25:25] POWER LIMIT requested 175 W; readback: 175.00 175.00 175.00 
+[22:25:25] COOL i2_pp2048_d0_pl175_r2 waited=0s start_temps=0,43 1,45 2,40  fan3=2866rpm
+[22:25:25] RUN i2_pp2048_d0_pl175_r2 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -r 3 -o csv
+[22:28:14] END i2_pp2048_d0_pl175_r2 exit=0
+[22:28:14] POWER LIMIT requested 125 W; readback: 125.00 125.00 125.00 
+[22:28:14] COOL i2_pp2048_d0_pl125_r3 waited=0s start_temps=0,43 1,45 2,40  fan3=3047rpm
+[22:28:14] RUN i2_pp2048_d0_pl125_r3 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -r 3 -o csv
+[22:30:32] END i2_pp2048_d0_pl125_r3 exit=0
+[22:30:32] POWER LIMIT requested 150 W; readback: 150.00 150.00 150.00 
+[22:30:32] COOL i2_pp2048_d16384_pl150_r2 waited=0s start_temps=0,42 1,45 2,39  fan3=3040rpm
+[22:30:32] RUN i2_pp2048_d16384_pl150_r2 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -d 16384 -r 3 -o csv
+[22:33:35] END i2_pp2048_d16384_pl150_r2 exit=0
+[22:33:36] POWER LIMIT requested 125 W; readback: 125.00 125.00 125.00 
+[22:33:46] COOL i2_pp2048_d16384_pl125_r2 waited=10s start_temps=0,46 1,48 2,43  fan3=2866rpm
+[22:33:46] RUN i2_pp2048_d16384_pl125_r2 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -d 16384 -r 3 -o csv
+[22:36:37] END i2_pp2048_d16384_pl125_r2 exit=0
+[22:36:37] POWER LIMIT requested 175 W; readback: 175.00 175.00 175.00 
+[22:36:47] COOL i2_pp2048_d16384_pl175_r2 waited=10s start_temps=0,45 1,48 2,43  fan3=3040rpm
+[22:36:47] RUN i2_pp2048_d16384_pl175_r2 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -d 16384 -r 3 -o csv
+[22:39:58] END i2_pp2048_d16384_pl175_r2 exit=0
+[22:39:58] POWER LIMIT requested 125 W; readback: 125.00 125.00 125.00 
+[22:40:19] COOL i2_pp2048_d16384_pl125_r3 waited=21s start_temps=0,46 1,48 2,43  fan3=2878rpm
+[22:40:19] RUN i2_pp2048_d16384_pl125_r3 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -d 16384 -r 3 -o csv
+[22:43:20] END i2_pp2048_d16384_pl125_r3 exit=0
+[22:43:20] POWER LIMIT requested 125 W; readback: 125.00 125.00 125.00 
+[22:43:20] === Item 3: concurrent clients (stack B server, -c 262144, MTP n-max 3 / p-min 0.0, serving sampler)
+[22:43:30] COOL i3_conc_np1 waited=10s start_temps=0,45 1,48 2,43  fan3=3040rpm
+[22:43:30] RUN(server) i3_conc_np1 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e LLAMA_SPEC_SAMPLE_TEMP=1.0 -e LLAMA_SPEC_DRAFT_TOPK=20 :: /workspace/build-nccl/bin/llama-server -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf --jinja --cache-ram 0 --no-cache-idle-slots --parallel 1 -c 262144 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -fit off -lm none --host 127.0.0.1 --port $PORT --temp 1.0 --top-k 20 --top-p 0.95 --min-p 0.0 --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.0 -ngld 99 -ubd 64 -ctkd q4_0 -ctvd q4_0 :: client: python3 $P1/p18client.py conc $P1/corpus/wiki.test.raw $P1/results/i3_conc_np1
+[22:45:26] SERVER UP i3_conc_np1 after 101s
+[23:03:53] END i3_conc_np1 exit=0 (client rc=0)
+[23:04:49] COOL i3_conc_np2kvu waited=56s start_temps=0,45 1,48 2,44  fan3=3040rpm
+[23:04:49] RUN(server) i3_conc_np2kvu :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e LLAMA_SPEC_SAMPLE_TEMP=1.0 -e LLAMA_SPEC_DRAFT_TOPK=20 :: /workspace/build-nccl/bin/llama-server -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf --jinja --cache-ram 0 --no-cache-idle-slots --parallel 2 --kv-unified -c 262144 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -fit off -lm none --host 127.0.0.1 --port $PORT --temp 1.0 --top-k 20 --top-p 0.95 --min-p 0.0 --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.0 -ngld 99 -ubd 64 -ctkd q4_0 -ctvd q4_0 :: client: python3 $P1/p18client.py conc $P1/corpus/wiki.test.raw $P1/results/i3_conc_np2kvu
+[23:06:42] SERVER UP i3_conc_np2kvu after 107s
+[23:26:58] END i3_conc_np2kvu exit=0 (client rc=0)
+[23:27:59] COOL i3_conc_np2nokvu waited=61s start_temps=0,45 1,48 2,44  fan3=3040rpm
+[23:27:59] RUN(server) i3_conc_np2nokvu :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e LLAMA_SPEC_SAMPLE_TEMP=1.0 -e LLAMA_SPEC_DRAFT_TOPK=20 :: /workspace/build-nccl/bin/llama-server -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf --jinja --cache-ram 0 --no-cache-idle-slots --parallel 2 --no-kv-unified -c 262144 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -fit off -lm none --host 127.0.0.1 --port $PORT --temp 1.0 --top-k 20 --top-p 0.95 --min-p 0.0 --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.0 -ngld 99 -ubd 64 -ctkd q4_0 -ctvd q4_0 :: client: python3 $P1/p18client.py conc $P1/corpus/wiki.test.raw $P1/results/i3_conc_np2nokvu
+[23:30:03] SERVER UP i3_conc_np2nokvu after 117s
+[23:48:34] END i3_conc_np2nokvu exit=0 (client rc=0)
+[23:48:34] === Item 4: -ub under NCCL (stack B, -b 32768, pp2048 at depth 0 and -d 16384, 3 reps)
+[23:49:35] COOL i4_pp2048_d0_ub512 waited=61s start_temps=0,45 1,48 2,44  fan3=2866rpm
+[23:49:35] RUN i4_pp2048_d0_ub512 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 512 -p 2048 -n 0 -r 3 -o csv
+[23:52:06] END i4_pp2048_d0_ub512 exit=0
+[23:52:06] COOL i4_pp2048_d0_ub1024 waited=0s start_temps=0,45 1,47 2,42  fan3=3047rpm
+[23:52:06] RUN i4_pp2048_d0_ub1024 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 1024 -p 2048 -n 0 -r 3 -o csv
+[23:54:21] END i4_pp2048_d0_ub1024 exit=0
+[23:54:22] COOL i4_pp2048_d0_ub2048 waited=1s start_temps=0,44 1,46 2,41  fan3=2866rpm
+[23:54:22] RUN i4_pp2048_d0_ub2048 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -r 3 -o csv
+[23:56:35] END i4_pp2048_d0_ub2048 exit=0
+[23:56:35] COOL i4_pp2048_d0_ub4096 waited=0s start_temps=0,43 1,45 2,40  fan3=3047rpm
+[23:56:35] RUN i4_pp2048_d0_ub4096 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 4096 -p 2048 -n 0 -r 3 -o csv
+[23:59:13] END i4_pp2048_d0_ub4096 exit=0
+[23:59:13] COOL i4_pp2048_d16384_ub4096 waited=0s start_temps=0,42 1,45 2,39  fan3=3040rpm
+[23:59:13] RUN i4_pp2048_d16384_ub4096 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 4096 -p 2048 -n 0 -d 16384 -r 3 -o csv
+[00:02:15] END i4_pp2048_d16384_ub4096 exit=0
+[00:02:20] COOL i4_pp2048_d16384_ub2048 waited=5s start_temps=0,46 1,48 2,43  fan3=2872rpm
+[00:02:20] RUN i4_pp2048_d16384_ub2048 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 2048 -n 0 -d 16384 -r 3 -o csv
+[00:05:40] END i4_pp2048_d16384_ub2048 exit=0
+[00:05:45] COOL i4_pp2048_d16384_ub1024 waited=5s start_temps=0,46 1,48 2,43  fan3=2872rpm
+[00:05:45] RUN i4_pp2048_d16384_ub1024 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 1024 -p 2048 -n 0 -d 16384 -r 3 -o csv
+[00:08:50] END i4_pp2048_d16384_ub1024 exit=0
+[00:09:00] COOL i4_pp2048_d16384_ub512 waited=10s start_temps=0,46 1,48 2,43  fan3=3047rpm
+[00:09:00] RUN i4_pp2048_d16384_ub512 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 512 -p 2048 -n 0 -d 16384 -r 3 -o csv
+[00:11:56] END i4_pp2048_d16384_ub512 exit=0
+[00:11:57] === Item 5: KLD and repeatability at -c 65536
+[00:12:12] COOL i5_ppl_val_A waited=15s start_temps=0,46 1,48 2,43  fan3=2872rpm
+[00:12:12] RUN i5_ppl_val_A :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 :: ./build-opt/bin/llama-perplexity -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -f /phase1/corpus/wiki.test.raw -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -c 4096 -b 4096 --chunks 1 -lm none -fit off -ub 2048 --kl-divergence-base /quant/kld18/val_ppl.bin
+[00:14:41] END i5_ppl_val_A exit=0
+[00:14:41] COOL i5_ld_val_A waited=0s start_temps=0,42 1,44 2,38  fan3=2878rpm
+[00:14:41] RUN i5_ld_val_A :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e LD_LIBRARY_PATH=/workspace/src/build-opt/bin :: /phase1/bin/logitdump_A /models/Qwen3.8-27B-UD-Q6_K_XL.gguf /phase1/corpus/wiki.test.raw 4096 2048 /quant/kld18/val_ld.bin
+[00:17:12] END i5_ld_val_A exit=0
+[00:17:12] ALERT: 00:17:12 LOGERROR i5_ld_val_A exit=0: 2212:set_abort_callback: call 
+[00:17:12] NOTE i5_ld_val_A: only the benign set_abort_callback line matched the error filter
+[00:17:22] COOL i5_ld_A2048_c65536 waited=0s start_temps=0,40 1,42 2,37  fan3=2878rpm
+[00:17:22] RUN i5_ld_A2048_c65536 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e LD_LIBRARY_PATH=/workspace/src/build-opt/bin :: /phase1/bin/logitdump_A /models/Qwen3.8-27B-UD-Q6_K_XL.gguf /phase1/corpus/wiki.test.raw 65536 2048 /quant/kld18/a2048.bin
+[00:28:03] END i5_ld_A2048_c65536 exit=0
+[00:28:03] ALERT: 00:28:03 LOGERROR i5_ld_A2048_c65536 exit=0: 2212:set_abort_callback: call 
+[00:28:03] NOTE i5_ld_A2048_c65536: only the benign set_abort_callback line matched the error filter
+[00:28:03] COOL i5_ld_B2048_c65536 waited=0s start_temps=0,45 1,47 2,42  fan3=2872rpm
+[00:28:03] RUN i5_ld_B2048_c65536 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e LD_LIBRARY_PATH=/workspace/build-nccl/bin :: /phase1/bin/logitdump_B /models/Qwen3.8-27B-UD-Q6_K_XL.gguf /phase1/corpus/wiki.test.raw 65536 2048 /quant/kld18/b2048.bin
+[00:36:56] END i5_ld_B2048_c65536 exit=0
+[00:36:56] ALERT: 00:36:56 LOGERROR i5_ld_B2048_c65536 exit=0: 2209:set_abort_callback: call 
+[00:36:56] NOTE i5_ld_B2048_c65536: only the benign set_abort_callback line matched the error filter
+[00:36:56] COOL i5_ld_A5_c65536 waited=0s start_temps=0,46 1,48 2,43  fan3=2878rpm
+[00:36:56] RUN i5_ld_A5_c65536 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e LD_LIBRARY_PATH=/workspace/src/build-opt/bin :: /phase1/bin/logitdump_A /models/Qwen3.8-27B-UD-Q6_K_XL.gguf /phase1/corpus/wiki.test.raw 65536 5 /quant/kld18/a5.bin
+[00:57:32] END i5_ld_A5_c65536 exit=0
+[00:57:32] ALERT: 00:57:32 LOGERROR i5_ld_A5_c65536 exit=0: 2212:set_abort_callback: call 
+[00:57:32] NOTE i5_ld_A5_c65536: only the benign set_abort_callback line matched the error filter
+[01:07:53] KLD c65536 NCCL_vs_nonNCCL_ub2048: overall: mean_kld=0.000891 median=0.000405 p99.9=0.022048 max=1.686653 top1_agree=98.622%
+[01:20:12] KLD c65536 nonNCCL_ub5_vs_ub2048: overall: mean_kld=0.001516 median=0.000683 p99.9=0.043158 max=0.554734 top1_agree=98.245%
+[01:20:12] COOL i5_ld_Bhash_c65536_r1 waited=0s start_temps=0,36 1,38 2,32  fan3=2878rpm
+[01:20:12] RUN i5_ld_Bhash_c65536_r1 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e LD_LIBRARY_PATH=/workspace/build-nccl/bin :: /phase1/bin/logitdump_B /models/Qwen3.8-27B-UD-Q6_K_XL.gguf /phase1/corpus/wiki.test.raw 65536 2048 -
+[01:29:08] END i5_ld_Bhash_c65536_r1 exit=0
+[01:29:08] ALERT: 01:29:08 LOGERROR i5_ld_Bhash_c65536_r1 exit=0: 2209:set_abort_callback: call 
+[01:29:08] NOTE i5_ld_Bhash_c65536_r1: only the benign set_abort_callback line matched the error filter
+[01:29:08] COOL i5_ld_Bhash_c65536_r2 waited=0s start_temps=0,46 1,48 2,43  fan3=2866rpm
+[01:29:08] RUN i5_ld_Bhash_c65536_r2 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e LD_LIBRARY_PATH=/workspace/build-nccl/bin :: /phase1/bin/logitdump_B /models/Qwen3.8-27B-UD-Q6_K_XL.gguf /phase1/corpus/wiki.test.raw 65536 2048 -
+[01:37:35] END i5_ld_Bhash_c65536_r2 exit=0
+[01:37:35] ALERT: 01:37:35 LOGERROR i5_ld_Bhash_c65536_r2 exit=0: 2209:set_abort_callback: call 
+[01:37:35] NOTE i5_ld_Bhash_c65536_r2: only the benign set_abort_callback line matched the error filter
+[01:37:40] COOL i5_ld_Bhash_c65536_r3 waited=5s start_temps=0,46 1,48 2,43  fan3=2866rpm
+[01:37:40] RUN i5_ld_Bhash_c65536_r3 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e LD_LIBRARY_PATH=/workspace/build-nccl/bin :: /phase1/bin/logitdump_B /models/Qwen3.8-27B-UD-Q6_K_XL.gguf /phase1/corpus/wiki.test.raw 65536 2048 -
+[01:46:17] END i5_ld_Bhash_c65536_r3 exit=0
+[01:46:17] ALERT: 01:46:17 LOGERROR i5_ld_Bhash_c65536_r3 exit=0: 2209:set_abort_callback: call 
+[01:46:17] NOTE i5_ld_Bhash_c65536_r3: only the benign set_abort_callback line matched the error filter
+[01:46:17] === Item 6: server soak, 90 minutes (stack B, -c 262144, MTP n-max 3 / p-min 0.0, serving sampler, one slot)
+[01:46:22] COOL i6_soak_B waited=5s start_temps=0,45 1,48 2,43  fan3=2872rpm
+[01:46:22] RUN(server) i6_soak_B :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e LLAMA_SPEC_SAMPLE_TEMP=1.0 -e LLAMA_SPEC_DRAFT_TOPK=20 :: /workspace/build-nccl/bin/llama-server -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf --jinja --cache-ram 0 --no-cache-idle-slots --parallel 1 -c 262144 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -fit off -lm none --host 127.0.0.1 --port $PORT --temp 1.0 --top-k 20 --top-p 0.95 --min-p 0.0 --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.0 -ngld 99 -ubd 64 -ctkd q4_0 -ctvd q4_0 :: client: python3 $P1/p18client.py soak $P1/corpus/wiki.test.raw 5400
+[01:48:25] SERVER UP i6_soak_B after 118s
+[03:18:28] END i6_soak_B exit=0 (client rc=0)
+[03:18:29] POWER LIMIT requested 125 W; readback: 125.00 125.00 125.00 
+[03:18:29] P18 ALL DONE
+[03:18:29] EXIT TRAP: power limit set to 125 W; readback: 125.00 125.00 125.00 
+[03:18:30] GUARD: orchestrator gone; power limit readback: 125.00 125.00 125.00 

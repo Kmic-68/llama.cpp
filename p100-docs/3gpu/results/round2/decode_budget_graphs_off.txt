@@ -1,0 +1,42 @@
+trace i1_nvprof_graphsunset_n36.csv: 222797 GPU rows, 735271 API rows, 3 devices, 37 token marks (logits DtoH 0.316 MB on dev0)
+steady window: last 32 tokens, 95.57 ms/token under nvprof; real (unprofiled tg512) 44.62 ms/token; inflation x2.14
+
+exchanges: 512.0 peer copies/token, 387.0 exchange ADDs/token -> 128.0 exchanges/token (4 copies each, generic 3-GPU butterfly); copy sizes KB: {20.0: 16384}
+
+per device, ms per token (trace kernel/copy time is real; idle corrected to the unprofiled token time):
+dev | busy | matvec | quant_act | attn_full | deltanet | norm | other_k | xchg_ops | trace_idle | real_idle |   xchg_wait |   other_idle(launch/host)
+GPU0 | 28.29 | 21.29 | 0.86 | 1.04 | 0.88 | 1.56 | 0.55 | 2.19 | 67.28 | 16.33 | 13.75 | 2.59
+GPU1 | 27.42 | 21.40 | 0.86 | 1.07 | 0.89 | 1.64 | 0.56 | 1.08 | 68.15 | 17.20 | 8.20 | 9.00
+GPU2 | 27.19 | 21.44 | 0.91 | 1.00 | 0.88 | 1.58 | 0.56 | 0.82 | 68.38 | 17.43 | 3.31 | 14.12
+
+non-exchange GPU busy per device (ms/token): GPU0 26.19, GPU1 26.42, GPU2 26.37; imbalance (max - mean) 0.10 ms/token = 0.2% of the token
+
+budget (mean over GPUs, ms/token and % of the real token):
+  matvec                                          21.38 ms   47.9%
+  activation quantize (for matvec)                 0.88 ms    2.0%
+  full attention (FA, rope, KV write, FWHT)        1.04 ms    2.3%
+  delta-net (GDN, conv, gating)                    0.88 ms    2.0%
+  norms                                            1.59 ms    3.6%
+  other kernels/copies                             0.56 ms    1.2%
+  exchange ops (copies+adds)                       1.36 ms    3.1%
+  exchange-adjacent idle                           8.42 ms   18.9%
+  other idle (launch gaps / host-bound)            8.57 ms   19.2%
+
+host API per token (profiled durations): 19174 calls, 69.56 ms summed
+  cudaGetLastError                            8115.0 calls    1.494 ms
+  cudaLaunchKernel                            5274.0 calls   49.514 ms
+  cudaStreamWaitEvent                         2048.0 calls    5.154 ms
+  cudaEventRecord                             1304.0 calls    5.233 ms
+  cudaGetDevice                                905.0 calls    0.506 ms
+  cudaSetDevice                                905.0 calls    0.902 ms
+  cudaMemcpyPeerAsync                          512.0 calls    5.328 ms
+  cudaOccupancyMaxActiveBlocksPerMultiprocessorWithFlags    48.0 calls    0.099 ms
+  cudaStreamSynchronize                         33.0 calls    1.063 ms
+  cudaMemcpyAsync                               30.0 calls    0.271 ms
+  enqueue (all but cudaStreamSynchronize/cudaDeviceSynchronize/cudaEventSynchronize): 68.50 ms
+
+CUDA graphs: 0.00 cudaGraphLaunch/token (per device: {}), 0.00 capture/instantiate/update calls/token
+host enqueue per device (profiled ms/token, by Correlation_ID; non-launch calls go to the next launch's device): GPU0 33.92, GPU1 18.44, GPU2 16.14, GPU? 0.00
+host: from token start to its last launch 95.55 ms (profiled)
+
+LLAMA_TL (server, unprofiled), last 400 decode steps: llama_decode enqueue 43.58 ms median, sync wait 0.96 ms median, step-to-step 45.32 ms

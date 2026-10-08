@@ -1,0 +1,6 @@
+files: n_ctx=4096 n_vocab=248320 n_chunk=1 scored_tokens=2047 (positions 2048..4094 per chunk) bad_or_nonfinite=0
+records that differ bytewise: 0 of 2047
+overall: mean_kld=0.000000 median=0.000000 p99.9=0.000000 max=0.000000 top1_agree=100.000%
+pos_start,pos_end,n,mean_kld,max_kld,top1_agree_pct
+2048,3071,1024,0.000000,0.000000,100.000
+3072,4094,1023,0.000000,0.000000,100.000

@@ -1,0 +1,241 @@
+[17:42:22] === G0 start
+[17:42:22] COOL g0_peer waited=0s start_temps=0,40 1,48 2,48 
+[17:42:22] RUN g0_peer ::  :: timeout 300 /phase1/p2pbench/p2pbench
+[17:42:40] END g0_peer exit=0
+[17:42:40] COOL g0_nopeer waited=0s start_temps=0,40 1,49 2,49 
+[17:42:40] RUN g0_nopeer ::  :: timeout 300 /phase1/p2pbench/p2pbench --no-peer
+[17:42:47] END g0_nopeer exit=0
+[17:42:47] === G0 done
+[17:43:55] === G1 throughput start
+[17:43:55] COOL g1_tg512_tp3_XL_r1 waited=0s start_temps=0,40 1,48 2,48 
+[17:43:55] RUN g1_tg512_tp3_XL_r1 ::  :: ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1/1 -p 0 -n 512 -r 3 -o csv
+[17:47:58] END g1_tg512_tp3_XL_r1 exit=0
+[17:50:29] COOL g1_tg512_tp3_Q8_r1 waited=151s start_temps=0,41 1,50 2,50 
+[17:50:29] RUN g1_tg512_tp3_Q8_r1 ::  :: ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-Q8_0.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1/1 -p 0 -n 512 -r 3 -o csv
+[17:55:13] END g1_tg512_tp3_Q8_r1 exit=0
+[17:58:00] COOL g1_tg512_p12_XL_r1 waited=167s start_temps=0,42 1,50 2,50 
+[17:58:00] RUN g1_tg512_p12_XL_r1 :: -e CUDA_VISIBLE_DEVICES=1,2 :: ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1 -p 0 -n 512 -r 3 -o csv
+[18:02:12] END g1_tg512_p12_XL_r1 exit=0
+[18:04:18] COOL g1_tg512_p12_Q8_r1 waited=126s start_temps=0,35 1,50 2,49 
+[18:04:18] RUN g1_tg512_p12_Q8_r1 :: -e CUDA_VISIBLE_DEVICES=1,2 :: ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-Q8_0.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1 -p 0 -n 512 -r 3 -o csv
+[18:09:07] END g1_tg512_p12_Q8_r1 exit=0
+[18:09:57] COOL g1_tg512_p01_XL_r1 waited=50s start_temps=0,32 1,50 2,49 
+[18:09:57] RUN g1_tg512_p01_XL_r1 :: -e CUDA_VISIBLE_DEVICES=0,1 :: ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1 -p 0 -n 512 -r 3 -o csv
+[18:14:03] END g1_tg512_p01_XL_r1 exit=0
+[18:14:48] COOL g1_tg512_p01_Q8_r1 waited=45s start_temps=0,40 1,50 2,39 
+[18:14:48] RUN g1_tg512_p01_Q8_r1 :: -e CUDA_VISIBLE_DEVICES=0,1 :: ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-Q8_0.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1 -p 0 -n 512 -r 3 -o csv
+[18:19:35] END g1_tg512_p01_Q8_r1 exit=0
+[18:20:25] COOL g1_tg512_p01_Q8_r2 waited=50s start_temps=0,42 1,50 2,38 
+[18:20:25] RUN g1_tg512_p01_Q8_r2 :: -e CUDA_VISIBLE_DEVICES=0,1 :: ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-Q8_0.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1 -p 0 -n 512 -r 3 -o csv
+[18:25:00] END g1_tg512_p01_Q8_r2 exit=0
+[18:25:56] COOL g1_tg512_p01_XL_r2 waited=56s start_temps=0,42 1,50 2,38 
+[18:25:56] RUN g1_tg512_p01_XL_r2 :: -e CUDA_VISIBLE_DEVICES=0,1 :: ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1 -p 0 -n 512 -r 3 -o csv
+[18:30:07] END g1_tg512_p01_XL_r2 exit=0
+[18:30:57] COOL g1_tg512_p12_Q8_r2 waited=50s start_temps=0,42 1,50 2,38 
+[18:30:57] RUN g1_tg512_p12_Q8_r2 :: -e CUDA_VISIBLE_DEVICES=1,2 :: ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-Q8_0.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1 -p 0 -n 512 -r 3 -o csv
+[18:35:43] END g1_tg512_p12_Q8_r2 exit=0
+[18:36:38] COOL g1_tg512_p12_XL_r2 waited=55s start_temps=0,33 1,50 2,47 
+[18:36:38] RUN g1_tg512_p12_XL_r2 :: -e CUDA_VISIBLE_DEVICES=1,2 :: ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1 -p 0 -n 512 -r 3 -o csv
+[18:40:43] END g1_tg512_p12_XL_r2 exit=0
+[18:41:39] COOL g1_tg512_tp3_Q8_r2 waited=56s start_temps=0,33 1,50 2,48 
+[18:41:39] RUN g1_tg512_tp3_Q8_r2 ::  :: ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-Q8_0.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1/1 -p 0 -n 512 -r 3 -o csv
+[18:46:26] END g1_tg512_tp3_Q8_r2 exit=0
+[18:47:21] COOL g1_tg512_tp3_XL_r2 waited=55s start_temps=0,41 1,50 2,48 
+[18:47:21] RUN g1_tg512_tp3_XL_r2 ::  :: ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1/1 -p 0 -n 512 -r 3 -o csv
+[18:51:42] END g1_tg512_tp3_XL_r2 exit=0
+[18:51:42] === G1 traces start
+[18:52:33] COOL g1_nvprof_tp3_XL_n4 waited=51s start_temps=0,42 1,50 2,48 
+[18:52:33] RUN g1_nvprof_tp3_XL_n4 ::  :: /usr/local/cuda/bin/nvprof --print-gpu-trace --csv --normalized-time-unit us --log-file /phase1/results/g1_nvprof_tp3_XL_n4.csv ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1/1 -p 0 -n 4 -r 1 --no-warmup -o csv
+[18:55:31] END g1_nvprof_tp3_XL_n4 exit=0
+[18:55:31] COOL g1_nvprof_tp3_XL_n36 waited=0s start_temps=0,37 1,46 2,44 
+[18:55:31] RUN g1_nvprof_tp3_XL_n36 ::  :: /usr/local/cuda/bin/nvprof --print-gpu-trace --csv --normalized-time-unit us --log-file /phase1/results/g1_nvprof_tp3_XL_n36.csv ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1/1 -p 0 -n 36 -r 1 --no-warmup -o csv
+[18:58:39] END g1_nvprof_tp3_XL_n36 exit=0
+[18:58:40] COOL g1_nvprof_tp3_Q8_n4 waited=0s start_temps=0,36 1,44 2,43 
+[18:58:40] RUN g1_nvprof_tp3_Q8_n4 ::  :: /usr/local/cuda/bin/nvprof --print-gpu-trace --csv --normalized-time-unit us --log-file /phase1/results/g1_nvprof_tp3_Q8_n4.csv ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-Q8_0.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1/1 -p 0 -n 4 -r 1 --no-warmup -o csv
+[19:02:15] END g1_nvprof_tp3_Q8_n4 exit=0
+[19:02:15] COOL g1_nvprof_tp3_Q8_n36 waited=0s start_temps=0,36 1,44 2,42 
+[19:02:15] RUN g1_nvprof_tp3_Q8_n36 ::  :: /usr/local/cuda/bin/nvprof --print-gpu-trace --csv --normalized-time-unit us --log-file /phase1/results/g1_nvprof_tp3_Q8_n36.csv ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-Q8_0.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1/1 -p 0 -n 36 -r 1 --no-warmup -o csv
+[19:05:54] END g1_nvprof_tp3_Q8_n36 exit=0
+[19:05:54] COOL g1_nvprof_p12_XL_n4 waited=0s start_temps=0,35 1,43 2,42 
+[19:05:54] RUN g1_nvprof_p12_XL_n4 :: -e CUDA_VISIBLE_DEVICES=1,2 :: /usr/local/cuda/bin/nvprof --print-gpu-trace --csv --normalized-time-unit us --log-file /phase1/results/g1_nvprof_p12_XL_n4.csv ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1 -p 0 -n 4 -r 1 --no-warmup -o csv
+[19:09:05] END g1_nvprof_p12_XL_n4 exit=0
+[19:09:05] COOL g1_nvprof_p12_XL_n36 waited=0s start_temps=0,34 1,43 2,41 
+[19:09:05] RUN g1_nvprof_p12_XL_n36 :: -e CUDA_VISIBLE_DEVICES=1,2 :: /usr/local/cuda/bin/nvprof --print-gpu-trace --csv --normalized-time-unit us --log-file /phase1/results/g1_nvprof_p12_XL_n36.csv ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1 -p 0 -n 36 -r 1 --no-warmup -o csv
+[19:12:13] END g1_nvprof_p12_XL_n36 exit=0
+[19:12:13] COOL g1_nvprof_p12_Q8_n4 waited=0s start_temps=0,33 1,43 2,42 
+[19:12:13] RUN g1_nvprof_p12_Q8_n4 :: -e CUDA_VISIBLE_DEVICES=1,2 :: /usr/local/cuda/bin/nvprof --print-gpu-trace --csv --normalized-time-unit us --log-file /phase1/results/g1_nvprof_p12_Q8_n4.csv ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-Q8_0.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1 -p 0 -n 4 -r 1 --no-warmup -o csv
+[19:15:44] END g1_nvprof_p12_Q8_n4 exit=0
+[19:15:44] COOL g1_nvprof_p12_Q8_n36 waited=0s start_temps=0,33 1,44 2,42 
+[19:15:44] RUN g1_nvprof_p12_Q8_n36 :: -e CUDA_VISIBLE_DEVICES=1,2 :: /usr/local/cuda/bin/nvprof --print-gpu-trace --csv --normalized-time-unit us --log-file /phase1/results/g1_nvprof_p12_Q8_n36.csv ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-Q8_0.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1 -p 0 -n 36 -r 1 --no-warmup -o csv
+[19:19:25] END g1_nvprof_p12_Q8_n36 exit=0
+[19:19:25] COOL g1_nvprof_p01_XL_n4 waited=0s start_temps=0,33 1,44 2,42 
+[19:19:25] RUN g1_nvprof_p01_XL_n4 :: -e CUDA_VISIBLE_DEVICES=0,1 :: /usr/local/cuda/bin/nvprof --print-gpu-trace --csv --normalized-time-unit us --log-file /phase1/results/g1_nvprof_p01_XL_n4.csv ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1 -p 0 -n 4 -r 1 --no-warmup -o csv
+[19:22:30] END g1_nvprof_p01_XL_n4 exit=0
+[19:22:30] COOL g1_nvprof_p01_XL_n36 waited=0s start_temps=0,36 1,44 2,40 
+[19:22:30] RUN g1_nvprof_p01_XL_n36 :: -e CUDA_VISIBLE_DEVICES=0,1 :: /usr/local/cuda/bin/nvprof --print-gpu-trace --csv --normalized-time-unit us --log-file /phase1/results/g1_nvprof_p01_XL_n36.csv ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1 -p 0 -n 36 -r 1 --no-warmup -o csv
+[19:25:41] END g1_nvprof_p01_XL_n36 exit=0
+[19:25:41] COOL g1_nvprof_p01_Q8_n4 waited=0s start_temps=0,36 1,44 2,40 
+[19:25:41] RUN g1_nvprof_p01_Q8_n4 :: -e CUDA_VISIBLE_DEVICES=0,1 :: /usr/local/cuda/bin/nvprof --print-gpu-trace --csv --normalized-time-unit us --log-file /phase1/results/g1_nvprof_p01_Q8_n4.csv ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-Q8_0.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1 -p 0 -n 4 -r 1 --no-warmup -o csv
+[19:29:17] END g1_nvprof_p01_Q8_n4 exit=0
+[19:29:17] COOL g1_nvprof_p01_Q8_n36 waited=0s start_temps=0,36 1,44 2,40 
+[19:29:17] RUN g1_nvprof_p01_Q8_n36 :: -e CUDA_VISIBLE_DEVICES=0,1 :: /usr/local/cuda/bin/nvprof --print-gpu-trace --csv --normalized-time-unit us --log-file /phase1/results/g1_nvprof_p01_Q8_n36.csv ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-Q8_0.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1 -p 0 -n 36 -r 1 --no-warmup -o csv
+[19:32:50] END g1_nvprof_p01_Q8_n36 exit=0
+[19:32:50] === G1 done
+[19:33:08] === G2 start
+[19:33:08] COOL g2_pp2048_d0_tp3_XL waited=0s start_temps=0,36 1,44 2,40 
+[19:33:08] RUN g2_pp2048_d0_tp3_XL ::  :: ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1/1 -p 2048 -n 0 -d 0 -r 3 -o csv
+[19:36:57] END g2_pp2048_d0_tp3_XL exit=0
+[19:36:57] COOL g2_pp2048_d0_tp3_Q8 waited=0s start_temps=0,40 1,48 2,46 
+[19:36:57] RUN g2_pp2048_d0_tp3_Q8 ::  :: ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-Q8_0.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1/1 -p 2048 -n 0 -d 0 -r 3 -o csv
+[19:41:10] END g2_pp2048_d0_tp3_Q8 exit=0
+[19:41:10] COOL g2_pp2048_d0_p12_Q8 waited=0s start_temps=0,41 1,49 2,47 
+[19:41:10] RUN g2_pp2048_d0_p12_Q8 :: -e CUDA_VISIBLE_DEVICES=1,2 :: ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-Q8_0.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1 -p 2048 -n 0 -d 0 -r 3 -o csv
+[19:45:00] END g2_pp2048_d0_p12_Q8 exit=0
+[19:45:00] COOL g2_pp2048_d0_p12_XL waited=0s start_temps=0,35 1,50 2,49 
+[19:45:00] RUN g2_pp2048_d0_p12_XL :: -e CUDA_VISIBLE_DEVICES=1,2 :: ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1 -p 2048 -n 0 -d 0 -r 3 -o csv
+[19:48:29] END g2_pp2048_d0_p12_XL exit=0
+[19:48:29] COOL g2_pp2048_d0_p01_XL waited=0s start_temps=0,34 1,50 2,48 
+[19:48:29] RUN g2_pp2048_d0_p01_XL :: -e CUDA_VISIBLE_DEVICES=0,1 :: ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1 -p 2048 -n 0 -d 0 -r 3 -o csv
+[19:51:44] END g2_pp2048_d0_p01_XL exit=0
+[19:51:44] COOL g2_pp2048_d0_p01_Q8 waited=0s start_temps=0,40 1,50 2,41 
+[19:51:44] RUN g2_pp2048_d0_p01_Q8 :: -e CUDA_VISIBLE_DEVICES=0,1 :: ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-Q8_0.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1 -p 2048 -n 0 -d 0 -r 3 -o csv
+[19:55:43] END g2_pp2048_d0_p01_Q8 exit=0
+[19:55:43] COOL g2_pp2048_d16384_tp3_Q8 waited=0s start_temps=0,41 1,50 2,39 
+[19:55:43] RUN g2_pp2048_d16384_tp3_Q8 ::  :: ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-Q8_0.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1/1 -p 2048 -n 0 -d 16384 -r 3 -o csv
+[20:00:43] END g2_pp2048_d16384_tp3_Q8 exit=0
+[20:00:58] COOL g2_pp2048_d16384_tp3_XL waited=15s start_temps=0,42 1,50 2,48 
+[20:00:58] RUN g2_pp2048_d16384_tp3_XL ::  :: ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1/1 -p 2048 -n 0 -d 16384 -r 3 -o csv
+[20:05:44] END g2_pp2048_d16384_tp3_XL exit=0
+[20:06:04] COOL g2_pp2048_d16384_p12_XL waited=20s start_temps=0,42 1,50 2,48 
+[20:06:04] RUN g2_pp2048_d16384_p12_XL :: -e CUDA_VISIBLE_DEVICES=1,2 :: ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1 -p 2048 -n 0 -d 16384 -r 3 -o csv
+[20:12:13] END g2_pp2048_d16384_p12_XL exit=0
+[20:12:59] COOL g2_pp2048_d16384_p12_Q8 waited=46s start_temps=0,34 1,50 2,48 
+[20:12:59] RUN g2_pp2048_d16384_p12_Q8 :: -e CUDA_VISIBLE_DEVICES=1,2 :: ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-Q8_0.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1 -p 2048 -n 0 -d 16384 -r 3 -o csv
+[20:23:53] END g2_pp2048_d16384_p12_Q8 exit=0
+[20:24:34] COOL g2_pp2048_d16384_p01_Q8 waited=41s start_temps=0,33 1,50 2,48 
+[20:24:34] RUN g2_pp2048_d16384_p01_Q8 :: -e CUDA_VISIBLE_DEVICES=0,1 :: ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-Q8_0.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1 -p 2048 -n 0 -d 16384 -r 3 -o csv
+[20:30:23] END g2_pp2048_d16384_p01_Q8 exit=0
+[20:31:03] COOL g2_pp2048_d16384_p01_XL waited=40s start_temps=0,42 1,50 2,39 
+[20:31:03] RUN g2_pp2048_d16384_p01_XL :: -e CUDA_VISIBLE_DEVICES=0,1 :: ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1 -p 2048 -n 0 -d 16384 -r 3 -o csv
+[20:36:45] END g2_pp2048_d16384_p01_XL exit=0
+[20:37:21] COOL g2_pp2048_d65536_tp3_XL waited=36s start_temps=0,42 1,50 2,38 
+[20:37:21] RUN g2_pp2048_d65536_tp3_XL ::  :: ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1/1 -p 2048 -n 0 -d 65536 -r 3 -o csv
+[20:46:13] END g2_pp2048_d65536_tp3_XL exit=0
+[20:46:58] COOL g2_pp2048_d65536_tp3_Q8 waited=45s start_temps=0,42 1,50 2,48 
+[20:46:58] RUN g2_pp2048_d65536_tp3_Q8 ::  :: ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-Q8_0.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1/1 -p 2048 -n 0 -d 65536 -r 3 -o csv
+[20:56:04] END g2_pp2048_d65536_tp3_Q8 exit=0
+[20:57:04] COOL g2_pp2048_d65536_p12_Q8 waited=60s start_temps=0,42 1,50 2,48 
+[20:57:04] RUN g2_pp2048_d65536_p12_Q8 :: -e CUDA_VISIBLE_DEVICES=1,2 :: ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-Q8_0.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1 -p 2048 -n 0 -d 65536 -r 3 -o csv
+[21:01:07] END g2_pp2048_d65536_p12_Q8 exit=139
+[21:01:07] LOGFLAG g2_pp2048_d65536_p12_Q8: 4:/workspace/src/ggml/src/ggml-cuda/ggml-cuda.cu:112: CUDA error 7:/workspace/src/build-opt/bin/libggml-base.so.0(ggml_abort+0x152)[0x7fafaf7e7152] 
+[21:01:07] COOL g2_pp2048_d65536_p12_XL waited=0s start_temps=0,35 1,45 2,44 
+[21:01:07] RUN g2_pp2048_d65536_p12_XL :: -e CUDA_VISIBLE_DEVICES=1,2 :: ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1 -p 2048 -n 0 -d 65536 -r 3 -o csv
+[21:08:16] END g2_pp2048_d65536_p12_XL exit=0
+[21:09:52] COOL g2_pp2048_d65536_p01_XL waited=96s start_temps=0,33 1,50 2,49 
+[21:09:52] RUN g2_pp2048_d65536_p01_XL :: -e CUDA_VISIBLE_DEVICES=0,1 :: ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1 -p 2048 -n 0 -d 65536 -r 3 -o csv
+[21:16:40] END g2_pp2048_d65536_p01_XL exit=0
+[21:18:20] COOL g2_pp2048_d65536_p01_Q8 waited=100s start_temps=0,42 1,50 2,39 
+[21:18:20] RUN g2_pp2048_d65536_p01_Q8 :: -e CUDA_VISIBLE_DEVICES=0,1 :: ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-Q8_0.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1 -p 2048 -n 0 -d 65536 -r 3 -o csv
+[21:22:33] END g2_pp2048_d65536_p01_Q8 exit=139
+[21:22:33] LOGFLAG g2_pp2048_d65536_p01_Q8: 4:/workspace/src/ggml/src/ggml-cuda/ggml-cuda.cu:112: CUDA error 7:/workspace/src/build-opt/bin/libggml-base.so.0(ggml_abort+0x152)[0x7f3cc0939152] 
+[21:22:33] === G2 traces start
+[21:22:33] COOL g2_nvprof_d16384_tp3_XL waited=0s start_temps=0,37 1,45 2,39 
+[21:22:33] RUN g2_nvprof_d16384_tp3_XL ::  :: /usr/local/cuda/bin/nvprof --print-gpu-trace --csv --normalized-time-unit us --log-file /phase1/results/g2_nvprof_d16384_tp3_XL.csv ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1/1 -p 2048 -n 0 -d 16384 -r 1 --no-warmup -o csv
+[21:27:14] END g2_nvprof_d16384_tp3_XL exit=0
+[21:27:20] COOL g2_nvprof_d16384_tp3_Q8 waited=6s start_temps=0,43 1,50 2,48 
+[21:27:20] RUN g2_nvprof_d16384_tp3_Q8 ::  :: /usr/local/cuda/bin/nvprof --print-gpu-trace --csv --normalized-time-unit us --log-file /phase1/results/g2_nvprof_d16384_tp3_Q8.csv ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-Q8_0.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1/1 -p 2048 -n 0 -d 16384 -r 1 --no-warmup -o csv
+[21:32:38] END g2_nvprof_d16384_tp3_Q8 exit=0
+[21:32:48] COOL g2_nvprof_d16384_p12_XL waited=10s start_temps=0,42 1,50 2,48 
+[21:32:48] RUN g2_nvprof_d16384_p12_XL :: -e CUDA_VISIBLE_DEVICES=1,2 :: /usr/local/cuda/bin/nvprof --print-gpu-trace --csv --normalized-time-unit us --log-file /phase1/results/g2_nvprof_d16384_p12_XL.csv ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1 -p 2048 -n 0 -d 16384 -r 1 --no-warmup -o csv
+[21:36:55] END g2_nvprof_d16384_p12_XL exit=0
+[21:37:31] COOL g2_nvprof_d65536_tp3_XL waited=36s start_temps=0,35 1,50 2,49 
+[21:37:31] RUN g2_nvprof_d65536_tp3_XL ::  :: /usr/local/cuda/bin/nvprof --print-gpu-trace --csv --normalized-time-unit us --log-file /phase1/results/g2_nvprof_d65536_tp3_XL.csv ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1/1 -p 2048 -n 0 -d 65536 -r 1 --no-warmup -o csv
+[21:45:24] END g2_nvprof_d65536_tp3_XL exit=0
+[21:46:04] COOL g2_nvprof_d65536_tp3_Q8 waited=40s start_temps=0,42 1,50 2,49 
+[21:46:04] RUN g2_nvprof_d65536_tp3_Q8 ::  :: /usr/local/cuda/bin/nvprof --print-gpu-trace --csv --normalized-time-unit us --log-file /phase1/results/g2_nvprof_d65536_tp3_Q8.csv ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-Q8_0.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1/1 -p 2048 -n 0 -d 65536 -r 1 --no-warmup -o csv
+[21:55:03] END g2_nvprof_d65536_tp3_Q8 exit=0
+[21:55:03] === G2 done
+[21:55:03] === G3 start
+[21:55:38] COOL g3_opprof_tg64_tp3_XL waited=35s start_temps=0,43 1,50 2,49 
+[21:55:38] RUN g3_opprof_tg64_tp3_XL :: -e GGML_CUDA_OP_PROFILE=1 :: ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1/1 -p 0 -n 64 -r 1 --no-warmup -o csv
+[21:58:55] END g3_opprof_tg64_tp3_XL exit=0
+[21:58:55] COOL g3_opprof_pp5_tp3_XL waited=0s start_temps=0,39 1,47 2,46 
+[21:58:55] RUN g3_opprof_pp5_tp3_XL :: -e GGML_CUDA_OP_PROFILE=1 :: ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1/1 -p 5 -n 0 -r 20 --no-warmup -o csv
+[22:01:57] END g3_opprof_pp5_tp3_XL exit=0
+[22:01:57] COOL g3_opprof_tg64_tp3_Q8 waited=0s start_temps=0,38 1,46 2,45 
+[22:01:57] RUN g3_opprof_tg64_tp3_Q8 :: -e GGML_CUDA_OP_PROFILE=1 :: ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-Q8_0.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1/1 -p 0 -n 64 -r 1 --no-warmup -o csv
+[22:05:43] END g3_opprof_tg64_tp3_Q8 exit=0
+[22:05:43] COOL g3_opprof_pp5_tp3_Q8 waited=0s start_temps=0,38 1,46 2,45 
+[22:05:43] RUN g3_opprof_pp5_tp3_Q8 :: -e GGML_CUDA_OP_PROFILE=1 :: ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-Q8_0.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1/1 -p 5 -n 0 -r 20 --no-warmup -o csv
+[22:09:21] END g3_opprof_pp5_tp3_Q8 exit=0
+[22:09:21] === G3 done
+[22:09:21] === G4 start
+[22:09:21] COOL g4_tg512_tensor_XL waited=0s start_temps=0,38 1,45 2,44 
+[22:09:21] RUN g4_tg512_tensor_XL ::  :: ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1/1 -p 0 -n 512 -r 3 -o csv
+[22:13:44] END g4_tg512_tensor_XL exit=0
+[22:14:40] COOL g4_tg512_layer_XL waited=56s start_temps=0,42 1,50 2,48 
+[22:14:40] RUN g4_tg512_layer_XL ::  :: ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm layer -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1/1 -p 0 -n 512 -r 3 -o csv
+[22:19:15] END g4_tg512_layer_XL exit=0
+[22:19:45] COOL g4_tg512_layer_Q8 waited=30s start_temps=0,42 1,50 2,49 
+[22:19:45] RUN g4_tg512_layer_Q8 ::  :: ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-Q8_0.gguf -sm layer -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1/1 -p 0 -n 512 -r 3 -o csv
+[22:25:16] END g4_tg512_layer_Q8 exit=0
+[22:25:47] COOL g4_tg512_tensor_Q8 waited=31s start_temps=0,42 1,50 2,49 
+[22:25:47] RUN g4_tg512_tensor_Q8 ::  :: ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-Q8_0.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1/1 -p 0 -n 512 -r 3 -o csv
+[22:30:19] END g4_tg512_tensor_Q8 exit=0
+[22:31:24] COOL g4_pp512_tensor_XL waited=65s start_temps=0,42 1,50 2,49 
+[22:31:24] RUN g4_pp512_tensor_XL ::  :: ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1/1 -p 512 -n 0 -r 3 -o csv
+[22:34:45] END g4_pp512_tensor_XL exit=0
+[22:34:45] COOL g4_pp512_layer_XL waited=0s start_temps=0,40 1,48 2,47 
+[22:34:45] RUN g4_pp512_layer_XL ::  :: ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm layer -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1/1 -p 512 -n 0 -r 3 -o csv
+[22:39:37] END g4_pp512_layer_XL exit=0
+[22:39:37] ALERT: 22:38:52 PAUSED by operator: LOGFLAG CUDA error (VMM pool alloc OOM) in g2_pp2048_d65536_p12_Q8 and _p01_Q8
+[22:39:37] PHASE1 STOPPED (g4 exited 0)
+[23:27:35] RESUMED by operator: 2-GPU Q8_0 @65536 recorded as does-not-fit (OOM); continuing G4
+[23:27:35] === G4 start
+[23:27:35] SKIP g4_tg512_tensor_XL (already done)
+[23:27:35] SKIP g4_tg512_layer_XL (already done)
+[23:27:35] SKIP g4_tg512_layer_Q8 (already done)
+[23:27:35] SKIP g4_tg512_tensor_Q8 (already done)
+[23:27:35] SKIP g4_pp512_tensor_XL (already done)
+[23:27:35] SKIP g4_pp512_layer_XL (already done)
+[23:27:35] COOL g4_pp512_layer_Q8 waited=0s start_temps=0,35 1,42 2,41 
+[23:27:35] RUN g4_pp512_layer_Q8 ::  :: ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-Q8_0.gguf -sm layer -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1/1 -p 512 -n 0 -r 3 -o csv
+[23:31:25] END g4_pp512_layer_Q8 exit=0
+[23:31:26] COOL g4_pp512_tensor_Q8 waited=1s start_temps=0,38 1,45 2,44 
+[23:31:26] RUN g4_pp512_tensor_Q8 ::  :: ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-Q8_0.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1/1 -p 512 -n 0 -r 3 -o csv
+[23:35:04] END g4_pp512_tensor_Q8 exit=0
+[23:35:04] COOL g4_pp2048_tensor_XL waited=0s start_temps=0,39 1,47 2,45 
+[23:35:04] RUN g4_pp2048_tensor_XL ::  :: ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1/1 -p 2048 -n 0 -r 3 -o csv
+[23:40:22] END g4_pp2048_tensor_XL exit=0
+[23:40:22] COOL g4_pp2048_layer_XL waited=0s start_temps=0,42 1,49 2,48 
+[23:40:22] RUN g4_pp2048_layer_XL ::  :: ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm layer -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1/1 -p 2048 -n 0 -r 3 -o csv
+[23:44:32] END g4_pp2048_layer_XL exit=0
+[23:44:32] COOL g4_pp2048_layer_Q8 waited=0s start_temps=0,41 1,48 2,47 
+[23:44:32] RUN g4_pp2048_layer_Q8 ::  :: ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-Q8_0.gguf -sm layer -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1/1 -p 2048 -n 0 -r 3 -o csv
+[23:52:16] END g4_pp2048_layer_Q8 exit=0
+[23:52:16] COOL g4_pp2048_tensor_Q8 waited=0s start_temps=0,40 1,48 2,47 
+[23:52:16] RUN g4_pp2048_tensor_Q8 ::  :: ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-Q8_0.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1/1 -p 2048 -n 0 -r 3 -o csv
+[23:57:15] END g4_pp2048_tensor_Q8 exit=0
+[23:57:15] COOL g4_pp16384_tensor_XL waited=0s start_temps=0,42 1,49 2,48 
+[23:57:15] RUN g4_pp16384_tensor_XL ::  :: ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1/1 -p 16384 -n 0 -r 3 -o csv
+[00:07:26] END g4_pp16384_tensor_XL exit=0
+[00:08:31] COOL g4_pp16384_layer_XL waited=65s start_temps=0,42 1,50 2,49 
+[00:08:31] RUN g4_pp16384_layer_XL ::  :: ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm layer -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1/1 -p 16384 -n 0 -r 3 -o csv
+[00:16:33] END g4_pp16384_layer_XL exit=0
+[00:17:53] COOL g4_pp16384_layer_Q8 waited=80s start_temps=0,41 1,50 2,47 
+[00:17:53] RUN g4_pp16384_layer_Q8 ::  :: ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-Q8_0.gguf -sm layer -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1/1 -p 16384 -n 0 -r 3 -o csv
+[00:18:45] QUEUE CHANGE by operator: g4 Q8_0 pp16384/pp65536 (both modes) removed via skip markers; XL pp65536 tensor+layer kept (-r 3)
+[00:25:03] END g4_pp16384_layer_Q8 exit=137
+[00:25:03] ALERT: 00:25:02 LOWCLOCK GPU2:999MHz@100%
+[00:25:03] PHASE1 STOPPED (g4 resume)
+[00:27:23] RESUMED by operator, option 2: XL pp65536 tensor only + G0b; layer pp65536 skipped; LOWCLOCK at 00:25 was power-cap throttling under -sm layer (114-127 W, 55-59C)
+[00:27:23] === FINISH (option 2) start
+[00:27:23] COOL g4_pp65536_tensor_XL waited=0s start_temps=0,39 1,47 2,46 
+[00:27:23] RUN g4_pp65536_tensor_XL ::  :: ./build-opt/bin/llama-bench -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -b 32768 -ub 2048 -ngl 99 -ts 1/1/1 -p 65536 -n 0 -r 3 -o csv
+[00:50:54] END g4_pp65536_tensor_XL exit=0
+[00:50:54] === G0b start (compile)
+[00:52:20] COOL g0b_latency_all2all waited=81s start_temps=0,42 1,50 2,49 
+[00:52:20] RUN g0b_latency_all2all ::  :: timeout 600 /phase1/p2pbench/p2pbench2
+[00:52:24] END g0b_latency_all2all exit=0
+[00:52:24] === G0b done
+[00:52:24] PHASE1 DONE (option 2)

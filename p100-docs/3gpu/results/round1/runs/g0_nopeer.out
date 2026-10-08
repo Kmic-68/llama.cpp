@@ -1,0 +1,94 @@
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 12.9.1
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+# devices 3, peer access DISABLED (staged)
+# dev 0 Tesla P100-PCIE-16GB pci 0000:01:00 cc 6.0 clock 1328500 kHz
+# dev 1 Tesla P100-PCIE-16GB pci 0000:03:00 cc 6.0 clock 1328500 kHz
+# dev 2 Tesla P100-PCIE-16GB pci 0000:04:00 cc 6.0 clock 1328500 kHz
+
+mode,src,dst,bytes,median_us,GBps
+staged_srcstream,0,1,20480,26.78,0.765
+staged_dststream,0,1,20480,21.95,0.933
+staged_srcstream,0,1,102400,45.41,2.255
+staged_dststream,0,1,102400,44.51,2.301
+staged_srcstream,0,1,262144,99.74,2.628
+staged_dststream,0,1,262144,93.66,2.799
+staged_srcstream,0,1,1048576,349.95,2.996
+staged_dststream,0,1,1048576,342.40,3.062
+staged_srcstream,0,1,20971520,3604.83,5.818
+staged_dststream,0,1,20971520,3594.27,5.835
+staged_srcstream,0,1,67108864,11125.28,6.032
+staged_dststream,0,1,67108864,11097.50,6.047
+staged_srcstream,0,2,20480,27.04,0.757
+staged_dststream,0,2,20480,21.95,0.933
+staged_srcstream,0,2,102400,45.54,2.249
+staged_dststream,0,2,102400,43.49,2.355
+staged_srcstream,0,2,262144,99.78,2.627
+staged_dststream,0,2,262144,94.53,2.773
+staged_srcstream,0,2,1048576,350.43,2.992
+staged_dststream,0,2,1048576,345.22,3.037
+staged_srcstream,0,2,20971520,3622.14,5.790
+staged_dststream,0,2,20971520,3617.31,5.798
+staged_srcstream,0,2,67108864,11200.45,5.992
+staged_dststream,0,2,67108864,11194.75,5.995
+staged_srcstream,1,0,20480,26.94,0.760
+staged_dststream,1,0,20480,22.02,0.930
+staged_srcstream,1,0,102400,45.44,2.254
+staged_dststream,1,0,102400,43.49,2.355
+staged_srcstream,1,0,262144,99.74,2.628
+staged_dststream,1,0,262144,94.43,2.776
+staged_srcstream,1,0,1048576,350.30,2.993
+staged_dststream,1,0,1048576,344.48,3.044
+staged_srcstream,1,0,20971520,3622.11,5.790
+staged_dststream,1,0,20971520,3618.14,5.796
+staged_srcstream,1,0,67108864,11199.33,5.992
+staged_dststream,1,0,67108864,11193.22,5.995
+staged_srcstream,1,2,20480,26.75,0.766
+staged_dststream,1,2,20480,22.53,0.909
+staged_srcstream,1,2,102400,45.50,2.250
+staged_dststream,1,2,102400,44.03,2.326
+staged_srcstream,1,2,262144,99.81,2.626
+staged_dststream,1,2,262144,94.59,2.771
+staged_srcstream,1,2,1048576,350.14,2.995
+staged_dststream,1,2,1048576,344.74,3.042
+staged_srcstream,1,2,20971520,3622.88,5.789
+staged_dststream,1,2,20971520,3618.50,5.796
+staged_srcstream,1,2,67108864,11202.11,5.991
+staged_dststream,1,2,67108864,11195.78,5.994
+staged_srcstream,2,0,20480,26.88,0.762
+staged_dststream,2,0,20480,20.58,0.995
+staged_srcstream,2,0,102400,45.44,2.254
+staged_dststream,2,0,102400,44.16,2.319
+staged_srcstream,2,0,262144,99.62,2.632
+staged_dststream,2,0,262144,94.53,2.773
+staged_srcstream,2,0,1048576,350.40,2.993
+staged_dststream,2,0,1048576,347.55,3.017
+staged_srcstream,2,0,20971520,3622.14,5.790
+staged_dststream,2,0,20971520,3616.93,5.798
+staged_srcstream,2,0,67108864,11197.34,5.993
+staged_dststream,2,0,67108864,11191.78,5.996
+staged_srcstream,2,1,20480,26.82,0.764
+staged_dststream,2,1,20480,21.98,0.932
+staged_srcstream,2,1,102400,45.47,2.252
+staged_dststream,2,1,102400,43.49,2.355
+staged_srcstream,2,1,262144,99.78,2.627
+staged_dststream,2,1,262144,93.73,2.797
+staged_srcstream,2,1,1048576,349.98,2.996
+staged_dststream,2,1,1048576,342.34,3.063
+staged_srcstream,2,1,20971520,3613.66,5.803
+staged_dststream,2,1,20971520,3599.49,5.826
+staged_srcstream,2,1,67108864,11139.20,6.025
+staged_dststream,2,1,67108864,11118.66,6.036
+# done

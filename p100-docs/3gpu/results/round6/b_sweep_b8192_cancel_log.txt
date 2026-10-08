@@ -1,0 +1,18 @@
+10.58.040.036 I slot print_timing: id  0 | task 197 | prompt processing, n_tokens =  16384, progress = 0.26, t =  33.56 s / 488.19 tokens per second
+11.17.559.835 I slot print_timing: id  0 | task 197 | prompt processing, n_tokens =  24576, progress = 0.38, t =  53.04 s / 463.31 tokens per second
+11.38.278.141 I slot print_timing: id  0 | task 197 | prompt processing, n_tokens =  32768, progress = 0.51, t =  73.70 s / 444.64 tokens per second
+12.00.206.096 I slot print_timing: id  0 | task 197 | prompt processing, n_tokens =  40960, progress = 0.64, t =  95.58 s / 428.53 tokens per second
+12.23.291.328 I slot print_timing: id  0 | task 197 | prompt processing, n_tokens =  49152, progress = 0.77, t = 118.62 s / 414.36 tokens per second
+12.47.569.461 I slot print_timing: id  0 | task 197 | prompt processing, n_tokens =  57344, progress = 0.90, t = 142.84 s / 401.46 tokens per second
+13.01.920.908 I slot print_timing: id  0 | task 197 | prompt processing, n_tokens =  61948, progress = 0.97, t = 158.67 s / 390.43 tokens per second
+13.08.458.454 I slot print_timing: id  0 | task 197 | prompt processing, n_tokens =  63996, progress = 1.00, t = 164.12 s / 389.94 tokens per second
+13.09.346.864 W srv          stop: cancel task, id_task = 197
+13.09.444.257 I slot      release: id  0 | task 197 | stop processing: n_tokens = 64000, truncated = 0
+13.09.444.275 I slot get_availabl: id  0 | task -1 | selected slot by LRU, t_last = 56037767890
+13.09.444.356 I slot launch_slot_: id  0 | task 204 | processing task, is_child = 0
+13.11.092.605 I slot print_timing: id  0 | task 204 | prompt eval time =     984.58 ms /    65 tokens (   15.15 ms per token,    66.02 tokens per second)
+13.11.092.610 I slot print_timing: id  0 | task 204 |        eval time =     663.63 ms /    32 tokens (   21.41 ms per token,    46.71 tokens per second)
+13.11.092.611 I slot print_timing: id  0 | task 204 |       total time =    1648.21 ms /    97 tokens
+13.11.092.612 I slot print_timing: id  0 | task 204 |    graphs reused =        145
+13.11.092.617 I slot print_timing: id  0 | task 204 | draft acceptance = 0.80769 (   21 accepted /    26 generated), mean len =  3.33
+13.11.092.661 I slot      release: id  0 | task 204 | stop processing: n_tokens = 96, truncated = 0

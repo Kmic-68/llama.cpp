@@ -1,0 +1,15 @@
+
+================ MODEL: p17-20261004-stackA-Qwen3.8-27B-UD-Q6_K_XL ================
+task                 | arm      |  n  ok%   llm  tool  errs  retr    kb   wall
+------------------------------------------------------------------------------
+err_python_env       | fixes    |  3 100%   0.0   0.0   0.0   0.0     0   109s
+err_replay_patch     | fixes    |  3 100%   0.0   0.0   0.0   0.0     0   104s
+err_ambiguous_edit   | fixes    |  3 100%   0.0   0.0   0.0   0.0     0   119s
+err_case_search      | fixes    |  3 100%   0.0   0.0   0.0   0.0     0   133s
+err_hidden_search    | fixes    |  3  67%   0.0   0.0   0.0   0.0     0   104s
+err_big_output       | fixes    |  3 100%   0.0   0.0   0.0   0.0     0   109s
+err_multi_dir        | fixes    |  3 100%   0.0   0.0   0.0   0.0     0   103s
+err_inline_script    | fixes    |  6 100%   0.0   0.0   0.0   0.0     0   237s
+err_big_file_read    | fixes    |  6   0%   0.0   0.0   0.0   0.0     0   600s
+------------------------------------------------------------------------------
+TOTAL                | fixes    | 33  79%   0.0   0.0   0.0   0.0     0   223s

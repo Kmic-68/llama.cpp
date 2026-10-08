@@ -1,0 +1,25 @@
+ggml_cuda_init: found 2 CUDA devices (Total VRAM: 32538 MiB):
+  Device 0: Tesla P100-PCIE-16GB, compute capability 6.0, VMM: yes, VRAM: 16269 MiB
+  Device 1: Tesla P100-PCIE-16GB, compute capability 6.0, VMM: yes, VRAM: 16269 MiB
+/workspace/src/ggml/src/ggml-cuda/ggml-cuda.cu:112: CUDA error
+/workspace/src/build-opt/bin/libggml-base.so.0(+0x1dafb)[0x7fafaf7e6afb]
+/workspace/src/build-opt/bin/libggml-base.so.0(ggml_print_backtrace+0x21f)[0x7fafaf7e6f7f]
+/workspace/src/build-opt/bin/libggml-base.so.0(ggml_abort+0x152)[0x7fafaf7e7152]
+/workspace/src/build-opt/bin/libggml-cuda.so.0(+0x30b0d6)[0x7fafa690b0d6]
+/workspace/src/build-opt/bin/libggml-cuda.so.0(_ZN18ggml_cuda_pool_vmm5allocEmPm+0x4e3)[0x7fafa692a783]
+/workspace/src/build-opt/bin/libggml-cuda.so.0(_Z23ggml_cuda_gemm_fold_tryR25ggml_backend_cuda_contextPK11ggml_tensorS3_PS1_+0x31b)[0x7fafa68c98fb]
+/workspace/src/build-opt/bin/libggml-cuda.so.0(+0x318079)[0x7fafa6918079]
+/workspace/src/build-opt/bin/libggml-cuda.so.0(+0x319bc9)[0x7fafa6919bc9]
+/workspace/src/build-opt/bin/libggml-cuda.so.0(+0x324232)[0x7fafa6924232]
+/workspace/src/build-opt/bin/libggml-cuda.so.0(+0x326feb)[0x7fafa6926feb]
+/workspace/src/build-opt/bin/libggml-base.so.0(+0x4f03d)[0x7fafaf81803d]
+/workspace/src/build-opt/bin/libggml-base.so.0(ggml_backend_sched_graph_compute_async+0x24d)[0x7fafaf806a1d]
+/workspace/src/build-opt/bin/libllama.so.0(_ZN13llama_context13graph_computeEP11ggml_cgraphb+0xa1)[0x7fafaefe54a1]
+/workspace/src/build-opt/bin/libllama.so.0(_ZN13llama_context14process_ubatchERK12llama_ubatch14llm_graph_typeP22llama_memory_context_iR11ggml_status+0x207)[0x7fafaefe7d47]
+/workspace/src/build-opt/bin/libllama.so.0(_ZN13llama_context6decodeERK11llama_batch+0x576)[0x7fafaeff0eb6]
+/workspace/src/build-opt/bin/libllama.so.0(llama_decode+0x10)[0x7fafaeff25c0]
+/workspace/src/build-opt/bin/libllama-bench-impl.so(+0x195aa)[0x7fafafd3b5aa]
+/workspace/src/build-opt/bin/libllama-bench-impl.so(_Z11llama_benchiPPc+0x1ddc)[0x7fafafd47d7c]
+/lib/x86_64-linux-gnu/libc.so.6(+0x29d90)[0x7fafaf8d1d90]
+/lib/x86_64-linux-gnu/libc.so.6(__libc_start_main+0x80)[0x7fafaf8d1e40]
+./build-opt/bin/llama-bench(+0x1295)[0x55c339255295]

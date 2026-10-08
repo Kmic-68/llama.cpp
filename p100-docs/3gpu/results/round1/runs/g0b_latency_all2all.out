@@ -1,0 +1,55 @@
+
+==========
+== CUDA ==
+==========
+
+CUDA Version 12.9.1
+
+Container image Copyright (c) 2016-2023, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+
+This container image and its contents are governed by the NVIDIA Deep Learning Container License.
+By pulling and using the container, you accept the terms and conditions of this license:
+https://developer.nvidia.com/ngc/nvidia-deep-learning-container-license
+
+A copy of this license is made available in this container at /NGC-DL-CONTAINER-LICENSE for your convenience.
+
+test,src,dst,bytes,median_us,p99_us
+write_flag_rt,0,1,0,6.144,7.168
+write_flag_rt,0,1,16384,9.216,10.240
+write_flag_rt,0,1,65536,18.432,19.456
+write_flag_rt,0,1,262144,58.368,59.392
+write_flag_rt,0,2,0,6.144,7.168
+write_flag_rt,0,2,16384,9.216,10.240
+write_flag_rt,0,2,65536,18.432,19.456
+write_flag_rt,0,2,262144,58.368,59.392
+write_flag_rt,1,0,0,7.168,7.168
+write_flag_rt,1,0,16384,10.240,10.240
+write_flag_rt,1,0,65536,19.456,19.456
+write_flag_rt,1,0,262144,58.368,58.368
+write_flag_rt,1,2,0,6.144,7.168
+write_flag_rt,1,2,16384,10.240,10.240
+write_flag_rt,1,2,65536,19.456,19.456
+write_flag_rt,1,2,262144,58.368,58.368
+write_flag_rt,2,0,0,6.144,7.168
+write_flag_rt,2,0,16384,9.216,10.240
+write_flag_rt,2,0,65536,19.456,19.456
+write_flag_rt,2,0,262144,58.368,59.392
+write_flag_rt,2,1,0,6.144,7.168
+write_flag_rt,2,1,16384,9.216,10.240
+write_flag_rt,2,1,65536,18.432,19.456
+write_flag_rt,2,1,262144,57.344,58.368
+
+test,mode,bytes_per_peer,gpu,median_us,send_GBps,per_link_GBps
+all_to_all,k_write,65536,0,41.54,3.156,1.578
+all_to_all,k_write,65536,1,42.11,3.112,1.556
+all_to_all,k_write,65536,2,39.97,3.279,1.640
+all_to_all,ce_push,65536,0,53.06,2.470,1.235
+all_to_all,ce_push,65536,1,53.95,2.429,1.215
+all_to_all,ce_push,65536,2,45.31,2.893,1.446
+all_to_all,k_write,20971520,0,13301.34,3.153,1.577
+all_to_all,k_write,20971520,1,13519.97,3.102,1.551
+all_to_all,k_write,20971520,2,13517.82,3.103,1.551
+all_to_all,ce_push,20971520,0,9483.58,4.423,2.211
+all_to_all,ce_push,20971520,1,10635.26,3.944,1.972
+all_to_all,ce_push,20971520,2,10626.78,3.947,1.973
+# note: all_to_all reports the median of 17 reps per GPU; GPUs are launched back to back from one host thread, so start skew of a few us is included at 64 KB

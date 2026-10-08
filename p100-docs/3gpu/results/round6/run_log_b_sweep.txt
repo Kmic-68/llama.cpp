@@ -1,0 +1,37 @@
+[06:57:05] P18 QUEUE START (no cutoff)
+[06:57:05] P19 QUEUE START (Part 1; no new run after 08:27:05)
+[06:57:05] POWER LIMIT requested 125 W; readback: 125.00 125.00 125.00 
+[06:57:05] === Item 1: -b sweep (server, -np 1, -ub 2048, -c 262144, MTP n-max 3 / p-min 0.0, serving sampler)
+[06:57:05] COOL i1_b32768 waited=0s start_temps=0,36 1,37 2,32  fan3=2872rpm
+[06:57:05] RUN(server) i1_b32768 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e LLAMA_SPEC_SAMPLE_TEMP=1.0 -e LLAMA_SPEC_DRAFT_TOPK=20 :: /workspace/build-nccl/bin/llama-server -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf --jinja --cache-ram 0 --no-cache-idle-slots --parallel 1 -c 262144 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -fit off -lm none --host 127.0.0.1 --port $PORT --temp 1.0 --top-k 20 --top-p 0.95 --min-p 0.0 --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.0 -ngld 99 -ubd 64 -ctkd q4_0 -ctvd q4_0 :: client: python3 $P1/p19client.py bsweep $P1/corpus/wiki.test.raw $P1/results/i1_b32768
+[06:59:15] SERVER UP i1_b32768 after 125s
+[07:14:03] END i1_b32768 exit=0 (client rc=0)
+[07:15:03] COOL i1_b2048 waited=60s start_temps=0,45 1,48 2,44  fan3=2884rpm
+[07:15:03] RUN(server) i1_b2048 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e LLAMA_SPEC_SAMPLE_TEMP=1.0 -e LLAMA_SPEC_DRAFT_TOPK=20 :: /workspace/build-nccl/bin/llama-server -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf --jinja --cache-ram 0 --no-cache-idle-slots --parallel 1 -c 262144 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 2048 -ub 2048 -fit off -lm none --host 127.0.0.1 --port $PORT --temp 1.0 --top-k 20 --top-p 0.95 --min-p 0.0 --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.0 -ngld 99 -ubd 64 -ctkd q4_0 -ctvd q4_0 :: client: python3 $P1/p19client.py bsweep $P1/corpus/wiki.test.raw $P1/results/i1_b2048
+[07:17:27] SERVER UP i1_b2048 after 138s
+[07:32:23] END i1_b2048 exit=0 (client rc=0)
+[07:33:24] COOL i1_b8192 waited=61s start_temps=0,45 1,48 2,44  fan3=3047rpm
+[07:33:24] RUN(server) i1_b8192 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e LLAMA_SPEC_SAMPLE_TEMP=1.0 -e LLAMA_SPEC_DRAFT_TOPK=20 :: /workspace/build-nccl/bin/llama-server -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf --jinja --cache-ram 0 --no-cache-idle-slots --parallel 1 -c 262144 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 8192 -ub 2048 -fit off -lm none --host 127.0.0.1 --port $PORT --temp 1.0 --top-k 20 --top-p 0.95 --min-p 0.0 --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.0 -ngld 99 -ubd 64 -ctkd q4_0 -ctvd q4_0 :: client: python3 $P1/p19client.py bsweep $P1/corpus/wiki.test.raw $P1/results/i1_b8192
+[07:35:15] SERVER UP i1_b8192 after 104s
+[07:50:10] END i1_b8192 exit=0 (client rc=0)
+[07:51:11] COOL i1_b4096 waited=61s start_temps=0,46 1,48 2,44  fan3=2866rpm
+[07:51:11] RUN(server) i1_b4096 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS -e LLAMA_SPEC_SAMPLE_TEMP=1.0 -e LLAMA_SPEC_DRAFT_TOPK=20 :: /workspace/build-nccl/bin/llama-server -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf --jinja --cache-ram 0 --no-cache-idle-slots --parallel 1 -c 262144 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 4096 -ub 2048 -fit off -lm none --host 127.0.0.1 --port $PORT --temp 1.0 --top-k 20 --top-p 0.95 --min-p 0.0 --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-p-min 0.0 -ngld 99 -ubd 64 -ctkd q4_0 -ctvd q4_0 :: client: python3 $P1/p19client.py bsweep $P1/corpus/wiki.test.raw $P1/results/i1_b4096
+[07:53:20] SERVER UP i1_b4096 after 118s
+[08:08:13] END i1_b4096 exit=0 (client rc=0)
+[08:08:13] === Item 2: -ub 2048 against 4096 with an 8,192-token prompt (llama-bench, -b 32768, -r 3)
+[08:09:14] COOL i2_pp8192_d0_ub2048 waited=61s start_temps=0,45 1,48 2,44  fan3=2878rpm
+[08:09:14] RUN i2_pp8192_d0_ub2048 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 8192 -n 0 -r 3 -o csv
+[08:12:29] END i2_pp8192_d0_ub2048 exit=0
+[08:12:49] COOL i2_pp8192_d0_ub4096 waited=20s start_temps=0,46 1,48 2,43  fan3=3047rpm
+[08:12:49] RUN i2_pp8192_d0_ub4096 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 4096 -p 8192 -n 0 -r 3 -o csv
+[08:15:46] END i2_pp8192_d0_ub4096 exit=0
+[08:16:01] COOL i2_pp8192_d16384_ub4096 waited=15s start_temps=0,46 1,48 2,44  fan3=2872rpm
+[08:16:01] RUN i2_pp8192_d16384_ub4096 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 4096 -p 8192 -n 0 -d 16384 -r 3 -o csv
+[08:20:16] END i2_pp8192_d16384_ub4096 exit=0
+[08:20:46] COOL i2_pp8192_d16384_ub2048 waited=30s start_temps=0,45 1,48 2,43  fan3=2872rpm
+[08:20:46] RUN i2_pp8192_d16384_ub2048 :: -e GGML_CUDA_GRAPHS_PRE_VOLTA=3 -e NCCL_P2P_LEVEL=SYS :: /workspace/build-nccl/bin/llama-bench -lm none -m /models/Qwen3.8-27B-UD-Q6_K_XL.gguf -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 -ngl 99 -ts 1/1/1 -b 32768 -ub 2048 -p 8192 -n 0 -d 16384 -r 3 -o csv
+[08:24:45] END i2_pp8192_d16384_ub2048 exit=0
+[08:24:46] POWER LIMIT requested 125 W; readback: 125.00 125.00 125.00 
+[08:24:46] P19 PART1 DONE
+[08:24:46] EXIT TRAP: power limit set to 125 W; readback: 125.00 125.00 125.00 
+[08:24:47] GUARD: orchestrator gone; power limit readback: 125.00 125.00 125.00 

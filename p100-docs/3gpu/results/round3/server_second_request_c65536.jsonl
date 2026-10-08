@@ -1,0 +1,7 @@
+{"prompt_tokens": 65, "completion_tokens": 121, "predicted_tps": 40.297367708778985, "draft_n": 147, "draft_n_accepted": 71, "req": "req1 A"}
+{"prompt_tokens": 65, "completion_tokens": 128, "predicted_tps": 49.39764050419822, "draft_n": 125, "draft_n_accepted": 85, "req": "req2 B (different prompt)"}
+{"prompt_tokens": 65, "completion_tokens": 121, "predicted_tps": 40.44518009733133, "draft_n": 147, "draft_n_accepted": 71, "req": "req3 A again"}
+{"prompt_tokens": 181, "completion_tokens": 64, "predicted_tps": 43.31185844309682, "draft_n": 68, "draft_n_accepted": 40, "req": "req5 follow-up turn"}
+{"prompt_tokens": 7557, "completion_tokens": 96, "predicted_tps": 48.6820238808387, "draft_n": 92, "draft_n_accepted": 64, "req": "req6 long prompt (~6k tokens)"}
+{"prompt_tokens": 65, "completion_tokens": 64, "predicted_tps": 42.63223606078139, "draft_n": 70, "draft_n_accepted": 39, "req": "req7 B after long"}
+ALL REQUESTS OK

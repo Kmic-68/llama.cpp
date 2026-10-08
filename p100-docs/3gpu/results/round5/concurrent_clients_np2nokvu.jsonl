@@ -1,0 +1,13 @@
+{"sc": "props", "total_slots": 2, "n_ctx_slot": 131072}
+{"sc": "single_chat", "rep": 0, "ttft": 0.6374049186706543, "total": 3.1529221534729004, "tps": 44.534892690790265, "n": 113, "error": null}
+{"sc": "single_chat", "rep": 1, "ttft": 0.6345875263214111, "total": 4.696044921875, "tps": 48.99942678057515, "n": 200, "error": null}
+{"sc": "single_pp20k", "prompt_n": 20000, "prompt_tps": 445.32663651137347, "total": 45.263585567474365, "error": null}
+{"sc": "a", "rep": 0, "c2_ttft": 163.97662734985352, "c2_total": 167.31110835075378, "c2_tps": 38.09290710069784, "c2_n": 128, "c1_total": 170.4395272731781, "c1_prompt_n": 64000, "c1_prompt_tps": 378.7942749767194, "c1_prompt_s": 168.957147, "c1_error": null, "c2_error": null}
+{"sc": "a", "rep": 1, "c2_ttft": 163.57225704193115, "c2_total": 167.21387600898743, "c2_tps": 34.87570928817029, "c2_n": 128, "c1_total": 170.64951348304749, "c1_prompt_n": 64000, "c1_prompt_tps": 379.2247548628968, "c1_prompt_s": 168.765354, "c1_error": null, "c2_error": null}
+{"sc": "a", "rep": 2, "c2_ttft": 163.87353491783142, "c2_total": 168.01458954811096, "c2_tps": 30.672120346773678, "c2_n": 128, "c1_total": 170.64334082603455, "c1_prompt_n": 64000, "c1_prompt_tps": 378.5583307489334, "c1_prompt_s": 169.062453, "c1_error": null, "c2_error": null}
+{"sc": "b", "rep": 0, "tps": [30.56781169490682, 26.578953449033254], "n": [200, 200], "total": [8.19248080253601, 8.49515151977539], "ttft": [1.6818768978118896, 1.0074801445007324], "aggregate_tps": 47.08227646063817, "errors": [null, null]}
+{"sc": "b", "rep": 1, "tps": [23.263069899913855, 26.69547810796403], "n": [200, 200], "total": [9.23414945602417, 8.31138300895691], "ttft": [0.6792497634887695, 0.8565323352813721], "aggregate_tps": 43.3161276773738, "errors": [null, null]}
+{"sc": "b", "rep": 2, "tps": [28.175523031153915, 32.22824463926067], "n": [200, 200], "total": [7.7486350536346436, 7.076312780380249], "ttft": [0.6852903366088867, 0.9008164405822754], "aggregate_tps": 51.6200223295182, "errors": [null, null]}
+{"sc": "c", "rep": 0, "cancel_at_s": 84.464159, "release_s": 84.15410685539246, "slots_poll_error": null, "next_ttft": 0.6117501258850098, "next_total": 1.252596139907837, "next_error": null, "log_lines": 12, "close_error": null}
+{"sc": "c", "rep": 1, "cancel_at_s": 84.464159, "release_s": 83.89906883239746, "slots_poll_error": null, "next_ttft": 0.6077220439910889, "next_total": 1.2532768249511719, "next_error": null, "log_lines": 12, "close_error": null}
+{"sc": "c", "rep": 2, "cancel_at_s": 84.464159, "release_s": 83.94100570678711, "slots_poll_error": null, "next_ttft": 0.6133766174316406, "next_total": 1.2780816555023193, "next_error": null, "log_lines": 12, "close_error": null}

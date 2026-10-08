@@ -1,0 +1,4 @@
+g4_pp16384_tensor_Q8
+g4_pp65536_tensor_Q8
+g4_pp65536_layer_Q8
+g4_pp65536_layer_XL

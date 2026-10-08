@@ -1,0 +1,28 @@
+##### p12_XL
+no PtoP copies: 2-GPU one-kernel P2P AllReduce path; marker = k_ar_p2p kernels on dev0
+exchange markers per token: 128.0
+steady-state window: 32 tokens, 77807.7 us/token under nvprof
+dev0: busy 33658 us, matvec 27911, xchg ops 949, xchg-adjacent idle 17388, other idle 26762, htod 53 us/token; s_dec = 23.6%
+dev1: busy 33412 us, matvec 27734, xchg ops 974, xchg-adjacent idle 1297, other idle 43099, htod 53 us/token; s_dec = 2.9%
+s_dec mean 13.2%, max 23.6% (nvprof-inflated wall 77808 us/token)
+##### p12_Q8
+no PtoP copies: 2-GPU one-kernel P2P AllReduce path; marker = k_ar_p2p kernels on dev0
+exchange markers per token: 128.0
+steady-state window: 32 tokens, 78691.1 us/token under nvprof
+dev0: busy 37799 us, matvec 32219, xchg ops 957, xchg-adjacent idle 12077, other idle 28815, htod 53 us/token; s_dec = 16.6%
+dev1: busy 37332 us, matvec 31818, xchg ops 1002, xchg-adjacent idle 979, other idle 40380, htod 53 us/token; s_dec = 2.5%
+s_dec mean 9.5%, max 16.6% (nvprof-inflated wall 78691 us/token)
+##### p01_XL
+no PtoP copies: 2-GPU one-kernel P2P AllReduce path; marker = k_ar_p2p kernels on dev0
+exchange markers per token: 128.0
+steady-state window: 32 tokens, 78362.7 us/token under nvprof
+dev0: busy 33753 us, matvec 28067, xchg ops 926, xchg-adjacent idle 17322, other idle 27289, htod 52 us/token; s_dec = 23.3%
+dev1: busy 33799 us, matvec 28026, xchg ops 960, xchg-adjacent idle 1313, other idle 43251, htod 52 us/token; s_dec = 2.9%
+s_dec mean 13.1%, max 23.3% (nvprof-inflated wall 78363 us/token)
+##### p01_Q8
+no PtoP copies: 2-GPU one-kernel P2P AllReduce path; marker = k_ar_p2p kernels on dev0
+exchange markers per token: 128.0
+steady-state window: 32 tokens, 72843.9 us/token under nvprof
+dev0: busy 37625 us, matvec 32145, xchg ops 925, xchg-adjacent idle 11720, other idle 23499, htod 53 us/token; s_dec = 17.4%
+dev1: busy 37597 us, matvec 32019, xchg ops 983, xchg-adjacent idle 970, other idle 34277, htod 52 us/token; s_dec = 2.7%
+s_dec mean 10.0%, max 17.4% (nvprof-inflated wall 72844 us/token)

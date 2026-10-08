@@ -1,0 +1,9 @@
+run,exit_code,cooldown_s,cooldown_capped,start_temp_gpu0,start_temp_gpu1,start_temp_gpu2,test,mean_tps,stdev_tps,note
+i1_b32768,0,0,0,36,37,32,server scenarios,,,see the per-server .jsonl file
+i1_b2048,0,60,0,45,48,44,server scenarios,,,see the per-server .jsonl file
+i1_b8192,0,61,0,45,48,44,server scenarios,,,see the per-server .jsonl file
+i1_b4096,0,61,0,46,48,44,server scenarios,,,see the per-server .jsonl file
+i2_pp8192_d0_ub2048,0,61,0,45,48,44,pp8192 sm=tensor ub=2048 threads=6,498.25,0.89,
+i2_pp8192_d0_ub4096,0,20,0,46,48,43,pp8192 sm=tensor ub=4096 threads=6,504.63,0.84,
+i2_pp8192_d16384_ub4096,0,15,0,46,48,44,pp8192@d16384 sm=tensor ub=4096 threads=6,440.24,0.86,
+i2_pp8192_d16384_ub2048,0,30,0,45,48,43,pp8192@d16384 sm=tensor ub=2048 threads=6,436.68,0.88,
