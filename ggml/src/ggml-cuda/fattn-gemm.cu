@@ -168,6 +168,11 @@ static __global__ void fattn_gemm_softmax(
         }
         __syncthreads();
         vmax = red[0];
+        // every thread must have read the max out of red[0] before pass 2 reuses red for the row sum:
+        // without this barrier warp 0 can store its partial sum into red[0] first, a late warp then
+        // takes that sum as the row max, and exp(v - m) is wrong for its keys -- run-to-run drift in
+        // fp32, and in fp16 a probability that overflows to inf and NaNs the output
+        __syncthreads();
     }
 
     const float m_old = m_state[h*nt + t];
