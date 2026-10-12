@@ -42,6 +42,7 @@
 #include "ggml-cuda/opt-step-adamw.cuh"
 #include "ggml-cuda/opt-step-sgd.cuh"
 #include "ggml-cuda/out-prod.cuh"
+#include "ggml-cuda/p60-moe-gemm.cuh"
 #include "ggml-cuda/pad.cuh"
 #include "ggml-cuda/pool2d.cuh"
 #include "ggml-cuda/pool1d.cuh"
@@ -2452,6 +2453,9 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         }
 
         if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
+            if (ggml_cuda_p60_moe_gemm(ctx, src0, src1, ids, dst)) {
+                return;
+            }
             ggml_cuda_mul_mat_q(ctx, src0, src1, ids, dst);
             return;
         }
