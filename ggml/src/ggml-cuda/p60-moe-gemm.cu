@@ -60,26 +60,28 @@ __global__ void moe_jobs(const int32_t * __restrict__ bounds, int n_experts, int
 
 // TYPE: GGML_TYPE_Q4_K (144 B / 256), GGML_TYPE_Q5_K (176 B / 256) or GGML_TYPE_Q6_K (210 B / 256)
 // BN: pairs per tile (64, 32 or 16: fewer when experts get few tokens, e.g. short prompts)
-template <int TYPE, int BN>
+// BMT: rows per tile (64 or 128; 128 halves the weight-side shared-memory loads per HFMA2)
+template <int TYPE, int BN, int BMT>
 __global__ void __launch_bounds__(NTH, 2) moe_gemm_f16(const uint8_t * __restrict__ W, int64_t row_bytes, int64_t exp_bytes, int K,
         const half2 * __restrict__ X, const moe_job * __restrict__ jobs, const int * __restrict__ njobs,
         const int32_t * __restrict__ ids_dst, char * __restrict__ dst, int64_t nb1) {
-    __shared__ __align__(16) half2 AP[KP][BM];   // weights: AP[kp][row]
+    __shared__ __align__(16) half2 AP[KP][BMT];  // weights: AP[kp][row]
     __shared__ __align__(16) half2 BP[KP][BN];   // activations: BP[kp][pair]
     if ((int) blockIdx.x >= *njobs) {
         return;
     }
     const moe_job jb = jobs[blockIdx.x];
-    const int m0 = blockIdx.y * BM;
+    const int m0 = blockIdx.y * BMT;
     constexpr int PPT = BN / 16;           // pairs per thread
+    constexpr int RPT = BMT / 16;          // rows per thread
     constexpr int TPP = NTH / BN, KPT = KP / TPP; // activation loader: threads per pair, k-pairs per thread
     const int tid = threadIdx.x, tx = tid & 15, ty = tid >> 4;
     const uint8_t * Wexp = W + (int64_t) jb.expert * exp_bytes;
     constexpr int SBB = TYPE == GGML_TYPE_Q4_K ? 144 : TYPE == GGML_TYPE_Q5_K ? 176 : 210, QS = TYPE == GGML_TYPE_Q4_K ? 16 : 48;
 
-    float acc[4][PPT];
+    float acc[RPT][PPT];
 #pragma unroll
-    for (int i = 0; i < 4; i++)
+    for (int i = 0; i < RPT; i++)
 #pragma unroll
         for (int j = 0; j < PPT; j++) acc[i][j] = 0.f;
 
@@ -87,72 +89,75 @@ __global__ void __launch_bounds__(NTH, 2) moe_gemm_f16(const uint8_t * __restric
     const int bpair = tid / TPP, bq = tid % TPP;    // activation loader: pair, KPT k-pairs
 
     for (int k0 = 0; k0 < K; k0 += BK) {
-        if constexpr (TYPE == GGML_TYPE_Q6_K) {
-            // 210 B superblocks (2 B aligned): step j covers y[64 j ..]: half n = j / 2, upper nibbles / qh bits 4-7
-            // for odd j; first 32 weights from ql[64 n + l], the next 32 from ql[64 n + 32 + l], l = 8 lp + e
-            const int sb = k0 / 256, j = (k0 % 256) / 64, n = j >> 1, odd = j & 1;
-            const uint8_t * blk = Wexp + (int64_t) (m0 + lr) * row_bytes + sb * SBB;
-            const unsigned short * ql0 = (const unsigned short *) (blk + 64 * n + 8 * lp);
-            const unsigned short * ql1 = (const unsigned short *) (blk + 64 * n + 32 + 8 * lp);
-            const unsigned short * qhp = (const unsigned short *) (blk + 128 + 32 * n + 8 * lp);
-            uint8_t a0[8], a1[8], hh[8];
 #pragma unroll
-            for (int e = 0; e < 4; e++) {
-                const unsigned short u0 = ql0[e], u1 = ql1[e], uh = qhp[e];
-                a0[2 * e] = u0 & 0xFF; a0[2 * e + 1] = u0 >> 8;
-                a1[2 * e] = u1 & 0xFF; a1[2 * e + 1] = u1 >> 8;
-                hh[2 * e] = uh & 0xFF; hh[2 * e + 1] = uh >> 8;
-            }
-            const int is = lp >> 1;
-            const int8_t * sc = (const int8_t *) (blk + 192 + 8 * n + 4 * odd);
-            const float d = __half2float(*(const half *) (blk + 208));
-            const float dl = d * sc[is], dh = d * sc[is + 2];
-            const int sh = 4 * odd;
-            float lo[8], hi[8];
-#pragma unroll
-            for (int e = 0; e < 8; e++) {
-                const int q0 = ((a0[e] >> sh) & 0xF) | (((hh[e] >> sh) & 3) << 4);
-                const int q1 = ((a1[e] >> sh) & 0xF) | (((hh[e] >> (sh + 2)) & 3) << 4);
-                lo[e] = dl * (q0 - 32);
-                hi[e] = dh * (q1 - 32);
-            }
-#pragma unroll
-            for (int e = 0; e < 8; e += 2) {
-                AP[(8 * lp + e) / 2][lr]      = __floats2half2_rn(lo[e], lo[e + 1]);
-                AP[(32 + 8 * lp + e) / 2][lr] = __floats2half2_rn(hi[e], hi[e + 1]);
-            }
-        } else {
-            const int sb = k0 / 256, j = (k0 % 256) / 64;
-            const uint8_t * blk = Wexp + (int64_t) (m0 + lr) * row_bytes + sb * SBB;
-            const float d = __half2float(*(const half *) blk), dmin = __half2float(*(const half *) (blk + 2));
-            int s0, mn0, s1, mn1;
-            p60_scale_min_k4(2 * j, blk + 4, s0, mn0);
-            p60_scale_min_k4(2 * j + 1, blk + 4, s1, mn1);
-            const float d0 = d * s0, c0 = dmin * mn0, d1 = d * s1, c1 = dmin * mn1;
-            const uint2 q8 = *(const uint2 *) (blk + QS + 32 * j + 8 * lp);
-            const uint8_t * qb = (const uint8_t *) &q8;
-            unsigned hb0 = 0, hb1 = 0;
-            if constexpr (TYPE == GGML_TYPE_Q5_K) {
-                const uint2 h8 = *(const uint2 *) (blk + 16 + 8 * lp);
-                const uint8_t * hbb = (const uint8_t *) &h8;
-#pragma unroll
-                for (int e = 0; e < 8; e++) {
-                    hb0 |= ((hbb[e] >> (2 * j)) & 1u) << e;
-                    hb1 |= ((hbb[e] >> (2 * j + 1)) & 1u) << e;
+        for (int rr = 0; rr < BMT / 64; rr++) {
+            if constexpr (TYPE == GGML_TYPE_Q6_K) {
+                // 210 B superblocks (2 B aligned): step j covers y[64 j ..]: half n = j / 2, upper nibbles / qh bits 4-7
+                // for odd j; first 32 weights from ql[64 n + l], the next 32 from ql[64 n + 32 + l], l = 8 lp + e
+                const int sb = k0 / 256, j = (k0 % 256) / 64, n = j >> 1, odd = j & 1;
+                const uint8_t * blk = Wexp + (int64_t) (m0 + lr + 64 * rr) * row_bytes + sb * SBB;
+                const unsigned short * ql0 = (const unsigned short *) (blk + 64 * n + 8 * lp);
+                const unsigned short * ql1 = (const unsigned short *) (blk + 64 * n + 32 + 8 * lp);
+                const unsigned short * qhp = (const unsigned short *) (blk + 128 + 32 * n + 8 * lp);
+                uint8_t a0[8], a1[8], hh[8];
+    #pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    const unsigned short u0 = ql0[e], u1 = ql1[e], uh = qhp[e];
+                    a0[2 * e] = u0 & 0xFF; a0[2 * e + 1] = u0 >> 8;
+                    a1[2 * e] = u1 & 0xFF; a1[2 * e + 1] = u1 >> 8;
+                    hh[2 * e] = uh & 0xFF; hh[2 * e + 1] = uh >> 8;
                 }
-            }
-            float lo[8], hi[8];
-#pragma unroll
-            for (int e = 0; e < 8; e++) {
-                int ql = qb[e] & 0xF, qh = qb[e] >> 4;
-                if constexpr (TYPE == GGML_TYPE_Q5_K) { ql |= ((hb0 >> e) & 1) << 4; qh |= ((hb1 >> e) & 1) << 4; }
-                lo[e] = d0 * ql - c0;
-                hi[e] = d1 * qh - c1;
-            }
-#pragma unroll
-            for (int e = 0; e < 8; e += 2) {
-                AP[(8 * lp + e) / 2][lr]      = __floats2half2_rn(lo[e], lo[e + 1]);
-                AP[(32 + 8 * lp + e) / 2][lr] = __floats2half2_rn(hi[e], hi[e + 1]);
+                const int is = lp >> 1;
+                const int8_t * sc = (const int8_t *) (blk + 192 + 8 * n + 4 * odd);
+                const float d = __half2float(*(const half *) (blk + 208));
+                const float dl = d * sc[is], dh = d * sc[is + 2];
+                const int sh = 4 * odd;
+                float lo[8], hi[8];
+    #pragma unroll
+                for (int e = 0; e < 8; e++) {
+                    const int q0 = ((a0[e] >> sh) & 0xF) | (((hh[e] >> sh) & 3) << 4);
+                    const int q1 = ((a1[e] >> sh) & 0xF) | (((hh[e] >> (sh + 2)) & 3) << 4);
+                    lo[e] = dl * (q0 - 32);
+                    hi[e] = dh * (q1 - 32);
+                }
+    #pragma unroll
+                for (int e = 0; e < 8; e += 2) {
+                    AP[(8 * lp + e) / 2][lr + 64 * rr]      = __floats2half2_rn(lo[e], lo[e + 1]);
+                    AP[(32 + 8 * lp + e) / 2][lr + 64 * rr] = __floats2half2_rn(hi[e], hi[e + 1]);
+                }
+            } else {
+                const int sb = k0 / 256, j = (k0 % 256) / 64;
+                const uint8_t * blk = Wexp + (int64_t) (m0 + lr + 64 * rr) * row_bytes + sb * SBB;
+                const float d = __half2float(*(const half *) blk), dmin = __half2float(*(const half *) (blk + 2));
+                int s0, mn0, s1, mn1;
+                p60_scale_min_k4(2 * j, blk + 4, s0, mn0);
+                p60_scale_min_k4(2 * j + 1, blk + 4, s1, mn1);
+                const float d0 = d * s0, c0 = dmin * mn0, d1 = d * s1, c1 = dmin * mn1;
+                const uint2 q8 = *(const uint2 *) (blk + QS + 32 * j + 8 * lp);
+                const uint8_t * qb = (const uint8_t *) &q8;
+                unsigned hb0 = 0, hb1 = 0;
+                if constexpr (TYPE == GGML_TYPE_Q5_K) {
+                    const uint2 h8 = *(const uint2 *) (blk + 16 + 8 * lp);
+                    const uint8_t * hbb = (const uint8_t *) &h8;
+    #pragma unroll
+                    for (int e = 0; e < 8; e++) {
+                        hb0 |= ((hbb[e] >> (2 * j)) & 1u) << e;
+                        hb1 |= ((hbb[e] >> (2 * j + 1)) & 1u) << e;
+                    }
+                }
+                float lo[8], hi[8];
+    #pragma unroll
+                for (int e = 0; e < 8; e++) {
+                    int ql = qb[e] & 0xF, qh = qb[e] >> 4;
+                    if constexpr (TYPE == GGML_TYPE_Q5_K) { ql |= ((hb0 >> e) & 1) << 4; qh |= ((hb1 >> e) & 1) << 4; }
+                    lo[e] = d0 * ql - c0;
+                    hi[e] = d1 * qh - c1;
+                }
+    #pragma unroll
+                for (int e = 0; e < 8; e += 2) {
+                    AP[(8 * lp + e) / 2][lr + 64 * rr]      = __floats2half2_rn(lo[e], lo[e + 1]);
+                    AP[(32 + 8 * lp + e) / 2][lr + 64 * rr] = __floats2half2_rn(hi[e], hi[e + 1]);
+                }
             }
         }
         {
@@ -174,14 +179,16 @@ __global__ void __launch_bounds__(NTH, 2) moe_gemm_f16(const uint8_t * __restric
             }
         }
         __syncthreads();
-        half2 h[4][PPT];
+        half2 h[RPT][PPT];
 #pragma unroll
-        for (int i = 0; i < 4; i++)
+        for (int i = 0; i < RPT; i++)
 #pragma unroll
             for (int j = 0; j < PPT; j++) h[i][j] = __float2half2_rn(0.f);
 #pragma unroll 8
         for (int kp = 0; kp < KP; kp++) {
-            const uint4 a = *(const uint4 *) &AP[kp][4 * ty];
+            half2 ah[RPT];
+#pragma unroll
+            for (int i = 0; i < RPT; i += 4) *(uint4 *) &ah[i] = *(const uint4 *) &AP[kp][RPT * ty + i];
             half2 bh[PPT];
             if constexpr (PPT == 4) {
                 *(uint4 *) bh = *(const uint4 *) &BP[kp][4 * tx];
@@ -190,14 +197,13 @@ __global__ void __launch_bounds__(NTH, 2) moe_gemm_f16(const uint8_t * __restric
             } else {
                 bh[0] = BP[kp][tx];
             }
-            const half2 * ah = (const half2 *) &a;
 #pragma unroll
-            for (int i = 0; i < 4; i++)
+            for (int i = 0; i < RPT; i++)
 #pragma unroll
                 for (int j = 0; j < PPT; j++) h[i][j] = __hfma2(ah[i], bh[j], h[i][j]);
         }
 #pragma unroll
-        for (int i = 0; i < 4; i++)
+        for (int i = 0; i < RPT; i++)
 #pragma unroll
             for (int j = 0; j < PPT; j++) { const float2 f = __half22float2(h[i][j]); acc[i][j] += f.x + f.y; }
         __syncthreads();
@@ -206,8 +212,9 @@ __global__ void __launch_bounds__(NTH, 2) moe_gemm_f16(const uint8_t * __restric
     for (int j = 0; j < PPT; j++) {
         const int p = PPT * tx + j;
         if (p < jb.np) {
-            float * o = (float *) (dst + (int64_t) ids_dst[jb.p0 + p] * nb1) + m0 + 4 * ty;
-            *(float4 *) o = make_float4(acc[0][j], acc[1][j], acc[2][j], acc[3][j]);
+            float * o = (float *) (dst + (int64_t) ids_dst[jb.p0 + p] * nb1) + m0 + RPT * ty;
+#pragma unroll
+            for (int i = 0; i < RPT; i += 4) *(float4 *) (o + i) = make_float4(acc[i][j], acc[i + 1][j], acc[i + 2][j], acc[i + 3][j]);
         }
     }
 }
@@ -260,13 +267,14 @@ bool ggml_cuda_p60_moe_gemm(ggml_backend_cuda_context & ctx, const ggml_tensor *
     }
     moe_jobs<<<1, nthr, 0, stream>>>(bounds.get(), (int) n_experts, bn, jobs.get(), njobs.get());
 
-    const dim3 grid(max_jobs, M / BM);
+    const int bmt = bn == 64 && M % 128 == 0 ? 128 : 64;
+    const dim3 grid(max_jobs, M / bmt);
     using kfn = void (*)(const uint8_t *, int64_t, int64_t, int, const half2 *, const moe_job *, const int *, const int32_t *, char *, int64_t);
-#define P60_MOE_GEMM_K(TYPE) { moe_gemm_f16<TYPE, 64>, moe_gemm_f16<TYPE, 32>, moe_gemm_f16<TYPE, 16> }
-    static const kfn kern[3][3] = { P60_MOE_GEMM_K(GGML_TYPE_Q4_K), P60_MOE_GEMM_K(GGML_TYPE_Q5_K), P60_MOE_GEMM_K(GGML_TYPE_Q6_K) };
+#define P60_MOE_GEMM_K(TYPE) { moe_gemm_f16<TYPE, 64, 128>, moe_gemm_f16<TYPE, 64, 64>, moe_gemm_f16<TYPE, 32, 64>, moe_gemm_f16<TYPE, 16, 64> }
+    static const kfn kern[3][4] = { P60_MOE_GEMM_K(GGML_TYPE_Q4_K), P60_MOE_GEMM_K(GGML_TYPE_Q5_K), P60_MOE_GEMM_K(GGML_TYPE_Q6_K) };
 #undef P60_MOE_GEMM_K
     const int ti = src0->type == GGML_TYPE_Q4_K ? 0 : src0->type == GGML_TYPE_Q5_K ? 1 : 2;
-    kern[ti][bn == 64 ? 0 : bn == 32 ? 1 : 2]<<<grid, NTH, 0, stream>>>((const uint8_t *) src0->data, src0->nb[1], src0->nb[2], (int) K,
+    kern[ti][bn == 64 ? (bmt == 128 ? 0 : 1) : bn == 32 ? 2 : 3]<<<grid, NTH, 0, stream>>>((const uint8_t *) src0->data, src0->nb[1], src0->nb[2], (int) K,
         xs.get(), jobs.get(), njobs.get(), ids_dst.get(), (char *) dst->data, dst->nb[1]);
     CUDA_CHECK(cudaGetLastError());
     return true;
