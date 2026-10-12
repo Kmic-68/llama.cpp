@@ -58,7 +58,7 @@ __global__ void moe_jobs(const int32_t * __restrict__ bounds, int n_experts, moe
     }
 }
 
-// TYPE: GGML_TYPE_Q4_K (144 B / 256) or GGML_TYPE_Q5_K (176 B / 256)
+// TYPE: GGML_TYPE_Q4_K (144 B / 256), GGML_TYPE_Q5_K (176 B / 256) or GGML_TYPE_Q6_K (210 B / 256)
 template <int TYPE>
 __global__ void __launch_bounds__(NTH, 2) moe_gemm_f16(const uint8_t * __restrict__ W, int64_t row_bytes, int64_t exp_bytes, int K,
         const half2 * __restrict__ X, const moe_job * __restrict__ jobs, const int * __restrict__ njobs,
@@ -72,7 +72,7 @@ __global__ void __launch_bounds__(NTH, 2) moe_gemm_f16(const uint8_t * __restric
     const int m0 = blockIdx.y * BM;
     const int tid = threadIdx.x, tx = tid & 15, ty = tid >> 4;
     const uint8_t * Wexp = W + (int64_t) jb.expert * exp_bytes;
-    constexpr int SBB = TYPE == GGML_TYPE_Q4_K ? 144 : 176, QS = TYPE == GGML_TYPE_Q4_K ? 16 : 48;
+    constexpr int SBB = TYPE == GGML_TYPE_Q4_K ? 144 : TYPE == GGML_TYPE_Q5_K ? 176 : 210, QS = TYPE == GGML_TYPE_Q4_K ? 16 : 48;
 
     float acc[4][4];
 #pragma unroll
@@ -84,7 +84,41 @@ __global__ void __launch_bounds__(NTH, 2) moe_gemm_f16(const uint8_t * __restric
     const int bpair = tid >> 2, bq = tid & 3; // activation loader: pair, 8 k-pairs
 
     for (int k0 = 0; k0 < K; k0 += BK) {
-        {
+        if constexpr (TYPE == GGML_TYPE_Q6_K) {
+            // 210 B superblocks (2 B aligned): step j covers y[64 j ..]: half n = j / 2, upper nibbles / qh bits 4-7
+            // for odd j; first 32 weights from ql[64 n + l], the next 32 from ql[64 n + 32 + l], l = 8 lp + e
+            const int sb = k0 / 256, j = (k0 % 256) / 64, n = j >> 1, odd = j & 1;
+            const uint8_t * blk = Wexp + (int64_t) (m0 + lr) * row_bytes + sb * SBB;
+            const unsigned short * ql0 = (const unsigned short *) (blk + 64 * n + 8 * lp);
+            const unsigned short * ql1 = (const unsigned short *) (blk + 64 * n + 32 + 8 * lp);
+            const unsigned short * qhp = (const unsigned short *) (blk + 128 + 32 * n + 8 * lp);
+            uint8_t a0[8], a1[8], hh[8];
+#pragma unroll
+            for (int e = 0; e < 4; e++) {
+                const unsigned short u0 = ql0[e], u1 = ql1[e], uh = qhp[e];
+                a0[2 * e] = u0 & 0xFF; a0[2 * e + 1] = u0 >> 8;
+                a1[2 * e] = u1 & 0xFF; a1[2 * e + 1] = u1 >> 8;
+                hh[2 * e] = uh & 0xFF; hh[2 * e + 1] = uh >> 8;
+            }
+            const int is = lp >> 1;
+            const int8_t * sc = (const int8_t *) (blk + 192 + 8 * n + 4 * odd);
+            const float d = __half2float(*(const half *) (blk + 208));
+            const float dl = d * sc[is], dh = d * sc[is + 2];
+            const int sh = 4 * odd;
+            float lo[8], hi[8];
+#pragma unroll
+            for (int e = 0; e < 8; e++) {
+                const int q0 = ((a0[e] >> sh) & 0xF) | (((hh[e] >> sh) & 3) << 4);
+                const int q1 = ((a1[e] >> sh) & 0xF) | (((hh[e] >> (sh + 2)) & 3) << 4);
+                lo[e] = dl * (q0 - 32);
+                hi[e] = dh * (q1 - 32);
+            }
+#pragma unroll
+            for (int e = 0; e < 8; e += 2) {
+                AP[(8 * lp + e) / 2][lr]      = __floats2half2_rn(lo[e], lo[e + 1]);
+                AP[(32 + 8 * lp + e) / 2][lr] = __floats2half2_rn(hi[e], hi[e + 1]);
+            }
+        } else {
             const int sb = k0 / 256, j = (k0 % 256) / 64;
             const uint8_t * blk = Wexp + (int64_t) (m0 + lr) * row_bytes + sb * SBB;
             const float d = __half2float(*(const half *) blk), dmin = __half2float(*(const half *) (blk + 2));
@@ -173,13 +207,14 @@ bool ggml_cuda_p60_moe_gemm(ggml_backend_cuda_context & ctx, const ggml_tensor *
     }
     const int64_t K = src0->ne[0], M = src0->ne[1], n_experts = src0->ne[2];
     const int64_t n_used = ids->ne[0], n_tokens = ids->ne[1];
-    if ((src0->type != GGML_TYPE_Q4_K && src0->type != GGML_TYPE_Q5_K) || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+    if ((src0->type != GGML_TYPE_Q4_K && src0->type != GGML_TYPE_Q5_K && src0->type != GGML_TYPE_Q6_K) || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
             ids->type != GGML_TYPE_I32 || K % 256 != 0 || M % BM != 0 || n_experts > 1024 || src0->ne[3] != 1 ||
             src1->ne[0] != K || src1->ne[3] != 1 || dst->ne[3] != 1 || src1->nb[0] != sizeof(float) || src1->nb[1] % 8 != 0 ||
             (src1->ne[1] != 1 && src1->ne[1] != n_used) || src1->ne[2] != n_tokens || src1->nb[2] % src1->nb[1] != 0 ||
             dst->ne[0] != M || dst->ne[1] != n_used || dst->ne[2] != n_tokens || dst->nb[0] != sizeof(float) ||
             dst->nb[2] != dst->nb[1] * n_used || dst->nb[1] % 16 != 0 || ((uintptr_t) dst->data) % 16 != 0 ||
-            src0->nb[1] != (size_t) K / 256 * (src0->type == GGML_TYPE_Q4_K ? 144 : 176) || src0->nb[2] != src0->nb[1] * M ||
+            src0->nb[1] != (size_t) K / 256 * (src0->type == GGML_TYPE_Q4_K ? 144 : src0->type == GGML_TYPE_Q5_K ? 176 : 210) ||
+            src0->nb[2] != src0->nb[1] * M ||
             ids->nb[0] != sizeof(int32_t)) {
         return false;
     }
@@ -210,8 +245,11 @@ bool ggml_cuda_p60_moe_gemm(ggml_backend_cuda_context & ctx, const ggml_tensor *
     if (src0->type == GGML_TYPE_Q4_K) {
         moe_gemm_f16<GGML_TYPE_Q4_K><<<grid, NTH, 0, stream>>>((const uint8_t *) src0->data, src0->nb[1], src0->nb[2], (int) K,
             xs.get(), jobs.get(), njobs.get(), ids_dst.get(), (char *) dst->data, dst->nb[1]);
-    } else {
+    } else if (src0->type == GGML_TYPE_Q5_K) {
         moe_gemm_f16<GGML_TYPE_Q5_K><<<grid, NTH, 0, stream>>>((const uint8_t *) src0->data, src0->nb[1], src0->nb[2], (int) K,
+            xs.get(), jobs.get(), njobs.get(), ids_dst.get(), (char *) dst->data, dst->nb[1]);
+    } else {
+        moe_gemm_f16<GGML_TYPE_Q6_K><<<grid, NTH, 0, stream>>>((const uint8_t *) src0->data, src0->nb[1], src0->nb[2], (int) K,
             xs.get(), jobs.get(), njobs.get(), ids_dst.get(), (char *) dst->data, dst->nb[1]);
     }
     CUDA_CHECK(cudaGetLastError());
