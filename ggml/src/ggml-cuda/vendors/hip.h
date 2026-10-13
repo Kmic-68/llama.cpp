@@ -34,6 +34,7 @@
 #define __shfl_xor_sync(mask, var, laneMask, width) __shfl_xor(var, laneMask, width)
 #define __all_sync(mask, var) __all(var)
 #define __any_sync(mask, var) __any(var)
+#define __ballot_sync(mask, var) __ballot(var)
 #define cublasStrsmBatched hipblasStrsmBatched
 #define cublasCreate hipblasCreate
 #define cublasDestroy hipblasDestroy
