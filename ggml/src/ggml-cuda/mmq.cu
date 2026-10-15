@@ -195,8 +195,9 @@ void ggml_cuda_mul_mat_q(
             ncols_opt = ne12;
 
             // Each expert only sees ne12*n_expert_used/ne02 tokens on average.
-            // On RDNA3 and RDNA4 it is faster to pick the tile size against this value instead of ne12.
-            if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
+            // On RDNA3, RDNA4 and NVIDIA without dp4a (sm_60) it is faster to pick the tile size against this value instead of ne12.
+            if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc) ||
+                    (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_DP4A)) {
                 ncols_opt = (ne12*n_expert_used + ne02 - 1) / ne02;
             }
         }
