@@ -30,6 +30,10 @@ PRELUDE = '''#include <cuda_fp16.h>
 #include <cfloat>
 #define QK4_0 32
 typedef struct { half d; uint8_t qs[QK4_0/2]; } block_q4_0;
+#define QK8_0 32
+typedef struct { half d; int8_t qs[QK8_0]; } block_q8_0;
+enum ggml_type { GGML_TYPE_F16 = 1, GGML_TYPE_Q4_0 = 2, GGML_TYPE_Q8_0 = 8 };
+#define GGML_ABORT(...) __builtin_trap()
 #define WARP_SIZE 32
 '''
 

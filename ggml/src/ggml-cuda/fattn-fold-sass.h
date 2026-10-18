@@ -2,7 +2,7 @@
 // fa_fold_qk2 / fa_fold_pv2 compiled alone for sm_60, registers renamed to avoid operand bank
 // conflicts (bankfix.py: a permutation of names, bit-identical results).
 #pragma once
-static const char fattn_fold_sass_src_hash[] = "690ac80fe6d4ade0";
+static const char fattn_fold_sass_src_hash[] = "dcdd71698198675f";
 static const char fattn_fold_sass_name_qk2[] = "_ZN7fa_fold11fa_fold_qk2EPK6__halfS2_S2_PKflPS0_PfS6_iiiiNS_13fa_fold_splitEb";
 static const unsigned char fattn_fold_sass_qk2[43744] = {
     0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01, 0x01, 0x33, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0xbe, 0x00, 0x78, 0x00, 0x00, 0x00,
