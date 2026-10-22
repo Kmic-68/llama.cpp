@@ -2983,6 +2983,10 @@ static void mmvq_f16_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor 
     *sc_out = sc_ptr;
 }
 
+bool ggml_cuda_mmvq_f16_takes(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, const int64_t ncols) {
+    return mmvq_f16_shape_ok(src0, src1, dst, ncols);
+}
+
 bool ggml_cuda_mmvq_f16_try(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
                             ggml_tensor * dst, const int64_t ncols) {
     const int64_t K = src0->ne[0], rows = src0->ne[1];

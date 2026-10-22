@@ -2128,8 +2128,16 @@ static bool ggml_cuda_mul_mat_is_cublas_f16(ggml_backend_cuda_context & ctx, con
             return false; // (the transposed-vector case; conservatively without its remaining conditions)
         }
         if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false) ||
-            ggml_cuda_should_use_mmvq(src0->type, cc, ne11) ||
-            ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
+            ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
+            return false;
+        }
+        // the 9..16-column fp16 matvec route ggml_cuda_mul_mat takes before MMQ and cuBLAS; without this a SwiGLU
+        // planned for the fold GEMM was skipped and never computed (GGML_ASSERT(!ggml_cuda_gemm_fold_glu_pending()))
+        if (ne11 > MMVQ_MAX_BATCH_SIZE && !ggml_cuda_gemm_fold_wants_f32(ctx, src0, src1, dst) &&
+            ggml_cuda_mmvq_f16_takes(src0, src1, dst, ne11)) {
+            return false;
+        }
+        if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
             return false;
         }
     }
