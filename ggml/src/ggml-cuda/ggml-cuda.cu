@@ -1182,8 +1182,27 @@ static bool ggml_backend_cuda_comm_try_allreduce_nccl(
 }
 #endif // GGML_USE_NCCL
 
+static bool ggml_cuda_allreduce_chunked(ggml_backend_cuda_context * ctx[2], struct ggml_tensor ** tensors, const int64_t ne);
+
 static bool ggml_backend_cuda_comm_try_allreduce_internal(
         ggml_backend_cuda_comm_context * comm_ctx, struct ggml_tensor ** tensors) {
+    // Large (prefill) exchanges whose fold GEMM ran in token chunks: send each chunk while the later ones
+    // compute (ggml_cuda_allreduce_chunked). Without P2P its cudaMemcpyPeerAsync is staged by the driver,
+    // which is exactly when overlapping the slow transfer pays. It declines (and the exchange takes the
+    // usual path) unless the matmul was chunked and its partials were probed f16-exact.
+    // GGML_CUDA_XCHG_NOP2P=0 turns this off.
+    static const bool chunked_on = [] { const char * e = getenv("GGML_CUDA_XCHG_NOP2P"); return !e || atoi(e) != 0; }();
+    if (chunked_on && comm_ctx->backends.size() == 2 && tensors[0] && tensors[1] &&
+            tensors[0]->type == GGML_TYPE_F32 && ggml_nelements(tensors[0])*sizeof(float) > 256*1024) {
+        ggml_backend_cuda_context * ctx[2] = {
+            (ggml_backend_cuda_context *) comm_ctx->backends[0]->context,
+            (ggml_backend_cuda_context *) comm_ctx->backends[1]->context,
+        };
+        if (ggml_nelements(tensors[1]) == ggml_nelements(tensors[0]) &&
+                ggml_cuda_allreduce_chunked(ctx, tensors, ggml_nelements(tensors[0]))) {
+            return true;
+        }
+    }
     return ggml_backend_cuda_comm_allreduce_internal(comm_ctx, tensors);
 }
 
