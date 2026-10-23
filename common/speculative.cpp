@@ -1365,6 +1365,40 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<std::vector<float>> verify_h;
     std::vector<int32_t> verify_h_rows;
 
+    // Target positions of the rows above: pending_h holds h at pending_pos (-1: unknown), the row it
+    // replaced is kept as prev_h/prev_pos, and verify row 0 is at verify_pos0. A batch starting at
+    // pos p pairs its first token with h at p-1, looked up here by position: a context-checkpoint
+    // restore, a slot restore or a speculative replay resumes at a position the last process() call
+    // did not end on, and pairing it with whatever row was left over made the draft cache (and so
+    // the greedy output with MTP) depend on earlier requests. An unknown row is zeros.
+    std::vector<llama_pos>          pending_pos;
+    std::vector<llama_pos>          prev_pos;
+    std::vector<std::vector<float>> prev_h;
+    std::vector<llama_pos>          verify_pos0;
+    std::vector<float>              zero_h;
+    int64_t                         n_h_miss = 0;
+
+    const float * h_at(llama_seq_id seq_id, llama_pos pos) {
+        if (pos >= 0) {
+            if (pending_pos[seq_id] == pos) {
+                return pending_h[seq_id].data();
+            }
+            if (prev_pos[seq_id] == pos) {
+                return prev_h[seq_id].data();
+            }
+            const llama_pos i = pos - verify_pos0[seq_id];
+            if (verify_pos0[seq_id] >= 0 && i >= 0 && i < verify_h_rows[seq_id]) {
+                return verify_h[seq_id].data() + (size_t) i * n_embd;
+            }
+            if (++n_h_miss <= 8) {
+                SPC_DBG("MTP: no target h for seq %d pos %d (pending %d, prev %d, verify %d+%d), using zeros\n",
+                        (int) seq_id, (int) pos, (int) pending_pos[seq_id], (int) prev_pos[seq_id],
+                        (int) verify_pos0[seq_id], (int) verify_h_rows[seq_id]);
+            }
+        }
+        return zero_h.data();
+    }
+
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
@@ -1508,6 +1542,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         this->n_max = this->params.n_max;
 
         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
+        pending_pos.assign(n_seq, -1);
+        prev_pos.assign(n_seq, -1);
+        prev_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
+        verify_pos0.assign(n_seq, -1);
+        zero_h.assign(n_embd, 0.0f);
 
         i_last.assign(n_seq, -1);
         i_batch_beg.assign(n_seq, -1);
@@ -1620,7 +1659,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     continue;
                 }
 
-                set_h(i_batch_beg[seq_id], pending_h[seq_id].data());
+                set_h(i_batch_beg[seq_id], h_at(seq_id, batch_in.pos[i_batch_beg[seq_id]] - 1));
             }
 
             auto * mem_dft = llama_get_memory(ctx_dft);
@@ -1668,6 +1707,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
             verify_h_rows[seq_id] = n_rows;
+            verify_pos0[seq_id]   = batch_in.pos[i_batch_beg[seq_id]];
             verify_h[seq_id].resize((size_t) n_rows * n_embd);
 
             for (int32_t i = 0; i < n_rows; ++i) {
@@ -1675,8 +1715,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
             }
 
+            std::swap(prev_h[seq_id], pending_h[seq_id]);
+            prev_pos[seq_id] = pending_pos[seq_id];
             std::memcpy(pending_h[seq_id].data(),
                     verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
+            pending_pos[seq_id] = batch_in.pos[i_batch_end[seq_id]];
         }
 
         return true;
@@ -1715,12 +1758,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             common_batch_add(batch, dp.id_last, dp.pos0, { seq_id }, true);
-            std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[seq_id].data(), row_bytes);
+            const float * h_last = h_at(seq_id, dp.pos0 - 1);
+            std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, h_last, row_bytes);
 
             i_last[seq_id] = batch.n_tokens - 1;
 
             if (chain_heads) {
-                chain_h[seq_id].assign(pending_h[seq_id].begin(), pending_h[seq_id].end());
+                chain_h[seq_id].assign(h_last, h_last + n_embd);
             }
         }
 
@@ -1910,6 +1954,35 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
     }
 
+    // the pending row and its position travel with context checkpoints and slot files
+    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || pending_pos[seq_id] < 0) {
+            return false;
+        }
+        const size_t row_bytes = (size_t) n_embd * sizeof(float);
+        data.resize(sizeof(llama_pos) + row_bytes);
+        std::memcpy(data.data(), &pending_pos[seq_id], sizeof(llama_pos));
+        std::memcpy(data.data() + sizeof(llama_pos), pending_h[seq_id].data(), row_bytes);
+        return true;
+    }
+
+    void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+        // whatever else is stashed belongs to the state being replaced
+        prev_pos[seq_id]      = -1;
+        verify_pos0[seq_id]   = -1;
+        verify_h_rows[seq_id] = 0;
+        pending_pos[seq_id]   = -1;
+        const size_t row_bytes = (size_t) n_embd * sizeof(float);
+        if (data.size() != sizeof(llama_pos) + row_bytes) {
+            return;
+        }
+        std::memcpy(&pending_pos[seq_id], data.data(), sizeof(llama_pos));
+        std::memcpy(pending_h[seq_id].data(), data.data() + sizeof(llama_pos), row_bytes);
+    }
+
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
@@ -1923,6 +1996,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+        pending_pos[seq_id] = verify_pos0[seq_id] + i_h;
 
         if (spec_log && seq_id < (llama_seq_id) spec_log_recs.size() && spec_log_recs[seq_id].t_end > 0) {
             const auto & r = spec_log_recs[seq_id];
@@ -3126,6 +3200,7 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
 
 // TODO: support the case of more than one speculative implementations having a state
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data) {
+    data.clear();
     if (spec == nullptr) {
         return false;
     }

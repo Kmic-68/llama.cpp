@@ -336,14 +336,20 @@ struct server_slot {
         if (ctx_dft) {
             llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         }
+        // the draft's carry-over (MTP: the hidden row the next batch pairs with), as in slot files
+        common_speculative_get_state(spec, id, cur->data.spec);
 
         return true;
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
+        std::optional<std::vector<uint8_t>> data_spec;
+        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id, &data_spec);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
+        } else if (data_spec) {
+            // a cached state replaced the slot's: its carry-over too (empty: none, the next batch pairs with zeros)
+            common_speculative_set_state(spec, id, *data_spec);
         }
 
         return res;
@@ -2643,6 +2649,56 @@ private:
                         }
                     }
 
+                    // the draft's own carry-over (the MTP head pairs the next token with the target's last
+                    // hidden row): without it a restored slot drafts from a stale row and the output depends
+                    // on whatever ran before the restore
+                    {
+                        std::vector<uint8_t> data_spec;
+                        const std::string path_spec = filepath + ".spec";
+                        if (common_speculative_get_state(spec.get(), slot->id, data_spec)) {
+                            std::ofstream f(path_spec, std::ios::binary);
+                            f.write(reinterpret_cast<const char *>(data_spec.data()), data_spec.size());
+                            if (!f) {
+                                send_error(task, "Unable to save the speculative state of the slot", ERROR_TYPE_SERVER);
+                                break;
+                            }
+                            nwrite_dft += data_spec.size();
+                        } else {
+                            std::remove(path_spec.c_str());
+                        }
+                    }
+
+                    // the context checkpoints: a recurrent/hybrid target cannot truncate its state, so without them
+                    // a restored slot whose next request diverges before the saved end (e.g. the same conversation
+                    // without the generated reply) reprocesses the whole prompt
+                    {
+                        const std::string path_ckpt = filepath + ".ckpt";
+                        const auto & ckpts = slot->prompt.checkpoints;
+                        if (ckpts.empty()) {
+                            std::remove(path_ckpt.c_str());
+                        } else {
+                            std::ofstream f(path_ckpt, std::ios::binary);
+                            auto put = [&](const void * p, size_t n) { f.write(reinterpret_cast<const char *>(p), n); };
+                            auto put_buf = [&](const uint8_t * p, uint64_t n) { put(&n, sizeof(n)); put(p, n); };
+                            const uint32_t magic = 0x54504b43, n_ckpt = (uint32_t) ckpts.size(); // "CKPT"
+                            put(&magic, sizeof(magic));
+                            put(&n_ckpt, sizeof(n_ckpt));
+                            for (const auto & ck : ckpts) {
+                                put(&ck.n_tokens, sizeof(ck.n_tokens));
+                                put(&ck.pos_min,  sizeof(ck.pos_min));
+                                put(&ck.pos_max,  sizeof(ck.pos_max));
+                                put_buf(ck.data_tgt.data(),  ck.data_tgt.size());
+                                put_buf(ck.data_dft.data(),  ck.data_dft.size());
+                                put_buf(ck.data_spec.data(), ck.data_spec.size());
+                                nwrite_dft += ck.size();
+                            }
+                            if (!f) {
+                                send_error(task, "Unable to save the context checkpoints of the slot", ERROR_TYPE_SERVER);
+                                break;
+                            }
+                        }
+                    }
+
                     const int64_t t_end = ggml_time_us();
                     const double t_save_ms = (t_end - t_start) / 1000.0;
 
@@ -2707,6 +2763,16 @@ private:
                             }
                         }
 
+                        if (spec) {
+                            std::vector<uint8_t> data_spec;
+                            std::ifstream f(filepath + ".spec", std::ios::binary);
+                            if (f) {
+                                data_spec.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+                            }
+                            // empty: no carry-over, the next batch starts from a zero row instead of a stale one
+                            common_speculative_set_state(spec.get(), slot->id, data_spec);
+                        }
+
                         if (restored.size() > (size_t) slot->n_ctx) {
                             throw std::runtime_error("Restored prompt does not fit in the slot context");
                         }
@@ -2717,6 +2783,30 @@ private:
 
                         slot->prompt.clear();
                         slot->prompt.tokens = std::move(restored);
+
+                        // context checkpoints saved with the slot (see SLOT_SAVE); only those inside the restored tokens
+                        if (std::ifstream f{filepath + ".ckpt", std::ios::binary}) {
+                            auto get = [&](void * p, size_t n) { return (bool) f.read(reinterpret_cast<char *>(p), n); };
+                            uint32_t magic = 0, n_ckpt = 0;
+                            if (!get(&magic, sizeof(magic)) || magic != 0x54504b43 || !get(&n_ckpt, sizeof(n_ckpt))) {
+                                throw std::runtime_error("Invalid context checkpoint file");
+                            }
+                            for (uint32_t i = 0; i < n_ckpt; ++i) {
+                                auto & ck = slot->prompt.checkpoints.emplace_back();
+                                uint64_t n = 0;
+                                bool ok = get(&ck.n_tokens, sizeof(ck.n_tokens)) && get(&ck.pos_min, sizeof(ck.pos_min)) &&
+                                          get(&ck.pos_max, sizeof(ck.pos_max));
+                                ok = ok && get(&n, sizeof(n)); if (ok) { ck.data_tgt.resize(n);  ok = get(ck.data_tgt.data(),  n); }
+                                ok = ok && get(&n, sizeof(n)); if (ok) { ck.data_dft.resize(n);  ok = get(ck.data_dft.data(),  n); }
+                                ok = ok && get(&n, sizeof(n)); if (ok) { ck.data_spec.resize(n); ok = get(ck.data_spec.data(), n); }
+                                if (!ok) {
+                                    throw std::runtime_error("Truncated context checkpoint file");
+                                }
+                                if (ck.n_tokens > (int64_t) slot->prompt.tokens.size()) {
+                                    slot->prompt.checkpoints.pop_back();
+                                }
+                            }
+                        }
                     } catch (const std::exception & err) {
                         slot->prompt_clear();
                         send_error(task, std::string("Unable to restore slot: ") + err.what(), ERROR_TYPE_INVALID_REQUEST);
