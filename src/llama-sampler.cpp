@@ -2954,26 +2954,45 @@ static void llama_sampler_penalties_apply(struct llama_sampler * smpl, llama_tok
         return;
     }
 
-    // Apply frequency and presence penalties to the cur_p
-    for (size_t i = 0; i < cur_p->size; ++i) {
-        const auto token_iter = ctx->token_count.find(cur_p->data[i].id);
-        if (token_iter == ctx->token_count.end()) {
-            continue;
-        }
-
-        const int count = token_iter->second;
-
+    const auto apply = [ctx](llama_token_data & cand, const int count) {
         assert(count > 0 && count <= ctx->penalty_last_n);
 
         // The academic publication that described this technique actually just only divided, but that would cause tokens with negative logits to become more likely, which is obviously wrong.
         // This is common fix for this problem, which is to multiply by the penalty instead of dividing.
-        if (cur_p->data[i].logit <= 0) {
-            cur_p->data[i].logit *= ctx->penalty_repeat;
+        if (cand.logit <= 0) {
+            cand.logit *= ctx->penalty_repeat;
         } else {
-            cur_p->data[i].logit /= ctx->penalty_repeat;
+            cand.logit /= ctx->penalty_repeat;
         }
 
-        cur_p->data[i].logit -= float(count) * ctx->penalty_freq + float(count > 0) * ctx->penalty_present;
+        cand.logit -= float(count) * ctx->penalty_freq + float(count > 0) * ctx->penalty_present;
+    };
+
+    // The candidates usually still are the whole vocabulary in token-id order here (penalties come first in the
+    // chain), so visit only the <= penalty_last_n distinct tokens in the window instead of looking up every one of
+    // ~150k candidates in the map: that loop cost 2 ms+ per sampled token, and MTP samples every verified token
+    // (Qwen3.8, presence 1.5: decode -7% without MTP, -10% with). Same arithmetic on the same entries.
+    bool in_id_order = true;
+    for (const auto & [token, count] : ctx->token_count) {
+        if (token < 0 || (size_t) token >= cur_p->size || cur_p->data[token].id != token) {
+            in_id_order = false;
+            break;
+        }
+    }
+
+    if (in_id_order) {
+        for (const auto & [token, count] : ctx->token_count) {
+            apply(cur_p->data[token], count);
+        }
+    } else {
+        // Apply frequency and presence penalties to the cur_p
+        for (size_t i = 0; i < cur_p->size; ++i) {
+            const auto token_iter = ctx->token_count.find(cur_p->data[i].id);
+            if (token_iter == ctx->token_count.end()) {
+                continue;
+            }
+            apply(cur_p->data[i], token_iter->second);
+        }
     }
 
     cur_p->sorted = false;
