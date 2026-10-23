@@ -7,7 +7,10 @@
 #include "active-tokens.cuh"
 
 #include <cstdint>
+#include <algorithm>
+#include <array>
 #include <type_traits>
+#include <unordered_map>
 
 // only enabled on DGX Spark, where it is a gain on every type below. On the higher-bandwidth parts the kernel
 // has little exposed latency left to hide and the extra requests cost more than they save.
@@ -2151,4 +2154,65 @@ void ggml_cuda_op_mul_mat_vec_q(
         1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, stream);
 
     GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_ncols, src1_padded_row_size);
+}
+
+// Pascal, 17..GGML_CUDA_MMVQ_CHUNK_MAX (default 28) columns of q6_K or q5_K weights (9..16 columns are
+// taken first by mmvq-f16.cu's single-launch kernels, see ggml_cuda_mul_mat): short prompts
+// and chat turns appended to a cached context. Instead of dequantizing each weight matrix to f16 for
+// a 128-column GEMM tile (a flat ~430 ms per pass of this model below 64 columns), run the fp16
+// mat-vec kernels of mmvq-f16.cu over balanced column chunks of at most 5, so each chunk computes
+// exactly what an MTP verify of that width does. The cost then grows with the column count instead.
+// The fold GEMM's planners (gemm-fold.cu) ask ggml_cuda_mmvq_chunked_ok too, so they never plan a
+// fusion or prefetch for a matmul this path takes. GGML_CUDA_MMVQ_CHUNK_ALL=1 also chunks the other
+// MMVQ types (8 wide, integer q8_1 path: faster, but measurably less accurate than the fold GEMM).
+// Above 28 columns the fold GEMM's 32/64-column tiles are faster (pp32 93.3 -> 104.3) and as accurate.
+static constexpr int64_t MMVQ_CHUNK_MAX_CHUNKS = 32;
+
+static int64_t ggml_cuda_mmvq_chunk_width(const ggml_type type) {
+    return type == GGML_TYPE_Q6_K || type == GGML_TYPE_Q5_K ? 5 : MMVQ_MAX_BATCH_SIZE;
+}
+
+bool ggml_cuda_mmvq_chunked_ok(const int cc, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst) {
+    static const int64_t max_cols = [] {
+        const char * s = getenv("GGML_CUDA_MMVQ_CHUNK_MAX");
+        return std::min(s ? (int64_t) atoi(s) : (int64_t) 28, 5*MMVQ_CHUNK_MAX_CHUNKS);
+    }();
+    static const bool all_types = [] { const char * s = getenv("GGML_CUDA_MMVQ_CHUNK_ALL"); return s && atoi(s) != 0; }();
+    const int64_t n = src1->ne[1];
+    return (all_types || ggml_cuda_mmvq_chunk_width(src0->type) == 5) && n > MMVQ_MAX_BATCH_SIZE && n <= max_cols &&
+        GGML_CUDA_CC_IS_NVIDIA(cc) && cc < GGML_CUDA_CC_VOLTA && ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_VOLTA &&
+        ggml_is_quantized(src0->type) && ggml_cuda_should_use_mmvq(src0->type, cc, 1) &&
+        src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
+        src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+        dst->ne[2] == 1 && dst->ne[3] == 1 && src1->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float);
+}
+
+bool ggml_cuda_mul_mat_vec_q_chunked(ggml_backend_cuda_context & ctx, const ggml_tensor * src0,
+                                     const ggml_tensor * src1, ggml_tensor * dst) {
+    if (!ggml_cuda_mmvq_chunked_ok(ggml_cuda_info().devices[ctx.device].cc, src0, src1, dst)) {
+        return false;
+    }
+    const int64_t n      = src1->ne[1];
+    const int64_t wmax   = ggml_cuda_mmvq_chunk_width(src0->type);
+    const int64_t nchunk = (n + wmax - 1)/wmax;
+    GGML_ASSERT(nchunk <= MMVQ_CHUNK_MAX_CHUNKS);
+    // Both mat-vec paths cache the prepared activation keyed on the src1 tensor's address and data
+    // pointer, so each (node, chunk) view gets a fixed address of its own that no other activation reuses.
+    static thread_local std::unordered_map<const ggml_tensor *, std::array<ggml_tensor, MMVQ_CHUNK_MAX_CHUNKS>> views;
+    auto & v = views[src1];
+    int64_t c0 = 0;
+    for (int64_t c = 0; c < nchunk; ++c) {
+        const int64_t w = (n - c0)/(nchunk - c); // balanced widths, e.g. 16 -> 4+4+4+4
+        ggml_tensor & s1 = v[c];
+        s1 = *src1;
+        s1.ne[1]    = w;
+        s1.data     = (char *) src1->data + c0*src1->nb[1];
+        s1.view_src = nullptr;
+        ggml_tensor d = *dst;
+        d.ne[1] = w;
+        d.data  = (char *) dst->data + c0*dst->nb[1];
+        ggml_cuda_mul_mat_vec_q(ctx, src0, &s1, nullptr, &d);
+        c0 += w;
+    }
+    return true;
 }
