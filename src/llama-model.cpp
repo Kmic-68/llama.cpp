@@ -380,6 +380,30 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     const bool is_dsv4 = ud->model->arch == LLM_ARCH_DEEPSEEK4 ||
         (ud->model->arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0);
 
+    // LoRA tensors "<base>.lora_a" [n_in, r] and "<base>.lora_b" [r, n_out] follow the base weight's split:
+    // output-split base (axis 1) -> B split the same way, A mirrored; input-split base (axis 0) -> A split the
+    // same way (its rank-r product is a partial sum, reduced like the base's), B mirrored
+    {
+        const bool is_a = tensor_name.size() > 7 && tensor_name.compare(tensor_name.size() - 7, 7, ".lora_a") == 0;
+        const bool is_b = tensor_name.size() > 7 && tensor_name.compare(tensor_name.size() - 7, 7, ".lora_b") == 0;
+        if (is_a || is_b) {
+            const ggml_tensor * base = ud->model->get_tensor(tensor_name.substr(0, tensor_name.size() - 7).c_str());
+            GGML_ASSERT(base != nullptr);
+            const ggml_backend_meta_split_state base_ss = llama_meta_device_get_split_state(base, userdata);
+            if ((is_b && base_ss.axis == GGML_BACKEND_SPLIT_AXIS_1) || (is_a && base_ss.axis == GGML_BACKEND_SPLIT_AXIS_0)) {
+                return base_ss;
+            }
+            GGML_ASSERT(base_ss.axis == GGML_BACKEND_SPLIT_AXIS_0 || base_ss.axis == GGML_BACKEND_SPLIT_AXIS_1 ||
+                        base_ss.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
+            ggml_backend_meta_split_state ss;
+            memset(&ss, 0, sizeof(ss));
+            ss.axis       = GGML_BACKEND_SPLIT_AXIS_MIRRORED;
+            ss.nr[0]      = 1;
+            ss.n_segments = 1;
+            return ss;
+        }
+    }
+
     static const std::regex pattern_q_weight        ("blk\\.\\d*\\.attn_q.weight");
     static const std::regex pattern_kv_weight       ("blk\\.\\d*\\.attn_(k|v).weight");
     static const std::regex pattern_qkv_weight      ("blk\\.\\d*\\.attn_qkv.weight");
