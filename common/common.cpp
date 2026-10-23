@@ -26,10 +26,12 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <mutex>
 #include <regex>
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -2274,6 +2276,27 @@ void common_prompt_checkpoint::clear() {
     data_spec.clear();
 }
 
+// Freed large blocks are kept for the next checkpoint (LLAMA_CKPT_POOL blocks, default 4): checkpoints
+// of one slot all have the same size, and a fresh 150 MiB block pays ~38k first-touch page faults and the
+// kernel's zero fill (~0.1 s on a host whose RAM is mostly page cache) where a recycled one pays nothing.
+namespace {
+struct ckpt_pool {
+    std::mutex mtx;
+    std::unordered_map<void *, size_t> live;            // large blocks handed out: ptr -> bytes
+    std::unordered_multimap<size_t, void *> free_blocks; // bytes -> ptr
+    size_t cap = [] { const char * e = getenv("LLAMA_CKPT_POOL"); return e ? (size_t) atoll(e) : (size_t) 4; }();
+    // LLAMA_CKPT_PREFAULT (default 1): after a block is handed out and none of its size is left, fault in a spare one
+    // on a background thread. With many checkpoints per slot (-ctxcp 32) nothing is evicted for 32 requests, so every
+    // checkpoint was a fresh block and each short chat turn paid its ~0.1-0.16 s of page faults and zero fill.
+    bool prefault = [] { const char * e = getenv("LLAMA_CKPT_PREFAULT"); return !e || atoi(e) != 0; }();
+    bool refilling = false;
+};
+ckpt_pool & get_ckpt_pool() {
+    static ckpt_pool pool;
+    return pool;
+}
+}
+
 void * common_ckpt_alloc(size_t n) {
     constexpr size_t huge = (size_t) 2 << 20;
     if (n < 2*huge) {
@@ -2284,17 +2307,75 @@ void * common_ckpt_alloc(size_t n) {
         return p;
     }
     const size_t sz = (n + huge - 1)/huge*huge;
+    auto & pool = get_ckpt_pool();
+    std::lock_guard<std::mutex> lock(pool.mtx);
+    // keep one pre-faulted block of this size ready for the next checkpoint (pool.mtx held)
+    auto refill = [&pool, sz]() {
+        if (!pool.prefault || pool.refilling || pool.free_blocks.count(sz) > 0 || pool.free_blocks.size() >= pool.cap) {
+            return;
+        }
+        pool.refilling = true;
+        std::thread([sz]() {
+            void * q = aligned_alloc((size_t) 2 << 20, sz);
+            if (q != nullptr) {
+                memset(q, 0, sz);   // take the page faults here, off the request's path
+            }
+            auto & pl = get_ckpt_pool();
+            std::lock_guard<std::mutex> lk(pl.mtx);
+            pl.refilling = false;
+            if (q != nullptr) {
+                if (pl.free_blocks.size() < pl.cap) {
+                    pl.free_blocks.emplace(sz, q);
+                } else {
+                    free(q);
+                }
+            }
+        }).detach();
+    };
+    auto it = pool.free_blocks.find(sz);
+    if (it != pool.free_blocks.end()) {
+        void * p = it->second;
+        pool.free_blocks.erase(it);
+        pool.live[p] = sz;
+        refill();
+        return p;
+    }
     void * p = aligned_alloc(huge, sz);
     if (p == nullptr) {
         throw std::bad_alloc();
     }
+    refill();
 #if defined(__linux__) && defined(MADV_HUGEPAGE)
-    madvise(p, sz, MADV_HUGEPAGE);   // advisory: ignored where transparent huge pages are off
+    // Off by default (LLAMA_CKPT_MADVISE=1 turns it on): with THP enabled "always" the block may get huge
+    // pages anyway, but with THP defrag "madvise" (a common default) an madvised region compacts memory
+    // synchronously on its first faults, and on a host whose RAM is mostly page cache that stalled each
+    // 150 MiB checkpoint by ~0.1-0.3 s -- more than the faults it saves.
+    static const bool adv = [] { const char * e = getenv("LLAMA_CKPT_MADVISE"); return e && atoi(e) != 0; }();
+    if (adv) {
+        madvise(p, sz, MADV_HUGEPAGE);
+    }
 #endif
+    pool.live[p] = sz;
     return p;
 }
 
 void common_ckpt_free(void * p) {
+    if (p == nullptr) {
+        return;
+    }
+    auto & pool = get_ckpt_pool();
+    {
+        std::lock_guard<std::mutex> lock(pool.mtx);
+        auto it = pool.live.find(p);
+        if (it != pool.live.end()) {
+            const size_t sz = it->second;
+            pool.live.erase(it);
+            if (pool.free_blocks.size() < pool.cap) {
+                pool.free_blocks.emplace(sz, p);
+                return;
+            }
+        }
+    }
     free(p);
 }
 
