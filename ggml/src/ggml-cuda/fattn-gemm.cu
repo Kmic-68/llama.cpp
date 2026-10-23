@@ -1713,7 +1713,9 @@ bool ggml_cuda_flash_attn_ext_gemm_supported(const ggml_tensor * dst) {
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
 
-    if (!mask || sinks) {
+    // No mask (vision encoders: every query sees every key) is fine: the softmax reads the mask only
+    // for keys at or past mask_first[t], which is then set to nkv.
+    if (sinks) {
         return false;
     }
     if (Q->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
@@ -1742,7 +1744,7 @@ bool ggml_cuda_flash_attn_ext_gemm_supported(const ggml_tensor * dst) {
     // nb33*(sequence % ne33) (fattn-tile.cuh:860); this path has no equivalent, so a mask
     // that is not broadcast across heads and sequences would silently be read from
     // sequence 0 for every sequence. Decline those shapes and let the tile kernel take them.
-    if (mask->ne[2] != 1 || mask->ne[3] != 1) {
+    if (mask && (mask->ne[2] != 1 || mask->ne[3] != 1)) {
         return false;
     }
     // F16 needs no conversion at all (cuBLAS takes an arbitrary lda, so we point it straight
@@ -1773,7 +1775,7 @@ bool ggml_cuda_flash_attn_ext_gemm_supported(const ggml_tensor * dst) {
 }
 
 void ggml_cuda_flash_attn_ext_gemm(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    if (ggml_cuda_fa_fold_usable(dst)) {
+    if (dst->src[3] && ggml_cuda_fa_fold_usable(dst)) {
         ggml_cuda_flash_attn_ext_fold(ctx, dst);
         return;
     }
@@ -1852,14 +1854,18 @@ void ggml_cuda_flash_attn_ext_gemm(ggml_backend_cuda_context & ctx, ggml_tensor 
     const int64_t dst_s1 = dst->nb[1]/sizeof(float);
     const int64_t dst_s2 = dst->nb[2]/sizeof(float);
     ggml_cuda_pool_alloc<half> mask_stair(pool);
-    const fattn_gemm_mask_view mview = fattn_gemm_mask_get(mask, nt, nkv, mask_stair, stream);
+    const fattn_gemm_mask_view mview = mask ? fattn_gemm_mask_get(mask, nt, nkv, mask_stair, stream) : fattn_gemm_mask_view{ nullptr, 0 };
     const int64_t s_mask = mview.s;
 
     // Where each mask row stops being zero; the mask is shared by every sequence and head.
-    {
+    // Without a mask no row has a nonzero entry, so the softmax never reads mview.data.
+    if (mask) {
         dim3 grid(nt, 1, 1);
         fattn_gemm_mask_first_nz<256><<<grid, 256, 0, stream>>>(
             mview.data, mask_first.ptr, s_mask, (int) nkv);
+        CUDA_CHECK(cudaGetLastError());
+    } else {
+        fattn_gemm_fill<<<(nt + 255)/256, 256, 0, stream>>>(mask_first.ptr, (float) nkv, nt);
         CUDA_CHECK(cudaGetLastError());
     }
 

@@ -11062,6 +11062,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // vision-encoder attention (Qwen3-VL: head 72, 16 heads, f16 K/V, no mask) at sizes that take the
+    // pre-Volta GEMM path (>= 4096 keys, >= 128 queries); 4608 leaves a partial 2048-key chunk
+    for (int64_t kv : {4096, 4608}) {
+        test_cases.emplace_back(new test_flash_attn_ext(72, 72, 16, {1, 1}, kv, kv, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
+    }
     // asymmetric head_dim (hsk != hsv) with one or both sides not 64-aligned
     test_cases.emplace_back(new test_flash_attn_ext(72, 64, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     // prefill attention of this model per GPU under -sm tensor: D 256, 2 KV heads, GQA 6, q4_0 cache
