@@ -3027,6 +3027,13 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     GGML_UNUSED(backend);
 }
 
+// SSM_CONV nodes whose single-token CONCAT -> CPY -> SSM_CONV -> SILU chain was planned at the CONCAT
+// (ggml_cuda_try_fuse); cleared at the start of every graph compute
+static std::unordered_map<const ggml_tensor *, std::pair<const ggml_tensor *, const ggml_tensor *>> & ggml_cuda_conv_decode_pending() {
+    static thread_local std::unordered_map<const ggml_tensor *, std::pair<const ggml_tensor *, const ggml_tensor *>> m;
+    return m;
+}
+
 static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
     return ggml_is_empty(t) || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_TRANSPOSE ||
            t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_NONE;
@@ -4945,6 +4952,57 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // single-token decode: CONCAT -> CPY of its tail (the conv state update) ... SSM_CONV -> SILU, one launch.
+    // The state ops of the delta net sit between the CPY and the SSM_CONV, so CONCAT and CPY are skipped
+    // here and the fused kernel runs at the SSM_CONV (where its output buffer is live); nothing in between
+    // may read the concat or touch the conv-state cache. GGML_CUDA_FUSE_CONV_DECODE=0 disables.
+    if (node->op == GGML_OP_CONCAT && node->ne[0] == 4 && node->ne[2] == 1 && !(node->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        static const bool cd_on = [] {
+            const char * s = getenv("GGML_CUDA_FUSE_CONV_DECODE");
+            return s == nullptr || atoi(s) != 0;
+        }();
+        int j = i + 1;
+        while (cd_on && j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
+            ++j;
+        }
+        ggml_tensor * cpy = cd_on && j < cgraph->n_nodes ? cgraph->nodes[j] : nullptr;
+        if (cpy && cpy->op == GGML_OP_CPY && (cpy->flags & GGML_TENSOR_FLAG_COMPUTE) && cpy->src[0]->view_src == node) {
+            const auto root = [](const ggml_tensor * t) { while (t && t->view_src) { t = t->view_src; } return t; };
+            const ggml_tensor * cache = root(cpy->src[1]);
+            int k = -1;
+            for (int q = j + 1; q < cgraph->n_nodes && q < j + 64; ++q) {
+                const ggml_tensor * n = cgraph->nodes[q];
+                if (n->op == GGML_OP_SSM_CONV && n->src[0] == node) {
+                    k = q;
+                    break;
+                }
+                bool touches = root(n) == cache || root(n) == node;
+                for (int sidx = 0; sidx < GGML_MAX_SRC && !touches; ++sidx) {
+                    touches = n->src[sidx] && (root(n->src[sidx]) == node || root(n->src[sidx]) == cache);
+                }
+                if (touches && !ggml_cuda_is_view_or_noop(n)) {
+                    break;
+                }
+            }
+            if (k > 0 && k + 1 < cgraph->n_nodes &&
+                    ggml_cuda_can_fuse(cgraph, k, { GGML_OP_SSM_CONV, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU }) &&
+                    ggml_cuda_ssm_conv_decode_fused_ok(node, cpy, cgraph->nodes[k], cgraph->nodes[k + 1])) {
+                ggml_cuda_conv_decode_pending()[cgraph->nodes[k]] = { node, cpy };
+                return j - i;
+            }
+        }
+    }
+    if (node->op == GGML_OP_SSM_CONV) {
+        auto & pending = ggml_cuda_conv_decode_pending();
+        auto it = pending.find(node);
+        if (it != pending.end()) {
+            const auto [cat, cpy] = it->second;
+            pending.erase(it);
+            GGML_ASSERT(ggml_cuda_op_ssm_conv_decode_fused(*cuda_ctx, cat, cpy, node, cgraph->nodes[i + 1]));
+            return 1;
+        }
+    }
+
     // CONCAT -> CPY of its tail (the conv state update, views between): one launch.
     // GGML_CUDA_FUSE_CONCAT_CPY=0 disables.
     if (node->op == GGML_OP_CONCAT) {
@@ -5495,6 +5553,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     // activation is only valid within a single graph evaluation.
     cuda_ctx->mmvq_q8_1_invalidate();
     ggml_cuda_mmvq_f16_invalidate(*cuda_ctx);
+    ggml_cuda_conv_decode_pending().clear();
     ggml_cuda_gdn_gather_reset();
     cuda_ctx->xchg.data = nullptr;
 
