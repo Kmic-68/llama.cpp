@@ -3881,6 +3881,7 @@ private:
                             /* .temp     = */ slot.task->params.sampling.temp,
                             /* .seed     = */ slot.task->params.sampling.seed,
                         };
+                        common_speculative_get_draft_params(spec.get(), slot.id).target_temp = slot.task->params.sampling.temp;
 
                         drafting.push_back(&slot);
                     }

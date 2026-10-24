@@ -85,6 +85,10 @@ struct common_speculative_draft_params {
     // with the speculative-sampling rule (common_sampler_sample_and_accept_n_dist). empty for
     // greedy drafts.
     std::vector<std::vector<llama_token_data>> dists = {};
+
+    // the target sampler's temperature for this sequence's request (< 0: unknown). LLAMA_SPEC_STOP_ISO applies only
+    // when it lies in LLAMA_SPEC_STOP_ISO_TEMP (or is unknown)
+    float target_temp = -1.0f;
 };
 
 // whether any configured draft type reads common_speculative_draft_params::prompt when drafting (the
