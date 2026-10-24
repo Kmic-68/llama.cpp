@@ -1502,14 +1502,16 @@ static const float spec_stop_iso = [] {
     const char * s = getenv("LLAMA_SPEC_STOP_ISO");
     return s ? (float) atof(s) : 0.0f;
 }();
-// LLAMA_SPEC_STOP_ISO_TEMP=<lo>,<hi> (default 0.5,0.9): the rule only for requests whose target temperature lies in
-// [lo, hi]; others keep the p-min test. The tables were fit at the thinking-off sampling (target T 0.7, top-p 0.8,
-// presence 1.5), where the rule measured +4.7% (chat) and +4.8% (long context, 32k-200k); at the thinking sampling
-// (T 1.0, top-p 0.95) the target accepts more of the draft than the tables predict, the rule stops too early and
-// measured -0.8% / +1.9% (budget / block verify), so it is off there.
+// LLAMA_SPEC_STOP_ISO_TEMP=<lo>,<hi> (default 0.001,1e9: any positive temperature): the target temperatures these
+// tables apply to; the thinking tables below take their own window first, and requests outside both (greedy, T <= 0)
+// keep the p-min test. The tables were fit at the thinking-off sampling (target T 0.7, top-p 0.8, presence 1.5),
+// where the rule measured +4.7% (chat) and +4.8% (long context, 32k-200k). At the thinking sampling (T 1.0, top-p
+// 0.95) they stop too early (measured -0.8% / +1.9%, budget / block verify), hence the thinking tables. Tables
+// recomputed offline for 480 target settings (T 0.3-1.2, top-p, top-k, min-p, presence) came within ~0.1% of these
+// two sets everywhere (/work/bench/mtp3/CF_ANALYSIS.md), so they also serve the temperatures between and beyond.
 static const std::pair<float, float> spec_stop_iso_temp = [] {
     const char * s = getenv("LLAMA_SPEC_STOP_ISO_TEMP");
-    float lo = 0.5f, hi = 0.9f;
+    float lo = 0.001f, hi = 1e9f;
     if (s) {
         sscanf(s, "%f,%f", &lo, &hi);
     }
@@ -2061,12 +2063,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 // only collect very high-confidence draft tokens
                 const float pc_next = p_cum[seq_id]*cur_p->data[0].p;
-                // the request's target temperature picks the tables: thinking off, thinking on, or none (p-min)
+                // the request's target temperature picks the tables: the thinking window first, then the chat tables
+                // (their range, or an unknown temperature), else none (p-min)
                 const float t_tgt     = dparams.at(seq_id).target_temp;
-                const bool  iso_chat  = spec_stop_iso > 0.0f &&
-                                        (t_tgt < 0.0f || (t_tgt >= spec_stop_iso_temp.first && t_tgt <= spec_stop_iso_temp.second));
-                const bool  iso_think = !iso_chat && spec_stop_iso_think > 0.0f &&
+                const bool  iso_think = spec_stop_iso_think > 0.0f &&
                                         t_tgt >= spec_stop_iso_think_temp.first && t_tgt <= spec_stop_iso_think_temp.second;
+                const bool  iso_chat  = !iso_think && spec_stop_iso > 0.0f &&
+                                        (t_tgt < 0.0f || (t_tgt >= spec_stop_iso_temp.first && t_tgt <= spec_stop_iso_temp.second));
                 const bool  iso_on    = iso_chat || iso_think;
                 const float iso_theta = iso_chat ? spec_stop_iso : spec_stop_iso_think;
                 const float * iso_tq  = iso_chat ? spec_iso_q  : spec_iso_q_think;
