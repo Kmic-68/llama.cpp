@@ -1536,6 +1536,27 @@ static float spec_iso_lookup(const float * tab, const float x) {
     return tab[23];
 }
 
+// LLAMA_SPEC_STOP_ISO_THINK=<theta> (default off) with LLAMA_SPEC_STOP_ISO_THINK_TEMP=<lo>,<hi> (default 0.95,1.05):
+// the same rule with tables fit on thinking-on cycles (target T 1.0, top-p 0.95, a 2,048-token reasoning budget;
+// the dev split of ~36,000 traced cycles), for requests at those target temperatures. Simulated on held-out
+// prompts: +3.4% at 0.15.
+static const float spec_stop_iso_think = [] {
+    const char * s = getenv("LLAMA_SPEC_STOP_ISO_THINK");
+    return s ? (float) atof(s) : 0.0f;
+}();
+static const std::pair<float, float> spec_stop_iso_think_temp = [] {
+    const char * s = getenv("LLAMA_SPEC_STOP_ISO_THINK_TEMP");
+    float lo = 0.95f, hi = 1.05f;
+    if (s) {
+        sscanf(s, "%f,%f", &lo, &hi);
+    }
+    return std::make_pair(lo, hi);
+}();
+static const float spec_iso_q_think [24] = { 0.000f, 0.251f, 0.330f, 0.376f, 0.381f, 0.429f, 0.434f, 0.434f, 0.458f, 0.458f, 0.458f, 0.458f,
+                                             0.506f, 0.506f, 0.524f, 0.543f, 0.555f, 0.566f, 0.605f, 0.633f, 0.663f, 0.765f, 0.849f, 0.991f };
+static const float spec_iso_p1_think[24] = { 0.124f, 0.124f, 0.124f, 0.124f, 0.240f, 0.274f, 0.290f, 0.348f, 0.377f, 0.377f, 0.407f, 0.438f,
+                                             0.461f, 0.461f, 0.486f, 0.500f, 0.520f, 0.540f, 0.572f, 0.602f, 0.645f, 0.751f, 0.844f, 0.991f };
+
 struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     common_params_speculative_draft params; // reuses the draft-model params slot (ctx_tgt/ctx_dft)
 
@@ -2040,10 +2061,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 // only collect very high-confidence draft tokens
                 const float pc_next = p_cum[seq_id]*cur_p->data[0].p;
-                const float t_tgt   = dparams.at(seq_id).target_temp;
-                const bool  iso_on  = spec_stop_iso > 0.0f &&
-                                      (t_tgt < 0.0f || (t_tgt >= spec_stop_iso_temp.first && t_tgt <= spec_stop_iso_temp.second));
-                const bool  stop    = (iso_on ? s_iso[seq_id]*spec_iso_lookup(spec_iso_p1, cur_p->data[0].p) < spec_stop_iso
+                // the request's target temperature picks the tables: thinking off, thinking on, or none (p-min)
+                const float t_tgt     = dparams.at(seq_id).target_temp;
+                const bool  iso_chat  = spec_stop_iso > 0.0f &&
+                                        (t_tgt < 0.0f || (t_tgt >= spec_stop_iso_temp.first && t_tgt <= spec_stop_iso_temp.second));
+                const bool  iso_think = !iso_chat && spec_stop_iso_think > 0.0f &&
+                                        t_tgt >= spec_stop_iso_think_temp.first && t_tgt <= spec_stop_iso_think_temp.second;
+                const bool  iso_on    = iso_chat || iso_think;
+                const float iso_theta = iso_chat ? spec_stop_iso : spec_stop_iso_think;
+                const float * iso_tq  = iso_chat ? spec_iso_q  : spec_iso_q_think;
+                const float * iso_tp  = iso_chat ? spec_iso_p1 : spec_iso_p1_think;
+                const bool  stop    = (iso_on ? s_iso[seq_id]*spec_iso_lookup(iso_tp, cur_p->data[0].p) < iso_theta
                                               : cur_p->data[0].p < params.p_min) ||
                                       pc_next < p_cum_min(dparams.at(seq_id).pos0);
                 if (stop) {
@@ -2100,7 +2128,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
 
                 if (iso_on) {
-                    s_iso[seq_id] *= spec_iso_lookup(spec_iso_q, q_id);
+                    s_iso[seq_id] *= spec_iso_lookup(iso_tq, q_id);
                 }
 
                 common_sampler_accept(smpl, id, true);
