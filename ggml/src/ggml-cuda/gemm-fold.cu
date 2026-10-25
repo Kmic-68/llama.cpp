@@ -26,6 +26,7 @@
 // to cuBLAS COMPUTE_16F.
 
 #include "gemm-fold.cuh"
+#include "mmvq.cuh"
 
 #include <unordered_map>
 #include <vector>
@@ -273,6 +274,144 @@ __global__ void __launch_bounds__(256, 1) gemm_fold_kernel(
 // fold as HADD2.F32 with the 2^-112 moved into the column scale (a power of two, so every rounding
 // is unchanged), and blocks grouped by RASTER weight row-blocks for L2 reuse. Needs K % 64 == 0.
 // Harness 8704x5120 N=2048: 14.57 -> 13.68 ms, 0 of 17.8M outputs differ.
+// The u2 kernel's arithmetic for small batches: a BM x BNN tile (BNN = 32 or 64) instead of 128 columns,
+// so a 9..64-token batch stops paying for a 128-wide tile of padding. Thread (tx, ty) keeps the same 8 rows
+// and TN = BNN/16 adjacent columns; every output is the same chain of products, folds (HADD2 to fp32) and
+// rounding as in gemm_fold_kernel_u2, only fewer columns per block. (gemm_fold_kernel's integer fold
+// keeps the sums at 2^-112 scale, where outputs near zero land in fp32 subnormals: not the same values.)
+template <int BNN>
+__global__ void __launch_bounds__(256, 1) gemm_fold_kernel_narrow(
+        const half * __restrict__ W, const half * __restrict__ X, const float * __restrict__ cs,
+        float * __restrict__ Y, const int M, const int N, const int K, const int64_t sy) {
+    static_assert(BNN == 32 || BNN == 64, "BNN");
+    constexpr int TN = BNN/16;
+    constexpr int fold_k2 = 128;
+    __shared__ __align__(16) uint32_t As[2][BK2][BM];
+    __shared__ __align__(16) uint32_t Bs[2][BK2][BNN];
+
+    const int t  = threadIdx.x;
+    const int tx = t & 15;
+    const int ty = t >> 4;
+    const int m0 = blockIdx.x*BM;
+    const int n0 = blockIdx.y*BNN;
+
+    float acc[8][TN];
+    half2 h[8][TN];
+#pragma unroll
+    for (int i = 0; i < 8; i++) {
+#pragma unroll
+        for (int j = 0; j < TN; j++) {
+            acc[i][j] = 0.0f;
+            h[i][j]   = make_half2(0.0f, 0.0f);
+        }
+    }
+
+    // B: BNN rows x 4 uint4 = BNN*4 loads (all threads for 64, the first half for 32)
+    const bool bt = t < BNN*4;
+    uint4 ra[2];
+    uint4 rb;
+    auto gload = [&](const int k0) {
+#pragma unroll
+        for (int i = 0; i < 2; i++) {
+            const int l = t + 256*i;
+            const int r = l >> 2;
+            const int c = l & 3;
+            ra[i] = m0 + r < M ? *(const uint4 *) (W + (int64_t) (m0 + r)*K + k0 + c*8) : make_uint4(0, 0, 0, 0);
+        }
+        const int r = t >> 2;
+        const int c = t & 3;
+        rb = bt && n0 + r < N ? *(const uint4 *) (X + (int64_t) (n0 + r)*K + k0 + c*8) : make_uint4(0, 0, 0, 0);
+    };
+    auto sstore = [&](const int buf) {
+#pragma unroll
+        for (int i = 0; i < 2; i++) {
+            const int l = t + 256*i;
+            const int r = l >> 2;
+            const int c = l & 3;
+            const int rs = r ^ (c << 3);
+            As[buf][c*4 + 0][rs] = ra[i].x; As[buf][c*4 + 1][rs] = ra[i].y;
+            As[buf][c*4 + 2][rs] = ra[i].z; As[buf][c*4 + 3][rs] = ra[i].w;
+        }
+        if (bt) {
+            const int r = t >> 2;
+            const int c = t & 3;
+            const int rs = r ^ (c << 3);
+            Bs[buf][c*4 + 0][rs] = rb.x; Bs[buf][c*4 + 1][rs] = rb.y;
+            Bs[buf][c*4 + 2][rs] = rb.z; Bs[buf][c*4 + 3][rs] = rb.w;
+        }
+    };
+
+    const int nt = K / (2*BK2);
+    gload(0);
+    sstore(0);
+    __syncthreads();
+
+    for (int it = 0; it < nt; it++) {
+        const int buf = it & 1;
+        if (it + 1 < nt) {
+            gload((it + 1)*2*BK2);
+        }
+        const bool restart = (it*BK2) % fold_k2 == 0;
+#pragma unroll
+        for (int k2 = 0; k2 < BK2; k2++) {
+            const int   sw = (k2 >> 2) << 3;
+            const uint4 a0 = *(const uint4 *) &As[buf][k2][(ty*4) ^ sw];
+            const uint4 a1 = *(const uint4 *) &As[buf][k2][(64 + ty*4) ^ sw];
+            const uint32_t a[8] = {a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w};
+            uint32_t b[TN];
+            if constexpr (TN == 4) {
+                const uint4 b0 = *(const uint4 *) &Bs[buf][k2][(tx*4) ^ sw];
+                b[0] = b0.x; b[1] = b0.y; b[2] = b0.z; b[3] = b0.w;
+            } else {
+                const uint2 b0 = *(const uint2 *) &Bs[buf][k2][(tx*2) ^ sw];
+                b[0] = b0.x; b[1] = b0.y;
+            }
+#pragma unroll
+            for (int i = 0; i < 8; i++) {
+#pragma unroll
+                for (int j = 0; j < TN; j++) {
+                    const half2 ai = *(const half2 *) &a[i];
+                    const half2 bj = *(const half2 *) &b[j];
+                    h[i][j] = k2 == 0 && restart ? __hmul2(bj, ai) : __hfma2(bj, ai, h[i][j]);
+                }
+            }
+        }
+        if (((it + 1)*BK2) % fold_k2 == 0 || it + 1 == nt) {
+#pragma unroll
+            for (int i = 0; i < 8; i++) {
+#pragma unroll
+                for (int j = 0; j < TN; j++) {
+                    acc[i][j] += __half2float(__hadd(__low2half(h[i][j]), __high2half(h[i][j])));
+                }
+            }
+        }
+        if (it + 1 < nt) {
+            sstore(buf ^ 1);
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int j = 0; j < TN; j++) {
+        const int n = n0 + tx*TN + j;
+        if (n >= N) {
+            continue;
+        }
+        const float s = cs[n] * 0x1p-112f;
+#pragma unroll
+        for (int ih = 0; ih < 2; ih++) {
+            const int m = m0 + ih*64 + ty*4;
+            if (m >= M) {
+                continue;
+            }
+            float4 v = make_float4(acc[ih*4 + 0][j]*s, acc[ih*4 + 1][j]*s, acc[ih*4 + 2][j]*s, acc[ih*4 + 3][j]*s);
+            v.x = __half2float(__float2half(v.x)); v.y = __half2float(__float2half(v.y));
+            v.z = __half2float(__float2half(v.z)); v.w = __half2float(__float2half(v.w));
+            *(float4 *) (Y + n*sy + m) = v;
+        }
+    }
+}
+
 constexpr int GEMM_FOLD_RASTER = 4;
 
 // PAIR: two weights sharing X in one launch (gemm_fold_pair). Rows [0, Ms) come from W into Y, rows
@@ -503,7 +642,8 @@ static bool ggml_cuda_gemm_fold_eligible(ggml_backend_cuda_context & ctx, const 
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
     return ggml_cuda_gemm_fold_mode() != 0 && cc >= GGML_CUDA_CC_PASCAL && cc < GGML_CUDA_CC_VOLTA && fast_fp16_available(cc) &&
         src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 &&
-        src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1;
+        src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+        !ggml_cuda_mmvq_chunked_ok(cc, src0, src1, dst);
 }
 
 bool ggml_cuda_gemm_fold_wants_f32(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
@@ -759,6 +899,21 @@ bool ggml_cuda_gemm_fold_try(ggml_backend_cuda_context & ctx, const ggml_tensor 
     // GGML_CUDA_GEMM_FOLD_U2=0 falls back to gemm_fold_kernel (bit-identical, slower)
     static const bool u2_env = ggml_cuda_gemm_fold_env("GGML_CUDA_GEMM_FOLD_U2", 1) != 0;
     const bool u2 = u2_env && o16 && K % 64 == 0 && ggml_cuda_gemm_fold_k2() == 128;
+
+    // small batches: a 32/64-column tile, outputs identical to the 128-column kernels
+    // (GGML_CUDA_GEMM_FOLD_NARROW=0: always 128 columns)
+    static const int narrow = ggml_cuda_gemm_fold_env("GGML_CUDA_GEMM_FOLD_NARROW", 64);
+    if (u2 && N <= narrow) {
+        gemm_fold_partner = nullptr;
+        gemm_fold_learn(ctx, src0, nullptr);
+        if (N <= 32) {
+            gemm_fold_kernel_narrow<32><<<dim3(grid.x, (N + 31)/32), 256, 0, stream>>>(W16, X16, cs, Y, M, N, K, sy);
+        } else {
+            gemm_fold_kernel_narrow<64><<<dim3(grid.x, (N + 63)/64), 256, 0, stream>>>(W16, X16, cs, Y, M, N, K, sy);
+        }
+        CUDA_CHECK(cudaGetLastError());
+        return true;
+    }
 
     // gate/up style pair: one prescale (above) and one launch over both weights' rows
     ggml_tensor * pt = gemm_fold_partner;

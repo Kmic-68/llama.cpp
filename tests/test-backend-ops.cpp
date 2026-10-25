@@ -11162,6 +11162,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32, m, n, 5120, {1, 1}, {1, 1}));
         }
     }
+    // short prompts on Pascal: q6_K/q5_K at 17..28 columns run as fp16 matvec column chunks (mmvq.cu),
+    // 29..64 columns on the fold GEMM's 32/64-column tiles (gemm-fold.cu); 6150 rows leaves a partial
+    // block of rows, 1028 a partial tile, and 300 rows stays below the fold GEMM
+    for (ggml_type type_a : {GGML_TYPE_Q6_K, GGML_TYPE_Q5_K}) {
+        for (int m : {6150, 1028, 300}) {
+            for (int n : {17, 24, 28, 29, 32, 44, 64}) {
+                test_cases.emplace_back(new test_mul_mat(type_a, GGML_TYPE_F32, m, n, 5120, {1, 1}, {1, 1}));
+            }
+        }
+    }
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_0, GGML_TYPE_F32, 2048, 64, 4096, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16,  GGML_TYPE_F32, 1024, 130, 4096, {1, 1}, {1, 1}));
 

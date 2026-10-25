@@ -2201,6 +2201,11 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
             ggml_cuda_mmvq_f16_try(ctx, src0, src1, dst, ne11)) {
         return;
     }
+    // above that, q6_K/q5_K up to GGML_CUDA_MMVQ_CHUNK_MAX (28) columns as fp16 matvec column
+    // chunks (mmvq.cu); wider batches go to the fold GEMM's 32/64/128-column tiles
+    if (ggml_cuda_mul_mat_vec_q_chunked(ctx, src0, src1, dst)) {
+        return;
+    }
     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
         return;
