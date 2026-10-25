@@ -20,3 +20,5 @@ void ggml_cuda_op_mul_mat_vec_q(
 // Pascal: 17..GGML_CUDA_MMVQ_CHUNK_MAX (default 28) columns of q6_K/q5_K weights as fp16 mat-vec column chunks
 bool ggml_cuda_mmvq_chunked_ok(int cc, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst);
 bool ggml_cuda_mul_mat_vec_q_chunked(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
+// strided (view) quantized src0 without a non-contiguous converter: mat-vec column chunks instead of cuBLAS
+bool ggml_cuda_mul_mat_vec_q_chunked_strided(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);

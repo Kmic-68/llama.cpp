@@ -2238,11 +2238,37 @@ bool ggml_cuda_mmvq_chunked_ok(const int cc, const ggml_tensor * src0, const ggm
         dst->ne[2] == 1 && dst->ne[3] == 1 && src1->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float);
 }
 
+static void ggml_cuda_mul_mat_vec_q_chunks(ggml_backend_cuda_context & ctx, const ggml_tensor * src0,
+                                           const ggml_tensor * src1, ggml_tensor * dst);
+
 bool ggml_cuda_mul_mat_vec_q_chunked(ggml_backend_cuda_context & ctx, const ggml_tensor * src0,
                                      const ggml_tensor * src1, ggml_tensor * dst) {
     if (!ggml_cuda_mmvq_chunked_ok(ggml_cuda_info().devices[ctx.device].cc, src0, src1, dst)) {
         return false;
     }
+    ggml_cuda_mul_mat_vec_q_chunks(ctx, src0, src1, dst);
+    return true;
+}
+
+// A quantized src0 whose rows are a view (non-contiguous) with no non-contiguous fp16 converter cannot
+// take the cuBLAS path; the mat-vec kernels read strided rows, so run it as mat-vec column chunks.
+bool ggml_cuda_mul_mat_vec_q_chunked_strided(ggml_backend_cuda_context & ctx, const ggml_tensor * src0,
+                                             const ggml_tensor * src1, ggml_tensor * dst) {
+    const int64_t n = src1->ne[1];
+    if (!ggml_is_quantized(src0->type) || ggml_is_contiguously_allocated(src0) ||
+            !ggml_cuda_should_use_mmvq(src0->type, ggml_cuda_info().devices[ctx.device].cc, 1) ||
+            n > ggml_cuda_mmvq_chunk_width(src0->type)*MMVQ_CHUNK_MAX_CHUNKS ||
+            src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+            src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
+            dst->ne[2] != 1 || dst->ne[3] != 1 || src1->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float)) {
+        return false;
+    }
+    ggml_cuda_mul_mat_vec_q_chunks(ctx, src0, src1, dst);
+    return true;
+}
+
+static void ggml_cuda_mul_mat_vec_q_chunks(ggml_backend_cuda_context & ctx, const ggml_tensor * src0,
+                                           const ggml_tensor * src1, ggml_tensor * dst) {
     const int64_t n      = src1->ne[1];
     const int64_t wmax   = ggml_cuda_mmvq_chunk_width(src0->type);
     const int64_t nchunk = (n + wmax - 1)/wmax;
@@ -2265,5 +2291,4 @@ bool ggml_cuda_mul_mat_vec_q_chunked(ggml_backend_cuda_context & ctx, const ggml
         ggml_cuda_mul_mat_vec_q(ctx, src0, &s1, nullptr, &d);
         c0 += w;
     }
-    return true;
 }

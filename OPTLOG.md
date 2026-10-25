@@ -9295,3 +9295,50 @@ Server, two agents: 37-38 t/s each (solo 61-63, three agents 23-25), model-card 
 KLD on Q5_K_M (8 chunks, -ub 10 vs a -ub 512 base): new 0.001199 (max 0.150, top-1 98.88%), before the
 fold 0.001262 (max 0.526, top-1 98.72%). Gate: tg256 34.12 ± 0.20 (cool cards, 37/39 C; the gate's own
 run read 29.81 ± 2.96 at 71/73 C after the KLD passes), PPL 2.6101, full suite 16658/16658.
+
+## 289 — community PR round (Keoian #5-#16) reviewed and merged (2026-10-24): kept 11, closed #10
+
+Each PR built on d90ec36a3 and compared by raw-logit md5 (perplexity --kl-divergence-base files, -c 4096
+x 4 or -c 2048 x 2) at ubatch 1, 5, 16, 24, 32, 64, 512 and 2048, base vs PR vs all combined.
+- Byte-identical to the base at every width: #6 meta UAF, #7 MTP hidden row by position, #8 chat-turn
+  checkpoints, #10 (text), #12 no-P2P exchange (a no-op with P2P), #13 conv decode fusion, #14 LoRA split,
+  #15 docs + vision-bench, #16 penalty window.
+- #5 (9-16-token GGML_ASSERT): ub16 identical to the base with GGML_CUDA_FOLD_GLU=0.
+- #9 (17-64-token prefill): 32/64-column tiles identical; 17-28 columns differ but are closer to a
+  -ub 512 reference (KLD 0.00127 vs 0.00134, max 0.06 vs 0.13). Combined with #5, ub16 KLD 0.00117 vs 0.00120.
+- #11 (q8_0 K decode): q4_0 path identical; q8_0 vs an f16-K reference KLD 0.00312 vs 0.00300 (+-0.0003),
+  top-1 99.02 vs 98.73%. Did not compile with CUDA 12.0: <5,6> KQ8 instance used 0xc8f0 B static smem;
+  merged with a PT 1 at R > 24 follow-up (7fc5fbf10). q8_0/q4_0 tg32 +7%, at d32768 +12%.
+- #10 (vision on GEMM attention): encode 7.45 -> 5.66 s at 3600 tokens, but embedding error vs
+  GGML_CUDA_FA_GEMM_PREC=32 0.76% -> 1.40% (fp16 scores); PREC=32 is slower than tile (8.7 s). Closed.
+Speed, combined vs base: pp17 43.6 -> 101, pp32 80 -> 129, pp64 149 -> 189, pp512/2048/tg256 unchanged;
+presence_penalty 1.5 with MTP 44.3 -> 53.5 t/s (texts identical); chat turn prompt_ms 1029 -> 424.
+Gate on 9537805ba: tg256 33.30, PPL 2.6101, FLASH_ATTN_EXT 3/3. Also refreshed fattn-fold-sass.h's hash
+(cherry-pick of 87fbf8339; it had been stale on p100-optimizations since PR #3).
+
+## 290 — upstream merge d327bf1f0 (752 commits, 09-22 .. 10-24) (2026-10-24): kept
+
+18 conflicted files; how each overlap was resolved is in the merge commit message. Two semantic breaks
+the textual merge hid:
+- upstream #29856 gathers the recurrent states once and views the result; the empty extra-states view
+  made our GDN state-gather matcher decline at every decode (98 extra GET_ROWS per token, different
+  logits). The matcher now ignores zero-size consumers.
+- upstream #28175 added norm tests with ne[2]/ne[3] = 65536 (CUDA grid limit 65535); our norm kernels
+  were kept, so wider tensors now run as chunked launches of the unchanged kernels and the fused norm
+  paths decline them.
+- new upstream MUL_MAT cases with a strided (view) quantized src0 at 9+ columns reached cuBLAS, which
+  has no non-contiguous K-quant converter (GGML_ASSERT(convert_func)); without DP4A no other path took
+  them. They now run as mat-vec column chunks (ggml_cuda_mul_mat_vec_q_chunked_strided). The model's
+  weights are never views, so its logits are unchanged.
+Also: our fp16 tile FA config table kept (upstream's 40-112 retune needs np > 1, which the fp32 per-tile
+fold does not support; the static_assert caught it), -ubd and --spec-draft-n-ubatch share one field.
+
+Raw logits vs 9537805ba: byte-identical at ubatch 1, 16, 24, 32, 64, 512, 2048; ubatch 5 KLD mean
+0.000000, max 0.000075, 100% same top (upstream crops non-output rows before the last layer).
+Server: greedy MTP text and draft counts identical (4 prompts), sampled MTP at model-card sampling
+8/8 texts identical, acceptance 0.549 both; slot save/restore, chat turns unchanged.
+Speed, interleaved 8+8 tg128 on warm cards: 31.66 vs 31.77 t/s (-0.35%, inside the gate's noise);
+pp512/pp2048 tied. Gate (cold cards, 32/30 C): tg256 33.46 +- 0.15 (pre-merge 33.30), PPL 2.6101,
+full op suite 19576/19576 on both GPUs (was 16658 before the merge).
+Slot files: LLAMA_STATE_SEQ_VERSION 3 -> 4 upstream, so earlier slot files (the depth-bench snapshots)
+no longer load and must be re-saved.

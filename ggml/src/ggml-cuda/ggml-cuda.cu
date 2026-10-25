@@ -2381,6 +2381,9 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
         return;
     }
+    if (ggml_get_to_fp16_nc_cuda(src0->type) == nullptr && ggml_cuda_mul_mat_vec_q_chunked_strided(ctx, src0, src1, dst)) {
+        return;
+    }
     ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
 }
 
@@ -2576,6 +2579,39 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         nb1, nb2, nb3, stream);
 }
 
+// The norm kernels take ne[2] and ne[3] as gridDim.y / gridDim.z, which CUDA caps at 65535. Larger
+// tensors run in chunks of channels (or samples), each a view of the same contiguous output, so every
+// row is computed by the unchanged kernel. False if the tensor fits in one launch.
+static constexpr int64_t GGML_CUDA_NORM_GRID_MAX = 65535;
+static bool ggml_cuda_norm_too_wide(const ggml_tensor * t) {
+    return t->ne[2] > GGML_CUDA_NORM_GRID_MAX || t->ne[3] > GGML_CUDA_NORM_GRID_MAX;
+}
+static bool ggml_cuda_norm_chunked(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+                                   void (*op)(ggml_backend_cuda_context &, ggml_tensor *)) {
+    const ggml_tensor * src = dst->src[0];
+    if (!ggml_cuda_norm_too_wide(dst)) {
+        return false;
+    }
+    GGML_ASSERT(ggml_is_contiguous(dst));
+    // chunk ne[2] one sample at a time when it is the wide one, else whole samples
+    const bool    wide2 = dst->ne[2] > GGML_CUDA_NORM_GRID_MAX;
+    const int64_t s2    = wide2 ? GGML_CUDA_NORM_GRID_MAX : dst->ne[2];
+    const int64_t s3    = wide2 ? 1 : GGML_CUDA_NORM_GRID_MAX;
+    for (int64_t i3 = 0; i3 < dst->ne[3]; i3 += s3) {
+        for (int64_t i2 = 0; i2 < dst->ne[2]; i2 += s2) {
+            ggml_tensor s = *src;
+            ggml_tensor d = *dst;
+            s.ne[2] = d.ne[2] = std::min(s2, dst->ne[2] - i2);
+            s.ne[3] = d.ne[3] = std::min(s3, dst->ne[3] - i3);
+            s.data = (char *) src->data + i2*src->nb[2] + i3*src->nb[3];
+            d.data = (char *) dst->data + i2*dst->nb[2] + i3*dst->nb[3];
+            d.src[0] = &s;
+            op(ctx, &d);
+        }
+    }
+    return true;
+}
+
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
     switch (dst->op) {
         case GGML_OP_ARGMAX:
@@ -2730,13 +2766,17 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             }
             break;
         case GGML_OP_NORM:
-            ggml_cuda_op_norm(ctx, dst);
+            if (!ggml_cuda_norm_chunked(ctx, dst, ggml_cuda_op_norm)) {
+                ggml_cuda_op_norm(ctx, dst);
+            }
             break;
         case GGML_OP_GROUP_NORM:
             ggml_cuda_op_group_norm(ctx, dst);
             break;
         case GGML_OP_L2_NORM:
-            ggml_cuda_op_l2_norm(ctx, dst);
+            if (!ggml_cuda_norm_chunked(ctx, dst, ggml_cuda_op_l2_norm)) {
+                ggml_cuda_op_l2_norm(ctx, dst);
+            }
             break;
         case GGML_OP_CONCAT:
             ggml_cuda_op_concat(ctx, dst);
@@ -2763,7 +2803,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             ggml_cuda_op_silu_back(ctx, dst);
             break;
         case GGML_OP_RMS_NORM:
-            ggml_cuda_op_rms_norm(ctx, dst);
+            if (!ggml_cuda_norm_chunked(ctx, dst, ggml_cuda_op_rms_norm)) {
+                ggml_cuda_op_rms_norm(ctx, dst);
+            }
             break;
         case GGML_OP_RMS_NORM_BACK:
             ggml_cuda_op_rms_norm_back(ctx, dst);
@@ -4456,6 +4498,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     if (ggml_cuda_fusion_disabled()) {
         return 0;
+    }
+
+    // the fused norm kernels launch ne[2] x ne[3] blocks too; past the grid limit the plain ops run chunked
+    {
+        const ggml_tensor * n0 = cgraph->nodes[i];
+        if ((n0->op == GGML_OP_NORM || n0->op == GGML_OP_RMS_NORM || n0->op == GGML_OP_L2_NORM ||
+             n0->op == GGML_OP_ADD) && ggml_cuda_norm_too_wide(n0)) {
+            return 0;
+        }
     }
 
     // consecutive same-shape copies between the same two tensors (delta-net conv-state snapshots)
