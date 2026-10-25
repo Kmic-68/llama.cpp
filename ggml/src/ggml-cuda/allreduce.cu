@@ -167,9 +167,8 @@ static __global__ void ggml_cuda_ar_kernel(
             __builtin_amdgcn_s_sleep(4);
 #elif __CUDA_ARCH__ >= GGML_CUDA_CC_VOLTA
             __nanosleep(100);
-#else
-            NO_DEVICE_CODE;
 #endif // GGML_USE_HIP
+            // pre-Volta has no __nanosleep: spin on the mapped host flag (one PCIe read per poll)
         }
     }
 
@@ -309,6 +308,8 @@ struct ggml_cuda_ar_pipeline {
     size_t   copy_chunk_bytes;
     size_t   bf16_threshold; // tensors >= this size (bytes) are reduced via FP32->BF16 round-trip; 0 disables
     uint64_t call_count;
+    bool     pascal;       // pre-Volta host-staged mode (no P2P between the two GPUs)
+    size_t   host_max;     // pascal: largest exchange (bytes) taken by this path
 
     // Per-device resources.
     ggml_cuda_ar_host_mapping host_buf[GGML_CUDA_MAX_DEVICES];   // pinned staging (chunked kernel)
@@ -405,11 +406,26 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
         return nullptr;
     }
 
-    // The chunked kernel uses __nanosleep (NVIDIA, sm70+) or
-    // __builtin_amdgcn_s_sleep (AMD).
+    // The chunked kernel sleeps with __nanosleep (NVIDIA, sm70+) or
+    // __builtin_amdgcn_s_sleep (AMD) while it waits. Pascal has no sleep and
+    // spins instead; it takes this path only when the two GPUs cannot reach
+    // each other directly (no P2P, e.g. one card behind the chipset), where
+    // the alternative is a driver-staged cudaMemcpyPeer per exchange.
+    bool pascal_no_p2p = n_devices == 2 && devices[0] != devices[1];
+    for (size_t i = 0; i < n_devices && pascal_no_p2p; ++i) {
+        const int cc = ggml_cuda_info().devices[devices[i]].cc;
+        int can = 0;
+        CUDA_CHECK(cudaDeviceCanAccessPeer(&can, ggml_cuda_info().devices[devices[i]].physical_device,
+                                           ggml_cuda_info().devices[devices[1 - i]].physical_device));
+        pascal_no_p2p = cc >= GGML_CUDA_CC_PASCAL && cc < GGML_CUDA_CC_VOLTA && !can &&
+                        ggml_cuda_info().devices[devices[0]].physical_device != ggml_cuda_info().devices[devices[1]].physical_device;
+    }
+    if (const char * env = getenv("GGML_CUDA_AR_HOST")) {
+        pascal_no_p2p = pascal_no_p2p && atoi(env) != 0;
+    }
     for (size_t i = 0; i < n_devices; ++i) {
         const int cc = ggml_cuda_info().devices[devices[i]].cc;
-        if (cc < GGML_CUDA_CC_VOLTA) {
+        if (cc < GGML_CUDA_CC_VOLTA && !pascal_no_p2p) {
             GGML_LOG_DEBUG("%s: internal AllReduce requires compute capability >= %d "
                            "(device %d has cc=%d); falling back\n",
                            __func__, GGML_CUDA_CC_VOLTA, devices[i], cc);
@@ -432,7 +448,11 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
     // Default 1: BF16 round-trip is always on for F32 inputs (any non-zero
     // ne).  Set GGML_CUDA_AR_BF16_THRESHOLD=0 to disable, or to a larger
     // byte threshold to opt out for small tensors.
-    p->bf16_threshold   = ggml_cuda_ar_env_u64("GGML_CUDA_AR_BF16_THRESHOLD", 1);
+    // Pascal: no BF16 round trip (lossy); partials go over the wire in f32, or in f16 when the
+    // tensor-parallel f16 probe found them f16-exact (see ggml_cuda_ar_allreduce's wire_f16)
+    p->bf16_threshold   = ggml_cuda_ar_env_u64("GGML_CUDA_AR_BF16_THRESHOLD", pascal_no_p2p ? 0 : 1);
+    p->pascal           = pascal_no_p2p;
+    p->host_max         = ggml_cuda_ar_env_u64("GGML_CUDA_AR_HOST_MAX", GGML_CUDA_AR_MAX_BYTES);
     for (size_t i = 0; i < n_devices; ++i) {
         p->devices[i] = devices[i];
     }
@@ -532,6 +552,9 @@ ggml_cuda_ar_pipeline * ggml_cuda_ar_pipeline_init(const int * devices, size_t n
         }
     }
 
+    if (p->pascal) {
+        GGML_LOG_INFO("%s: no P2P between the GPUs; tensor-parallel exchanges are staged through pinned host memory\n", __func__);
+    }
     GGML_LOG_INFO("%s: initialized AllReduce pipeline: %zu GPUs, "
                   "%zu KB chunked kernel staging + %zu MB copy-engine staging per GPU\n",
                   __func__, n_devices, p->buf_bytes >> 10, p->copy_bytes >> 20);
@@ -761,6 +784,13 @@ bool ggml_cuda_ar_allreduce(
     GGML_ASSERT(ne > 0);
 
     const size_t   input_nbytes = ggml_nbytes(tensors[0]);
+
+    // Pascal host-staged mode takes the small (decode / MTP verify) exchanges, which are latency
+    // bound. Larger (prefill) ones return false and take the meta backend's peer copy + ADD, which
+    // sends f16-exact partials as f16; GGML_CUDA_AR_HOST_MAX (bytes) moves the cut.
+    if (p->pascal && input_nbytes > p->host_max) {
+        return false;
+    }
 
     // BF16 round-trip: F32 inputs >= bf16_threshold are converted to BF16 for
     // the reduction (chunked or copy-engine), halving on-wire bytes. Matches
