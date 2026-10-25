@@ -22,5 +22,9 @@ bool ggml_cuda_mmvq_f16_gdn_gate(ggml_backend_cuda_context & ctx, const ggml_ten
 bool ggml_cuda_mmvq_f16_glu(ggml_backend_cuda_context & ctx, const ggml_tensor * mm_gate, const ggml_tensor * mm_up,
                             ggml_tensor * dst, int64_t ncols);
 
+// Whether ggml_cuda_mmvq_f16_try would take this matmul (no launch); the graph loop asks before planning a fusion
+// that only the cuBLAS/fold path can complete.
+bool ggml_cuda_mmvq_f16_takes(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, int64_t ncols);
+
 // Forget the cached fp16 activation (called at the start of every graph compute, like the q8_1 cache).
 void ggml_cuda_mmvq_f16_invalidate(ggml_backend_cuda_context & ctx);
