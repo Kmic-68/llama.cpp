@@ -134,7 +134,9 @@ struct fattn_q4p_cfg {
 #define Q4P_K8_PT 2
 #endif
     static constexpr int NSPLIT = KQ8 ? Q4P_K8_NSPLIT : Q4P_KNOB(NSPLIT, R <= 18 ? 2 : 4);
-    static constexpr int PT     = KQ8 ? Q4P_K8_PT : Q4P_KNOB(PT, R <= 24 ? 2 : 1);
+    // 30 rows (5 tokens over the whole GQA group, GGML_CUDA_Q4P_NC2=6) at PT 2 need 0xc8f0 bytes of static shared
+    // memory, over sm_60's 48 KB (ptxas error with CUDA 12.0)
+    static constexpr int PT     = KQ8 ? (R > 24 ? 1 : Q4P_K8_PT) : Q4P_KNOB(PT, R <= 24 ? 2 : 1);
     static constexpr int NQP    = NT/(NSPLIT*RG);         // position slots per pass
     static constexpr int C      = NQP*PT;                 // KV positions per chunk
     static constexpr int BPS    = 8/NSPLIT;               // K blocks per split
