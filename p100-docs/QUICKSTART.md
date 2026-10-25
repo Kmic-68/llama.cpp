@@ -12,7 +12,7 @@ One command for text and vision. For vision, add the projector line shown below 
     ./build-opt/bin/llama-server \
       -m /path/to/Qwen3.8-27B-Q6_K.gguf \
       -ngl 99 -sm tensor -fa 1 -ctk q4_0 -ctv q4_0 \
-      -c 262144 -b 32768 -ub 2048 -np 1 \
+      -c 262144 -b 2048 -ub 2048 -np 1 \
       --spec-type draft-mtp --spec-draft-n-max 4 --spec-draft-p-min 0.2 \
       -ngld 99 -ubd 64 -ctkd q4_0 -ctvd q4_0 \
       --jinja --temp 1.0 --top-k 20 --top-p 0.95 --min-p 0.0 \
@@ -68,7 +68,7 @@ creative writing. Cards that have been under sustained load read ~5-10% lower.
 | `-ctk q4_0 -ctv q4_0` | q4_0 KV cache. An f16 cache doesn't fit at 262k |
 | `-c 262144` | the model's full context. Reserving it costs nothing until it fills |
 | `-np 1` | one server slot. Each slot allocates its own full KV cache |
-| `-b 32768` | **needed for MTP at long context.** A larger batch turns a long prompt into one huge batch, and draft acceptance collapses |
+| `-b 2048` | the logical batch. With `-ub` dividing it, the GPU passes are the same at any `-b`: a 112k-token prompt and three greedy answers gave byte-identical text and identical MTP draft counts at `-b 32768` and `-b 2048` (2x P100, deterministic drafting). What it does change is how long a dropped client keeps the server busy, because cancellation is checked between batches: a 64k prompt abandoned after 60 s held the slot ~33 s more at 32768, ~2 s at 2048 ([THREE-GPU.md](THREE-GPU.md) reported the same). An older version of this row said MTP needed 32768; that no longer holds |
 | `-ub 2048` | tokens per GPU pass. 2048 is the fastest prefill that still leaves VRAM headroom at 262k, with or without vision |
 | `--spec-type draft-mtp` | speculative decoding with the model's built-in MTP head |
 | `--spec-draft-n-max 4 --spec-draft-p-min 0.2` | draft up to 4 tokens; stop below 20% confidence. Use 3 if you mostly work past ~150k context |
