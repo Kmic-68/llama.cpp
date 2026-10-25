@@ -705,7 +705,11 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                 }
             }
         } else {
-            if (Q->ne[1] <= 2) {
+            // GGML_CUDA_FA_VEC_MAX_Q: largest batch a quantized cache without a direct tile path sends
+            // to vec (two tokens per block). Above it the tile kernel first converts the whole K/V cache
+            // to f16 in pool scratch, which grows with the context.
+            static const int vec_max_q = [] { const char * e = getenv("GGML_CUDA_FA_VEC_MAX_Q"); return e ? atoi(e) : 2; }();
+            if (Q->ne[1] <= vec_max_q) {
                 return BEST_FATTN_KERNEL_VEC;
             }
         }

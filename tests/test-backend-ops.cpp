@@ -11071,6 +11071,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 continue;
             }
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
         }
     }
     test_cases.emplace_back(new test_flash_attn_ext(64, 72, 4, {1, 1}, 256, 2, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
@@ -11111,6 +11112,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int kv : {768, 1280}) {
         test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
     }
+    // the same decode/verify shapes with a q8_0 K cache (q4p's q8_0-K variant on Pascal)
+    for (int kv : {256, 768, 1280, 4096, 32768, 262144}) {
+        for (int nb : {1, 2, 3, 4, 5}) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
+        }
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 4096, 5, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
     // and without a mask, and with a second sequence
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 4096, 1, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, 4096, 5, false, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
@@ -11743,6 +11751,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     for (int kv : {32768, 65536, 131072, 262144}) {
         for (int nb : {2048, 1024, 512, 16, 8, 7, 6, 5, 4, 3, 2, 1}) {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
+            // the same with a q8_0 K cache (q4p and fold q8_0-K variants)
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {6, 1}, kv, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0));
         }
     }
     // decode and verify widths at shallower depths, where fixed per-launch costs start to show
