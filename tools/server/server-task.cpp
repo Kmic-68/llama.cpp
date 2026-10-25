@@ -1784,13 +1784,15 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         /*.data   =*/ {
             /*.main =*/ std::move(state_data_tgt),
             /*.drft =*/ std::move(state_data_dft),
+            /*.spec =*/ {},
         },
     });
 
     return &states.back();
 }
 
-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
+                               std::optional<std::vector<uint8_t>> * spec_out) {
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
@@ -1857,6 +1859,10 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                 data.clear();
                 data.shrink_to_fit();
             }
+        }
+
+        if (spec_out != nullptr) {
+            *spec_out = std::move(it_best->data.spec);
         }
 
         prompt = std::move(it_best->prompt);
