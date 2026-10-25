@@ -1166,7 +1166,8 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
 //
 
 // Allocator for checkpoint state buffers (hundreds of MiB each, written once by a device-to-host copy):
-// no value-initialization, and large blocks on 2 MiB-aligned memory advised for transparent huge pages.
+// no value-initialization, and large blocks on 2 MiB-aligned memory (advised for transparent huge pages
+// only with LLAMA_CKPT_MADVISE=1, see common_ckpt_alloc).
 // A fresh std::vector<uint8_t> of 150 MiB spent ~68 ms zero-filling and taking ~38k page faults, about
 // twice the copy itself, on every checkpoint.
 void * common_ckpt_alloc(size_t n);
