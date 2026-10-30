@@ -1266,9 +1266,11 @@ static int q4p_half_group() {
 static void ggml_cuda_flash_attn_ext_q4p(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     // a fixed-width verify graph may have only its first tokens real (active-tokens.cuh): run the
     // kernel on views of Q and the output that stop there. The mask keeps its rows.
-    const int64_t n_act = ggml_cuda_active_cols(dst->src[0]->ne[1]);
+    ggml_tensor * dst_full = dst;
+    const int64_t n_full = dst->src[0]->ne[1];
+    const int64_t n_act = ggml_cuda_active_cols(n_full);
     ggml_tensor q_act, dst_act;
-    if (n_act < dst->src[0]->ne[1]) {
+    if (n_act < n_full) {
         q_act          = *dst->src[0];
         q_act.ne[1]    = n_act;
         dst_act        = *dst;
@@ -1290,5 +1292,13 @@ static void ggml_cuda_flash_attn_ext_q4p(ggml_backend_cuda_context & ctx, ggml_t
             else                       { ggml_cuda_flash_attn_ext_q4p_case<5, 3>(ctx, dst); }
             break;
         default: GGML_ABORT("fatal error");
+    }
+    if (n_act < n_full) {
+        // columns [n_act, n_full) were never written above and hold stale compute-buffer bytes;
+        // zero them so ops downstream that read the full width (GDN, conv1d) do not see garbage
+        const size_t pad_bytes = (size_t) (n_full - n_act) * dst_full->nb[2];
+        for (int64_t i3 = 0; i3 < dst_full->ne[3]; ++i3) {
+            CUDA_CHECK(cudaMemsetAsync((char *) dst_full->data + i3*dst_full->nb[3] + n_act*dst_full->nb[2], 0, pad_bytes, ctx.stream()));
+        }
     }
 }

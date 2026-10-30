@@ -2874,6 +2874,13 @@ bool ggml_cuda_mmvq_f16_gdn_gate(ggml_backend_cuda_context & ctx, const ggml_ten
         });
     });
     CUDA_CHECK(cudaGetLastError());
+    if (ncols < mm_a->ne[1]) {
+        // the GDN gate and beta that feed the recurrent state run on the whole padded width with
+        // no n_active check of their own; zero the columns the kernel above left unwritten so a
+        // padded verify does not carry stale compute-buffer bytes into the recurrent snapshot
+        CUDA_CHECK(cudaMemsetAsync(Y + ncols*ra, 0, (size_t) (mm_a->ne[1] - ncols) * ra * sizeof(float), stream));
+        CUDA_CHECK(cudaMemsetAsync(g.Y2 + ncols*rb, 0, (size_t) (mm_b->ne[1] - ncols) * rb * sizeof(float), stream));
+    }
     return true;
 }
 
@@ -2902,8 +2909,12 @@ bool ggml_cuda_mmvq_f16_glu(ggml_backend_cuda_context & ctx, const ggml_tensor *
     const int64_t sy = dst->nb[1]/sizeof(float);
     constexpr int ORW = MMVQ_F16_RPW/2;
     cudaStream_t stream = ctx.stream();
+    const int64_t full = mm_gate->ne[1];
     if (wg->type != GGML_TYPE_Q6_K) {
         mmvq_f16_gen_launch(wg->type, W, g.W2, wg->nb[1], xs_ptr, sc_ptr, Y, sy, rows, K, ncols, true, stream);
+        if (ncols < full) {
+            CUDA_CHECK(cudaMemsetAsync(Y + ncols*sy, 0, (size_t) (full - ncols) * sy * sizeof(float), stream));
+        }
         return true;
     }
     const int64_t rb = wg->nb[1];
@@ -2919,6 +2930,11 @@ bool ggml_cuda_mmvq_f16_glu(ggml_backend_cuda_context & ctx, const ggml_tensor *
         });
     });
     CUDA_CHECK(cudaGetLastError());
+    if (ncols < full) {
+        // this FFN output does not feed GDN, but a short verify's unwritten columns still hold
+        // stale compute-buffer bytes; zero them for the same reason as ggml_cuda_mmvq_f16_gdn_gate
+        CUDA_CHECK(cudaMemsetAsync(Y + ncols*sy, 0, (size_t) (full - ncols) * sy * sizeof(float), stream));
+    }
     return true;
 }
 
