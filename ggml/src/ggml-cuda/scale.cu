@@ -10,8 +10,10 @@ static __global__ void scale_f32(const T * x, T * dst, const float scale, const 
     int64_t stride = (int64_t)blockDim.x * (int64_t)gridDim.x;
 
     ggml_cuda_pdl_sync();
+    // scale == 0 means "zero this state" (llama-graph.cpp build_rs); do not let 0 * non-finite x
+    // stay non-finite, or a state that was supposed to be cleared keeps poisoning every reuse of it
     for (int64_t i = tid; i < nelements; i += stride) {
-        dst[i] = ggml_cuda_cast<T>(scale * ggml_cuda_cast<float>(x[i]) + bias);
+        dst[i] = ggml_cuda_cast<T>(scale == 0.0f ? bias : scale * ggml_cuda_cast<float>(x[i]) + bias);
     }
 }
 

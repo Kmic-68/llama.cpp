@@ -2174,6 +2174,17 @@ void ggml_cuda_mul_mat_vec_q(
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
+
+    if (!ids && ne1a < ne1) {
+        // columns [ne1a, ne1) were never written above and hold stale compute-buffer bytes; zero
+        // them so ops downstream that read the full width (GDN, conv1d) do not see garbage
+        const size_t pad_bytes = (size_t) (ne1 - ne1a) * s1 * ts_dst;
+        for (int64_t i3 = 0; i3 < ne3; ++i3) {
+            for (int64_t i2 = 0; i2 < ne2; ++i2) {
+                CUDA_CHECK(cudaMemsetAsync((char *) dst_d + (i3*s3 + i2*s2 + ne1a*s1) * ts_dst, 0, pad_bytes, stream));
+            }
+        }
+    }
 }
 
 void ggml_cuda_op_mul_mat_vec_q(
