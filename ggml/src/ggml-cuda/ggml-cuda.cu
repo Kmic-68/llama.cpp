@@ -3980,6 +3980,39 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
     return is_ok;
 }
 
+// p100-series: the fused top-k MoE router rounds differently from the unfused softmax / argsort / get_rows / norm chain, and for
+// batches of more than TOPK_MOE_ROWS_PER_BLOCK rows the fusion was refused whenever its outputs overlapped a live input -- so which
+// path ran depended on where the allocator put the router logits. Flash-Next's output then changed with buffer placement (first
+// request after load != later ones; upstream #31243 moved the layout). Instead of falling back, stage the outputs in pool memory and
+// copy them into place after the kernel has read everything: always fused, placement-independent. GGML_CUDA_TOPK_MOE_STAGE=0 = old
+// fallback.
+static bool ggml_cuda_topk_moe_fused_or_staged(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int node_idx, int n_ops,
+                                               const int * out_nodes, const ggml_tensor * logits, ggml_tensor * weights, ggml_tensor * ids,
+                                               const ggml_tensor * clamp, const ggml_tensor * scale, const ggml_tensor * bias,
+                                               const ggml_cuda_topk_moe_args & args) {
+    if (ggml_cuda_check_fusion_memory_ranges(cgraph, node_idx, n_ops, out_nodes, 2, /*is_topk_moe=*/true)) {
+        ggml_cuda_op_topk_moe(ctx, logits, weights, ids, clamp, scale, bias, args);
+        return true;
+    }
+    static const bool stage = [] { const char * e = getenv("GGML_CUDA_TOPK_MOE_STAGE"); return !e || atoi(e) != 0; }();
+    if (!stage) {
+        return false;
+    }
+    // ids is a view into the argsort-shaped buffer (row stride n_expert): copy its whole span, which the unfused argsort writes too
+    const size_t nb_w = ggml_nbytes(weights);
+    const size_t nb_i = ggml_nbytes(ids);
+    ggml_cuda_pool_alloc<char> w_tmp(ctx.pool(), nb_w);
+    ggml_cuda_pool_alloc<char> i_tmp(ctx.pool(), nb_i);
+    ggml_tensor w_staged = *weights;
+    ggml_tensor i_staged = *ids;
+    w_staged.data = w_tmp.ptr;
+    i_staged.data = i_tmp.ptr;
+    ggml_cuda_op_topk_moe(ctx, logits, &w_staged, &i_staged, clamp, scale, bias, args);
+    CUDA_CHECK(cudaMemcpyAsync(weights->data, w_tmp.ptr, nb_w, cudaMemcpyDeviceToDevice, ctx.stream()));
+    CUDA_CHECK(cudaMemcpyAsync(ids->data,     i_tmp.ptr, nb_i, cudaMemcpyDeviceToDevice, ctx.stream()));
+    return true;
+}
+
 // The long form spans 2*k + 1 nodes. ggml_can_fuse_subgraph() accepts at most
 // 31 nodes, so k <= 15; larger values use the per-operation path.
 static constexpr int MOE_WEIGHTED_REDUCTION_MAX_EXPERTS = 15;
@@ -4634,8 +4667,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
                 if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
                         ggml_cuda_should_use_topk_moe(node, logits, weights, ids) &&
-                        ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/true)) {
-                    ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
+                        ggml_cuda_topk_moe_fused_or_staged(*cuda_ctx, cgraph, i, ops.size(), out_nodes, logits, weights, ids, clamp, scale, bias, args)) {
                     return ops.size() - 1;
                 }
             } else if (!args.norm && !args.prob_bias) {
@@ -4649,8 +4681,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 int out_nodes[2] = { i + 1, i + 5 };
                 if (ggml_can_fuse_subgraph(cgraph, i, ops.size(), ops.data(), out_nodes, 2) &&
                         ggml_cuda_should_use_topk_moe(softmax, logits, weights, ids) &&
-                        ggml_cuda_check_fusion_memory_ranges(cgraph, i, ops.size(), out_nodes, 2, /*is_topk_moe=*/true)) {
-                    ggml_cuda_op_topk_moe(*cuda_ctx, logits, weights, ids, clamp, scale, bias, args);
+                        ggml_cuda_topk_moe_fused_or_staged(*cuda_ctx, cgraph, i, ops.size(), out_nodes, logits, weights, ids, clamp, scale, bias, args)) {
                     return ops.size() - 1;
                 }
             }
