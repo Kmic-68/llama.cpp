@@ -6,6 +6,7 @@
 #include "llama-batch.h"
 #include "llama-cparams.h"
 #include "llama-sampler.h"
+#include "llama-moe-lru.h"
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
@@ -1601,6 +1602,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     hdmd             (params.hdmd),
     samplers         (params.samplers),
     cb_func          (params.cb),
+    lru              (params.lru),
     res              (params.res),
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
@@ -2166,6 +2168,35 @@ ggml_tensor * llm_graph_context::build_ffn(
     return cur;
 }
 
+// p100-series LLAMA_MOE_LRU_TAIL=1: exclusive pools of IQ3_S / IQ4_NL experts assemble only the host part (the tile MUL_MAT_ID
+// reads the pooled experts from the pool itself): no device-to-device copy of the pooled experts, and the assembled tensors
+// (this layer's and the prefetched next layer's) shrink by n_slot / n_expert
+static bool llama_lru_tail_on() {
+    static const bool on = [] { const char * e = getenv("LLAMA_MOE_LRU_TAIL"); return e && atoi(e) != 0; }();
+    return on;
+}
+
+static bool llama_lru_tail_kind(llama_moe_lru * lru, int il, int fk) {
+    const ggml_type t = lru->pool_get(il, fk)->type;
+    return llama_lru_tail_on() && lru->is_exclusive() && (t == GGML_TYPE_IQ3_S || t == GGML_TYPE_IQ4_NL);
+}
+
+// every kind of the layer assembles its tail only
+static bool llama_lru_tail_layer(llama_moe_lru * lru, int il) {
+    return llama_lru_tail_kind(lru, il, 0) && llama_lru_tail_kind(lru, il, 1) && llama_lru_tail_kind(lru, il, 2);
+}
+
+static ggml_tensor * llama_lru_assemble(ggml_context * ctx0, llama_moe_lru * lru, int il, int fk, int64_t n_expert) {
+    ggml_tensor * pool = lru->pool_get(il, fk);
+    const bool tail = llama_lru_tail_kind(lru, il, fk);
+    static const bool zerocopy = [] { const char * e = getenv("LLAMA_MOE_LRU_ZEROCOPY"); return e && atoi(e) != 0; }();
+    if (tail && zerocopy) {
+        return ggml_lru_assemble_zerocopy(ctx0, lru->state_get(il), lru->exps_get(il, fk), pool, n_expert, lru->ctrl(), lru->pool_index(il));
+    }
+    return tail ? ggml_lru_assemble_tail(ctx0, lru->state_get(il), lru->exps_get(il, fk), pool, n_expert, lru->ctrl(), lru->pool_index(il))
+                : ggml_lru_assemble_ext (ctx0, lru->state_get(il), lru->exps_get(il, fk), pool, n_expert, lru->ctrl(), lru->pool_index(il));
+}
+
 ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * cur,
          ggml_tensor * gate_inp,
@@ -2380,6 +2411,164 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
+    // lookahead measurement (LLAMA_MOE_LOOKAHEAD_TRACE=1, with LLAMA_MOE_TRACE): predict the next pooled layer's experts by
+    // applying its router to this layer's MoE input; the node "ffn_moe_pred-<next layer>" is dumped by the trace hook
+    static const bool la_trace = [] { const char * e = getenv("LLAMA_MOE_LOOKAHEAD_TRACE"); return e && atoi(e) != 0; }();
+    if (la_trace && lru != nullptr && lru->pooled(il) && !cparams.warmup && n_tokens > 0) {
+        const int nx = lru->next_pooled(il);
+        if (nx >= 0 && lru->router_get(nx, 0) != nullptr) {
+            ggml_tensor * pl = ggml_mul_mat(ctx0, lru->router_get(nx, 0), cur);   // [n_expert, n_tokens]
+            if (lru->router_get(nx, 1)) {
+                pl = ggml_add(ctx0, pl, lru->router_get(nx, 1));
+            }
+            ggml_tensor * sel = pl;
+            if (lru->router_get(nx, 2)) {   // selection bias is added to the gated probabilities
+                ggml_tensor * pp = gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID ? ggml_sigmoid(ctx0, pl) : ggml_soft_max(ctx0, pl);
+                sel = ggml_add(ctx0, pp, lru->router_get(nx, 2));
+            }
+            ggml_tensor * pred = ggml_argsort_top_k(ctx0, sel, n_expert_used);
+            ggml_format_name(pred, "ffn_moe_pred-%d", nx);
+            ggml_build_forward_expand(gf, pred);
+        }
+    }
+
+    ggml_tensor * lru_host_dec = nullptr;   // the decide of host-computed misses (LLAMA_MOE_LRU_HOST)
+    bool lru_decided = false;               // the small-batch decide path ran (the assembly below is its alternative)
+    if (lru != nullptr && lru->pooled(il) && !cparams.warmup &&
+        n_tokens > 0 && (int64_t) n_tokens * n_expert_used <= lru->n_slots_min()) {
+        GGML_ASSERT(gate_up_exps == nullptr && up_exps_b == nullptr && gate_exps_b == nullptr &&
+                    down_exps_b == nullptr && gate_up_exps_b == nullptr &&
+                    up_exps_s == nullptr && gate_exps_s == nullptr && down_exps_s == nullptr);
+        // LLAMA_MOE_LRU_TAIL_SKIP=R (Strata's route-tail skip, 1-based rank): a missing expert that every token of the batch ranks R or
+        // lower is neither filled nor computed and its routing weight is dropped (no renormalisation). 0 / unset = off.
+        static const int tail_rank = [] { const char * e = getenv("LLAMA_MOE_LRU_TAIL_SKIP"); return e ? atoi(e) : 0; }();
+        const int tail = tail_rank > 1 && tail_rank <= n_expert_used ? tail_rank - 1 : 0;
+        // host-computed misses: past the fill budget a miss is computed by the CPU pool while the GPU runs the cached experts
+        const bool host = tail == 0 && lru->host_enabled() && n_tokens <= GGML_LRU_HOST_MAX_TOK && lru->host_req(il) != nullptr;
+        ggml_tensor * out = tail > 0 ?
+            ggml_lru_decide_tail(ctx0, selected_experts, lru->state_get(il), (int32_t) hparams.n_expert, (int32_t) lru->n_slots(il),
+                                 lru->ctrl(), lru->pool_index(il), tail) :
+            host ?
+            ggml_lru_decide_host(ctx0, selected_experts, lru->state_get(il), (int32_t) hparams.n_expert, (int32_t) lru->n_slots(il),
+                                 lru->pool_index(il), cur, lru->host_max_fill_get(), lru->host_req(il), lru->host_writer(),
+                                 lru->host_every_get()) :
+            ggml_lru_decide_ext(ctx0, selected_experts, lru->state_get(il),
+                                            (int32_t) hparams.n_expert, (int32_t) lru->n_slots(il), lru->ctrl(), lru->pool_index(il));
+        if (host) {
+            lru_host_dec = out;
+        }
+        if (auto pfa = lru_pf_ahead.find(il); pfa != lru_pf_ahead.end()) {
+            // the prefetch ran on a side stream: its decide output and predicted ids stay allocated until this decide (which
+            // waits for that stream), so nothing on the main stream reuses their memory while the side stream may read them
+            out->src[3] = pfa->second[0];
+            out->src[4] = pfa->second[1];
+            lru_pf_ahead.erase(pfa);
+        }
+        if (tail > 0) {
+            ggml_tensor * keep = ggml_view_1d(ctx0, out, (int64_t) n_expert_used * n_tokens,
+                                              ((int64_t) n_expert_used * n_tokens + 3 * lru->n_slots(il) + 1) * sizeof(int32_t));
+            keep = ggml_reshape_3d(ctx0, ggml_cast(ctx0, keep, GGML_TYPE_F32), 1, n_expert_used, n_tokens);
+            weights = ggml_mul(ctx0, weights, keep);
+            cb(weights, "ffn_moe_weights_tail", il);
+        }
+        ggml_tensor * slot = ggml_view_2d(ctx0, out, n_expert_used, n_tokens,
+                                          n_expert_used * sizeof(int32_t), 0);
+        ggml_build_forward_expand(gf, slot);
+        ggml_tensor * flist = ggml_view_1d(ctx0, out, 3 * lru->n_slots(il) + 1,
+                                           (int64_t) n_expert_used * n_tokens * sizeof(int32_t));
+        ggml_tensor * upd[llama_moe_lru::N_KIND];
+        for (int fk = 0; fk < 3; fk++) {
+            upd[fk] = ggml_lru_fill_ext(ctx0, flist, lru->exps_get(il, fk), lru->pool_get(il, fk), lru->ctrl(), lru->pool_index(il));
+            ggml_build_forward_expand(gf, upd[fk]);
+        }
+        up_exps   = upd[llama_moe_lru::KIND_UP];
+        gate_exps = upd[llama_moe_lru::KIND_GATE];
+        down_exps = upd[llama_moe_lru::KIND_DOWN];
+        selected_experts = slot;
+        lru_decided = true;
+        if (moe_overlap != nullptr) {
+            ggml_build_forward_expand(gf, moe_overlap);
+        }
+    }
+    moe_overlap = nullptr;
+    {
+    // LLAMA_MOE_LRU_PF=k: decode prefetch. The next pooled layer's router on this layer's MoE input names k experts per token;
+        // a decide + fill of the next layer's cache for them runs on the backend's side stream while this layer computes, so the
+        // ones it would miss are already loading. The next layer's own decide (its real routing) waits for it and decides as
+        // always: the prediction only moves weights, every computed expert is the one the router picked.
+        // (after this layer's own decide and fills: its real misses are queued before the next layer's prefetch)
+        static const int pf_k = [] { const char * e = getenv("LLAMA_MOE_LRU_PF"); return e ? atoi(e) : 0; }();
+        if (pf_k > 0 && lru != nullptr && lru->pooled(il) && lru->is_exclusive() && !cparams.warmup && n_tokens > 0) {
+            const int nx = lru->next_pooled(il);
+            if (nx >= 0 && lru->router_get(nx, 0) != nullptr && (int64_t) n_tokens * pf_k <= lru->n_slots(nx) &&
+                    (int64_t) n_tokens * n_expert_used <= lru->n_slots_min()) {
+                ggml_tensor * pl = ggml_mul_mat(ctx0, lru->router_get(nx, 0), cur);   // [n_expert, n_tokens]
+                if (lru->router_get(nx, 1)) {
+                    pl = ggml_add(ctx0, pl, lru->router_get(nx, 1));
+                }
+                ggml_tensor * sel = pl;
+                if (lru->router_get(nx, 2)) {
+                    ggml_tensor * pp = gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID ? ggml_sigmoid(ctx0, pl) : ggml_soft_max(ctx0, pl);
+                    sel = ggml_add(ctx0, pp, lru->router_get(nx, 2));
+                }
+                ggml_tensor * pred = ggml_cont(ctx0, ggml_argsort_top_k(ctx0, sel, std::min<int>(pf_k, (int) hparams.n_expert)));
+                ggml_tensor * pf = ggml_lru_decide_tail(ctx0, pred, lru->state_get(nx), (int32_t) hparams.n_expert,
+                                                        (int32_t) lru->n_slots(nx), nullptr, lru->pool_index(nx), -1);
+                ggml_build_forward_expand(gf, pf);
+                ggml_tensor * flist = ggml_view_1d(ctx0, pf, 3 * lru->n_slots(nx) + 1, (int64_t) pred->ne[0] * pred->ne[1] * sizeof(int32_t));
+                for (int fk = 0; fk < 3; fk++) {
+                    ggml_build_forward_expand(gf, ggml_lru_fill_ext(ctx0, flist, lru->exps_get(nx, fk), lru->pool_get(nx, fk), nullptr, lru->pool_index(nx)));
+                }
+                lru_pf_ahead[nx] = { pf, pred };
+            }
+        }
+    }
+    if (lru_decided) {
+        // the small-batch path above
+    } else if (lru != nullptr && lru->pooled(il) && n_tokens > 0 && lru->assemble()) {
+        // large batch: the pools hold the recently used experts, so build the full expert tensors on the GPU from the
+        // pools plus the missing experts from pinned host memory, instead of the scheduler uploading every expert
+        ggml_tensor * asmb[llama_moe_lru::N_KIND];
+        auto ahead = lru_asm_ahead.find(il);
+        if (ahead != lru_asm_ahead.end()) {
+            for (int fk = 0; fk < 3; fk++) {
+                asmb[fk] = ahead->second[fk];
+            }
+            lru_asm_ahead.erase(ahead);
+        } else {
+            for (int fk = 0; fk < 3; fk++) {
+                asmb[fk] = llama_lru_assemble(ctx0, lru, il, fk, hparams.n_expert);
+            }
+        }
+        // the next pooled layer's experts do not depend on anything computed here: put their assembly into the graph now,
+        // before this layer's expert matmuls, so the backend can run it on a side stream during this layer's MoE and the
+        // next layer's attention (one extra layer of assembled experts stays live)
+        if (lru->prefetch()) {
+            int nx = il + 1;
+            while (nx < (int) hparams.n_layer() && !lru->pooled(nx)) {
+                nx++;
+            }
+            // tail mode: no prefetch into or out of a layer with fully assembled kinds (the Q8_0-down layers): the compute buffer
+            // is sized by the largest pair of live assemblies, and two tail layers are about the size of one full layer
+            const bool pf_ok = !llama_lru_tail_on() || (llama_lru_tail_layer(lru, il) && nx < (int) hparams.n_layer() && llama_lru_tail_layer(lru, nx));
+            if (pf_ok && nx < (int) hparams.n_layer() && lru_asm_ahead.find(nx) == lru_asm_ahead.end()) {
+                std::array<ggml_tensor *, 3> nxt;
+                for (int fk = 0; fk < 3; fk++) {
+                    nxt[fk] = llama_lru_assemble(ctx0, lru, nx, fk, hparams.n_expert);
+                    ggml_build_forward_expand(gf, nxt[fk]);
+                }
+                lru_asm_ahead[nx] = nxt;
+            }
+        }
+        up_exps   = asmb[llama_moe_lru::KIND_UP];
+        gate_exps = asmb[llama_moe_lru::KIND_GATE];
+        down_exps = asmb[llama_moe_lru::KIND_DOWN];
+        if (lru->is_exclusive()) {
+            // the exclusive assembly is laid out [pool slots | host slots]: remap the expert ids to match
+            ggml_tensor * rm = ggml_lru_remap(ctx0, selected_experts, lru->state_get(il), (int32_t) hparams.n_expert, (int32_t) lru->n_slots(il));
+            selected_experts = ggml_view_2d(ctx0, rm, n_expert_used, n_tokens, n_expert_used * sizeof(int32_t), 0);
+        }
+    }
     // the experts of host-resident layers may be read from the MoE cache
     ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);
 
@@ -2544,6 +2733,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
         experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s, slots); // [n_embd, n_expert_used, n_tokens]
         //ggml_prec_set_src(experts, GGML_PREC_BF16, 1); // (see TODO above)
+        if (lru_host_dec != nullptr) {
+            // the host's experts enter where the matmuls wrote zeros (slot -1), before the router weights
+            experts = ggml_lru_host_merge(ctx0, experts, lru_host_dec, lru->host_req(il), lru->host_writer());
+        }
         cb(experts, "ffn_moe_down", il);
 
         if (amax_src1.scale_s) {
@@ -2607,6 +2800,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     return moe_out;
 }
+
 
 ggml_tensor * llm_graph_context::build_moe_cache_slots(
          ggml_tensor * selected_experts,
@@ -3924,8 +4118,11 @@ ggml_tensor * llm_graph_context::build_rs(
 
     // Clear a single state which will then be copied to the other cleared states.
     // Note that this is a no-op when the view is zero-sized.
+    // p100-series (qr0n patch 0014): fill, not scale by 0 -- 0 * NaN = NaN, so a cell whose state went non-finite could never be
+    // cleared and every later sequence assigned to it started from NaN (a llama-server slot returned garbage until a restart).
+    // Identical for finite states (up to the sign of zero).
     ggml_tensor * state_zero = ggml_view_1d(ctx0, states, state_size*(rs_zero >= 0), rs_zero*states->nb[1]*(rs_zero >= 0));
-    ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, state_zero, 0));
+    ggml_build_forward_expand(gf, ggml_fill_inplace(ctx0, state_zero, 0.0f));
 
     // copy states
     // NOTE: assuming the copy destinations are ALL contained between rs_head and rs_head + n_rs

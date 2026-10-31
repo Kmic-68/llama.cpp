@@ -641,6 +641,8 @@ struct llama_layer {
     struct llama_layer_switch_lora switch_lora;
 };
 
+struct llama_moe_lru;
+
 struct llama_device {
     bool is_meta;
 
@@ -876,6 +878,8 @@ struct llama_model {
 
     uint32_t n_gpu_layers() const;
     llama_split_mode split_mode() const;
+    int32_t moe_lru_slots() const;   // p100-series MoE expert cache
+    std::unique_ptr<llama_moe_lru> create_moe_lru(const std::vector<ggml_backend_t> & gpu_backends) const;
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 

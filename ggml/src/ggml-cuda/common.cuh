@@ -1478,8 +1478,83 @@ struct ggml_cuda_stream_context {
     }
 };
 
+// p100-series LRU victim stash (exclusive cache, GGML_CUDA_LRU_STASH=<MiB>): ring control block in device memory
+struct lru_stash_ctl {
+    uint32_t counter;      // entries allocated by the decides (monotonic; ring slot = entry % cap)
+    uint32_t flushed;      // entries written back to the host slots (set by the last block of a flush)
+    uint32_t snap;         // entries whose fills have completed (every decide and the end of a pass write it)
+    uint32_t done;         // flush last-block counter
+    uint32_t a, b;         // range of the next flush (latched on the flush stream)
+    uint32_t cap;          // ring entries (0 = no ring yet)
+    uint32_t pad;
+    uint32_t last[1024];   // per LRU layer index: its newest entry + 1 (0 = none)
+};
+// one ring entry: where each of the (up to 3) slices of the victim goes; bytes 0 = nothing to write
+struct lru_stash_rec {
+    char *   dst[3];
+    uint32_t off[3];
+    uint32_t bytes[3];
+};
+
 struct ggml_backend_cuda_context {
     int device;
+
+    // p100-series MoE expert cache (moe-lru.cu)
+    // p100-series LRU fill overlap (GGML_CUDA_LRU_OVERLAP=1): the decode fill runs on a high-priority side stream; the expert
+    // matvec computes the resident entries first, waits for lru_ovl_fill_event, then the filled ones
+    cudaStream_t lru_ovl_stream = nullptr;
+    cudaEvent_t  lru_ovl_dec_event = nullptr;
+    cudaEvent_t  lru_ovl_fill_event = nullptr;
+    bool         lru_ovl_active = false;
+    const int32_t * lru_ovl_fill = nullptr;
+    int          lru_ovl_nslot = 0;
+    int          lru_ovl_npools = 0;
+    const char * lru_ovl_pool[3] = {};
+    size_t       lru_ovl_pool_bytes[3] = {};
+
+    // p100-series: LRU_ASSEMBLE runs on a side stream (prefill copy/compute overlap); the side stream first waits for the main
+    // stream's position (the allocator may reuse memory of earlier nodes), a consumer waits for the assembly's event. Pending
+    // assemblies are drained into the main stream at the end of every graph evaluation.
+    static constexpr int LRU_MAX_PENDING = 16;
+    cudaStream_t lru_stream = nullptr;
+    cudaEvent_t  lru_fork_event = nullptr;
+    cudaEvent_t  lru_events[LRU_MAX_PENDING] = {};
+    const ggml_tensor * lru_pending[LRU_MAX_PENDING] = {};   // nullptr = slot free
+    int n_lru_pending = 0;
+    // host mirrors of LRU states for the copy-engine assembly (ggml_cuda_lru_mirror in ggml-cuda.cu)
+    void * lru_mirror = nullptr;
+    // exclusive LRU: a fill saves its victims to a VRAM staging buffer, a side-stream kernel writes them back to the host slots
+    // while the matmuls run; the next fill (and any host-slot reader) waits for lru_wb_event
+    void *       lru_staging = nullptr;
+    size_t       lru_staging_size = 0;
+    cudaStream_t lru_wb_stream = nullptr;
+    cudaEvent_t  lru_wb_event = nullptr;
+    cudaEvent_t  lru_fill_event = nullptr;
+    bool         lru_wb_pending = false;
+    // exclusive LRU with disk refill: last-block counter of the fill kernel (device memory, reset by the last block)
+    unsigned int * lru_counter = nullptr;
+    // p100-series LRU victim stash (GGML_CUDA_LRU_STASH=<MiB>, exclusive cache): a decode fill parks each victim in a VRAM ring
+    // instead of writing it back over PCIe inside the fill; small flush kernels on lru_wb_stream drain the ring every few fill
+    // calls and at the end of the pass (meta backend hook); a decide only waits until its own layer's earlier victims have landed
+    lru_stash_ctl * lru_stash_ctl = nullptr;   // device memory
+    lru_stash_rec * lru_stash_rec = nullptr;   // device memory, cap entries
+    char *       lru_stash = nullptr;          // cap x lru_stash_stride bytes
+    size_t       lru_stash_stride = 0;         // bytes per entry (the largest fill seen when the ring was sized)
+    size_t       lru_stash_need = 0;           // largest fill seen so far
+    uint32_t     lru_stash_cap = 0;
+    bool         lru_stash_armed = false;      // inside a meta pass: decides may allocate entries
+    bool         lru_stash_dirty = false;      // entries allocated since the last flush
+    bool         lru_stash_flushed = false;    // a flush has been issued (host-slot readers wait for lru_stash_event)
+    int          lru_stash_calls = 0;          // fill calls since the last flush
+    cudaEvent_t  lru_stash_main_event = nullptr;
+    cudaEvent_t  lru_stash_event = nullptr;
+    // copy-engine flush (GGML_CUDA_LRU_STASH_CE=1): records + snapshot in mapped pinned memory, the host issues the write-back
+    // copies at the next pass once this one has completed
+    uint32_t *   lru_stash_hsnap = nullptr;
+    uint32_t     lru_stash_hflushed = 0;       // entries covered by issued copy-engine flushes
+    bool         lru_stash_ce_pending = false;
+    cudaEvent_t  lru_stash_ce_event = nullptr;
+    void *       lru_stash_worker = nullptr;   // ggml_cuda_stash_worker (ggml-cuda.cu): issues the copies off the host's critical path
     std::string name;
     cudaEvent_t copy_event = nullptr;
 

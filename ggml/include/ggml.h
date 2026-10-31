@@ -602,6 +602,11 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_LRU_DECIDE,
+        GGML_OP_LRU_FILL,
+        GGML_OP_LRU_ASSEMBLE,
+        GGML_OP_LRU_HOST_MERGE,
+
         GGML_OP_COUNT,
     };
 
@@ -2632,6 +2637,145 @@ extern "C" {
             struct ggml_tensor  * a,
             struct ggml_tensor  * b,
             struct ggml_tensor  * state);
+
+    // p100-series MoE expert cache (moe-lru): see p100-docs/MOE.md
+    // LRU expert cache, decode path (single token or a small verification
+    // batch such as speculative decoding). n_used below is the router's
+    // top-k (llama-side name: n_expert_used).
+    //
+    // The persistent LRU state is one i32 tensor updated in place (like the
+    // KV cache, it has to survive across graph executions):
+    //   [0, n_expert)                    owner:  expert -> slot, -1 if none
+    //   [n_expert, n_expert + n_slot)    slot owner: slot -> expert, -1 if free
+    //   [n_expert + n_slot, +2*n_slot)   last_use: tick of the last use per slot
+    //   [n_expert + 2*n_slot]            tick: logical clock for last_use,
+    //                                       +1 per decide call
+    //   [n_expert + 2*n_slot + 1]        cumulative ids  (stats)
+    //   [n_expert + 2*n_slot + 2]        cumulative fills (stats)
+    //
+    // ggml_lru_decide: looks up the ids in the LRU state, refreshes recency,
+    // evicts the least recently used slot for every miss. Duplicate experts
+    // within the batch share one slot. The caller must guarantee
+    // n_tokens * n_used <= n_slot so the batch fits.
+    // ids: i32 [n_used, n_tokens]  router top-k expert ids per token
+    // returns one flat i32 tensor, laid out as [slot ids | fill list]:
+    //   [0, n_used*n_tokens)             slot id per input id, valid after fill
+    //   [n_used*n_tokens, +3*n_slot)     fill list: (expert, slot, host slot) triples (host slot = expert unless exclusive)
+    //   [n_used*n_tokens + 3*n_slot]     fill count this call (the position is
+    //                                     capacity-derived so views of the two
+    //                                     regions keep a fixed shape)
+    GGML_API struct ggml_tensor * ggml_lru_decide(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * state,
+            int32_t               n_expert,
+            int32_t               n_slot);
+
+    // ggml_lru_fill: copies whole entries named in the fill list from src
+    // (device-readable host memory) into pool slots. src is not stored as a
+    // graph source: a pointer to the tensor is captured in the op params at
+    // build time (the tensor object must outlive the graphs), and the fill
+    // kernel reads it in place. fill_list is the fill-list region of the
+    // decide output (a view), which orders the fill after the decide.
+    // Returns a view of the pool: consuming it as the weights orders the
+    // reader after the fills.
+    GGML_API struct ggml_tensor * ggml_lru_fill(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * fill_list,
+            struct ggml_tensor  * src,
+            struct ggml_tensor  * pool);
+
+    // ggml_lru_assemble: builds the full expert tensor [ne0, ne1, n_expert] in device memory for a large batch (prefill) that
+    // does not fit the pool: experts the LRU state maps to a slot are copied from the pool, the others are read from src
+    // (device-readable host memory, captured by pointer like ggml_lru_fill). The state is only read. Under a device split
+    // the result has the pool's split, so every device assembles its own slice.
+    GGML_API struct ggml_tensor * ggml_lru_assemble(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * src,
+            struct ggml_tensor  * pool,
+            int64_t               n_expert);
+
+    // Exclusive LRU with disk refill: the GPU drops a miss's victim instead of writing it back; a host thread refills the
+    // victim's host slot from the (mapped) model weights. Shared through device-readable host memory:
+    //   entries  [cap][4]            ring of (layer, victim, host slot, step) logged by the decide on device 0
+    //   content  [n_layer][n_host]   expert whose bytes a host slot holds (set by the host after the copy); every reader
+    //                                of a host slot waits until it holds the expert it wants
+    //   done     [n_dev][n_layer]    fill launches finished per device and layer (+kinds per launch); the host overwrites a
+    //                                slot only after every device finished the fill of the step that freed it
+    //   mode     [n_dev][cap]        hybrid: per device and entry, 1 = this device wrote the victim back itself (swap, chosen
+    //                                when the ring backlog >= swap_backlog), 0 = left to the host; the host copies from the
+    //                                model if any device left it (identical bytes), else only publishes the content
+    //   lcount   [16]                per-device count of logged entries (the ring index; one counter per device across all
+    //                                layers -- each device's decides run in order on its stream, so only it touches its counter)
+    struct ggml_lru_ctrl {
+        volatile uint32_t head;   // written by the GPU
+        volatile uint32_t tail;   // written by the host
+        uint32_t cap, n_layer, n_host, n_dev;
+        int32_t  * entries;
+        int32_t  * content;
+        uint32_t * done;
+        int32_t  * mode;
+        uint32_t swap_backlog;
+        volatile uint32_t lcount[16];
+    };
+
+    // exclusive cache: map router expert ids to the assembled [pool slots | host slots] layout (slot if pooled, else
+    // n_slot + host slot); no state change. Same output layout as ggml_lru_decide (take a view of the first n_ids values).
+    GGML_API struct ggml_tensor * ggml_lru_remap(
+            struct ggml_context * ctx, struct ggml_tensor * ids, struct ggml_tensor * state, int32_t n_expert, int32_t n_slot);
+
+    // ggml_lru_decide_ext with route-tail skip: a missing expert that every entry of the batch ranks >= tail (0-based position in the
+    // descending top-k) is neither filled nor computed -- its entries read the same token's rank-0 slot and get keep = 0. The output
+    // gains n_ids int32 keep flags (1 = keep, 0 = skipped) after the fill list.
+    GGML_API struct ggml_tensor * ggml_lru_decide_tail(
+            struct ggml_context * ctx, struct ggml_tensor * ids, struct ggml_tensor * state,
+            int32_t n_expert, int32_t n_slot, struct ggml_lru_ctrl * ctrl, int32_t layer, int32_t tail);
+    GGML_API struct ggml_tensor * ggml_lru_decide_ext(
+            struct ggml_context * ctx, struct ggml_tensor * ids, struct ggml_tensor * state,
+            int32_t n_expert, int32_t n_slot, struct ggml_lru_ctrl * ctrl, int32_t layer);
+    // Host-computed misses (exclusive cache, decode): beyond max_fill fills per call a missing expert is neither filled nor
+    // computed on the GPU (slot -1: the matmuls write zeros); the decide lists it in a request in device-readable host memory
+    // together with the activations, a host thread pool computes it from its host slot, and ggml_lru_host_merge writes the
+    // result into the expert outputs. Every routed expert is still computed exactly once.
+    // One request per pooled layer; seq/done hand it over (GPU bumps seq after writing, the host sets done = seq).
+    #define GGML_LRU_HOST_MAX_TOK 8
+    struct ggml_lru_host_req {
+        volatile uint32_t seq;      // written by the GPU after the payload
+        volatile uint32_t done;     // written by the host after out[] (or by the GPU when nothing goes to the host)
+        volatile int32_t  n_tok;
+        volatile int32_t  n_ent;
+        int32_t  n_embd, max_ent;
+        int32_t  * ent;             // [max_ent][3]: (entry = token*n_used + k, expert, host slot)
+        float    * x;               // [GGML_LRU_HOST_MAX_TOK][n_embd] the layer's MoE input
+        float    * out;             // [max_ent][n_embd] unweighted expert outputs
+    };
+    // writer: 1 = only device 0 writes the request and merges (tensor split: the expert outputs are partial sums that are
+    // all-reduced after the experts), 2 = the device that runs the layer does (one device per layer)
+    GGML_API struct ggml_tensor * ggml_lru_decide_host(
+            struct ggml_context * ctx, struct ggml_tensor * ids, struct ggml_tensor * state,
+            int32_t n_expert, int32_t n_slot, int32_t layer, struct ggml_tensor * x,
+            int32_t max_fill, struct ggml_lru_host_req * req, int32_t writer, int32_t every);
+    // in place on the expert outputs [n_embd, n_used, n_tokens] (before the router weights): waits for the request and writes
+    // out[j] into entry ent[j][0]. dec orders it after the decide.
+    GGML_API struct ggml_tensor * ggml_lru_host_merge(
+            struct ggml_context * ctx, struct ggml_tensor * experts, struct ggml_tensor * dec,
+            struct ggml_lru_host_req * req, int32_t writer);
+    GGML_API struct ggml_tensor * ggml_lru_fill_ext(
+            struct ggml_context * ctx, struct ggml_tensor * fill_list, struct ggml_tensor * src, struct ggml_tensor * pool,
+            struct ggml_lru_ctrl * ctrl, int32_t layer);
+    GGML_API struct ggml_tensor * ggml_lru_assemble_ext(
+            struct ggml_context * ctx, struct ggml_tensor * state, struct ggml_tensor * src, struct ggml_tensor * pool,
+            int64_t n_expert, struct ggml_lru_ctrl * ctrl, int32_t layer);
+    // p100-series: the same assembly with only the host part ([n_slot, n_expert) of the [pool | host] layout, n_expert - n_slot
+    // experts): MUL_MAT_ID reads ids < n_slot from the pool (src[1]) and the rest from this tensor (CUDA tile path only)
+    // ... and with the tail read in place from the host pool by the tile MUL_MAT_ID (no copy, no assembled tensor)
+    GGML_API struct ggml_tensor * ggml_lru_assemble_zerocopy(
+            struct ggml_context * ctx, struct ggml_tensor * state, struct ggml_tensor * src, struct ggml_tensor * pool,
+            int64_t n_expert, struct ggml_lru_ctrl * ctrl, int32_t layer);
+    GGML_API struct ggml_tensor * ggml_lru_assemble_tail(
+            struct ggml_context * ctx, struct ggml_tensor * state, struct ggml_tensor * src, struct ggml_tensor * pool,
+            int64_t n_expert, struct ggml_lru_ctrl * ctrl, int32_t layer);
 
     /* Solves a specific equation of the form Ax=B, where A is a triangular matrix
     *  without zeroes on the diagonal (i.e. invertible).

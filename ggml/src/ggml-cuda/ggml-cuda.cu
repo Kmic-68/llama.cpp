@@ -60,6 +60,8 @@
 #include "ggml-cuda/mean.cuh"
 #include "ggml-cuda/tsembd.cuh"
 #include "ggml-cuda/topk-moe.cuh"
+#include "ggml-cuda/moe-lru.cuh"
+#include "ggml-cuda/tile-mm.cuh"
 #include "ggml-cuda/unary.cuh"
 #include "ggml-cuda/upscale.cuh"
 #include "ggml-cuda/wkv.cuh"
@@ -775,6 +777,7 @@ static std::condition_variable ggml_cuda_lock_cv;
 static std::atomic<int> ggml_cuda_lock_counter;
 
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+    ggml_cuda_lru_ctx_free(*this);   // p100-series MoE expert cache (moe-lru.cu)
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         if (mmvq_q8_1_ptr[i] != nullptr) {
             ggml_cuda_set_device(i);
@@ -873,6 +876,34 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
     return GGML_STATUS_SUCCESS;
 }
 
+// one synchronized copy per tensor per device. Only for callers that keep the host memory alive until the batch is closed.
+static thread_local bool     ggml_cuda_copy_batch_open    = false;
+static thread_local uint64_t ggml_cuda_copy_batch_devices = 0;
+
+static void ggml_cuda_copy_sync_or_defer(int device) {
+    if (ggml_cuda_copy_batch_open && device < 64) {
+        ggml_cuda_copy_batch_devices |= (uint64_t) 1 << device;
+        return;
+    }
+    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+}
+
+void ggml_backend_cuda_copy_batch(bool begin) {
+    if (begin) {
+        ggml_cuda_copy_batch_open    = true;
+        ggml_cuda_copy_batch_devices = 0;
+        return;
+    }
+    ggml_cuda_copy_batch_open = false;
+    for (int dev = 0; dev < 64 && ggml_cuda_copy_batch_devices != 0; ++dev) {
+        if (ggml_cuda_copy_batch_devices & ((uint64_t) 1 << dev)) {
+            ggml_cuda_set_device(dev);
+            CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+            ggml_cuda_copy_batch_devices &= ~((uint64_t) 1 << dev);
+        }
+    }
+}
+
 static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
@@ -886,7 +917,7 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
 
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    ggml_cuda_copy_sync_or_defer(ctx->device);
 }
 
 static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -894,7 +925,7 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
 
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    ggml_cuda_copy_sync_or_defer(ctx->device);
 }
 
 static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data,
@@ -904,7 +935,7 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemcpy2DAsync(
         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cudaStreamPerThread));
-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    ggml_cuda_copy_sync_or_defer(ctx->device);
 }
 
 static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor, void * data,
@@ -914,7 +945,7 @@ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemcpy2DAsync(
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cudaStreamPerThread));
-    CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    ggml_cuda_copy_sync_or_defer(ctx->device);
 }
 
 static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
@@ -2425,6 +2456,17 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     const ggml_tensor * src1 = dst->src[1];
     const ggml_tensor * ids  = dst->src[2];
 
+    // p100-series MoE expert cache: wait for a pool still being filled by the copy engines (moe-lru.cu); a tail assembly
+    // (pooled experts read from the pool) is understood only by the tile GEMM
+    ggml_cuda_lru_ce_pending_wait(ctx, src0->data);
+    if (src0->op == GGML_OP_LRU_ASSEMBLE && ggml_get_op_params_i32(src0, 5) != 0) {
+        if (!ggml_cuda_tile_mm_id_try(ctx, src0, src1, ids, dst)) {
+            GGML_ABORT("tail LRU assembly: the tile MUL_MAT_ID path refused this matmul (type %s, %lld tokens)",
+                       ggml_type_name(src0->type), (long long) src1->ne[2]);
+        }
+        return;
+    }
+
     GGML_ASSERT(src1->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
 
@@ -2449,6 +2491,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
                     return;
                 }
             }
+        }
+
+        // Pascal: fp16 tile GEMM over all experts (tile-mm.cu, MoE prefill) instead of MMQ's emulated-DP4A integer path
+        if (ggml_cuda_tile_mm_id_try(ctx, src0, src1, ids, dst)) {
+            return;
         }
 
         if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
@@ -2815,6 +2862,24 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_MUL_MAT_ID:
             ggml_cuda_mul_mat_id(ctx, dst);
+            break;
+        // p100-series MoE expert cache (moe-lru.cu)
+        case GGML_OP_LRU_DECIDE:
+            ggml_cuda_lru_decide(ctx, dst);
+            break;
+        case GGML_OP_LRU_FILL:
+            ggml_cuda_lru_fill(ctx, dst);
+            break;
+        case GGML_OP_LRU_HOST_MERGE:
+            ggml_cuda_lru_host_merge(ctx, dst);
+            break;
+        case GGML_OP_LRU_ASSEMBLE:
+            ggml_cuda_lru_ce_sync_host(ctx);
+            if (ggml_cuda_lru_dma_enabled()) {
+                ggml_cuda_lru_assemble_dma(ctx, dst, ctx.stream());
+            } else {
+                ggml_cuda_lru_assemble(ctx, dst);
+            }
             break;
         case GGML_OP_OUT_PROD:
             ggml_cuda_out_prod(ctx, dst);
@@ -3258,7 +3323,24 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
 static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
+    // p100-series MoE expert cache (moe-lru.cu): side-stream assemblies and write-backs land before the sync
+    ggml_cuda_lru_drain(*cuda_ctx);
+    ggml_cuda_lru_ovl_join(*cuda_ctx);
+    if (cuda_ctx->lru_wb_pending) {
+        CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), cuda_ctx->lru_wb_event, 0));
+        cuda_ctx->lru_wb_pending = false;
+    }
     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+    if (cuda_ctx->lru_stash_ce_pending) {
+        // victim stash, copy-engine mode: the pass has completed -> start the write-back now
+        ggml_cuda_set_device(cuda_ctx->device);
+        if (ggml_cuda_lru_stash_worker_post(*cuda_ctx, *(volatile uint32_t *) cuda_ctx->lru_stash_hsnap)) {
+            cuda_ctx->lru_stash_flushed    = true;
+            cuda_ctx->lru_stash_ce_pending = false;
+        } else {
+            ggml_cuda_lru_stash_flush_ce(*cuda_ctx);
+        }
+    }
 
     GGML_UNUSED(backend);
 }
@@ -3321,6 +3403,13 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
         if (ggml_cuda_is_view_or_noop(node)) {
             continue;
+        }
+
+        // p100-series MoE expert cache: ops whose work is decided on the host at launch time cannot be replayed (the prefill
+        // assembly: host mirror + copy-engine DMA; the copy-engine fills: a host thread replays the fill lists)
+        if (node->op == GGML_OP_LRU_ASSEMBLE ||
+                ((node->op == GGML_OP_LRU_FILL || node->op == GGML_OP_LRU_DECIDE) && ggml_cuda_lru_ce_enabled())) {
+            use_cuda_graph = false;
         }
 
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
@@ -4495,6 +4584,18 @@ static bool ggml_cuda_try_gdn_state_gather(const ggml_cgraph * cgraph, int i) {
 }
 
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+
+    // p100-series MoE expert cache: the gate/up/down LRU fills of a layer (same fill list, consecutive) in one launch (always:
+    // the copy-engine path needs the three kinds together)
+    {
+        ggml_tensor * node = cgraph->nodes[i];
+        if (node->op == GGML_OP_LRU_FILL && i + 2 < cgraph->n_nodes &&
+                cgraph->nodes[i + 1]->op == GGML_OP_LRU_FILL && cgraph->nodes[i + 1]->src[0] == node->src[0] &&
+                cgraph->nodes[i + 2]->op == GGML_OP_LRU_FILL && cgraph->nodes[i + 2]->src[0] == node->src[0]) {
+            ggml_cuda_lru_fill_n(*cuda_ctx, &cgraph->nodes[i], 3);
+            return 2;
+        }
+    }
 
     if (ggml_cuda_fusion_disabled()) {
         return 0;
@@ -5887,6 +5988,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     CUDA_CHECK(cudaEventRecord(prof_e0, cuda_ctx->stream()));
                 }
 
+                // p100-series MoE expert cache: wait for side-stream assemblies this node reads; run an assembly there
+                if (cuda_ctx->n_lru_pending > 0) {
+                    ggml_cuda_lru_wait_srcs(*cuda_ctx, cgraph, i);
+                }
+                if (cuda_ctx->lru_ovl_active) {
+                    ggml_cuda_lru_ovl_guard(*cuda_ctx, cgraph, i);
+                }
+                if (node->op == GGML_OP_LRU_ASSEMBLE && ggml_cuda_lru_async_enabled()) {
+                    ggml_cuda_lru_assemble_async(*cuda_ctx, node);
+                    continue;
+                }
+
                 const bool known_no_fuse = fce_valid && fce->no_fuse[i];
 
                 if (!known_no_fuse && node->op == GGML_OP_GET_ROWS && ggml_cuda_try_gdn_state_gather(cgraph, i)) {
@@ -6863,6 +6976,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 default:
                     return false;
             }
+        case GGML_OP_LRU_DECIDE:
+        case GGML_OP_LRU_FILL:
+        case GGML_OP_LRU_ASSEMBLE:
+        case GGML_OP_LRU_HOST_MERGE:
+            return true;
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
             {
@@ -7434,6 +7552,13 @@ static void ggml_backend_cuda_set_active_tokens(const int n_active, const int n_
     ggml_cuda_active_tokens_full = n_full;
 }
 
+// p100-series MoE expert cache: the meta backend marks pass boundaries (victim stash flushes, moe-lru.cu)
+static void ggml_backend_cuda_lru_pass(ggml_backend_t backend, int k) {
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(ctx->device);
+    ggml_cuda_lru_stash_pass(*ctx, k);
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_set_active_tokens") == 0) {
@@ -7456,6 +7581,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "ggml_backend_lru_pass") == 0) {
+        return (void *)ggml_backend_cuda_lru_pass;
+    }
+    if (strcmp(name, "ggml_backend_cuda_copy_batch") == 0) {
+        return (void *)ggml_backend_cuda_copy_batch;
     }
     return nullptr;
 }

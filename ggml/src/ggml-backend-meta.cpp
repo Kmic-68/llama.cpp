@@ -1080,6 +1080,18 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_UNARY: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
             } break;
+            // p100-series MoE expert cache (moe-lru): the decide works on the (mirrored) router ids and state; fills and assemblies
+            // take the pool's split, so every device fills / assembles its own slice; the host merge is in place
+            case GGML_OP_LRU_DECIDE: {
+                split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+            } break;
+            case GGML_OP_LRU_FILL:
+            case GGML_OP_LRU_ASSEMBLE: {
+                split_state = src_ss[1];
+            } break;
+            case GGML_OP_LRU_HOST_MERGE: {
+                split_state = src_ss[0];
+            } break;
             case GGML_OP_MAP_CUSTOM1:
             case GGML_OP_MAP_CUSTOM2:
             case GGML_OP_MAP_CUSTOM3:

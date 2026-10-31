@@ -1108,9 +1108,14 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "LRU_DECIDE",
+    "LRU_FILL",
+    "LRU_ASSEMBLE",
+    "LRU_HOST_MERGE",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1224,9 +1229,13 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+    "lru_decide(ids,state)",
+    "pool[slot]=src[expert]",
+    "w[expert]=pool[slot]|src[expert]",
+    "experts[host]=host(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6057,6 +6066,187 @@ struct ggml_tensor * ggml_rwkv_wkv7(
     result->src[6] = state;
 
     return result;
+}
+
+// p100-series MoE expert cache (moe-lru), see p100-docs/MOE.md
+
+struct ggml_tensor * ggml_lru_decide(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * state,
+        int32_t               n_expert,
+        int32_t               n_slot) {
+    GGML_ASSERT(ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(state->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_nelements(state) >= (int64_t) n_expert + 2 * n_slot + 3);
+
+    const int64_t ne[1] = { ggml_nelements(ids) + 3 * (int64_t) n_slot + 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_I32, 1, ne);
+
+    ggml_set_op_params_i32(result, 0, n_expert);
+    ggml_set_op_params_i32(result, 1, n_slot);
+
+    result->op     = GGML_OP_LRU_DECIDE;
+    result->src[0] = ids;
+    result->src[1] = state;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_lru_fill(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * fill_list,
+        struct ggml_tensor  * src,
+        struct ggml_tensor  * pool) {
+    struct ggml_tensor * result = ggml_view_tensor(ctx, pool);
+
+    ggml_set_op_params(result, &src, sizeof(src));
+    // op param 2: the decide's id count = an upper bound on the fills (fill_list is a view of the decide output
+    // [slot ids (n_ids) | fill list (2*n_slot + 1)]); the backend sizes the fill grid by it
+    const int64_t n_ids = fill_list->view_src ? fill_list->view_src->ne[0] - fill_list->ne[0] : 0;
+    ggml_set_op_params_i32(result, 2, (int32_t) n_ids);
+    // op param 3: exclusive cache (the decide's state carries the expert -> host slot map): the fill swaps
+    const struct ggml_tensor * dec = fill_list->view_src;
+    int32_t swap = 0;
+    if (dec != NULL && dec->op == GGML_OP_LRU_DECIDE) {
+        const int64_t n_expert = ggml_get_op_params_i32(dec, 0), n_slot = ggml_get_op_params_i32(dec, 1);
+        swap = ggml_nelements(dec->src[1]) >= 2 * n_expert + 2 * n_slot + 3;
+    }
+    ggml_set_op_params_i32(result, 3, swap);
+    // op param 7: exclusive (host pool laid out per device: [device][host slot][slice]); set even when a refill clears swap
+    ggml_set_op_params_i32(result, 7, swap);
+    result->op     = GGML_OP_LRU_FILL;
+    result->src[0] = fill_list;
+    result->src[1] = pool;
+
+    return result;
+}
+
+struct ggml_tensor * ggml_lru_assemble(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * src,
+        struct ggml_tensor  * pool,
+        int64_t               n_expert) {
+    GGML_ASSERT(state->type == GGML_TYPE_I32);
+    GGML_ASSERT(src->type == pool->type && src->ne[0] == pool->ne[0] && src->ne[1] == pool->ne[1]);
+    GGML_ASSERT(ggml_nelements(state) >= n_expert + 2 * pool->ne[2] + 3);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, pool->type, pool->ne[0], pool->ne[1], n_expert);
+
+    ggml_set_op_params(result, &src, sizeof(src));
+    result->op     = GGML_OP_LRU_ASSEMBLE;
+    result->src[0] = state;
+    result->src[1] = pool;
+
+    return result;
+}
+
+// op params: decide [0] n_expert [1] n_slot [2..3] ctrl [4] layer; fill [0..1] src [2] n_ids [3] swap [4..5] ctrl [6] layer;
+// assemble [0..1] src [2..3] ctrl [4] layer
+struct ggml_tensor * ggml_lru_remap(
+        struct ggml_context * ctx, struct ggml_tensor * ids, struct ggml_tensor * state, int32_t n_expert, int32_t n_slot) {
+    struct ggml_tensor * r = ggml_lru_decide(ctx, ids, state, n_expert, n_slot);
+    ggml_set_op_params_i32(r, 5, 1);   // remap only
+    return r;
+}
+
+struct ggml_tensor * ggml_lru_decide_ext(
+        struct ggml_context * ctx, struct ggml_tensor * ids, struct ggml_tensor * state,
+        int32_t n_expert, int32_t n_slot, struct ggml_lru_ctrl * ctrl, int32_t layer) {
+    struct ggml_tensor * r = ggml_lru_decide(ctx, ids, state, n_expert, n_slot);
+    memcpy((char *) r->op_params + 8, &ctrl, sizeof(ctrl));
+    ggml_set_op_params_i32(r, 4, layer);
+    return r;
+}
+
+struct ggml_tensor * ggml_lru_decide_tail(
+        struct ggml_context * ctx, struct ggml_tensor * ids, struct ggml_tensor * state,
+        int32_t n_expert, int32_t n_slot, struct ggml_lru_ctrl * ctrl, int32_t layer, int32_t tail) {
+    // tail < 0: a prefetch decide (p100-series LLAMA_MOE_LRU_PF): fills only, on the backend's side stream, no keep flags used
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 && state->type == GGML_TYPE_I32 && tail != 0);
+    GGML_ASSERT(ggml_nelements(state) >= (int64_t) n_expert + 2 * n_slot + 3);
+    const int64_t ne[1] = { 2 * ggml_nelements(ids) + 3 * (int64_t) n_slot + 1 };   // slots | fill list | keep flags
+    struct ggml_tensor * r = ggml_new_tensor(ctx, GGML_TYPE_I32, 1, ne);
+    ggml_set_op_params_i32(r, 0, n_expert);
+    ggml_set_op_params_i32(r, 1, n_slot);
+    memcpy((char *) r->op_params + 8, &ctrl, sizeof(ctrl));
+    ggml_set_op_params_i32(r, 4, layer);
+    ggml_set_op_params_i32(r, 6, tail);
+    r->op     = GGML_OP_LRU_DECIDE;
+    r->src[0] = ids;
+    r->src[1] = state;
+    return r;
+}
+
+struct ggml_tensor * ggml_lru_decide_host(
+        struct ggml_context * ctx, struct ggml_tensor * ids, struct ggml_tensor * state,
+        int32_t n_expert, int32_t n_slot, int32_t layer, struct ggml_tensor * x,
+        int32_t max_fill, struct ggml_lru_host_req * req, int32_t writer, int32_t every) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && x->nb[0] == sizeof(float) && x->ne[1] == ids->ne[1]);
+    GGML_ASSERT(ids->ne[1] <= GGML_LRU_HOST_MAX_TOK && max_fill >= 0 && req != NULL);
+    struct ggml_tensor * r = ggml_lru_decide_ext(ctx, ids, state, n_expert, n_slot, NULL, layer);
+    ggml_set_op_params_i32(r, 8, max_fill + 1);   // 0 = no host misses (every other decide)
+    memcpy((char *) r->op_params + 40, &req, sizeof(req));
+    ggml_set_op_params_i32(r, 12, writer);
+    ggml_set_op_params_i32(r, 13, every);   // also every every-th miss (0: only past max_fill)
+    r->src[2] = x;
+    return r;
+}
+
+struct ggml_tensor * ggml_lru_host_merge(
+        struct ggml_context * ctx, struct ggml_tensor * experts, struct ggml_tensor * dec,
+        struct ggml_lru_host_req * req, int32_t writer) {
+    GGML_ASSERT(experts->type == GGML_TYPE_F32 && dec->op == GGML_OP_LRU_DECIDE);
+    struct ggml_tensor * r = ggml_view_tensor(ctx, experts);
+    memcpy(r->op_params, &req, sizeof(req));
+    ggml_set_op_params_i32(r, 2, writer);
+    r->op     = GGML_OP_LRU_HOST_MERGE;
+    r->src[0] = experts;
+    r->src[1] = dec;
+    return r;
+}
+
+struct ggml_tensor * ggml_lru_fill_ext(
+        struct ggml_context * ctx, struct ggml_tensor * fill_list, struct ggml_tensor * src, struct ggml_tensor * pool,
+        struct ggml_lru_ctrl * ctrl, int32_t layer) {
+    struct ggml_tensor * r = ggml_lru_fill(ctx, fill_list, src, pool);
+    if (ctrl != NULL) {
+        ggml_set_op_params_i32(r, 3, 0);   // refill: no write-back
+    }
+    memcpy((char *) r->op_params + 16, &ctrl, sizeof(ctrl));
+    ggml_set_op_params_i32(r, 6, layer);
+    return r;
+}
+
+struct ggml_tensor * ggml_lru_assemble_ext(
+        struct ggml_context * ctx, struct ggml_tensor * state, struct ggml_tensor * src, struct ggml_tensor * pool,
+        int64_t n_expert, struct ggml_lru_ctrl * ctrl, int32_t layer) {
+    struct ggml_tensor * r = ggml_lru_assemble(ctx, state, src, pool, n_expert);
+    memcpy((char *) r->op_params + 8, &ctrl, sizeof(ctrl));
+    ggml_set_op_params_i32(r, 4, layer);
+    return r;
+}
+
+struct ggml_tensor * ggml_lru_assemble_tail(
+        struct ggml_context * ctx, struct ggml_tensor * state, struct ggml_tensor * src, struct ggml_tensor * pool,
+        int64_t n_expert, struct ggml_lru_ctrl * ctrl, int32_t layer) {
+    GGML_ASSERT(n_expert > pool->ne[2]);
+    struct ggml_tensor * r = ggml_lru_assemble_ext(ctx, state, src, pool, n_expert - pool->ne[2], ctrl, layer);
+    ggml_set_op_params_i32(r, 5, 1);   // tail: host part only
+    return r;
+}
+
+struct ggml_tensor * ggml_lru_assemble_zerocopy(
+        struct ggml_context * ctx, struct ggml_tensor * state, struct ggml_tensor * src, struct ggml_tensor * pool,
+        int64_t n_expert, struct ggml_lru_ctrl * ctrl, int32_t layer) {
+    // the tail is read in place from the (device-mapped, pinned) host pool: the result is a small placeholder (it still orders the
+    // host-slot waits before the matmul); op param 6 = the number of host experts behind it
+    GGML_ASSERT(n_expert > pool->ne[2]);
+    struct ggml_tensor * r = ggml_lru_assemble_ext(ctx, state, src, pool, 1, ctrl, layer);
+    ggml_set_op_params_i32(r, 5, 1);
+    ggml_set_op_params_i32(r, 6, (int32_t) (n_expert - pool->ne[2]));
+    return r;
 }
 
 // ggml_unary

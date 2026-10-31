@@ -1,4 +1,5 @@
 #include "mmvq.cuh"
+#include "moe-lru.cuh"
 #include "mmvq-f16.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
@@ -2006,6 +2007,17 @@ void ggml_cuda_mul_mat_vec_q(
     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
 
     GGML_TENSOR_BINARY_OP_LOCALS;
+
+    // p100-series MoE expert cache (moe-lru.cu): wait for an expert pool the copy engines are still filling (also the fused
+    // gate of a gate/up matvec); a tail assembly is only understood by the tile GEMM
+    GGML_ASSERT(!(src0->op == GGML_OP_LRU_ASSEMBLE && ggml_get_op_params_i32(src0, 5) != 0) &&
+                "tail LRU assembly reached mmvq (only the tile MUL_MAT_ID path handles it)");
+    if (ids) {
+        ggml_cuda_lru_ce_pending_wait(ctx, src0->data);
+        if (fusion && fusion->gate) {
+            ggml_cuda_lru_ce_pending_wait(ctx, fusion->gate->data);
+        }
+    }
 
     cudaStream_t stream = ctx.stream();
 

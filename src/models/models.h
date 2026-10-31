@@ -2692,10 +2692,16 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * sel,
                         int64_t   n_sel,
                           float   kq_scale,
-                            int   il);
+                            int   il,
+      const std::vector<ggml_tensor *> * sel_chunks = nullptr);
 
         // the QSA layers share one set of k-pool inputs, see llama_memory_hybrid_idx
         llm_graph_input_kpool * build_inp_kpool(const llama_memory_hybrid_idx_context * mctx_hyb);
+
+        // QSA gather path (LLAMA_QSA_GATHER=1, one-token decode): build_qsa_sel leaves the selected cells here (indices into the
+        // cache, dead slots -> cell 0, padded to FATTN_KQ_STRIDE) with their additive mask, build_attn_qsa attends over just them
+        ggml_tensor * qsa_gidx  = nullptr;
+        ggml_tensor * qsa_gmask = nullptr;
 
         // QSA: the additive mask [n_kv, n_tokens] of the top blocks and the tail, kq_mask included
         ggml_tensor * build_qsa_sel(
@@ -2705,7 +2711,8 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * inp_pos,
                     ggml_tensor * kq_mask,
                             int * sections,
-                            int   il);
+                            int   il,
+            std::vector<ggml_tensor *> * sel_chunks = nullptr);
 
         ggml_tensor * build_layer_attn_linear(
              llm_graph_input_rs * inp,

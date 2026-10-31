@@ -436,6 +436,40 @@ static void ggml_cpy_f32_iq4_nl_cuda(
         (cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
 }
 
+// p100-series: small device-to-device copies as a kernel. A cudaMemcpy(2D)Async D2D runs on a copy engine (~10-15 us on sm_60 for
+// the 61 KB GDN conv-state copies, 2 per GDN layer per token) and queues behind the LRU expert fills on the same engines; a kernel
+// copy takes ~3 us. GGML_CUDA_CPY_KERNEL=0 restores the memcpy. Width / pitches in bytes; 16-, 4- or 1-byte units by alignment.
+template <typename T>
+static __global__ void k_copy_2d(char * __restrict__ dst, const size_t dpitch, const char * __restrict__ src, const size_t spitch,
+                                 const size_t width, const size_t height) {
+    const size_t nw = width / sizeof(T), n = nw * height;
+    for (size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x; i < n; i += (size_t) gridDim.x * blockDim.x) {
+        const size_t r = i / nw, c = i % nw;
+        ((T *) (dst + r * dpitch))[c] = ((const T *) (src + r * spitch))[c];
+    }
+}
+
+static bool ggml_cuda_copy_2d_kernel(char * dst, size_t dpitch, const char * src, size_t spitch, size_t width, size_t height,
+                                     cudaStream_t stream) {
+    static const bool on = [] { const char * e = getenv("GGML_CUDA_CPY_KERNEL"); return !e || atoi(e) != 0; }();
+    const size_t bytes = width * height;
+    if (!on || bytes == 0 || bytes > (4u << 20)) {
+        return false;
+    }
+    const uintptr_t al = (uintptr_t) dst | (uintptr_t) src | dpitch | spitch | width;
+    const int unit = al % 16 == 0 ? 16 : al % 4 == 0 ? 4 : 1;
+    const size_t n = bytes / unit;
+    const int blocks = (int) std::min<size_t>((n + 255) / 256, 1024);
+    if (unit == 16) {
+        k_copy_2d<uint4><<<blocks, 256, 0, stream>>>(dst, dpitch, src, spitch, width, height);
+    } else if (unit == 4) {
+        k_copy_2d<uint32_t><<<blocks, 256, 0, stream>>>(dst, dpitch, src, spitch, width, height);
+    } else {
+        k_copy_2d<uint8_t><<<blocks, 256, 0, stream>>>(dst, dpitch, src, spitch, width, height);
+    }
+    return true;
+}
+
 // check if a same-type copy reduces to a 2D strided copy (height rows of width
 // contiguous bytes), so it can use cudaMemcpy2DAsync instead of the scalar kernel
 static bool ggml_cuda_cpy_as_memcpy_2d(const ggml_tensor * src0, const ggml_tensor * src1,
@@ -521,12 +555,14 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
             CUDA_CHECK(mudnnMemcpyAsync(ctx, src1, src0));
         } else
 #endif // GGML_USE_MUSA && GGML_MUSA_MUDNN_COPY
-        {
+        if (!ggml_cuda_copy_2d_kernel(src1_ddc, ggml_nbytes(src0), src0_ddc, ggml_nbytes(src0), ggml_nbytes(src0), 1, main_stream)) {
             CUDA_CHECK(cudaMemcpyAsync(src1_ddc, src0_ddc, ggml_nbytes(src0), cudaMemcpyDeviceToDevice, main_stream));
         }
     } else if (ggml_cuda_cpy_as_memcpy_2d(src0, src1, mc_width, mc_height, mc_spitch, mc_dpitch)) {
-        CUDA_CHECK(cudaMemcpy2DAsync(src1_ddc, mc_dpitch, src0_ddc, mc_spitch,
-                                     mc_width, mc_height, cudaMemcpyDeviceToDevice, main_stream));
+        if (!ggml_cuda_copy_2d_kernel(src1_ddc, mc_dpitch, src0_ddc, mc_spitch, mc_width, mc_height, main_stream)) {
+            CUDA_CHECK(cudaMemcpy2DAsync(src1_ddc, mc_dpitch, src0_ddc, mc_spitch,
+                                         mc_width, mc_height, cudaMemcpyDeviceToDevice, main_stream));
+        }
     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32) {
         if (can_be_transposed) {
             ggml_cpy_scalar_cuda<float, float, true>

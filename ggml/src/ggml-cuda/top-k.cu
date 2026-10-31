@@ -200,12 +200,41 @@ static __global__ void top_k_radix_gather(
         if (key > state->prefix) {
             const int pos = atomicAdd(&state->greater_count, 1);
             row_dst[pos] = col;
-        } else if (key == state->prefix) {
-            const int pos = atomicAdd(&state->equal_count, 1);
-            if (pos < state->rank) {
-                row_dst[k - state->rank + pos] = col;
-            }
         }
+        // ties at the threshold: top_k_radix_ties, in index order (an atomic slot here picked a timing-dependent subset of them;
+        // qwen4exp's QSA indexer scores are rectified sums with many exact zeros, so long-context prefill was not reproducible)
+    }
+}
+
+// p100-series: the threshold ties of each row, lowest column first, one block per row (deterministic)
+template <int BLOCK_SIZE>
+static __global__ void top_k_radix_ties(const float * __restrict__ src, int * __restrict__ dst, const top_k_radix_state * __restrict__ states,
+                                        int ncols, int k) {
+    const int row = blockIdx.x, tid = threadIdx.x, lane = tid % WARP_SIZE, wid = tid / WARP_SIZE;
+    const float * row_src = src + (size_t) row * ncols;
+    int * row_dst = dst + (size_t) row * k;
+    const top_k_radix_state st = states[row];
+    __shared__ int wsum[BLOCK_SIZE / WARP_SIZE];
+    int found = 0;
+    for (int base = 0; base < ncols && found < st.rank; base += BLOCK_SIZE) {
+        const int col = base + tid;
+        const bool eq = col < ncols && top_k_float_to_ordered(row_src[col]) == st.prefix;
+        const unsigned m = __ballot_sync(0xffffffffu, eq);
+        if (lane == 0) {
+            wsum[wid] = __popc(m);
+        }
+        __syncthreads();
+        int before = 0, total = 0;
+        for (int w = 0; w < BLOCK_SIZE / WARP_SIZE; w++) {
+            before += w < wid ? wsum[w] : 0;
+            total  += wsum[w];
+        }
+        const int pos = found + before + __popc(m & ((1u << lane) - 1u));
+        if (eq && pos < st.rank) {
+            row_dst[k - st.rank + pos] = col;
+        }
+        found += total;
+        __syncthreads();
     }
 }
 
@@ -244,6 +273,7 @@ static void top_k_radix_cuda(
         top_k_radix_gather<BLOCK_SIZE>
             <<<row_grid, BLOCK_SIZE, 0, stream>>>(
                 src, dst, states, ncols, k, blocks_per_row);
+        top_k_radix_ties<BLOCK_SIZE><<<iter_nrows, BLOCK_SIZE, 0, stream>>>(src, dst, states, ncols, k);
 
         src += (size_t) ncols * iter_nrows;
         dst += (size_t) k     * iter_nrows;

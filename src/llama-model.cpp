@@ -1,4 +1,5 @@
 #include "llama-model.h"
+#include "llama-moe-lru.h"
 
 #include "llama-arch.h"
 #include "llama-ext.h"
@@ -463,6 +464,9 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
     static const std::regex pattern_ffn_gate_bias     ("blk\\.\\d*\\.ffn_gate(_exps)?.bias");
     static const std::regex pattern_ffn_gate_up_weight("blk\\.\\d*\\.ffn_gate_up(_exps)?.weight");
     static const std::regex pattern_ffn_down_weight   ("blk\\.\\d*\\.ffn_down(_exps)?.weight");
+    // p100-series MoE expert cache: the VRAM pools split like the expert weights they cache
+    static const std::regex pattern_moe_lru_pool_up_gate ("blk\\.\\d*\\.moe_lru_pool\\.(gate|up)");
+    static const std::regex pattern_moe_lru_pool_down   ("blk\\.\\d*\\.moe_lru_pool\\.down");
     static const std::regex pattern_ffn_down_bias         ("blk\\.\\d*\\.ffn_down.bias");
     static const std::regex pattern_ffn_down_exps_bias    ("blk\\.\\d*\\.ffn_down_exps.bias");
     static const std::regex pattern_ffn_up_shexp_weight   ("blk\\.\\d*\\.ffn_up_shexp.weight");
@@ -621,7 +625,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         }
 
         // FFN
-        if (std::regex_match(tensor_name, pattern_ffn_up_weight) || std::regex_match(tensor_name, pattern_ffn_gate_weight)) {
+        if (std::regex_match(tensor_name, pattern_ffn_up_weight) || std::regex_match(tensor_name, pattern_ffn_gate_weight) ||
+                std::regex_match(tensor_name, pattern_moe_lru_pool_up_gate)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down.weight", "ffn_down_exps.weight");
         }
         if (std::regex_match(tensor_name, pattern_ffn_up_bias) || std::regex_match(tensor_name, pattern_ffn_gate_bias)) {
@@ -630,7 +635,8 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
         if (std::regex_match(tensor_name, pattern_ffn_gate_up_weight)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down.weight", "ffn_down_exps.weight");
         }
-        if (std::regex_match(tensor_name, pattern_ffn_down_weight)) {
+        if (std::regex_match(tensor_name, pattern_ffn_down_weight) ||
+                std::regex_match(tensor_name, pattern_moe_lru_pool_down)) {
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ffn_down.weight", "ffn_down_exps.weight");
         }
         if (std::regex_match(tensor_name, pattern_ffn_down_bias)) {
@@ -1627,6 +1633,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const int n_gpu_layers = this->n_gpu_layers();
 
     const bool use_mmap_buffer = true;
+
+    // p100-series MoE expert cache (--moe-lru-slots): host expert weights load into pinned memory the GPUs can read
+    std::vector<llama_model_tensor_buft_override> lru_override_storage;
+    if (llama_moe_lru::init_model_overrides(ml, devices, lru_override_storage, params.moe_lru_slots)) {
+        LLAMA_LOG_DEBUG("llama_moe_lru: expert overrides redirected for pinned loading\n");
+    }
 
     this->ml = &ml; // to be used by create_tensor() and load_arch_tensors()
 
@@ -3428,6 +3440,19 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
     return res;
 }
 
+int32_t llama_model::moe_lru_slots() const {
+    return params.moe_lru_slots;
+}
+
+std::unique_ptr<llama_moe_lru> llama_model::create_moe_lru(const std::vector<ggml_backend_t> & gpu_backends) const {
+    try {
+        return std::make_unique<llama_moe_lru>(*this, gpu_backends, params.moe_lru_slots);
+    } catch (const std::exception & e) {
+        LLAMA_LOG_WARN("llama_moe_lru: %s, running without pools\n", e.what());
+        return nullptr;
+    }
+}
+
 ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
     std::unique_ptr<llm_graph_context> llm = build_arch_graph(params);
 
@@ -3466,6 +3491,7 @@ llama_model_params llama_model_default_params() {
         /*.lazy_mode                   =*/ LLAMA_LAZY_MODE_AUTO,
         /*.main_gpu                    =*/ 0,
         /*.tensor_split                =*/ nullptr,
+        /*.moe_lru_slots               =*/ 0,
         /*.progress_callback           =*/ nullptr,
         /*.progress_callback_user_data =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,

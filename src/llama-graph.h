@@ -5,7 +5,9 @@
 #include "llama-hparams.h"
 #include "llama-adapter.h"
 
+#include <array>
 #include <cstdint>
+#include <map>
 #include <cstdlib>
 #include <vector>
 #include <memory>
@@ -100,6 +102,7 @@ struct llama_cross {
 };
 
 struct llm_graph_params;
+struct llama_moe_lru;
 
 //
 // llm_graph_input
@@ -811,6 +814,7 @@ struct llm_graph_params {
 
     const llama_hadamard * hdmd = nullptr;
 
+    llama_moe_lru * lru = nullptr;
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     static bool samplers_equal(
@@ -1072,6 +1076,17 @@ struct llm_graph_context {
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     const llm_graph_cb & cb_func;
+
+    llama_moe_lru * lru = nullptr;
+
+    // LRU_ASSEMBLE nodes created one pooled layer ahead (build_moe_ffn of the previous layer), so the backend can assemble
+    // them on a side stream while that layer and the next attention compute: layer -> {gate, up, down}
+    mutable std::map<int, std::array<ggml_tensor *, 3>> lru_asm_ahead;
+    // LLAMA_MOE_LRU_PF: decode prefetch of the next pooled layer's predicted experts: layer -> {prefetch decide, predicted ids}
+    mutable std::map<int, std::array<ggml_tensor *, 2>> lru_pf_ahead;
+    // independent work (e.g. a shared expert) expanded right after the LRU fills of the next build_moe_ffn, ahead of its expert
+    // matmuls: with copy-engine fills it runs while the missing experts land
+    mutable ggml_tensor * moe_overlap = nullptr;
 
     llm_graph_result * res;
 

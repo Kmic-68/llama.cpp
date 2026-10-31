@@ -172,6 +172,41 @@ static const llm_fused_op_probe llm_fused_op_top_k_mask_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+// p100-series
+// LLAMA_UB_KV_BUDGET=<cells x tokens>: attention scratch (masks, scores, f16 K/V copies) grows with n_kv x n_ubatch, and the
+// worst case (n_ctx x n_ubatch) is what a long context cannot afford for large prefill ubatches. With a budget, the compute
+// buffers are reserved for budget / n_ctx tokens at the full context, and each decode call takes ubatches of up to
+// budget / (context length after the call) tokens (multiples of 256, at most n_ubatch): large while the context is short,
+// smaller as it fills. The buffers grow once for the large-ubatch / short-context corner. 0 / unset = off.
+static uint64_t llama_ub_kv_budget() {
+    static const uint64_t b = [] { const char * e = getenv("LLAMA_UB_KV_BUDGET"); return e ? (uint64_t) strtoull(e, nullptr, 10) : 0ull; }();
+    return b;
+}
+
+static uint32_t llama_ub_for_kv(uint32_t n_ubatch, uint64_t n_kv) {
+    const uint64_t b = llama_ub_kv_budget();
+    if (b == 0 || n_kv == 0) {
+        return n_ubatch;
+    }
+    const uint64_t ub = std::max<uint64_t>(256, (b / n_kv) / 256 * 256);
+    return (uint32_t) std::min<uint64_t>(n_ubatch, ub);
+}
+
+// the CUDA backend's copy batching (ggml_backend_cuda_copy_batch), or nullptr when no loaded backend offers it
+using llama_copy_batch_fn = void (*)(bool);
+static llama_copy_batch_fn llama_copy_batch_get() {
+    static const llama_copy_batch_fn fn = [] {
+        for (size_t i = 0; i < ggml_backend_reg_count(); ++i) {
+            ggml_backend_reg_t reg = ggml_backend_reg_get(i);
+            if (void * p = ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_copy_batch")) {
+                return (llama_copy_batch_fn) p;
+            }
+        }
+        return (llama_copy_batch_fn) nullptr;
+    }();
+    return fn;
+}
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -563,6 +598,18 @@ llama_context::llama_context(
             moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size);
         }
 
+        // p100-series MoE expert cache (--moe-lru-slots, p100-docs/MOE.md): VRAM pools of the host-resident expert layers
+        if (model.moe_lru_slots() > 0) {
+            std::vector<ggml_backend_t> lru_backends;
+            for (const auto & b : backends) {
+                ggml_backend_dev_t d = ggml_backend_get_device(b.get());
+                if (d && llama_moe_lru::backend_supports(d)) {
+                    lru_backends.push_back(b.get());
+                }
+            }
+            lru = model.create_moe_lru(lru_backends);
+        }
+
         sched_reserve();
 
         if (!cparams.flash_attn) {
@@ -586,6 +633,10 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+
+    if (lru) {
+        lru->log_final_stats();
+    }
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
@@ -743,9 +794,10 @@ void llama_context::sched_reserve() {
     const int64_t t_start_us = ggml_time_us();
 
     const uint32_t n_seqs = cparams.n_seq_max;
-    const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+    // LLAMA_UB_KV_BUDGET: reserve the full-context worst case at the budget's ubatch (graph capacity stays for n_ubatch)
+    const uint32_t n_tokens = llama_ub_for_kv(std::min(cparams.n_ctx, cparams.n_ubatch), cparams.n_ctx);
 
-    const size_t max_nodes = this->graph_max_nodes(n_tokens);
+    const size_t max_nodes = this->graph_max_nodes(std::min(cparams.n_ctx, cparams.n_ubatch));
 
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
@@ -1010,7 +1062,7 @@ bool llama_context::memory_update(bool optimize) {
         }
 
         const uint32_t n_seqs = cparams.n_seq_max;
-        const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+        const uint32_t n_tokens = llama_ub_for_kv(std::min(cparams.n_ctx, cparams.n_ubatch), cparams.n_ctx);
 
         const uint32_t n_outputs_max = std::min(n_tokens, cparams.n_outputs_max);
 
@@ -1603,7 +1655,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //const auto t_start_us = ggml_time_us();
 
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
+        // p100-series: the input copies (~60 small tensors per GPU at a decode step) inside one CUDA copy batch, so each device
+        // synchronizes once at the end instead of after every copy. Sources are pageable host memory, staged by cudaMemcpyAsync
+        // before it returns. LLAMA_INPUT_BATCH=0 turns it off.
+        static const bool input_batch = [] { const char * e = getenv("LLAMA_INPUT_BATCH"); return !e || atoi(e) != 0; }();
+        const llama_copy_batch_fn batch = input_batch ? llama_copy_batch_get() : nullptr;
+        if (batch) {
+            batch(true);
+        }
         res->set_inputs(&ubatch);
+        if (batch) {
+            batch(false);
+        }
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
@@ -1988,7 +2051,16 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     llama_memory_context_ptr mctx;
 
     while (true) {
-        mctx = memory->init_batch(*balloc, cparams.n_ubatch, embd_all);
+        uint32_t n_ub = cparams.n_ubatch;
+        if (llama_ub_kv_budget() > 0) {
+            // the context length after this call bounds the n_kv its ubatches see
+            llama_pos pmax = -1;
+            for (llama_seq_id sq = 0; sq < (llama_seq_id) cparams.n_seq_max; ++sq) {
+                pmax = std::max(pmax, memory->seq_pos_max(sq));
+            }
+            n_ub = llama_ub_for_kv(cparams.n_ubatch, (uint64_t) (pmax + 1) + n_tokens_all);
+        }
+        mctx = memory->init_batch(*balloc, n_ub, embd_all);
         if (!mctx) {
             return -2;
         }
@@ -2633,6 +2705,9 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         res *= 4;
     }
 
+    if (lru) {
+        res += lru->n_pooled() * llama_moe_lru::NODES_PER_LAYER;   // p100-series MoE expert cache
+    }
     return res;
 }
 
@@ -2789,6 +2864,7 @@ llm_graph_params llama_context::graph_params(
         /*.moe_cache   =*/ moe_cache.get(),
         /*.prec_policy =*/ &model.prec_policy,
         /*.hdmd        =*/ model.hdmd.rot.empty() ? nullptr : &model.hdmd,
+        /*.lru         =*/ lru.get(),
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
         /*.cb          =*/ graph_get_cb(),

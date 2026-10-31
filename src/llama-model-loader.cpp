@@ -15,6 +15,11 @@
 #include <regex>
 #include <unordered_set>
 
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
 static const size_t kiB = 1024;
 static const size_t MiB = 1024*kiB;
 static const size_t GiB = 1024*MiB;
@@ -1238,6 +1243,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
 
         ggml_backend_buffer_type_t buft = nullptr;
+        bool buft_explicit = false; // an override named this buffer type (not the CPU fallback)
 
         // check overrides
         if (tensor_buft_overrides) {
@@ -1256,6 +1262,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                         }
                     } else {
                         buft = overrides->buft;
+                        buft_explicit = true;
                     }
 
                     LLAMA_LOG_DEBUG("tensor %s (%zu MiB %s) buffer type overridden to %s\n",
@@ -1274,9 +1281,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
         }
 
-        // avoid using a host buffer when using mmap
+        // avoid using a host buffer when using mmap -- unless an override asked for it: the MoE LRU pools redirect the expert
+        // weights to the pinned host buffer (the fill kernels read them in place), the other weights stay mapped
         auto * buft_dev = ggml_backend_buft_get_device(buft);
-        if (use_mmap && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev)) {
+        if (use_mmap && !buft_explicit && buft_dev && buft == ggml_backend_dev_host_buffer_type(buft_dev)) {
             auto * cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
             if (!cpu_dev) {
                 throw std::runtime_error("no CPU backend found");
@@ -1416,6 +1424,25 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
 }
 
 void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps) {
+#if defined(__linux__)
+    // prefetching (MAP_POPULATE / WILLNEED) reads every file in full; for a model larger than RAM that
+    // is a pass over the whole disk that only evicts itself (Qwen3.8-Flash-Next: 104 GiB, 7.5 min per
+    // load on a 62 GiB machine). The tensors that are read get faulted in on use instead.
+    if (prefetch && use_mmap) {
+        size_t total = 0;
+        for (const auto & file : files) {
+            total += file->size();
+        }
+        const long pages = sysconf(_SC_PHYS_PAGES);
+        const long psize = sysconf(_SC_PAGE_SIZE);
+        if (pages > 0 && psize > 0 && total > (size_t) pages * (size_t) psize) {
+            LLAMA_LOG_INFO("%s: model files (%.1f GiB) are larger than RAM (%.1f GiB), not prefetching them\n",
+                __func__, total/1073741824.0, (double) pages * psize / 1073741824.0);
+            prefetch = false;
+            exceeds_ram = true;
+        }
+    }
+#endif
     // note: read_lazy also requires mmap; this condition make sure it's usable even when --load-mode is not set to mmap
     if (use_mmap || lazy.any()) {
         mappings.reserve(files.size());
@@ -1857,6 +1884,28 @@ bool llama_model_loader::load_all_data(
                     mapping->unmap_fragment(mmap_used.second, mapping->size());
                 }
             }
+#if defined(__linux__) && defined(MADV_PAGEOUT)
+            // a model larger than RAM: the pages of tensors that went to device memory sit between
+            // host tensors, so the ranges above keep them mapped and resident, in competition with
+            // the host weights that are read on every step. Drop them from the page cache.
+            if (exceeds_ram) {
+                const size_t ps = (size_t) sysconf(_SC_PAGE_SIZE);
+                size_t released = 0;
+                for (const auto & it : weights_map) {
+                    const auto & w = it.second;
+                    if (w.tensor->buffer == nullptr || ggml_backend_buffer_is_host(w.tensor->buffer)) {
+                        continue;
+                    }
+                    const uintptr_t base = (uintptr_t) mappings.at(w.idx)->addr();
+                    const uintptr_t a0 = (base + w.offs + ps - 1) & ~(uintptr_t) (ps - 1);
+                    const uintptr_t a1 = (base + w.offs + ggml_nbytes(w.tensor)) & ~(uintptr_t) (ps - 1);
+                    if (a1 > a0 && madvise((void *) a0, a1 - a0, MADV_PAGEOUT) == 0) {
+                        released += a1 - a0;
+                    }
+                }
+                LLAMA_LOG_INFO("%s: released %.2f GiB of page cache held by tensors loaded to devices\n", __func__, released/1073741824.0);
+            }
+#endif
         }
         if (progress_callback) {
             // Even though the model is done loading, we still honor
