@@ -36,6 +36,7 @@ Perplexity 2.6101, all-fp32 2.6095; at this size perplexity can't separate them,
 | [CHANGES.md](CHANGES.md) | every code change, grouped by subsystem, with what it measured |
 | [FINDINGS.md](FINDINGS.md) | what worked, what failed, what transfers to other Pascal cards, and the measurement traps |
 | [BUILD.md](BUILD.md) | building from source and verifying a build |
+| [MOE.md](MOE.md) | large MoE models whose experts don't fit in VRAM (Flash-Next): the expert cache, threaded dispatch, and the config finder |
 | [THREE-GPU.md](THREE-GPU.md) | measurements on three P100s from a contributor: NCCL, graphs, cancel latency |
 | [`../OPTLOG.md`](../OPTLOG.md) | the full record: every attempt, kept or reverted, with numbers |
 
