@@ -7571,7 +7571,9 @@ static void * ggml_backend_cuda_ar_rank_create(ggml_backend_t b0, ggml_backend_t
         return nullptr;
     }
     const char * env = getenv("GGML_META_AR_MAX_BYTES");
-    const size_t max_bytes = env ? (size_t) strtoull(env, nullptr, 10) : ggml_cuda_ar_rank_wire() != 0 ? (size_t) 32 << 20 : (size_t) 1 << 20;
+    // up to 32 MiB in-kernel (prefill activations too): without it every larger reduction takes the peer copy + ADD
+    // path, whose two receive buffers per device cost more VRAM than the inbox (Flash-Next -ub 3072: guard kill)
+    const size_t max_bytes = env ? (size_t) strtoull(env, nullptr, 10) : (size_t) 32 << 20;
     return max_bytes > 0 ? ggml_cuda_ar_rank_init(d0, d1, max_bytes) : nullptr;
 }
 
