@@ -61,6 +61,7 @@
 #include "ggml-cuda/tsembd.cuh"
 #include "ggml-cuda/topk-moe.cuh"
 #include "ggml-cuda/moe-lru.cuh"
+#include "ggml-cuda/ar-rank.cuh"
 #include "ggml-cuda/tile-mm.cuh"
 #include "ggml-cuda/unary.cuh"
 #include "ggml-cuda/upscale.cuh"
@@ -7559,6 +7560,48 @@ static void ggml_backend_cuda_lru_pass(ggml_backend_t backend, int k) {
     ggml_cuda_lru_stash_pass(*ctx, k);
 }
 
+// two-GPU AllReduce launched per device, for the meta backend's threaded dispatch (ar-rank.cu, wispoffates' p100-series)
+static void * ggml_backend_cuda_ar_rank_create(ggml_backend_t b0, ggml_backend_t b1) {
+    if (!ggml_backend_is_cuda(b0) || !ggml_backend_is_cuda(b1)) {
+        return nullptr;
+    }
+    const int d0 = ((ggml_backend_cuda_context *) b0->context)->device;
+    const int d1 = ((ggml_backend_cuda_context *) b1->context)->device;
+    if (d0 == d1) {
+        return nullptr;
+    }
+    const char * env = getenv("GGML_META_AR_MAX_BYTES");
+    const size_t max_bytes = env ? (size_t) strtoull(env, nullptr, 10) : ggml_cuda_ar_rank_wire() != 0 ? (size_t) 32 << 20 : (size_t) 1 << 20;
+    return max_bytes > 0 ? ggml_cuda_ar_rank_init(d0, d1, max_bytes) : nullptr;
+}
+
+static void ggml_backend_cuda_ar_rank_destroy(void * c) {
+    ggml_cuda_ar_rank_free((ggml_cuda_ar_rank_ctx *) c);
+}
+
+static bool ggml_backend_cuda_ar_rank_can(void * c, const ggml_tensor * t) {
+    return ggml_cuda_ar_rank_eligible((const ggml_cuda_ar_rank_ctx *) c, t);
+}
+
+static void ggml_backend_cuda_ar_rank_run(void * c, int rank, ggml_backend_t backend, ggml_tensor * t) {
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(ctx->device);
+    ggml_cuda_ar_rank_reduce((ggml_cuda_ar_rank_ctx *) c, rank, ctx->stream(), t);
+}
+
+static bool ggml_backend_cuda_ar_rank_can_norm(void * c, const ggml_tensor * t) {
+    return ggml_cuda_ar_rank_norm_eligible((const ggml_cuda_ar_rank_ctx *) c, t);
+}
+
+static void ggml_backend_cuda_ar_rank_run_norm(void * c, int rank, ggml_backend_t backend, ggml_tensor * t, const float * res, float * x_out,
+                                               const float * w, const float * add2, float * y, float eps) {
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(ctx->device);
+    ggml_cuda_ar_rank_norm_args a;
+    a.res = res; a.x_out = x_out; a.w = w; a.add2 = add2; a.y = y; a.eps = eps;
+    ggml_cuda_ar_rank_reduce_norm((ggml_cuda_ar_rank_ctx *) c, rank, ctx->stream(), t, a);
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_set_active_tokens") == 0) {
@@ -7566,6 +7609,24 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
         return (void *)ggml_backend_cuda_comm_init;
+    }
+    if (strcmp(name, "ggml_backend_ar_rank_create") == 0) {
+        return (void *)ggml_backend_cuda_ar_rank_create;
+    }
+    if (strcmp(name, "ggml_backend_ar_rank_destroy") == 0) {
+        return (void *)ggml_backend_cuda_ar_rank_destroy;
+    }
+    if (strcmp(name, "ggml_backend_ar_rank_can") == 0) {
+        return (void *)ggml_backend_cuda_ar_rank_can;
+    }
+    if (strcmp(name, "ggml_backend_ar_rank_run") == 0) {
+        return (void *)ggml_backend_cuda_ar_rank_run;
+    }
+    if (strcmp(name, "ggml_backend_ar_rank_can_norm") == 0) {
+        return (void *)ggml_backend_cuda_ar_rank_can_norm;
+    }
+    if (strcmp(name, "ggml_backend_ar_rank_run_norm") == 0) {
+        return (void *)ggml_backend_cuda_ar_rank_run_norm;
     }
     if (strcmp(name, "ggml_backend_comm_free") == 0) {
         return (void *)ggml_backend_cuda_comm_free;

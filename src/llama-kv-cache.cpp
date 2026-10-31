@@ -1886,7 +1886,9 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
 
 bool llama_kv_cache::kq_mask_compact_static() const {
     static const bool on = [] { const char * e = getenv("LLAMA_KQ_MASK_COMPACT"); return !e || atoi(e) != 0; }();
-    return on && n_seq_max == 1 && swa_type == LLAMA_SWA_TYPE_NONE && !hparams.use_alibi && v_cells.size() == 1;
+    // models with a sparse-attention indexer (QSA / DSA) build their selection masks from the full kq_mask layout
+    return on && n_seq_max == 1 && swa_type == LLAMA_SWA_TYPE_NONE && !hparams.use_alibi && v_cells.size() == 1 &&
+           hparams.indexer_top_k == 0;
 }
 
 bool llama_kv_cache::kq_mask_prefix(const llama_ubatch * ubatch, uint32_t n_kv, bool causal_attn, int32_t * L) const {

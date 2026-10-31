@@ -6,6 +6,14 @@
 #include "ggml-cpp.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <condition_variable>
+#include <cstdio>
+#include <cstdlib>
+#include <functional>
+#include <mutex>
+#include <thread>
 #include <cassert>
 #include <cmath>
 #include <cstddef>
@@ -160,6 +168,15 @@ static bool ggml_backend_meta_device_supports_op(ggml_backend_dev_t dev, const g
         [op](ggml_backend_dev_t simple_dev) { return ggml_backend_dev_supports_op(simple_dev, op); });
 }
 
+// Host-weight ops (CPU-resident experts during prefill) are offloaded when every simple device would offload them
+// (buun 0d8923a77). Without this hook, -sm tensor ran every prefill MUL_MAT_ID with host experts on the CPU.
+static bool ggml_backend_meta_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    GGML_ASSERT(ggml_backend_dev_is_meta(dev));
+    const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
+    return std::all_of(meta_dev_ctx->simple_devs.begin(), meta_dev_ctx->simple_devs.end(),
+        [op](ggml_backend_dev_t simple_dev) { return ggml_backend_dev_offload_op(simple_dev, op); });
+}
+
 static bool ggml_backend_meta_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     GGML_ASSERT(ggml_backend_dev_is_meta(dev));
     ggml_backend_dev_t dev_buft = ggml_backend_buft_get_device(buft);
@@ -191,7 +208,7 @@ static const ggml_backend_device_i ggml_backend_meta_device_iface = {
     /* .buffer_from_host_ptr = */ nullptr,
     /* .supports_op          = */ ggml_backend_meta_device_supports_op,
     /* .supports_buft        = */ ggml_backend_meta_device_supports_buft,
-    /* .offload_op           = */ nullptr,
+    /* .offload_op           = */ ggml_backend_meta_device_offload_op,
     /* .event_new            = */ nullptr,
     /* .event_free           = */ nullptr,
     /* .event_synchronize    = */ nullptr,
@@ -901,6 +918,24 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
                     split_state = ggml_backend_meta_get_split_state(stc, tensor->view_src, assume_sync);
                 } else {
                     split_state = {GGML_BACKEND_SPLIT_AXIS_MIRRORED, {0}, {1}, 1};
+                    // A scheduler copy of a host-resident weight ("<backend>#<weight>#<n>") keeps the weight's own split, so
+                    // each device uploads and runs only its share of a host expert tensor during prefill instead of every
+                    // device uploading the full tensor (buun 893bd25ae, generalized from his expert axis to any split axis:
+                    // our tensor split slices experts -- gate/up on axis 1, down on axis 0).
+                    const char * first = strchr(tensor->name, '#');
+                    const char * last  = strrchr(tensor->name, '#');
+                    if (first != nullptr && last > first + 1 && tensor->buffer != nullptr) {
+                        ggml_tensor weight = *tensor;
+                        snprintf(weight.name, sizeof(weight.name), "%.*s", int(last - first - 1), first + 1);
+                        const ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(tensor->buffer));
+                        if (dev != nullptr && ggml_backend_dev_is_meta(dev)) {
+                            const auto * dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
+                            const ggml_backend_meta_split_state ss = dev_ctx->get_split_state(&weight, dev_ctx->get_split_state_ud);
+                            if (ss.axis != GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+                                return ss; // absolute sizes from the weight, not a ratio taken over from a source
+                            }
+                        }
+                    }
                 }
             } break;
             case GGML_OP_DUP: {
@@ -1865,7 +1900,129 @@ struct ggml_backend_meta_context {
         backend_config(ggml_backend_t backend, const size_t n_reduce_steps) : backend(backend) {
             bufs.resize(n_reduce_steps);
         }
+
+        ggml_backend_buffer_ptr bufs_par[2]; // threaded dispatch: AllReduce receive buffers, alternating by subgraph parity
     };
+
+    // threaded dispatch (wispoffates' p100-series): 2 devices (default; GGML_META_THREADS=0 disables) -> one host thread per device issues that device's subgraphs and
+    // its half of each AllReduce. Single-threaded, the host time per token is the SUM of the devices' launch work (decode on 2 P100s
+    // is bound by it); with a thread per device it is the max. The main thread drives device 0, a persistent worker device 1.
+    struct threaded_dispatch {
+        bool                                enabled = false;
+        std::thread                         worker;
+        std::mutex                          mtx;
+        std::condition_variable             cv;
+        std::atomic<uint64_t>               job_gen{0};
+        std::atomic<uint64_t>               done_gen{0};
+        bool                                quit = false;
+        std::function<ggml_status(size_t)> job;
+        ggml_status                         worker_status = GGML_STATUS_SUCCESS;
+        int64_t                             spin_us = 2000; // GGML_META_SPIN_US: spin this long before sleeping on the cv
+
+        std::atomic<int>                    bar_count{0};
+        std::atomic<int>                    bar_gen{0};
+
+        // backend-provided per-device AllReduce (CUDA: ar-rank.cu, P2P + in-kernel handshake): each thread enqueues its device's
+        // half and continues -- no host barriers. nullptr -> peer copy + ADD with two barriers. GGML_META_AR=0 disables.
+        void * ar = nullptr;
+        bool (*ar_can)(void * ar, const ggml_tensor * t)                               = nullptr;
+        void (*ar_run)(void * ar, int rank, ggml_backend_t backend, ggml_tensor * t)    = nullptr;
+        void (*ar_destroy)(void * ar)                                                   = nullptr;
+        // AllReduce fused with the RMS norm (+ MUL, residual ADDs) that opens the next subgraph; GGML_META_AR_NORM=0 disables
+        bool (*ar_can_norm)(void * ar, const ggml_tensor * t)                           = nullptr;
+        void (*ar_run_norm)(void * ar, int rank, ggml_backend_t backend, ggml_tensor * t, const float * res, float * x_out,
+                            const float * w, const float * add2, float * y, float eps)  = nullptr;
+        // the AR -> ADD -> norm chain (qwen35moe) measured 0.6 % slower fused (one block per row pumps the P2P writes);
+        // GGML_META_AR_NORM=2 fuses it too
+        bool ar_norm_add_first = false;
+        // GGML_META_AR_STATS=1: per-rank counts printed at teardown (fused AllReduce, + norm chain, peer copy + ADD)
+        bool                 stats = false;
+        std::atomic<int64_t> n_ar{0}, n_ar_norm{0}, n_copy{0};
+
+        static inline void cpu_relax() {
+#if defined(__x86_64__) || defined(__i386__)
+            __builtin_ia32_pause();
+#endif
+        }
+
+        // spin (with pause) until pred() or spin_us elapsed; condvar wake-ups cost ~50-100 us each (buun-llama-cpp's measurement),
+        // two per graph compute = 1-2 % of a decode step
+        template <typename P> bool spin_until(P pred) const {
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int k = 1;; ++k) {
+                if (pred()) {
+                    return true;
+                }
+                cpu_relax();
+                if ((k & 1023) == 0 && std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0).count() > spin_us) {
+                    return false;
+                }
+            }
+        }
+
+        // two-party spin barrier: the devices' subgraphs are issued in lock step, so waits are short; pause, rarely yield
+        void barrier() {
+            const int g = bar_gen.load(std::memory_order_acquire);
+            if (bar_count.fetch_add(1, std::memory_order_acq_rel) == 1) {
+                bar_count.store(0, std::memory_order_relaxed);
+                bar_gen.fetch_add(1, std::memory_order_release);
+                return;
+            }
+            for (int spin = 1; bar_gen.load(std::memory_order_acquire) == g; ++spin) {
+                cpu_relax();
+                if ((spin & ((1 << 20) - 1)) == 0) {
+                    std::this_thread::yield();
+                }
+            }
+        }
+
+        void worker_loop() {
+            uint64_t seen = 0;
+            for (;;) {
+                if (!spin_until([&] { return job_gen.load(std::memory_order_acquire) != seen; })) {
+                    std::unique_lock<std::mutex> lock(mtx);
+                    cv.wait(lock, [&] { return quit || job_gen.load(std::memory_order_acquire) != seen; });
+                    if (quit) {
+                        return;
+                    }
+                }
+                std::function<ggml_status(size_t)> f;
+                {
+                    std::lock_guard<std::mutex> lock(mtx);
+                    if (quit) {
+                        return;
+                    }
+                    seen = job_gen.load(std::memory_order_acquire);
+                    f    = job;
+                }
+                const ggml_status st = f(1);
+                {
+                    std::lock_guard<std::mutex> lock(mtx);
+                    worker_status = st;
+                    done_gen.store(seen, std::memory_order_release);
+                }
+                cv.notify_all();
+            }
+        }
+
+        ggml_status run(const std::function<ggml_status(size_t)> & f) {
+            uint64_t g;
+            {
+                std::lock_guard<std::mutex> lock(mtx);
+                job = f;
+                g   = job_gen.load(std::memory_order_relaxed) + 1;
+                job_gen.store(g, std::memory_order_release);
+            }
+            cv.notify_all();
+            const ggml_status st0 = f(0);
+            if (!spin_until([&] { return done_gen.load(std::memory_order_acquire) == g; })) {
+                std::unique_lock<std::mutex> lock(mtx);
+                cv.wait(lock, [&] { return done_gen.load(std::memory_order_acquire) == g; });
+            }
+            std::lock_guard<std::mutex> lock(mtx);
+            return st0 != GGML_STATUS_SUCCESS ? st0 : worker_status;
+        }
+    } disp;
     std::string                 name;
     std::vector<backend_config> backend_configs;
     ggml_context_ptr            ctx;
@@ -1912,9 +2069,64 @@ struct ggml_backend_meta_context {
                     ggml_backend_get_device(simple_backends[0])), "ggml_backend_comm_allreduce_tensor");
             GGML_ASSERT(comm_allreduce != nullptr);
         }
+
+        const char * env_threads = getenv("GGML_META_THREADS");
+        // note: the CUDA backend always returns a comm context (mode "none" when neither NCCL nor its internal AllReduce can run,
+        // e.g. below Volta: comm_allreduce then declines and the butterfly fallback runs). The threaded path does its own
+        // peer-copy + ADD AllReduce (= that fallback) and never calls comm_allreduce.
+        // default on for 2 devices; GGML_META_THREADS=0 restores single-threaded dispatch
+        if ((env_threads == nullptr || atoi(env_threads) != 0) && n_devs == 2) {
+            disp.enabled = true;
+            const char * env_spin = getenv("GGML_META_SPIN_US");
+            if (env_spin != nullptr) {
+                disp.spin_us = atoll(env_spin);
+            }
+            disp.stats = getenv("GGML_META_AR_STATS") != nullptr && atoi(getenv("GGML_META_AR_STATS")) != 0;
+            const char * env_ar = getenv("GGML_META_AR");
+            if (env_ar == nullptr || atoi(env_ar) != 0) {
+                ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(simple_backends[0]));
+                auto ar_create  = (void * (*)(ggml_backend_t, ggml_backend_t)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_ar_rank_create");
+                disp.ar_can     = (bool (*)(void *, const ggml_tensor *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_ar_rank_can");
+                disp.ar_run     = (void (*)(void *, int, ggml_backend_t, ggml_tensor *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_ar_rank_run");
+                disp.ar_destroy = (void (*)(void *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_ar_rank_destroy");
+                if (ar_create && disp.ar_can && disp.ar_run && disp.ar_destroy) {
+                    disp.ar = ar_create(simple_backends[0], simple_backends[1]);
+                }
+                const char * env_arn = getenv("GGML_META_AR_NORM");
+                disp.ar_norm_add_first = env_arn != nullptr && atoi(env_arn) == 2;
+                if (disp.ar != nullptr && (env_arn == nullptr || atoi(env_arn) != 0)) {
+                    disp.ar_can_norm = (bool (*)(void *, const ggml_tensor *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_ar_rank_can_norm");
+                    disp.ar_run_norm = (void (*)(void *, int, ggml_backend_t, ggml_tensor *, const float *, float *, const float *, const float *, float *, float))
+                        ggml_backend_reg_get_proc_address(reg, "ggml_backend_ar_rank_run_norm");
+                    if (disp.ar_can_norm == nullptr || disp.ar_run_norm == nullptr) {
+                        disp.ar_can_norm = nullptr;
+                        disp.ar_run_norm = nullptr;
+                    }
+                }
+            }
+            disp.worker  = std::thread([this] { disp.worker_loop(); });
+            fprintf(stderr, "%s: threaded dispatch: one host thread per device (GGML_META_THREADS=0 to disable), AllReduce: %s\n", name.c_str(),
+                disp.ar ? (disp.ar_run_norm ? "in-kernel P2P handshake + fused RMS norm (GGML_META_AR=0 / GGML_META_AR_NORM=0 to disable)"
+                                            : "in-kernel P2P handshake (GGML_META_AR=0 to disable)") : "peer copy + ADD");
+        }
     }
 
     ~ggml_backend_meta_context() {
+        if (disp.enabled) {
+            {
+                std::lock_guard<std::mutex> lock(disp.mtx);
+                disp.quit = true;
+            }
+            disp.cv.notify_all();
+            disp.worker.join();
+            if (disp.stats) {
+                fprintf(stderr, "%s: AllReduce stats (both ranks): in-kernel %lld (+ norm chain %lld), peer copy + ADD %lld\n", name.c_str(),
+                        (long long) disp.n_ar.load(), (long long) disp.n_ar_norm.load(), (long long) disp.n_copy.load());
+            }
+            if (disp.ar != nullptr) {
+                disp.ar_destroy(disp.ar);
+            }
+        }
         if (comm_ctx != nullptr) {
             ggml_backend_comm_free_t comm_free = (ggml_backend_comm_free_t) ggml_backend_reg_get_proc_address(
                 ggml_backend_dev_backend_reg(ggml_backend_get_device(backend_configs[0].backend)), "ggml_backend_comm_free");
@@ -2039,6 +2251,74 @@ static void ggml_backend_meta_synchronize(ggml_backend_t backend) {
     for (size_t i = 0; i < n_backends; i++) {
         ggml_backend_synchronize(ggml_backend_meta_simple_backend(backend, i));
     }
+}
+
+// p100-series: does the subgraph after an AllReduce open with [ADD(ar, res)] RMS_NORM MUL(w) [ADD(other)] -- a chain the CUDA backend
+// would run as one rms_norm(+mul+add) kernel -- so the AllReduce kernel can compute it? Fills the fused kernel's operands and the
+// number of leading nodes it replaces.
+struct meta_ar_norm_match {
+    int           skip  = 0;
+    const float * res   = nullptr;
+    float *       x_out = nullptr;
+    const float * w     = nullptr;
+    const float * add2  = nullptr;
+    float *       y     = nullptr;
+    float         eps   = 0.0f;
+};
+
+static bool meta_match_ar_norm(const ggml_cgraph * g, const ggml_tensor * ar, meta_ar_norm_match & m, const bool allow_add_first) {
+    auto f32c = [&](const ggml_tensor * t) {
+        return t != nullptr && t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && t->data != nullptr && ggml_are_same_shape(t, ar);
+    };
+    const int n = g->n_nodes;
+    int k = 0;
+    const ggml_tensor * x = ar;
+    if (n >= 1 && g->nodes[0]->op == GGML_OP_ADD && (g->nodes[0]->src[0] == ar || g->nodes[0]->src[1] == ar)) {
+        if (!allow_add_first) {
+            return false;
+        }
+        ggml_tensor *       add = g->nodes[0];
+        const ggml_tensor * res = add->src[0] == ar ? add->src[1] : add->src[0];
+        if (res == ar || !f32c(res) || !f32c(add)) {
+            return false;
+        }
+        m.res   = (const float *) res->data;
+        m.x_out = (float *) add->data;
+        x = add;
+        k = 1;
+    }
+    if (k + 2 > n) {
+        return false;
+    }
+    ggml_tensor * nrm = g->nodes[k];
+    ggml_tensor * mul = g->nodes[k + 1];
+    if (nrm->op != GGML_OP_RMS_NORM || nrm->src[0] != x || mul->op != GGML_OP_MUL || mul->src[0] != nrm || !f32c(mul)) {
+        return false;
+    }
+    const ggml_tensor * w = mul->src[1];
+    if (w == nullptr || w->type != GGML_TYPE_F32 || !ggml_is_contiguous(w) || w->data == nullptr || w->ne[0] != ar->ne[0] ||
+        ggml_nelements(w) != ar->ne[0]) {
+        return false;
+    }
+    if (!ggml_can_fuse(g, k, { GGML_OP_RMS_NORM, GGML_OP_MUL })) {
+        return false; // the norm's output has another consumer
+    }
+    memcpy(&m.eps, nrm->op_params, sizeof(float));
+    m.w    = (const float *) w->data;
+    m.y    = (float *) mul->data;
+    m.skip = k + 2;
+    if (k + 2 < n && ggml_can_fuse(g, k, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD })) {
+        ggml_tensor * a2 = g->nodes[k + 2];
+        if (a2->src[0] == mul || a2->src[1] == mul) {
+            const ggml_tensor * o = a2->src[0] == mul ? a2->src[1] : a2->src[0];
+            if (o != mul && f32c(o) && f32c(a2)) {
+                m.add2 = (const float *) o->data;
+                m.y    = (float *) a2->data;
+                m.skip = k + 3;
+            }
+        }
+    }
+    return true;
 }
 
 static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {
@@ -2525,6 +2805,116 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         return GGML_STATUS_SUCCESS;
     };
 
+
+    if (backend_ctx->disp.enabled && n_backends == 2) {
+        // Device j issues its subgraphs and pulls the peer's partial sum for each AllReduce (2 devices = one butterfly step):
+        //   compute(i) -> [barrier A: both partials enqueued] -> copy peer -> recv[i % 2] (enqueued on the PEER's stream, plus a
+        //   wait on ours) -> [barrier B: both pulls enqueued before either in-place ADD overwrites its partial] -> ADD(i) -> ...
+        // The receive buffer alternates by parity: the peer's copy(i) runs after its wait on our copy-out(i - 1), which our stream
+        // issues after ADD(i - 2) -- the last reader of recv[i % 2]. Each device uses its own slice of the aux node / graph pools.
+        const size_t n_sub = backend_ctx->n_subgraphs;
+        const size_t ms    = backend_ctx->max_subgraphs;
+        auto run = [&](const size_t j) -> ggml_status {
+            auto & me   = backend_ctx->backend_configs[j];
+            auto & peer = backend_ctx->backend_configs[j ^ 1];
+            size_t ina_j = j * 3 * backend_ctx->n_reduce_steps * ms;
+            size_t iga_j = j * 2 * backend_ctx->n_reduce_steps * ms;
+            auto node_aux = [&](const ggml_tensor * t) -> ggml_tensor * {
+                ggml_tensor * ret = backend_ctx->nodes_aux[ina_j++];
+                memset(ret, 0, sizeof(ggml_tensor));
+                ret->op   = GGML_OP_NONE;
+                ret->type = t->type;
+                for (size_t k = 0; k < GGML_MAX_DIMS; k++) {
+                    ret->ne[k] = t->ne[k];
+                    ret->nb[k] = t->nb[k];
+                }
+                return ret;
+            };
+            int skip = 0; // leading nodes of subgraph i already computed by the previous AllReduce kernel
+            for (size_t i = 0; i < n_sub; i++) {
+                ggml_cgraph * gi = me.cgraphs[i].cgraph_main;
+                ggml_status st = GGML_STATUS_SUCCESS;
+                if (skip == 0) {
+                    st = ggml_backend_graph_compute_async(me.backend, gi);
+                } else if (skip < gi->n_nodes) {
+                    ggml_cgraph view = ggml_graph_view(gi, skip, gi->n_nodes);
+                    st = ggml_backend_graph_compute_async(me.backend, &view);
+                }
+                skip = 0;
+                GGML_ASSERT(st == GGML_STATUS_SUCCESS && "threaded dispatch: subgraph compute failed");
+                if (i + 1 == n_sub) {
+                    break;
+                }
+                ggml_tensor * node_dst = me.cgraphs[i].cgraph_main->nodes[me.cgraphs[i].cgraph_main->n_nodes - 1];
+                if (!(node_dst->flags & GGML_TENSOR_FLAG_COMPUTE) && ggml_nelements(node_dst) > 0) {
+                    // zero-sized slice on this device: its partial is zero
+                    ggml_tensor * node_zero = node_aux(node_dst);
+                    node_zero->op = GGML_OP_FILL;
+                    node_zero->src[0] = node_dst;
+                    ggml_set_op_params_f32(node_zero, 0, 0.0f);
+                    node_zero->data   = node_dst->data;
+                    node_zero->buffer = node_dst->buffer;
+                    node_zero->flags |= GGML_TENSOR_FLAG_COMPUTE;
+                    ggml_cgraph * g = backend_ctx->cgraphs_aux[iga_j++];
+                    g->nodes[0] = node_zero;
+                    g->n_nodes  = 1;
+                    st = ggml_backend_graph_compute_async(me.backend, g);
+                    GGML_ASSERT(st == GGML_STATUS_SUCCESS);
+                }
+                if (backend_ctx->disp.ar != nullptr && backend_ctx->disp.ar_can(backend_ctx->disp.ar, node_dst)) {
+                    // same decision on both threads (identical shapes and graphs): the GPUs pair up inside the kernel
+                    meta_ar_norm_match m;
+                    if (backend_ctx->disp.ar_run_norm != nullptr && backend_ctx->disp.ar_can_norm(backend_ctx->disp.ar, node_dst) &&
+                            meta_match_ar_norm(me.cgraphs[i + 1].cgraph_main, node_dst, m, backend_ctx->disp.ar_norm_add_first)) {
+                        backend_ctx->disp.ar_run_norm(backend_ctx->disp.ar, (int) j, me.backend, node_dst, m.res, m.x_out, m.w, m.add2, m.y, m.eps);
+                        skip = m.skip;
+                        if (backend_ctx->disp.stats) {
+                            backend_ctx->disp.n_ar_norm++;
+                        }
+                    } else {
+                        backend_ctx->disp.ar_run(backend_ctx->disp.ar, (int) j, me.backend, node_dst);
+                    }
+                    if (backend_ctx->disp.stats) {
+                        backend_ctx->disp.n_ar++;
+                    }
+                    continue;
+                }
+                if (backend_ctx->disp.stats) {
+                    backend_ctx->disp.n_copy++;
+                }
+                backend_ctx->disp.barrier(); // A
+
+                ggml_tensor * node_src = peer.cgraphs[i].cgraph_main->nodes[peer.cgraphs[i].cgraph_main->n_nodes - 1];
+                GGML_ASSERT(ggml_is_contiguous(node_src) && ggml_is_contiguous(node_dst));
+                ggml_backend_buffer_ptr & rb = me.bufs_par[i & 1];
+                if (!rb || ggml_backend_buffer_get_size(rb.get()) < backend_ctx->max_tmp_size) {
+                    rb.reset(ggml_backend_alloc_buffer(me.backend, backend_ctx->max_tmp_size));
+                }
+                ggml_tensor * node_tmp = node_aux(node_dst);
+                node_tmp->buffer = rb.get();
+                node_tmp->data   = ggml_backend_buffer_get_base(rb.get());
+                ggml_backend_tensor_copy_async(peer.backend, me.backend, node_src, node_tmp);
+                backend_ctx->disp.barrier(); // B
+
+                ggml_tensor * node_red = node_aux(node_dst);
+                node_red->view_src  = node_dst->view_src == nullptr ? node_dst : node_dst->view_src;
+                node_red->view_offs = node_dst->view_offs;
+                node_red->op        = GGML_OP_ADD;
+                node_red->src[0]    = node_dst;
+                node_red->src[1]    = node_tmp;
+                node_red->flags    |= GGML_TENSOR_FLAG_COMPUTE;
+                ggml_backend_view_init(node_red);
+                ggml_cgraph * g = backend_ctx->cgraphs_aux[iga_j++];
+                g->nodes[0] = node_red;
+                g->n_nodes  = 1;
+                st = ggml_backend_graph_compute_async(me.backend, g);
+                GGML_ASSERT(st == GGML_STATUS_SUCCESS);
+            }
+            return GGML_STATUS_SUCCESS;
+        };
+        const ggml_status st_run = backend_ctx->disp.run(run);
+        return st_run;
+    }
 
     for (size_t i = 0; i < backend_ctx->n_subgraphs; i++) {
         for (size_t j = 0; j < n_backends; j++) {
