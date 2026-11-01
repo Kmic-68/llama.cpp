@@ -3,8 +3,7 @@
 This section covers mixture-of-experts models whose experts don't fit in VRAM, for example
 Qwen3.8-Flash-Next UD-IQ4_XS (94 GB of weights on two 16 GB cards) at 262144 context. The rest of
 the fork (the dense 27B path) is unchanged by it: with `--moe-lru-slots` unset, none of this code
-runs, except the threaded two-GPU dispatch below, which measured neutral on the 27B
-(tg256 34.40 vs 34.30 t/s, ABBA, Q5_K_M).
+runs, and the dense path keeps its single-threaded dispatch (see "Threaded dispatch").
 
 Credit: the expert cache, its CUDA ops and the threaded dispatch are wispoffates' work
 (p100-series fork), with the tensor-split support by lich-77. The slot-lending idea and the
@@ -54,7 +53,10 @@ fp16 HFMA2 with short chains folded into fp32, the same rule as the rest of this
 **Threaded dispatch** (`ggml-backend-meta.cpp`, `ggml-cuda/ar-rank.cu`): with `-sm tensor` on two
 GPUs, one host thread per device issues that device's work, and the AllReduce is a kernel that
 pairs the GPUs over P2P without host barriers, fused with the next RMS norm. Flash-Next decode is
-launch-bound (many small ops per token): 24.0 to 26.9 t/s. `GGML_META_THREADS=0` turns it off.
+launch-bound (many small ops per token): 24.0 to 26.9 t/s. It is on whenever `--moe-lru-slots` is set
+(`GGML_META_THREADS=0` turns it off, `=1` forces it for any model). Dense models don't get it by default: on the 27B
+it skips the single-threaded path's matmul-overlapped prefill exchange (pp2048 497 vs 462 t/s) for the same decode
+speed and little VRAM at depth (~110 MiB per card at 128k).
 
 ## The config finder
 
@@ -95,7 +97,7 @@ Not ported (yet): his fp16 single-token matvec kernels (`mmvq-gp100`, `mmvq-h1`)
 | `GGML_CUDA_LRU_DMA=1`, `GGML_CUDA_LRU_ASYNC=1`, `GGML_CUDA_LRU_CE=1` | | async copy-engine fills |
 | `LLAMA_MOE_LRU_PREFETCH`, `LLAMA_MOE_LRU_TAIL` | 0 | prefill assembly ahead / host experts only |
 | `LLAMA_UB_KV_BUDGET` | 0 | caps ubatch x context so a big `-ub` fits at full context |
-| `GGML_META_THREADS` | 1 | threaded two-GPU dispatch |
+| `GGML_META_THREADS` | on with the cache, else off | threaded two-GPU dispatch |
 | `GGML_META_AR_MAX_BYTES` | 32 MiB | largest in-kernel AllReduce |
 
 `autoconfig.py` prints the full set for the chosen config.

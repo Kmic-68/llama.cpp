@@ -463,6 +463,11 @@ llama_context::llama_context(
     }
 
     if (!hparams.vocab_only) {
+        // the MoE expert cache wants the meta backend's threaded two-GPU dispatch (p100-docs/MOE.md); dense models keep the
+        // default single-threaded one. An explicit GGML_META_THREADS wins.
+        if (model.moe_lru_slots() > 0) {
+            setenv("GGML_META_THREADS", "1", /*overwrite =*/ 0);
+        }
         // GPU backends
         for (const auto & dev : model.devices) {
             ggml_backend_t backend = ggml_backend_dev_init(dev.dev, nullptr);

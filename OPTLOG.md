@@ -9342,3 +9342,26 @@ pp512/pp2048 tied. Gate (cold cards, 32/30 C): tg256 33.46 +- 0.15 (pre-merge 33
 full op suite 19576/19576 on both GPUs (was 16658 before the merge).
 Slot files: LLAMA_STATE_SEQ_VERSION 3 -> 4 upstream, so earlier slot files (the depth-bench snapshots)
 no longer load and must be re-saved.
+
+## 291 — MoE expert cache ported from wispoffates' p100-series (branch p100-moe, 2026-10-31): kept
+
+Full write-up: p100-docs/MOE.md. Ported: LRU expert cache (ggml LRU ops, ggml-cuda/moe-lru.cu, src/llama-moe-lru.*), Pascal
+tile GEMM for assembled experts, copy-engine fills, tail assembly, prefetch, top-k tie fix, threaded 2-GPU meta dispatch +
+per-device P2P AllReduce (ar-rank.cu), host-weight offload, config finder (p100-handoff/moe-autoconfig). Not ported: his
+fp16 single-token matvecs (mmvq-gp100/h1: ~2 t/s Flash-Next decode, KLD 0.028 vs this fork; output-changing), 16-bit
+AllReduce wire (kept as GGML_CUDA_AR_WIRE=2, default off), QSA gather.
+
+| Flash-Next UD-IQ4_XS @262k, 2x P100 | this fork | his tree |
+|---|---|---|
+| decode, 145 slots | 26.9 (24.0 single-threaded) | 27.3 |
+| prefill, 100 slots, -ub 3072 | 501.3 (fp32 AllReduce) | 500.8 (fp16 wire) |
+
+Fixes on the way: compact I32 prefill mask off for models with a sparse-attention indexer (ggml_fill assert at startup);
+in-kernel AllReduce up to 32 MiB by default (else the peer-copy path's receive buffers overflowed -ub 3072).
+Port uses ~350 MiB/card more than his tree in Flash-Next prefill (gemm-fold stages fp16 weights in the pool; his MMQ
+does not) -> recalibrate the finder on this build.
+
+Threaded dispatch on dense models (27B Q5_K_M, ABBA): tg256 34.40 off / 34.30 on, PPL 2.6147 both (identical per chunk),
+pp2048 497.3 off / 462.3 on (it skips the matmul-overlapped prefill exchange and the gemm-fold weight prefetch). At depth:
+pp2048 @32k 354.0 / 313.4, @128k 184.4 / 207.8; tg128 @32k 30.37 / 28.89, @128k 24.85 / 25.72; peak VRAM at 128k
+13823 / 13711 MiB GPU0. VRAM savings vanish at depth -> threaded dispatch is opt-in, and on only with --moe-lru-slots.

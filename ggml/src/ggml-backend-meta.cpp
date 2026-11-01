@@ -2074,8 +2074,10 @@ struct ggml_backend_meta_context {
         // note: the CUDA backend always returns a comm context (mode "none" when neither NCCL nor its internal AllReduce can run,
         // e.g. below Volta: comm_allreduce then declines and the butterfly fallback runs). The threaded path does its own
         // peer-copy + ADD AllReduce (= that fallback) and never calls comm_allreduce.
-        // default on for 2 devices; GGML_META_THREADS=0 restores single-threaded dispatch
-        if ((env_threads == nullptr || atoi(env_threads) != 0) && n_devs == 2) {
+        // opt-in (GGML_META_THREADS=1, 2 devices). llama turns it on for the MoE expert cache (--moe-lru-slots), whose decode is
+        // launch-bound (Flash-Next 24.0 -> 26.9 t/s); dense models keep the single-threaded path and its matmul-overlapped
+        // prefill exchange (27B: same decode, pp2048 497 vs 462 t/s threaded, VRAM savings ~110 MiB/card at 128k depth)
+        if (env_threads != nullptr && atoi(env_threads) != 0 && n_devs == 2) {
             disp.enabled = true;
             const char * env_spin = getenv("GGML_META_SPIN_US");
             if (env_spin != nullptr) {
