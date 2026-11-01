@@ -9394,3 +9394,8 @@ GGML_CUDA_CUBLAS_COMPUTE_TYPE=f32 GGML_CUDA_FA_GEMM_PREC=32, -ub 512):
 Speed tg256: cold ABBA 35.27 -> 35.53 t/s; hot cards (73 C, 3-arm rotation) 29.4 -> 31.4. MTP server (model-card
 sampling, 8 prompts x 256): mean 61.9 -> 64.0, acceptance 0.56 -> 0.59 (one round each, inside noise).
 Prefill unchanged: PPL(Q) 2.730276 (8 x 4096) as before. MUL_MAT 2784/2784.
+
+Correction (11-01, release gate on 27B Q6_K, all q6_K): q6_K at 1 column on the fp16 path is slower there, tg128 29.82
+(integer) vs 28.57 (fp16), ABBA x2; kernel-level the two are even. Default back to integer for q6_K at 1 column
+(GGML_CUDA_MMVQ_F16_Q6_MIN=2; =1 opts in for accuracy). q5_K keeps fp16 at 1 column: Q5_K_M decode KLD vs fp32
+0.00300 -> 0.00178, tg256 hot 29.4 -> 31.5.
