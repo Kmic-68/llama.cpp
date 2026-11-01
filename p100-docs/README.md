@@ -40,6 +40,9 @@ Perplexity 2.6101, all-fp32 2.6095; at this size perplexity can't separate them,
 | [THREE-GPU.md](THREE-GPU.md) | measurements on three P100s from a contributor: NCCL, graphs, cancel latency |
 | [`../OPTLOG.md`](../OPTLOG.md) | the full record: every attempt, kept or reverted, with numbers |
 
+Windows: [PhoenixGames105/llama.cpp](https://github.com/PhoenixGames105/llama.cpp) is a community port of this fork
+that builds with MSVC. Its source fixes are merged here; for Windows build steps and support, see that repository.
+
 ## What's in it, briefly
 
 - **Decode matvec.** `mul_mat_vec_q` is rebuilt around one fact: the bottleneck is the q8_1

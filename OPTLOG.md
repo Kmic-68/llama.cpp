@@ -9365,3 +9365,37 @@ Threaded dispatch on dense models (27B Q5_K_M, ABBA): tg256 34.40 off / 34.30 on
 pp2048 497.3 off / 462.3 on (it skips the matmul-overlapped prefill exchange and the gemm-fold weight prefetch). At depth:
 pp2048 @32k 354.0 / 313.4, @128k 184.4 / 207.8; tg128 @32k 30.37 / 28.89, @128k 24.85 / 25.72; peak VRAM at 128k
 13823 / 13711 MiB GPU0. VRAM savings vanish at depth -> threaded dispatch is opt-in, and on only with --moe-lru-slots.
+
+## 316 — community round 10-31: PR #17, 4claps' MoE crash, Kane/wisp/Keoian/Phoenix picks (branch review-1031): kept
+
+Reviewed: PR #17 (junkgpulab), 4claps/p100-llamacpp-patch-bench, Frostbite1536/P100, KaneQuah/p100-optimization-q8,
+PhoenixGames105/llama.cpp, Mrinohk/qwen36-p100-patches, Keoian/dual-p100-qwen-3-8-27b, wispoffates/llama.cpp,
+engramsoftware/p100e-engine. Held to this fork's rules: exact or better math, gates on both models.
+
+Kept (one commit each, original authors credited):
+- PR #17: zero the unwritten pad columns of fixed-width verify outputs (mmvq, mmvq-f16 glu/gdn gate, fattn-q4p) and
+  scale-by-0 writes the bias. Padded verify is ON by default at -np 1, so the production MTP server had this latent bug.
+- 4claps' crash (Qwen3.6-35B-A3B tg @ depth, every Kmic arm): the GDN state-gather skip read its index after the
+  allocator had freed it (last recurrent layer). Fixed by skipping only while the index stays live. Repro from d1024.
+- Kane: repeated expert ids in MUL_MAT_ID (correctness); MMQ MoE tile by tokens per expert on sm_60; IQ2/IQ3 PRMT sign
+  flips + shared-memory grids (bit exact; his rows-per-block change not taken, ours already tuned).
+- Kane + Keoian (found independently): fattn-gemm drops a cublasSetStream that reset ggml's cuBLAS workspace.
+- wisp: top-k MoE router stages its outputs instead of falling back on overlap (placement-independent results).
+- Keoian: MTP draft stop rule (LLAMA_SPEC_STOP_ISO / _THINK, opt-in, distribution-exact).
+- Phoenix: MSVC build fixes (no change on Linux).
+
+Not taken: Keoian's unmasked GEMM attention for vision (rel-L2 vs BF16 0.0186 -> 0.0278: accuracy for speed);
+fp16 matvecs from wisp (h1/split-K/short-K), Mrinohk and p100e; Frostbite's patches (4claps measured MMVH -30..-74%
+decode, the rest no gain); Mrinohk/Kane GDN fusions (this tree already has equivalents); Kane's P2P all-reduce and
+q8_0 paths (not this fork's quants / p100-moe already has wisp's AR) -- candidates for a later round.
+
+Gates (27B Q5_K_M, Q6_K no longer on disk):
+- numerics: PPL(Q) over 8 chunks of ppl-orig -c 4096 = 2.730276 on baseline b5879f333 and on this branch (identical
+  digits); KLD -0.000006 is the stored-logit floor (the baseline against itself reads the same).
+- Flash-Next UD-IQ4_XS (static placement, -c 1024, 4 chunks): PPL(Q) 3.367978 both builds.
+- tg256 ABBA on cold cards, baseline vs branch (before the gather fix): 34.37 vs 34.39 t/s.
+- ops: MUL_MAT_ID 931/931, SCALE 7/7, TOPK_MOE 576/576, FLASH_ATTN_EXT 4180/4180, MUL_MAT (iq, k-quants) 1004/1004.
+- MTP server (Q5_K_M, -c 32768, model-card sampling, thinking off, 8 prompts x 256, ABC/CBA): mean 60.4 base,
+  61.2 branch, 60.6 branch + stop rule (acceptance 0.56 / 0.57 / 0.65) -- all inside temp-1.0 noise; the stop rule
+  shows no gain on this setup and stays off by default.
+- Qwen3.6-35B-A3B UD-Q2_K_XL 1 card: pp512/tg128 at d0/1024/16384 all run (was: illegal address from d1024).
