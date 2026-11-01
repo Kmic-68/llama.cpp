@@ -58,6 +58,26 @@ static void mmvq_f16_nc(const int64_t nc, F && f) {
     }
 }
 
+// MSVC cannot fold a constexpr captured from an enclosing lambda in template-argument position (it
+// reads it through the closure), so extra tags go to the callback as parameters.
+template <typename F, typename... T>
+static void mmvq_f16_nc_fwd(const int64_t nc, F && f, T &&... t) {
+    switch (nc) {
+        case 2:  f(std::integral_constant<int, 2>{},  t...); break;
+        case 3:  f(std::integral_constant<int, 3>{},  t...); break;
+        case 4:  f(std::integral_constant<int, 4>{},  t...); break;
+        case 5:  f(std::integral_constant<int, 5>{},  t...); break;
+        case 6:  f(std::integral_constant<int, 6>{},  t...); break;
+        case 7:  f(std::integral_constant<int, 7>{},  t...); break;
+        case 8:  f(std::integral_constant<int, 8>{},  t...); break;
+        case 9:  f(std::integral_constant<int, 9>{},  t...); break;
+        case 10: f(std::integral_constant<int, 10>{}, t...); break;
+        case 11: f(std::integral_constant<int, 11>{}, t...); break;
+        case 12: f(std::integral_constant<int, 12>{}, t...); break;
+        default: GGML_ABORT("mmvq_f16: %d columns", (int) nc);
+    }
+}
+
 // one warp per (window, column)
 static __global__ void mmvq_f16_prep(const float * __restrict__ X, const int64_t sx, __half * __restrict__ XS,
                                      float * __restrict__ S, const int K) {
@@ -1416,7 +1436,9 @@ static void mmvq_f16_32_launch(const bool q8, const uint8_t * W, const uint8_t *
         auto go = [&](auto q8t, auto ncc) {
             constexpr bool Q8 = decltype(q8t)::value;
             constexpr int NC = decltype(ncc)::value;
-            auto run = [&](auto rpwt, auto nwtt) {
+            auto run = [&](auto q8t, auto ncc, auto rpwt, auto nwtt) {
+                constexpr bool Q8 = decltype(q8t)::value;
+                constexpr int NC = decltype(ncc)::value;
                 constexpr int RPW = decltype(rpwt)::value, NWT = decltype(nwtt)::value, MINB = 12/NWT;
                 const int g = (int) ((rows + NWT*RPW - 1)/(NWT*RPW));
                 if constexpr (RPW <= 4) { if (glu) {
@@ -1433,9 +1455,9 @@ static void mmvq_f16_32_launch(const bool q8, const uint8_t * W, const uint8_t *
             const int nwt = cfg ? cfg%10 : K32_NWT(Q8, NC);
             using I1 = std::integral_constant<int, 1>; using I2 = std::integral_constant<int, 2>;
             using I4 = std::integral_constant<int, 4>; using I8 = std::integral_constant<int, 8>;
-            if (rpw == 2) { if (nwt == 1) run(I2{}, I1{}); else if (nwt == 2) run(I2{}, I2{}); else run(I2{}, I4{}); }
-            else if (rpw == 4) { if (nwt == 1) run(I4{}, I1{}); else if (nwt == 2) run(I4{}, I2{}); else run(I4{}, I4{}); }
-            else { if (nwt == 1) run(I8{}, I1{}); else if (nwt == 2) run(I8{}, I2{}); else run(I8{}, I4{}); }
+            if (rpw == 2) { if (nwt == 1) run(q8t, ncc, I2{}, I1{}); else if (nwt == 2) run(q8t, ncc, I2{}, I2{}); else run(q8t, ncc, I2{}, I4{}); }
+            else if (rpw == 4) { if (nwt == 1) run(q8t, ncc, I4{}, I1{}); else if (nwt == 2) run(q8t, ncc, I4{}, I2{}); else run(q8t, ncc, I4{}, I4{}); }
+            else { if (nwt == 1) run(q8t, ncc, I8{}, I1{}); else if (nwt == 2) run(q8t, ncc, I8{}, I2{}); else run(q8t, ncc, I8{}, I4{}); }
         };
         auto gq = [&](auto ncc) { if (q8) go(std::true_type{}, ncc); else go(std::false_type{}, ncc); };
         switch (n) {
@@ -1713,8 +1735,8 @@ static void mmvq_f16_s32_launch(const uint8_t * W, const uint8_t * W2, const int
     const int nw = (int) ((K + MMVQ_F16_WIN - 1)/MMVQ_F16_WIN);
     mmvq_f16_columns(ncols, [&](const int64_t c0, const int64_t n) {
         mmvq_s32_nc(n, [&](auto ncc) {
-            constexpr int NC = decltype(ncc)::value;
-            auto go = [&](auto rpw, auto nwt, auto ks, auto minb, auto gl) {
+            auto go = [&](auto ncc, auto rpw, auto nwt, auto ks, auto minb, auto gl) {
+                constexpr int NC = decltype(ncc)::value;
                 constexpr int RPW = decltype(rpw)::value, NWT = decltype(nwt)::value, MINB = decltype(minb)::value;
                 constexpr bool KS = decltype(ks)::value, GL = decltype(gl)::value;
                 const int g = KS ? (int) ((rows + RPW - 1)/RPW) : (int) ((rows + NWT*(GL ? RPW/2 : RPW) - 1)/(NWT*(GL ? RPW/2 : RPW)));
@@ -1722,10 +1744,10 @@ static void mmvq_f16_s32_launch(const uint8_t * W, const uint8_t * W2, const int
                     W, W2, row_bytes, xs + c0*K, sc + c0*nw, Y + c0*sy, sy, (int) rows, (int) K);
             };
             if (glu) {
-                go(std::integral_constant<int, H_RPW ? H_RPW : 4>{}, std::integral_constant<int, H_NWT ? H_NWT : 1>{}, std::false_type{},
+                go(ncc, std::integral_constant<int, H_RPW ? H_RPW : 4>{}, std::integral_constant<int, H_NWT ? H_NWT : 1>{}, std::false_type{},
                    std::integral_constant<int, H_MINB ? H_MINB : 8>{}, std::true_type{});
             } else {
-                go(std::integral_constant<int, H_RPW ? H_RPW : 4>{}, std::integral_constant<int, H_NWT ? H_NWT : 1>{}, std::false_type{},
+                go(ncc, std::integral_constant<int, H_RPW ? H_RPW : 4>{}, std::integral_constant<int, H_NWT ? H_NWT : 1>{}, std::false_type{},
                    std::integral_constant<int, H_MINB ? H_MINB : 8>{}, std::false_type{});
             }
         });
@@ -2198,6 +2220,26 @@ static void mmvq_f16_gen_columns(const int64_t ncols, F && f) {
             case 6: f(c0, std::integral_constant<int, 6>{}); break;
             case 7: f(c0, std::integral_constant<int, 7>{}); break;
             case 8: f(c0, std::integral_constant<int, 8>{}); break;
+            default: GGML_ABORT("mmvq_f16_gen: %d columns", (int) n);
+        }
+    }
+}
+
+// See mmvq_f16_nc_fwd: extra tags are forwarded to the callback as parameters.
+template <typename F, typename... T>
+static void mmvq_f16_gen_columns_fwd(const int64_t ncols, F && f, T &&... t) {
+    const int64_t n0 = ncols <= 8 ? ncols : (ncols + 1)/2;
+    for (int64_t c0 = 0; c0 < ncols; c0 += n0) {
+        const int64_t n = std::min(n0, ncols - c0);
+        switch (n) {
+            case 1: f(c0, std::integral_constant<int, 1>{}, t...); break;
+            case 2: f(c0, std::integral_constant<int, 2>{}, t...); break;
+            case 3: f(c0, std::integral_constant<int, 3>{}, t...); break;
+            case 4: f(c0, std::integral_constant<int, 4>{}, t...); break;
+            case 5: f(c0, std::integral_constant<int, 5>{}, t...); break;
+            case 6: f(c0, std::integral_constant<int, 6>{}, t...); break;
+            case 7: f(c0, std::integral_constant<int, 7>{}, t...); break;
+            case 8: f(c0, std::integral_constant<int, 8>{}, t...); break;
             default: GGML_ABORT("mmvq_f16_gen: %d columns", (int) n);
         }
     }
@@ -2783,8 +2825,8 @@ static void mmvq_f16_gen_launch(const ggml_type type, const uint8_t * W, const u
         return;
     }
     mmvq_f16_gen_dispatch(type, [&](auto tt) {
-        constexpr ggml_type T = decltype(tt)::value;
-        mmvq_f16_gen_columns(ncols, [&](const int64_t c0, auto ncc) {
+        mmvq_f16_gen_columns_fwd(ncols, [&](const int64_t c0, auto ncc, auto ttc) {
+            constexpr ggml_type T = decltype(ttc)::value;
             constexpr int NC = decltype(ncc)::value;
             constexpr int RPW = NC <= 4 ? 4 : 2, NWT = 2;
             if (glu) {
@@ -2796,7 +2838,7 @@ static void mmvq_f16_gen_launch(const ggml_type type, const uint8_t * W, const u
                 mmvq_f16_gen<T, NC, RPW, NWT, false><<<g, dim3(WARP_SIZE, NWT), 0, stream>>>(
                     W, nullptr, row_bytes, xs + c0*K, sc + c0*nw, Y + c0*sy, sy, (int) rows, (int) K);
             }
-        });
+        }, tt);
     });
     CUDA_CHECK(cudaGetLastError());
 }
@@ -3028,16 +3070,16 @@ bool ggml_cuda_mmvq_f16_try(ggml_backend_cuda_context & ctx, const ggml_tensor *
     // warps of a block split K over one row, so there are enough blocks and warps to cover the GPU
     int64_t c0 = 0, nc = ncols; // the column range of the current launch
     auto launch = [&](auto rpw, auto nwt, auto ks, auto minb) {
-        constexpr int  RPW  = decltype(rpw)::value;
-        constexpr int  NWT  = decltype(nwt)::value;
-        constexpr bool KS   = decltype(ks)::value;
-        constexpr int  MINB = decltype(minb)::value;
-        const dim3 bdk(WARP_SIZE, NWT);
-        const int g = KS ? (int) ((rows + RPW - 1)/RPW) : (int) ((rows + NWT*RPW - 1)/(NWT*RPW));
-        mmvq_f16_nc(nc, [&](auto ncc) {
-            constexpr int NC = decltype(ncc)::value;
+        mmvq_f16_nc_fwd(nc, [&](auto ncc, auto rpw_, auto nwt_, auto ks_, auto minb_) {
+            constexpr int  NC   = decltype(ncc)::value;
+            constexpr int  RPW  = decltype(rpw_)::value;
+            constexpr int  NWT  = decltype(nwt_)::value;
+            constexpr bool KS   = decltype(ks_)::value;
+            constexpr int  MINB = decltype(minb_)::value;
+            const dim3 bdk(WARP_SIZE, NWT);
+            const int g = KS ? (int) ((rows + RPW - 1)/RPW) : (int) ((rows + NWT*RPW - 1)/(NWT*RPW));
             mmvq_f16_q6_K<NC, RPW, NWT, KS, MINB><<<g, bdk, 0, stream>>>(W, src0->nb[1], xs_ptr + c0*K, sc_ptr + c0*nw, Y + c0*sy, sy, (int) rows, (int) K);
-        });
+        }, rpw, nwt, ks, minb);
     };
     using I = std::integral_constant<int, 1>;
     mmvq_f16_columns(ncols, [&](const int64_t c0_, const int64_t n_) {

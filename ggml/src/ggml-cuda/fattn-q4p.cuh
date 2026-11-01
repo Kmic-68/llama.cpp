@@ -1045,9 +1045,9 @@ static __global__ void flash_attn_ext_q4p(
             } else {
                 fold();
             }
-        } else
+        } else {
 #pragma unroll 2
-        for (int p = pg; p < p_end; p += NPG) {
+            for (int p = pg; p < p_end; p += NPG) {
             const float    dv = __half2float(__ushort_as_half((unsigned short) nd));
             const uint32_t wv = __byte_perm(nw0, nw1, pv_sel);
             {
@@ -1105,6 +1105,7 @@ static __global__ void flash_attn_ext_q4p(
                         acc[r][j] = fmaf(P[r], y[j], acc[r][j]);
                     }
                 }
+            }
             }
         }
         if constexpr (!NOEB) {

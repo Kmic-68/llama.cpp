@@ -19,6 +19,9 @@
 #include "unicode.h"
 
 #include <algorithm>
+#ifdef _MSC_VER
+#include <malloc.h> // _aligned_malloc/_aligned_free: MSVC has no C11 aligned_alloc
+#endif
 #include <cinttypes>
 #include <climits>
 #include <cmath>
@@ -2407,12 +2410,37 @@ ckpt_pool & get_ckpt_pool() {
     static ckpt_pool pool;
     return pool;
 }
+
+// Every pointer handed to common_ckpt_free comes from common_ckpt_alloc, so one free covers them
+// all. MSVC has no aligned_alloc, and _aligned_malloc cannot mix with malloc/free, so on MSVC the
+// small path is aligned too. Linux keeps malloc for small blocks and free for both.
+void * ckpt_raw_alloc(size_t n) {
+#ifdef _MSC_VER
+    return _aligned_malloc(n, 64);
+#else
+    return malloc(n);
+#endif
+}
+void * ckpt_raw_aligned(size_t alignment, size_t size) {
+#ifdef _MSC_VER
+    return _aligned_malloc(size, alignment);
+#else
+    return aligned_alloc(alignment, size);
+#endif
+}
+void ckpt_raw_free(void * p) {
+#ifdef _MSC_VER
+    _aligned_free(p);
+#else
+    free(p);
+#endif
+}
 }
 
 void * common_ckpt_alloc(size_t n) {
     constexpr size_t huge = (size_t) 2 << 20;
     if (n < 2*huge) {
-        void * p = malloc(n);
+        void * p = ckpt_raw_alloc(n);
         if (p == nullptr) {
             throw std::bad_alloc();
         }
@@ -2428,7 +2456,7 @@ void * common_ckpt_alloc(size_t n) {
         }
         pool.refilling = true;
         std::thread([sz]() {
-            void * q = aligned_alloc((size_t) 2 << 20, sz);
+            void * q = ckpt_raw_aligned((size_t) 2 << 20, sz);
             if (q != nullptr) {
                 memset(q, 0, sz);   // take the page faults here, off the request's path
             }
@@ -2439,7 +2467,7 @@ void * common_ckpt_alloc(size_t n) {
                 if (pl.free_blocks.size() < pl.cap) {
                     pl.free_blocks.emplace(sz, q);
                 } else {
-                    free(q);
+                    ckpt_raw_free(q);
                 }
             }
         }).detach();
@@ -2452,7 +2480,7 @@ void * common_ckpt_alloc(size_t n) {
         refill();
         return p;
     }
-    void * p = aligned_alloc(huge, sz);
+    void * p = ckpt_raw_aligned(huge, sz);
     if (p == nullptr) {
         throw std::bad_alloc();
     }
@@ -2488,7 +2516,7 @@ void common_ckpt_free(void * p) {
             }
         }
     }
-    free(p);
+    ckpt_raw_free(p);
 }
 
 void common_prompt_checkpoint::update_pos(
