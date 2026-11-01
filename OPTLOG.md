@@ -9375,3 +9375,22 @@ Gates (27B Q5_K_M, Q6_K no longer on disk):
   61.2 branch, 60.6 branch + stop rule (acceptance 0.56 / 0.57 / 0.65) -- all inside temp-1.0 noise; the stop rule
   shows no gain on this setup and stays off by default.
 - Qwen3.6-35B-A3B UD-Q2_K_XL 1 card: pp512/tg128 at d0/1024/16384 all run (was: illegal address from d1024).
+
+## 317 — fp16 matvec with fp32 folds at one column (single-token decode, MTP draft step) for q5_K and q6_K: kept
+
+The integer path rounds activations to 8 bits (q8_1); the fp16 kernels (mmvq-f16.cu: fp16 products, short HFMA2
+chains folded into fp32) round them to 11. Round 282 had kept 1 column on the integer path for speed; in-model it is
+now faster too. q5_K takes the fp16 path from 1 column; q6_K from GGML_CUDA_MMVQ_F16_Q6_MIN (default 1, 2 = old).
+
+27B Q5_K_M, decode path (-ub 1, -c 512 x 8 chunks of ppl-orig), KLD against an all-fp32 run (GGML_CUDA_NO_MMQ=1
+GGML_CUDA_CUBLAS_COMPUTE_TYPE=f32 GGML_CUDA_FA_GEMM_PREC=32, -ub 512):
+| decode matvec at 1 column | KLD vs fp32 | same top | RMS dp |
+|---|---|---|---|
+| integer q8_1 (before) | 0.00300 | 97.79 % | 1.64 % |
+| q5_K fp16 only | 0.00178 | 98.28 % | 1.31 % |
+| q5_K + q6_K fp16 (kept) | 0.00101 | 98.87 % | 1.10 % |
+| prefill path, for scale | 0.00107 | 98.19 % | 1.14 % |
+
+Speed tg256: cold ABBA 35.27 -> 35.53 t/s; hot cards (73 C, 3-arm rotation) 29.4 -> 31.4. MTP server (model-card
+sampling, 8 prompts x 256): mean 61.9 -> 64.0, acceptance 0.56 -> 0.59 (one round each, inside noise).
+Prefill unchanged: PPL(Q) 2.730276 (8 x 4096) as before. MUL_MAT 2784/2784.

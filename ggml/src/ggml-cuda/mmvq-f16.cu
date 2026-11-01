@@ -63,6 +63,7 @@ static void mmvq_f16_nc(const int64_t nc, F && f) {
 template <typename F, typename... T>
 static void mmvq_f16_nc_fwd(const int64_t nc, F && f, T &&... t) {
     switch (nc) {
+        case 1:  f(std::integral_constant<int, 1>{},  t...); break;
         case 2:  f(std::integral_constant<int, 2>{},  t...); break;
         case 3:  f(std::integral_constant<int, 3>{},  t...); break;
         case 4:  f(std::integral_constant<int, 4>{},  t...); break;
@@ -2170,7 +2171,9 @@ static bool mmvq_f16_gen_takes(const ggml_type t, const int64_t ncols) {
         return true;
     }
     switch (t) {
-        case GGML_TYPE_Q2_K: case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K: case GGML_TYPE_MXFP4:
+        case GGML_TYPE_Q5_K: // from 1 column: 27B Q5_K_M decode KLD vs fp32 0.00300 -> 0.00178, tg256 +5% (OPTLOG 317)
+            return ncols >= 1;
+        case GGML_TYPE_Q2_K: case GGML_TYPE_Q4_K: case GGML_TYPE_MXFP4:
             return ncols >= 2;
         case GGML_TYPE_Q3_K:
             return ncols >= 3;
@@ -2992,11 +2995,15 @@ static bool mmvq_f16_shape_ok(const ggml_tensor * src0, const ggml_tensor * src1
     const int64_t K = src0->ne[0], rows = src0->ne[1];
     // q6_K: its own kernel (K must hold an even number of blocks); the other types: the generic kernel
     const bool q6 = src0->type == GGML_TYPE_Q6_K;
+    // GGML_CUDA_MMVQ_F16_Q6_MIN: the fewest columns q6_K takes this path with. 1 (single-token decode and the MTP
+    // draft step): 27B Q5_K_M decode-path KLD vs an all-fp32 run 0.00300 (q8_1 integer path) -> 0.00101 with q5_K and
+    // q6_K both here, same top token 97.8 -> 98.9 %, tg256 +2 t/s (OPTLOG 317). 2 restores the integer path at 1 column.
+    static const int64_t q6_min = [] { const char * s = getenv("GGML_CUDA_MMVQ_F16_Q6_MIN"); return s ? (int64_t) atoll(s) : (int64_t) 1; }();
     if (!q6 && mmvq_f16_gen_type(src0->type) && !mmvq_f16_gen_takes(src0->type, ncols)) {
         return false;
     }
     return !(!enabled || cc >= GGML_CUDA_CC_VOLTA || GGML_CUDA_CC_IS_AMD(cc) || !(q6 || mmvq_f16_gen_type(src0->type)) ||
-            src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || ncols < (q6 ? 2 : 1) || ncols > MMVQ_F16_MAX_COLS ||
+            src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || ncols < (q6 ? q6_min : 1) || ncols > MMVQ_F16_MAX_COLS ||
             K % (q6 ? 512 : 256) != 0 || rows < min_rows || src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
             src0->nb[1] != ggml_row_size(src0->type, K) || src1->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float) ||
             (src1->nb[1] % 16) != 0 || ((uintptr_t) src1->data % 16) != 0 || ((uintptr_t) src0->data % 4) != 0);
