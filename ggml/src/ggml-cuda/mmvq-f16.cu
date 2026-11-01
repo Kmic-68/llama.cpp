@@ -2995,10 +2995,10 @@ static bool mmvq_f16_shape_ok(const ggml_tensor * src0, const ggml_tensor * src1
     const int64_t K = src0->ne[0], rows = src0->ne[1];
     // q6_K: its own kernel (K must hold an even number of blocks); the other types: the generic kernel
     const bool q6 = src0->type == GGML_TYPE_Q6_K;
-    // GGML_CUDA_MMVQ_F16_Q6_MIN: the fewest columns q6_K takes this path with. 1 (single-token decode and the MTP
-    // draft step): 27B Q5_K_M decode-path KLD vs an all-fp32 run 0.00300 (q8_1 integer path) -> 0.00101 with q5_K and
-    // q6_K both here, same top token 97.8 -> 98.9 %, tg256 +2 t/s (OPTLOG 317). 2 restores the integer path at 1 column.
-    static const int64_t q6_min = [] { const char * s = getenv("GGML_CUDA_MMVQ_F16_Q6_MIN"); return s ? (int64_t) atoll(s) : (int64_t) 1; }();
+    // GGML_CUDA_MMVQ_F16_Q6_MIN: the fewest columns q6_K takes this path with (default 2). 1 also sends single-token
+    // decode here: 3x closer to an all-fp32 run (27B Q5_K_M decode KLD 0.00178 -> 0.00101) but -1.25 t/s on the
+    // all-q6_K 27B Q6_K (tg128 29.82 -> 28.57, ABBA x2), so it stays opt-in (OPTLOG 317).
+    static const int64_t q6_min = [] { const char * s = getenv("GGML_CUDA_MMVQ_F16_Q6_MIN"); return s ? (int64_t) atoll(s) : (int64_t) 2; }();
     if (!q6 && mmvq_f16_gen_type(src0->type) && !mmvq_f16_gen_takes(src0->type, ncols)) {
         return false;
     }
