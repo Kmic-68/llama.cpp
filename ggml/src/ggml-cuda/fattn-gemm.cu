@@ -1799,8 +1799,8 @@ void ggml_cuda_flash_attn_ext_gemm(ggml_backend_cuda_context & ctx, ggml_tensor 
     memcpy(&scale, (const float *) dst->op_params + 0, sizeof(float));
 
     cudaStream_t stream = ctx.stream();
+    // the handle is already bound to this stream; cublasSetStream would also reset its workspace to cuBLAS's default
     cublasHandle_t cublas = ctx.cublas_handle();
-    CUBLAS_CHECK(cublasSetStream(cublas, stream));
 
     // Chunk size is bounded by the score-matrix scratch: S is nkv_c*nt*gqa floats.
     // 2048 keeps that near 100 MB at nt=2048, gqa=6, versus 512 MiB for the tile
