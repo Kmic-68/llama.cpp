@@ -75,7 +75,7 @@ cat > "$BIN/qwen-server" <<'EOF'
 # and turning graphs off costs 1.4% on tg256 -- 29.86 -> 29.44, inside the noise.
 # See OPTLOG attempts 167 and 168.
 BUILD="$(cd "$(dirname "$0")/../build" && pwd)"
-MODEL="${QWEN_MODEL:-/mnt/fast/models/Qwen3.8-27B-Q5_K_M.gguf}"
+MODEL="${QWEN_MODEL:-/mnt/fast/models/Qwen3.8-27B-Q6_K.gguf}"
 
 [ -f "$MODEL" ] || { echo "qwen-server: model not found: $MODEL" >&2; exit 1; }
 
