@@ -881,6 +881,9 @@ static __global__ void mul_mat_vec_q(
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
 
     const     int tid = warp_size*threadIdx.y + threadIdx.x;
+
+    mmvq_stage_grid<type>(tid, nwarps*warp_size);
+
     const     int row0 = rows_per_cuda_block*blockIdx.x;
     const     int blocks_per_row_x = ncols_x / qk;
     constexpr int blocks_per_iter = vdr * nwarps*warp_size / qi;
@@ -1485,6 +1488,8 @@ static __global__ void mul_mat_vec_q_moe(
             gate_scale = (const float *) fusion.gate_scale;
         }
     }
+
+    mmvq_stage_grid<type>(threadIdx.y*warp_size + threadIdx.x, blockDim.x*blockDim.y);
 
     const uint32_t token_idx   = threadIdx.y;
     const int      row0        = c_rows_per_block*blockIdx.x;
