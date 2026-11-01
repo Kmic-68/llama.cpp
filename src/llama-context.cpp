@@ -463,9 +463,10 @@ llama_context::llama_context(
     }
 
     if (!hparams.vocab_only) {
-        // the MoE expert cache wants the meta backend's threaded two-GPU dispatch (p100-docs/MOE.md); dense models keep the
-        // default single-threaded one. An explicit GGML_META_THREADS wins.
-        if (model.moe_lru_slots() > 0) {
+        // MoE models want the meta backend's threaded two-GPU dispatch (p100-docs/MOE.md): decode is launch-bound (Qwen3.6-35B-A3B
+        // -sm tensor tg128 73.4 -> 83.9 t/s, pp512 -4%; found by wispoffates). Dense models keep the single-threaded one (its
+        // matmul-overlapped prefill exchange wins there). An explicit GGML_META_THREADS wins.
+        if (model.moe_lru_slots() > 0 || hparams.n_expert > 0) {
             setenv("GGML_META_THREADS", "1", /*overwrite =*/ 0);
         }
         // GPU backends
