@@ -2698,10 +2698,16 @@ struct llama_model_qwen4exp : public llama_model_base {
         // the QSA layers share one set of k-pool inputs, see llama_memory_hybrid_idx
         llm_graph_input_kpool * build_inp_kpool(const llama_memory_hybrid_idx_context * mctx_hyb);
 
-        // QSA gather path (LLAMA_QSA_GATHER=1, one-token decode): build_qsa_sel leaves the selected cells here (indices into the
-        // cache, dead slots -> cell 0, padded to FATTN_KQ_STRIDE) with their additive mask, build_attn_qsa attends over just them
-        ggml_tensor * qsa_gidx  = nullptr;
-        ggml_tensor * qsa_gmask = nullptr;
+        // QSA gather path (LLAMA_QSA_GATHER=1, decode and prefill, Strata's design): build_qsa_sel leaves, per chunk of
+        // queries, each query's selected cells (indices into the cache, dead slots -> cell 0, padded to 256) with their
+        // additive mask; build_attn_qsa gathers those cells per query and attends over just them (one FA stream per query)
+        struct qsa_gchunk {
+            ggml_tensor * gidx;  // I32 [n_gpad, nt]
+            ggml_tensor * gmask; // F16 [n_gpad, 1, 1, nt]
+            int64_t       t0;
+            int64_t       nt;
+        };
+        std::vector<qsa_gchunk> qsa_g;
 
         // QSA: the additive mask [n_kv, n_tokens] of the top blocks and the tail, kq_mask included
         ggml_tensor * build_qsa_sel(

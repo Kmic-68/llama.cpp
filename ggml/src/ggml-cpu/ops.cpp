@@ -5305,6 +5305,20 @@ static void ggml_compute_forward_get_rows_q(
     const ggml_type type = src0->type;
     ggml_to_float_t const dequantize_row_q = ggml_get_type_traits(type)->to_float;
 
+    if (dst->type == type) {   // ggml_get_rows_raw: the rows as they are
+        const size_t row_bytes = ggml_row_size(type, nc);
+        const int dr = (nr + params->nth - 1)/params->nth;
+        for (int64_t i = dr*params->ith; i < MIN(dr*params->ith + dr, nr); ++i) {
+            const int64_t i12 = i/(ne11*ne10);
+            const int64_t i11 = (i - i12*ne11*ne10)/ne10;
+            const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
+            const int64_t i01 = *(int32_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
+            GGML_ASSERT(i01 >= 0 && i01 < ne01);
+            memcpy((char *) dst->data + i10*nb1 + i11*nb2 + i12*nb3, (const char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03, row_bytes);
+        }
+        return;
+    }
+
     assert(ne0  == nc);
     assert(ne02 == ne11);
     assert(nb00 == ggml_type_size(type));

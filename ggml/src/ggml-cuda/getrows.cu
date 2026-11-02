@@ -437,6 +437,24 @@ void get_rows_cuda(
     }
 }
 
+// ggml_get_rows_raw: whole quantized rows copied as they are, in units of T (2 bytes: every block type is 2-byte aligned)
+template <typename T>
+static __global__ void k_get_rows_raw(
+        const char * __restrict__ src0, const int32_t * __restrict__ src1, char * __restrict__ dst, const int64_t row_units,
+        const int64_t ne10, const int64_t ne11, const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t nb10, const size_t nb11, const size_t nb12, const size_t nb1, const size_t nb2, const size_t nb3) {
+    const int64_t i10 = blockIdx.x;
+    const int64_t i11 = blockIdx.y % ne11;
+    const int64_t i12 = blockIdx.y / ne11;
+    const int32_t i01 = *(const int32_t *) ((const char *) src1 + i10*nb10 + i11*nb11 + i12*nb12);
+    const T * s = (const T *) (src0 + i01*nb01 + i11*nb02 + i12*nb03);
+    T       * d = (T       *) (dst  + i10*nb1  + i11*nb2  + i12*nb3);
+    for (int64_t j = threadIdx.x; j < row_units; j += blockDim.x) {
+        d[j] = s[j];
+    }
+    GGML_UNUSED(ne10);
+}
+
 void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -447,6 +465,18 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     GGML_ASSERT(src1->type == GGML_TYPE_I32);
     GGML_ASSERT(ne13 == 1);
+
+    if (ggml_is_quantized(src0->type) && dst->type == src0->type) {
+        const size_t row_bytes = ggml_row_size(src0->type, ne00);
+        GGML_ASSERT(row_bytes % 2 == 0 && nb01 % 2 == 0 && nb1 % 2 == 0);
+        GGML_ASSERT(ne11*ne12 <= 65535);
+        const dim3 grid((unsigned) ne10, (unsigned) (ne11*ne12), 1);
+        const int64_t units = (int64_t) (row_bytes / 2);
+        k_get_rows_raw<uint16_t><<<grid, (unsigned) std::min<int64_t>(256, GGML_PAD(units, 32)), 0, stream>>>(
+            (const char *) src0->data, (const int32_t *) src1->data, (char *) dst->data, units,
+            ne10, ne11, nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3);
+        return;
+    }
 
     GGML_ASSERT(src0->nb[0] == ggml_type_size(src0->type));
     GGML_ASSERT(src1->nb[0] == ggml_type_size(src1->type));

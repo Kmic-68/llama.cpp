@@ -951,15 +951,19 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
             (uint32_t) ((rank[i] + 1) % kpool) :
             (uint32_t) ((p - sq.pos_min + 1) % (llama_pos) kpool);
 
+        // the tail oldest first, so the QSA gather reads cells in the cache's order (closer rounding to the masked path);
+        // LLAMA_QSA_TAIL_ASC=0: newest first, as before
+        static const bool tail_asc = [] { const char * e = getenv("LLAMA_QSA_TAIL_ASC"); return !e || atoi(e) != 0; }();
         for (uint32_t k = 0; k < kpool - 1; ++k) {
             int32_t cell = sentinel;
             bool    real = false;
+            const uint32_t kk = tail_asc && k < n_tail ? n_tail - 1 - k : k;
             if (k < n_tail && by_order) {
-                const uint32_t c = sq.cells[rank[i] - k].second;
+                const uint32_t c = sq.cells[rank[i] - kk].second;
                 cell = (int32_t) c;
                 real = true;
             } else if (k < n_tail) {
-                const llama_pos pt = p - (llama_pos) k;
+                const llama_pos pt = p - (llama_pos) kk;
                 auto it = std::lower_bound(sq.cells.begin(), sq.cells.end(), std::make_pair(pt, 0u));
                 if (it != sq.cells.end() && it->first == pt) {
                     cell = (int32_t) it->second;
@@ -970,6 +974,44 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
 
             if (gm != nullptr && n_sel % kpool != 0) {
                 gm[(size_t) i*n_sel + (size_t) n_top*kpool + k] = real ? 0.0f : -INFINITY;
+            }
+        }
+    }
+
+    // LLAMA_QSA_CHECK=1 (debug): every visible pool's cells plus the tail must be the token's visible cells, each once
+    static const bool qsa_check = [] { const char * e = getenv("LLAMA_QSA_CHECK"); return e && atoi(e) != 0; }();
+    if (qsa_check) {
+        static bool once = false; if (!once) { once = true; LLAMA_LOG_WARN("qsa_check: active, pool_mask %s, by_order %d\n", ggml_type_name(pool_mask->type), (int) by_order); }
+        for (uint32_t i = 0; i < n_tokens; ++i) {
+            const llama_seq_id s = ubatch->seq_id[i][0];
+            const llama_pos    p = ubatch->pos[i];
+            const auto & sq = lay.seqs[s];
+            std::vector<int> cnt(n_kv + 1, 0);
+            for (uint32_t ip = 0; ip < n_pool; ++ip) {
+                const float mv = pool_mask->type == GGML_TYPE_F16 ? ggml_fp16_to_fp32(((const ggml_fp16_t *) pool_mask->data)[(size_t) i*n_pool + ip]) :
+                                                                    ((const float *) pool_mask->data)[(size_t) i*n_pool + ip];
+                if (mv == 0.0f) {
+                    for (uint32_t k = 0; k < kpool; ++k) {
+                        cnt[std::min<int64_t>(pidx[(size_t) ip*kpool + k], n_kv)]++;
+                    }
+                }
+            }
+            for (uint32_t k = 0; k < kpool - 1; ++k) {
+                cnt[std::min<int64_t>(tidx[(size_t) i*(kpool - 1) + k], n_kv)]++;
+            }
+            int n_dup = 0, n_miss = 0, n_extra = 0, n_vis = 0;
+            for (size_t ic = 0; ic < sq.cells.size(); ++ic) {
+                const auto & c = sq.cells[ic];
+                if (by_order ? (int64_t) ic > rank[i] : c.first > p) continue;
+                ++n_vis;
+                if (cnt[c.second] == 0) ++n_miss;
+                if (cnt[c.second] > 1) ++n_dup;
+                cnt[c.second] = -1000;
+            }
+            for (uint32_t c = 0; c < n_kv; ++c) if (cnt[c] > 0) ++n_extra;
+            if (n_dup || n_miss || n_extra) {
+                LLAMA_LOG_WARN("qsa_check: pos %d vis %d dup %d miss %d extra %d (n_pool %u, pools %zu, n_kv %u)\n",
+                    (int) p, n_vis, n_dup, n_miss, n_extra, n_pool, sq.pools.size(), (unsigned) n_kv);
             }
         }
     }

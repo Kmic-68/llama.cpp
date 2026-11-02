@@ -9423,3 +9423,30 @@ Correction (11-01, release gate on 27B Q6_K, all q6_K): q6_K at 1 column on the 
 (integer) vs 28.57 (fp16), ABBA x2; kernel-level the two are even. Default back to integer for q6_K at 1 column
 (GGML_CUDA_MMVQ_F16_Q6_MIN=2; =1 opts in for accuracy). q5_K keeps fp16 at 1 column: Q5_K_M decode KLD vs fp32
 0.00300 -> 0.00178, tg256 hot 29.4 -> 31.5.
+
+## 318 — QSA gather attention (Strata's design): each query attends only its selected cells, gathered from the cache (Flash-Next, branch p100-moe): kept
+
+Step 1 of the Strata port (see the 11-01 head-to-head below). Before, every QSA layer ran dense FA over the whole cache
+under a top-k mask; now the selection (top 512 pools of 4 cells + the 3-cell tail, padded to 2304) is gathered per
+query with a new ggml_get_rows_raw (quantized rows copied as stored, so q4_0 K/V reach FA unchanged) and FA runs one
+stream per query over 2304 cells. Prefill goes in query chunks of LLAMA_QSA_GCHUNK (default 128). On whenever the cache
+is longer than the selection; LLAMA_QSA_GATHER=0 restores the masked path. The tail is now written oldest first
+(LLAMA_QSA_TAIL_ASC=0 = old order), which only moves rounding.
+
+Correctness. KLD vs the masked path read 0.017 (2 cards), 0.019 (1 card), 0.021 (CPU only), which looked like a bug and
+took most of the day. It is this model's noise floor: dense attention with only the FA kernel swapped
+(GGML_CUDA_FA_TILE_Q4_0=0, same math) reads 0.0257 +- 0.0027 vs dense; the gather reads 0.0292 +- 0.0035 vs dense
+(1K, -ub 1, one card). Top-10-of-512 routing turns 1e-5 rounding into other experts. Tensor dumps (fn-dump.sh): the
+gathered cells are exactly 0..p once each (index sums p(p+1)/2; LLAMA_QSA_CHECK=1 host coverage check clean), outputs
+bit-identical wherever the summation order matches. The masked path vs dense: KLD 0.000000 (LLAMA_QSA_DENSE=1 is the
+new dense reference switch). GET_ROWS 3/3 backends.
+
+Speed, 131072-token prompt + 1024 generated, model-card sampling, -ub 3072, prefetch, tail, CE (strata-shape.py):
+| | slots | prefill t/s | decode t/s | total s | peak GPU0 / GPU1 MiB (per card) |
+|---|---|---|---|---|---|
+| masked (before) | 105 | 241.2 | 15.66 | 609 | 14975 / 14315 |
+| gather (kept) | 100 | 261.4 | 16.86 | 562 | 14977 / 14319 |
+| Strata 0.1.41, other machine (DDR3) | - | 606.1 | 27.4 | 254 | - |
+At 105 slots the gather build hits the GPU0 guard (15187 > 15150): its reserved compute buffer is ~160 MiB larger.
+Open: trim that buffer; the expert path (decode 22 t/s already at 7K) and the prefill expert stream are the big gaps
+(steps 2 and 4). Found on the way: the expert cache hangs on one card (-sm none, main thread spins, GPU idle).
