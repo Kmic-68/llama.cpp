@@ -36,3 +36,7 @@ void ggml_cuda_lru_assemble(ggml_backend_cuda_context & ctx, ggml_tensor * dst, 
 void ggml_cuda_lru_wait_srcs(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i);
 // wait on the main stream for a pool still being filled by the copy engines (data == nullptr: all of them)
 void ggml_cuda_lru_ce_pending_wait(ggml_backend_cuda_context & ctx, const void * data);
+// GGML_CUDA_LRU_CE_GRAPH: copy-engine fills a CUDA graph can replay; graphable once the device's fills use the copy engines
+bool ggml_cuda_lru_ce_graph_enabled();
+bool ggml_cuda_lru_ce_graphable(int device);
+void ggml_cuda_lru_mirror_mark_all_dirty(ggml_backend_cuda_context & ctx);
