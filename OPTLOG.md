@@ -9492,3 +9492,6 @@ LLAMA_UBATCH_PROFILE_EVERY, LLAMA_INPUT_PROF, GGML_META_PROF.
 128k); mounting /mnt/fast with the in-kernel ntfs3 driver instead of ntfs-3g would remove most of it (user-side).
 Found: prefill is not deterministic run to run (same build, -ub 3072, 2 x 4096: KLD 0.018 vs itself; the remap A/B reads the
 same 0.017 both ways), under investigation.
+Fixed (same day): the nondeterminism was the gather path's unsorted top-k picks (radix select compacts with atomics, so the
+gathered cells came in a run-dependent order). Sorted ascending per query before the gather: KLD vs itself -0.000007 (the
+stored-logit floor), PPL 2.9430 vs the masked path's 2.9432 (-ub 3072, 2 x 4096). The masked path was deterministic already.

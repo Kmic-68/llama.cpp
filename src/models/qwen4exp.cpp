@@ -908,6 +908,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
                 cb(sc, "indexer_score", il);
                 tk = ggml_top_k(ctx0, sc, n_top_pool);
             }
+            // the radix top-k returns its picks in a run-dependent order (atomic compaction): sorted ascending, the gathered cells
+            // come in cache order every run, as the masked path reads them (an unsorted gather read KLD 0.018 against itself)
+            {
+                ggml_tensor * ord = ggml_argsort(ctx0, ggml_cast(ctx0, tk, GGML_TYPE_F32), GGML_SORT_ORDER_ASC);   // [n_top_pool, nt]
+                tk = ggml_reshape_2d(ctx0, ggml_get_rows(ctx0, ggml_reshape_3d(ctx0, tk, 1, n_top_pool, nt), ord), n_top_pool, nt);
+            }
             ggml_tensor * tl = ggml_cont(ctx0, ggml_view_2d(ctx0, inp_kpool->tail_idxs, inp_kpool->tail_idxs->ne[0], nt,
                                                             inp_kpool->tail_idxs->nb[1], t0*inp_kpool->tail_idxs->nb[1]));
             ggml_tensor * gidx = ggml_get_rows(ctx0, inp_kpool->pool_idxs, ggml_reshape_1d(ctx0, tk, n_top_pool*nt)); // [kpool, n_top_pool*nt]
