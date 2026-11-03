@@ -6,7 +6,9 @@
 
 // note: almost all graphs require at least sqrtf, so include cmath globally
 #include <cmath>
+#include <atomic>
 #include <map>
+#include <thread>
 
 class llama_memory_hybrid_idx_context;
 
@@ -2646,6 +2648,13 @@ struct llama_model_qwen4exp : public llama_model_base {
     llama_model_qwen4exp(const struct llama_model_params & params) : llama_model_base(params) {}
 
     class llm_graph_input_kpool;
+
+    void prefetch_batch(const llama_token * tokens, int64_t n_tokens) const override;
+    ~llama_model_qwen4exp() override;
+
+    // the PLE read-ahead threads of the last batch (prefetch_batch); joined before the next batch's and on destruction
+    mutable std::vector<std::thread> ple_pf_threads;
+    mutable std::atomic<bool> ple_pf_stop{false};
 
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;

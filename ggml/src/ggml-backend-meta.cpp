@@ -2330,6 +2330,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
 
     // If the previous cgraph had a defined UID it can be used to skip rebuilding the subgraphs per simple backend.
     const bool needs_rebuild = (cgraph->uid == 0) || (cgraph->uid != backend_ctx->uid);
+    // GGML_META_PROF=1: host time of the subgraph rebuild (every new graph uid: every prefill ubatch)
+    static const bool meta_prof = [] { const char * e = getenv("GGML_META_PROF"); return e && atoi(e) != 0; }();
+    const auto meta_t0 = std::chrono::steady_clock::now();
 
     bool max_nnodes_raised = false;
     if (cgraph->n_nodes > backend_ctx->max_nnodes) {
@@ -2651,6 +2654,10 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
         }
     }
 
+    if (meta_prof && needs_rebuild && cgraph->n_nodes > 1000) {
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - meta_t0).count();
+        fprintf(stderr, "meta_prof: rebuild %.1f ms, %d nodes, %zu subgraphs\n", ms, cgraph->n_nodes, backend_ctx->n_subgraphs);
+    }
     size_t iga = 0; // i graph aux
     size_t ina = 0; // i node aux
 

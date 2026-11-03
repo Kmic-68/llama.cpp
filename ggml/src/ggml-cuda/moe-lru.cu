@@ -35,6 +35,20 @@ struct ggml_cuda_lru_mirror {
 
 static __device__ unsigned long long lru_tail_skipped = 0, lru_tail_filled = 0, lru_tail_calls = 0;   // GGML_CUDA_LRU_TAIL_STATS
 
+// remap (exclusive cache, large batch): every entry independently -> a full grid, not the decide kernel's single warp (30k entries per
+// prefill ubatch at -ub 3072)
+static __global__ void k_lru_remap(const int32_t * __restrict__ ids, int32_t * __restrict__ slot_ids, const int32_t * __restrict__ state,
+                                   int n_used, int n_total, int n_expert, int n_slot, int ids_stride) {
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n_total) {
+        return;
+    }
+    const int32_t * owner = state;
+    const int32_t * hslot = state + n_expert + 2 * n_slot + 3;
+    const int32_t e = ids[(i / n_used) * ids_stride + i % n_used];
+    slot_ids[i] = (e < 0 || e >= n_expert) ? e : (owner[e] >= 0 ? owner[e] : n_slot + hslot[e]);
+}
+
 static __global__ void k_lru_decide(
         const int32_t * __restrict__ ids, int32_t * slot_ids,   // no __restrict__: lanes read what lane 0 wrote
         int32_t * state, int32_t * fill_list,
@@ -1141,6 +1155,13 @@ void ggml_cuda_lru_decide(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         ggml_cuda_lru_pf_state & pf = g_lru_pf[ctx.device];
         CUDA_CHECK(cudaStreamWaitEvent(ctx.stream(), pf.ev_layer[layer], 0));
         pf.pending[layer] = 0;
+    }
+    static const bool remap_warp = [] { const char * e = getenv("GGML_CUDA_LRU_REMAP_WARP"); return e && atoi(e) != 0; }();   // A/B: the old one-warp remap
+    if (remap && !remap_warp) {
+        const int n_total = n_used * n_tokens;
+        k_lru_remap<<<(n_total + 255) / 256, 256, 0, ctx.stream()>>>((const int32_t *) ids->data, (int32_t *) dst->data,
+            (const int32_t *) state->data, n_used, n_total, n_expert, n_slot, ids_stride);
+        return;
     }
     k_lru_decide<<<1, WARP_SIZE, 0, ctx.stream()>>>(
         (const int32_t *) ids->data, (int32_t *) dst->data,

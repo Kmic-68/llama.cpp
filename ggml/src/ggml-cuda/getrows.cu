@@ -230,6 +230,27 @@ static void get_rows_cuda_kq(
         s10, s11, s12/*, s13*/);
 }
 
+// rows of at most 64 elements (gather indices, per-row scores): one thread per element over all rows. The per-row blocks of
+// k_get_rows_float leave most threads idle and are bound by block scheduling there (~20 ns per row).
+template<typename src0_t, typename dst_t>
+static __global__ void k_get_rows_small(
+        const src0_t * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
+        const int64_t ne00, const int64_t ne10, const int64_t ne11, const int64_t n_total,
+        const size_t s1, const size_t s2, const size_t s3, const size_t nb01, const size_t nb02, const size_t nb03,
+        const size_t s10, const size_t s11, const size_t s12) {
+    for (int64_t idx = (int64_t) blockIdx.x*blockDim.x + threadIdx.x; idx < n_total; idx += (int64_t) gridDim.x*blockDim.x) {
+        const int64_t i00 = idx % ne00;
+        const int64_t r   = idx / ne00;
+        const int64_t i10 = r % ne10;
+        const int64_t r2  = r / ne10;
+        const int64_t i11 = r2 % ne11;
+        const int64_t i12 = r2 / ne11;
+        const int i01 = src1[i10*s10 + i11*s11 + i12*s12];
+        const src0_t * row = (const src0_t *) ((const char *) src0 + i01*nb01 + i11*nb02 + i12*nb03);
+        dst[i10*s1 + i11*s2 + i12*s3 + i00] = ggml_cuda_cast<dst_t>(row[i00]);
+    }
+}
+
 template<typename src0_t, typename dst_t>
 static void get_rows_cuda_float(
         const src0_t * src0_d, const int32_t * src1_d, dst_t * dst_d,
@@ -253,6 +274,14 @@ static void get_rows_cuda_float(
     GGML_ASSERT(ne12 > 0);
     GGML_ASSERT(ne11 <= std::numeric_limits<uint32_t>::max() / ne12);
     const uint3 ne12_fdv = init_fastdiv_values(ne12);
+
+    if (ne00 <= 64) {
+        const int64_t n_total = ne00*ne10*ne11*ne12;
+        const int64_t nb = std::min<int64_t>((n_total + 255)/256, 65535);
+        k_get_rows_small<src0_t, dst_t><<<(unsigned) nb, 256, 0, stream>>>(src0_d, src1_d, dst_d, ne00, ne10, ne11, n_total,
+            s1, s2, s3, nb01, nb02, nb03, s10, s11, s12);
+        return;
+    }
 
     if constexpr (std::is_same<src0_t, dst_t>::value) {
         constexpr int VEC = 16 / sizeof(dst_t);
@@ -437,22 +466,27 @@ void get_rows_cuda(
     }
 }
 
-// ggml_get_rows_raw: whole quantized rows copied as they are, in units of T (2 bytes: every block type is 2-byte aligned)
+// ggml_get_rows_raw: whole quantized rows copied as they are, in units of T (4 bytes when rows and strides allow, else 2: every
+// block type is 2-byte aligned). One warp per row, 8 rows per block: a block per row was bound by block scheduling (QSA prefill
+// gathers ~300k rows of 144 bytes per call)
 template <typename T>
 static __global__ void k_get_rows_raw(
         const char * __restrict__ src0, const int32_t * __restrict__ src1, char * __restrict__ dst, const int64_t row_units,
-        const int64_t ne10, const int64_t ne11, const size_t nb01, const size_t nb02, const size_t nb03,
+        const int64_t ne10, const int64_t ne11, const int64_t n_rows, const size_t nb01, const size_t nb02, const size_t nb03,
         const size_t nb10, const size_t nb11, const size_t nb12, const size_t nb1, const size_t nb2, const size_t nb3) {
-    const int64_t i10 = blockIdx.x;
-    const int64_t i11 = blockIdx.y % ne11;
-    const int64_t i12 = blockIdx.y / ne11;
+    const int64_t r = (int64_t) blockIdx.x*8 + threadIdx.y;
+    if (r >= n_rows) {
+        return;
+    }
+    const int64_t i10 = r % ne10;
+    const int64_t i11 = (r / ne10) % ne11;
+    const int64_t i12 = r / (ne10*ne11);
     const int32_t i01 = *(const int32_t *) ((const char *) src1 + i10*nb10 + i11*nb11 + i12*nb12);
     const T * s = (const T *) (src0 + i01*nb01 + i11*nb02 + i12*nb03);
     T       * d = (T       *) (dst  + i10*nb1  + i11*nb2  + i12*nb3);
-    for (int64_t j = threadIdx.x; j < row_units; j += blockDim.x) {
+    for (int64_t j = threadIdx.x; j < row_units; j += 32) {
         d[j] = s[j];
     }
-    GGML_UNUSED(ne10);
 }
 
 void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -469,12 +503,17 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     if (ggml_is_quantized(src0->type) && dst->type == src0->type) {
         const size_t row_bytes = ggml_row_size(src0->type, ne00);
         GGML_ASSERT(row_bytes % 2 == 0 && nb01 % 2 == 0 && nb1 % 2 == 0);
-        GGML_ASSERT(ne11*ne12 <= 65535);
-        const dim3 grid((unsigned) ne10, (unsigned) (ne11*ne12), 1);
-        const int64_t units = (int64_t) (row_bytes / 2);
-        k_get_rows_raw<uint16_t><<<grid, (unsigned) std::min<int64_t>(256, GGML_PAD(units, 32)), 0, stream>>>(
-            (const char *) src0->data, (const int32_t *) src1->data, (char *) dst->data, units,
-            ne10, ne11, nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3);
+        const int64_t n_rows = ne10*ne11*ne12;
+        const dim3 grid((unsigned) ((n_rows + 7)/8), 1, 1), block(32, 8, 1);
+        const bool w4 = row_bytes % 4 == 0 && nb01 % 4 == 0 && nb02 % 4 == 0 && nb03 % 4 == 0 && nb1 % 4 == 0 && nb2 % 4 == 0 &&
+                        nb3 % 4 == 0 && (uintptr_t) src0->data % 4 == 0 && (uintptr_t) dst->data % 4 == 0;
+        if (w4) {
+            k_get_rows_raw<uint32_t><<<grid, block, 0, stream>>>((const char *) src0->data, (const int32_t *) src1->data, (char *) dst->data,
+                (int64_t) (row_bytes / 4), ne10, ne11, n_rows, nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3);
+        } else {
+            k_get_rows_raw<uint16_t><<<grid, block, 0, stream>>>((const char *) src0->data, (const int32_t *) src1->data, (char *) dst->data,
+                (int64_t) (row_bytes / 2), ne10, ne11, n_rows, nb01, nb02, nb03, nb10, nb11, nb12, nb1, nb2, nb3);
+        }
         return;
     }
 

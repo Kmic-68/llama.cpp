@@ -916,6 +916,9 @@ struct llama_model {
     virtual void load_arch_tensors(llama_model_loader & ml) = 0;
     virtual std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const = 0;
 
+    // a hint before a batch is decoded: start reading what its ubatches will need from lazily mapped tensors (default: nothing)
+    virtual void prefetch_batch(const llama_token * tokens, int64_t n_tokens) const { (void) tokens; (void) n_tokens; }
+
 protected:
     llama_model_params params;
 

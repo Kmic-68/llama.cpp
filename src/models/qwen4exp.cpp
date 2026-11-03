@@ -1,5 +1,12 @@
 #include "models.h"
 #include "llama-impl.h"
+
+#include <memory>
+#include <thread>
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
 
@@ -1483,6 +1490,97 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
     }
 
     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
+}
+
+// The PLE rows a batch will read, from its tokens in order (one sequence assumed; the first n_gram-1 tokens see EOS as context, the
+// cache's tokens are not consulted): only a read-ahead hint, a wrong row costs a useless read, never a wrong result. The rows
+// sit in a lazily mapped tensor: set_input's own prefetch comes right before the read; this one runs a whole batch ahead, so with
+// a batch of several ubatches the later ubatches' rows load while the earlier ones compute (prefill: ~49k random rows per 3072-token
+// ubatch, ~3 s through ntfs-3g). LLAMA_PLE_PREFETCH=0: off.
+void llama_model_qwen4exp::prefetch_batch(const llama_token * tokens, int64_t n_tokens) const {
+    static const bool on = [] { const char * e = getenv("LLAMA_PLE_PREFETCH"); return !e || atoi(e) != 0; }();
+    ggml_tensor * ple = per_layer_tok_embd;
+    if (!on || tokens == nullptr || n_tokens <= 1 || ple == nullptr || !can_prefetch.count(ple)) {
+        return;
+    }
+#if defined(__linux__)
+    // the rows are read at random: no readahead (each 90-byte row would pull a whole readahead window through the filesystem).
+    // LLAMA_PLE_MADV_RANDOM=0: leave the kernel default
+    static const bool madv_random = [&] {
+        const char * e = getenv("LLAMA_PLE_MADV_RANDOM");
+        if (e && atoi(e) == 0) return false;
+        const long pg = sysconf(_SC_PAGESIZE);
+        const uintptr_t b = (uintptr_t) ple->data / pg * pg;
+        const uintptr_t en = (uintptr_t) ple->data + ggml_nbytes(ple);
+        if (madvise((void *) b, en - b, MADV_RANDOM) != 0) {
+            LLAMA_LOG_WARN("%s: madvise(MADV_RANDOM) on the PLE rows failed\n", __func__);
+        }
+        return true;
+    }();
+    (void) madv_random;
+#endif
+    const auto & hp = hparams;
+    const int64_t n_gram = hp.ple_ngram_size, n_heads = hp.ple_n_heads, per_gram = hp.ple_heads_per_ngram;
+    const int64_t eos = hp.ple_eos_token_id;
+    std::vector<int32_t> rows;
+    rows.reserve((size_t) n_heads * n_tokens);
+    std::vector<int64_t> ctx(n_gram);
+    for (int64_t i = 0; i < n_tokens; ++i) {
+        bool cut = false;
+        ctx[0] = tokens[i];
+        for (int64_t s = 1; s < n_gram; ++s) {
+            const llama_token t = cut || i - s < 0 ? (llama_token) eos : tokens[i - s];
+            cut = cut || t == eos;
+            ctx[s] = cut ? eos : t;
+        }
+        for (int64_t n = 2; n <= n_gram; ++n) {
+            uint64_t mixed = (uint64_t) ctx[0] * hp.ple_layer_multipliers[0];
+            for (int64_t j = 1; j < n; ++j) {
+                mixed ^= (uint64_t) ctx[j] * hp.ple_layer_multipliers[j];
+            }
+            const int64_t base = (n - 2) * per_gram;
+            for (int64_t g = 0; g < per_gram; ++g) {
+                const int64_t h_i = base + g;
+                rows.push_back((int32_t) (mixed % hp.ple_head_vocab_sizes[h_i] + hp.ple_head_offsets[h_i]));
+            }
+        }
+    }
+    // madvise(WILLNEED) reads nothing ahead through ntfs-3g (FUSE): fault the pages in from 8 threads, in token order, while the
+    // earlier ubatches compute (LLAMA_PLE_PREFETCH_THREADS, 0 = the madvise hint only)
+    static const int n_thr = [] { const char * e = getenv("LLAMA_PLE_PREFETCH_THREADS"); return e ? atoi(e) : 8; }();
+    if (n_thr <= 0) {
+        llama_prefetch_rows(ple, rows.data(), rows.size());
+        return;
+    }
+    // the previous batch's threads are done by now (or nearly: their pages are what that batch read)
+    ple_pf_stop = true;
+    for (auto & th : ple_pf_threads) {
+        th.join();
+    }
+    ple_pf_threads.clear();
+    ple_pf_stop = false;
+    auto shared_rows = std::make_shared<std::vector<int32_t>>(std::move(rows));
+    const char * base = (const char *) ple->data;
+    const size_t nb1 = ple->nb[1];
+    const size_t row_bytes = ggml_row_size(ple->type, ple->ne[0]);
+    std::atomic<bool> * stop = &ple_pf_stop;
+    for (int t = 0; t < n_thr; ++t) {
+        ple_pf_threads.emplace_back([shared_rows, base, nb1, row_bytes, t, stop]() {
+            const auto & r = *shared_rows;
+            for (size_t i = (size_t) t; i < r.size() && !stop->load(std::memory_order_relaxed); i += (size_t) n_thr) {
+                const volatile char * p = base + (size_t) r[i] * nb1;
+                (void) p[0];
+                (void) p[row_bytes - 1];
+            }
+        });
+    }
+}
+
+llama_model_qwen4exp::~llama_model_qwen4exp() {
+    ple_pf_stop = true;
+    for (auto & th : ple_pf_threads) {
+        th.join();
+    }
 }
 
 // Read a conv history out of its own recurrent row and write the new tail back.

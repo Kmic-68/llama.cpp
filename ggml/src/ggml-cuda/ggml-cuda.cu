@@ -5769,8 +5769,15 @@ struct ggml_cuda_op_prof {
 };
 
 static void ggml_cuda_op_prof_report();
+static void ggml_cuda_op_prof_report_dev(int device);
+
+// GGML_CUDA_OP_PROFILE_DECODE=1: only graphs whose matmuls and attention see one token (decode), not prefill
+static thread_local bool g_op_prof_skip = false;
 
 static ggml_cuda_op_prof * ggml_cuda_op_prof_get(int device) {
+    if (g_op_prof_skip) {
+        return nullptr;
+    }
     static const int every = [] {
         const char * s = getenv("GGML_CUDA_OP_PROFILE");
         return s ? atoi(s) : 0;
@@ -5827,14 +5834,25 @@ static void ggml_cuda_op_prof_flush(ggml_cuda_op_prof * P, int device, cudaStrea
     P->pending.clear();
     P->pool_used = 0;
     P->n_graphs++;
+    // GGML_CUDA_OP_PROFILE_EVERY=N: also print the (cumulative) totals every N profiled graphs
+    static const int every_n = [] { const char * e = getenv("GGML_CUDA_OP_PROFILE_EVERY"); return e ? atoi(e) : 0; }();
+    if (every_n > 0 && P->n_graphs % every_n == 0) {
+        ggml_cuda_op_prof_report_dev(device);
+    }
 }
 
 // cumulative totals, printed at exit: divide by the tokens processed to get per-token cost
 static void ggml_cuda_op_prof_report() {
     for (int device = 0; device < GGML_CUDA_MAX_DEVICES; ++device) {
+        ggml_cuda_op_prof_report_dev(device);
+    }
+}
+
+static void ggml_cuda_op_prof_report_dev(int device) {
+    {
         ggml_cuda_op_prof * P = ggml_cuda_op_prof_get(device);
         if (!P || P->n_graphs == 0) {
-            continue;
+            return;
         }
         std::vector<std::pair<double, std::string>> v;
         double tot = 0.0;
@@ -5855,6 +5873,19 @@ static void ggml_cuda_op_prof_report() {
 
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
+
+    static const bool prof_decode_only = [] { const char * e = getenv("GGML_CUDA_OP_PROFILE_DECODE"); return e && atoi(e) != 0; }();
+    if (prof_decode_only) {
+        g_op_prof_skip = false;
+        for (int i = 0; i < cgraph->n_nodes && !g_op_prof_skip; i++) {
+            const ggml_tensor * n = cgraph->nodes[i];
+            if ((n->op == GGML_OP_MUL_MAT && n->src[1] && n->src[1]->ne[1] > 1 && ggml_get_op_params_i32(n, 1) != GGML_HINT_SRC0_IS_HADAMARD) ||
+                (n->op == GGML_OP_MUL_MAT_ID && n->src[1] && n->src[1]->ne[2] > 1) ||
+                (n->op == GGML_OP_FLASH_ATTN_EXT && n->src[0]->ne[1]*n->src[0]->ne[3] > 1)) {
+                g_op_prof_skip = true;
+            }
+        }
+    }
 
     // flag used to determine whether it is an integrated_gpu
     const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;

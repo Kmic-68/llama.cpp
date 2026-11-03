@@ -1701,7 +1701,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         const int64_t tp4 = ggml_time_us();
         auto & P = g_ubatch_prof;
         P.build += tp2 - tp1; P.inputs += tp3 - tp2; P.compute += tp4 - tp3;
-        if (++P.n % 16 == 0) {
+        static const int every = [] { const char * e = getenv("LLAMA_UBATCH_PROFILE_EVERY"); return e && atoi(e) > 0 ? atoi(e) : 16; }();
+        if (++P.n % every == 0) {
             fprintf(stderr, "ubatch profile (%lld ubatches, n_tokens %u, n_kv ~%d): build+alloc %.1f ms, set_inputs %.1f ms, compute enqueue %.1f ms, prev-ubatch GPU wait %.1f ms (per ubatch)\n",
                 (long long) P.n, ubatch.n_tokens, (int) (mctx ? 0 : 0),
                 P.build/1e3/P.n, P.inputs/1e3/P.n, P.compute/1e3/P.n, P.sync/1e3/P.n);
@@ -2066,7 +2067,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             }
             n_ub = llama_ub_for_kv(cparams.n_ubatch, (uint64_t) (pmax + 1) + n_tokens_all);
         }
+        static const bool dprof = [] { const char * e = getenv("LLAMA_DECODE_PROF"); return e && atoi(e) != 0; }();
+        const int64_t td0 = dprof ? ggml_time_us() : 0;
+        if (n_tokens_all > n_ub) {
+            model.prefetch_batch(balloc->get_batch().token, (int64_t) n_tokens_all);
+        }
         mctx = memory->init_batch(*balloc, n_ub, embd_all);
+        if (dprof && n_tokens_all > 1) {
+            LLAMA_LOG_WARN("decode_prof: init_batch %.1f ms (%u tokens)\n", (ggml_time_us() - td0) / 1000.0, (unsigned) n_tokens_all);
+        }
         if (!mctx) {
             return -2;
         }
@@ -2143,7 +2152,17 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         ggml_status status;
 
+        static const bool dprof2 = [] { const char * e = getenv("LLAMA_DECODE_PROF"); return e && atoi(e) != 0; }();
+        static int64_t t_after_prev = 0;
+        if (dprof2 && ubatch.n_tokens > 1 && t_after_prev > 0) {
+            LLAMA_LOG_WARN("decode_prof: between ubatches %.1f ms\n", (ggml_time_us() - t_after_prev) / 1000.0);
+        }
+        const int64_t tpu0 = dprof2 ? ggml_time_us() : 0;
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+        if (dprof2 && ubatch.n_tokens > 1) {
+            LLAMA_LOG_WARN("decode_prof: process_ubatch %.1f ms\n", (ggml_time_us() - tpu0) / 1000.0);
+        }
+        t_after_prev = dprof2 ? ggml_time_us() : 0;
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module

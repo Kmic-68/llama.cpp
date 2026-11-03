@@ -9466,3 +9466,29 @@ nsys: without it the same config decodes at ~26 t/s (38.5 ms/token).
   Not worth it for <= 4.5 ms; patch kept at /mnt/fast/p100-scratch/moe/ce-graph-full.patch. Dropped.
 Conclusion: short-context decode (~26 t/s) is already near Strata's 128K figure (27.4); the decode gap is depth cost
 (16.9 t/s at 128K = +21 ms/token). Next: profile decode at 128K.
+
+## 320 — prefill: PLE rows read ahead, get_rows small-row / raw-row kernels, parallel remap (Flash-Next 128k: prefill 260 -> 321 t/s)
+
+New fast loop: p100-handoff/moe/probe.sh (stop previous server by PID + wait for VRAM, drop page cache, start, one strata-shape
+run, major-fault count, stop) and 30k probes instead of 128k; profilers: GGML_CUDA_OP_PROFILE_DECODE/_EVERY, LLAMA_DECODE_PROF,
+LLAMA_UBATCH_PROFILE_EVERY, LLAMA_INPUT_PROF, GGML_META_PROF.
+- nsys of a 5-ubatch prefill: GPUs busy 55%; one ~3 s stall per ubatch. Not graph build (150-370 ms), inputs (<130 ms), meta
+  rebuild (~35 ms) or between ubatches (5 ms): the per-layer-embedding table (per_layer_token_embd, IQ4_NL [160, 320M], 28.8 GB,
+  lazily mmapped) is read by a CPU get_rows, 16 hashed rows per token = ~49k random rows per 3072-token ubatch, ~24k major faults,
+  through ntfs-3g (FUSE, ~2.7-3.6k faults/s). The rows were madvise(WILLNEED)'d in set_input, right before the read.
+  Now: llama_model::prefetch_batch (qwen4exp) hashes the whole batch's rows at decode start and faults them in from 8 threads
+  (model-owned, joined) while the earlier ubatches compute; needs -b > -ub (server -b 32768). madvise WILLNEED alone: no gain
+  (FUSE reads nothing ahead); MADV_RANDOM: no change (kept, harmless); 16 threads = 8 (FUSE-bound). LLAMA_PLE_PREFETCH=0 off.
+- get_rows: rows of <= 64 elements one thread per element (the block-per-row kernel was ~20 ns/row of block scheduling: the
+  QSA index gathers took ~1.3 ms per call); get_rows_raw one warp per row, 4-byte units (QSA K/V gather 32 -> ~55 GB/s).
+  Raw kernel bit-identical (layer-3 attention dumps 0/216 differ); GET_ROWS 3/3 backends.
+- LRU remap (prefill decide): a full grid instead of one warp for 30k entries (GGML_CUDA_LRU_REMAP_WARP=1 = old).
+| 128k prompt + 512, 100 slots, -ub 3072 | prefill t/s | decode t/s | total s |
+|---|---|---|---|
+| before (OPTLOG 318 build) | 260.5 | 18.50 | 531 |
+| + kernels, remap (-b 3072) | 287.4 | 17.38 | 486 |
+| + PLE read-ahead (-b 32768) | 321.3 | 17.2 | 438 |
+30k probe: 317 -> 393.5 (-b 12288) -> 416.8 (-b 30720). The PLE reads still cap prefill on this disk (~1.12M faults in 408 s at
+128k); mounting /mnt/fast with the in-kernel ntfs3 driver instead of ntfs-3g would remove most of it (user-side).
+Found: prefill is not deterministic run to run (same build, -ub 3072, 2 x 4096: KLD 0.018 vs itself; the remap A/B reads the
+same 0.017 both ways), under investigation.
