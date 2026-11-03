@@ -9450,3 +9450,19 @@ Speed, 131072-token prompt + 1024 generated, model-card sampling, -ub 3072, pref
 At 105 slots the gather build hits the GPU0 guard (15187 > 15150): its reserved compute buffer is ~160 MiB larger.
 Open: trim that buffer; the expert path (decode 22 t/s already at 7K) and the prefill expert stream are the big gaps
 (steps 2 and 4). Found on the way: the expert cache hangs on one card (-sm none, main thread spins, GPU idle).
+
+## 319 — decode at short context: CUDA graphs for MoE subgraphs (fix kept, no gain), graph-replayable copy-engine fills (dropped)
+
+Profiled one decode token under nsys (105 slots, -ub 256, CE fills): 46.7 ms/token, GPU busy 32 ms per card (dense Q8_0
+matvecs ~10 ms, experts ~5 ms, ~3000 small kernels), ~10 ms in ~38 fill waits, ~4.5 ms launch gaps. Most of that "idle" is
+nsys: without it the same config decodes at ~26 t/s (38.5 ms/token).
+- GGML_CUDA_GRAPHS_PRE_VOLTA=3 judged MUL_MAT_ID by src1->ne[1] (the expert dim), so every MoE subgraph ran eagerly; tokens
+  are dim 2. Fixed (kept). With kernel fills (LRU_DMA=0) decode is then fully graphed but GPU-bound on the SM fills: 20.5.
+  With CE fills the LRU subgraphs stay eager, the rest is graphed. ABBA (2 x 128 tokens each, model-card sampling, seed 7):
+  eager 25.43/26.28, 25.25/26.01; graphs 24.99/25.54, 24.98/25.70. Output md5 identical in all 8. No gain: not default.
+- GGML_CUDA_LRU_CE_GRAPH (device job counter, flag waits, persistent worker): works eagerly (23.4 under the old worker
+  timing), deadlocks with graphs: the CE worker's CUDA calls stall while a dispatch thread captures, and a capture lock
+  turns it into a cross-device cycle (dev0 capture waits on dev1's exchange, dev1's GPU on dev0's, dev0's GPU on fills).
+  Not worth it for <= 4.5 ms; patch kept at /mnt/fast/p100-scratch/moe/ce-graph-full.patch. Dropped.
+Conclusion: short-context decode (~26 t/s) is already near Strata's 128K figure (27.4); the decode gap is depth cost
+(16.9 t/s at 128K = +21 ms/token). Next: profile decode at 128K.

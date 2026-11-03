@@ -1337,25 +1337,10 @@ bool ggml_cuda_lru_ce_enabled() {
 
 // the first fills of a device go through k_lru_fill: buffers that grow on first use (cudaMalloc/cudaFree wait for the whole
 // device) must not do so while a stream waits for host-issued copies. GGML_CUDA_LRU_CE_AFTER fill ops (default 2000 ~ 40 tokens).
-static int g_lru_ce_ready_count[GGML_CUDA_MAX_DEVICES] = {};
 static bool ggml_cuda_lru_ce_ready(int device) {
     static const int after = [] { const char * e = getenv("GGML_CUDA_LRU_CE_AFTER"); return e ? atoi(e) : 2000; }();
-    return ++g_lru_ce_ready_count[device] > after;
-}
-
-// GGML_CUDA_LRU_CE_GRAPH=1: copy-engine fills that a CUDA graph can replay. The publish kernel takes its job number from a device
-// counter and records it per descriptor set (expect[]); the main stream waits with a one-thread kernel comparing the done counters to
-// expect[], not with a host-baked cuStreamWaitValue32; a persistent worker walks the ring in order and looks the copy descriptors up
-// in a table the dispatch thread filled at launch (or capture) time. Nothing per job is decided on the host at launch time.
-bool ggml_cuda_lru_ce_graph_enabled() {
-    static const bool on = [] { const char * e = getenv("GGML_CUDA_LRU_CE_GRAPH"); return ggml_cuda_lru_ce_enabled() && e && atoi(e) != 0; }();
-    return on;
-}
-
-// true once every device that fills has switched to the copy engines (a graph captured before would keep the warm-up kernel fills)
-bool ggml_cuda_lru_ce_graphable(int device) {
-    static const int after = [] { const char * e = getenv("GGML_CUDA_LRU_CE_AFTER"); return e ? atoi(e) : 2000; }();
-    return ggml_cuda_lru_ce_graph_enabled() && g_lru_ce_ready_count[device] > after;
+    static int count[GGML_CUDA_MAX_DEVICES] = {};
+    return ++count[device] > after;
 }
 
 static constexpr int LRU_CE_RING = 256;
@@ -1363,7 +1348,6 @@ static constexpr int LRU_CE_MAXF = 256;
 struct lru_ce_slot {
     volatile uint32_t seq;
     volatile int32_t  n;
-    volatile int32_t  desc_idx;            // graph mode: the descriptor set (lru_ce_dev::desc_tab)
     int32_t list[3 * LRU_CE_MAXF];
 };
 struct lru_ce_job {
@@ -1402,13 +1386,6 @@ struct lru_ce_dev {
     std::condition_variable cv;
     std::vector<lru_ce_job> queue;
     std::thread worker;
-    // graph mode (GGML_CUDA_LRU_CE_GRAPH)
-    static constexpr int MAX_DESC = 512;
-    unsigned int * pub = nullptr;          // device memory: last job number taken by a publish kernel
-    unsigned int * expect = nullptr;       // device memory [MAX_DESC]: per descriptor set, the job number of its last publish
-    lru_ce_job desc_tab[MAX_DESC];         // per descriptor set: layer, kinds, descriptors (seq unused)
-    std::atomic<int> n_desc{0};
-    int pend_idx[3] = {};
 };
 static lru_ce_dev g_lru_ce[GGML_CUDA_MAX_DEVICES];
 
@@ -1423,37 +1400,6 @@ static __global__ void k_lru_ce_publish(const int32_t * __restrict__ fill_list, 
         __threadfence_system();
         slot->seq = seq;
         __threadfence_system();
-    }
-}
-
-static __global__ void k_lru_ce_publish_g(const int32_t * __restrict__ fill_list, int n_slot, lru_ce_slot * ring,
-                                          unsigned int * pub, unsigned int * expect, int idx) {
-    __shared__ uint32_t sseq;
-    if (threadIdx.x == 0) {
-        sseq = *(volatile unsigned int *) pub + 1;   // only this kernel writes it, one block, in stream order
-        *(volatile unsigned int *) pub = sseq;
-    }
-    __syncthreads();
-    lru_ce_slot * slot = ring + sseq % LRU_CE_RING;
-    const int n = min(fill_list[3 * n_slot], LRU_CE_MAXF);
-    for (int i = threadIdx.x; i < 3 * n; i += blockDim.x) {
-        slot->list[i] = fill_list[i];
-    }
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        slot->n = n;
-        slot->desc_idx = idx;
-        __threadfence_system();
-        slot->seq = sseq;
-        __threadfence_system();
-        *(volatile unsigned int *) (expect + idx) = sseq;
-    }
-}
-
-// until *ctr has reached the last publish of descriptor set idx (idx < 0: of any set, *pub)
-static __global__ void k_lru_ce_wait_g(const unsigned int * ctr, const unsigned int * expect, int idx, const unsigned int * pub) {
-    const uint32_t want = idx >= 0 ? *(volatile const unsigned int *) (expect + idx) : *(volatile const unsigned int *) pub;
-    while ((int32_t) (*(volatile const unsigned int *) ctr - want) < 0) {
     }
 }
 
@@ -1482,11 +1428,7 @@ void ggml_cuda_lru_ce_pending_wait(ggml_backend_cuda_context & ctx, const void *
     lru_ce_dev & cd = g_lru_ce[ctx.device];
     for (int k = 0; k < 3; k++) {
         if (cd.pend_pool[k] != nullptr && (data == nullptr || cd.pend_pool[k] == data)) {
-            if (ggml_cuda_lru_ce_graph_enabled()) {
-                k_lru_ce_wait_g<<<1, 1, 0, ctx.stream()>>>(cd.pend_ctr[k], cd.expect, cd.pend_idx[k], cd.pub);
-            } else {
-                CU_CHECK(cuStreamWaitValue32((CUstream) ctx.stream(), (CUdeviceptr) cd.pend_ctr[k], cd.pend_seq[k], CU_STREAM_WAIT_VALUE_GEQ));
-            }
+            CU_CHECK(cuStreamWaitValue32((CUstream) ctx.stream(), (CUdeviceptr) cd.pend_ctr[k], cd.pend_seq[k], CU_STREAM_WAIT_VALUE_GEQ));
             if (data == nullptr && ++cd.pend_unconsumed == 1) {
                 GGML_LOG_WARN("%s: device %d: a staged LRU fill was not consumed by a matvec (pool pointer mismatch?)\n", __func__, ctx.device);
             }
@@ -1497,31 +1439,9 @@ void ggml_cuda_lru_ce_pending_wait(ggml_backend_cuda_context & ctx, const void *
 
 static void ggml_cuda_lru_ce_worker(lru_ce_dev * cd) {
     ggml_cuda_set_device(cd->device);
-    const bool graph_mode = ggml_cuda_lru_ce_graph_enabled();
-    uint32_t next = 0;
     for (;;) {
         lru_ce_job job;
-        if (graph_mode) {
-            // jobs in ring order; idle -> back off to short sleeps after ~1 ms of spinning (a decode token publishes every layer)
-            job.seq = ++next;
-            lru_ce_slot * gs = cd->ring + job.seq % LRU_CE_RING;
-            for (int spins = 0; gs->seq != job.seq; ++spins) {
-                if (spins < 20000) {
-#if defined(__x86_64__)
-                    __builtin_ia32_pause();
-#endif
-                } else {
-                    std::this_thread::sleep_for(std::chrono::microseconds(20));
-                }
-            }
-            std::atomic_thread_fence(std::memory_order_acquire);
-            const int idx = gs->desc_idx;
-            GGML_ASSERT(idx >= 0 && idx < cd->n_desc.load(std::memory_order_acquire));
-            const lru_ce_job & t = cd->desc_tab[idx];
-            job.n_kinds = t.n_kinds;
-            job.layer   = t.layer;
-            for (int k = 0; k < 3; k++) job.d[k] = t.d[k];
-        } else {
+        {
             std::unique_lock<std::mutex> lk(cd->mtx);
             cd->cv.wait(lk, [cd] { return !cd->queue.empty(); });
             job = cd->queue.front();
@@ -1721,10 +1641,6 @@ static lru_ce_dev & ggml_cuda_lru_ce_dev(int device, size_t scratch_need) {
         CUDA_CHECK(cudaMemset(cd.wb_done, 0, sizeof(unsigned int)));
         CUDA_CHECK(cudaMalloc((void **) &cd.done_k, 2 * sizeof(unsigned int)));
         CUDA_CHECK(cudaMemset(cd.done_k, 0, 2 * sizeof(unsigned int)));
-        CUDA_CHECK(cudaMalloc((void **) &cd.pub, sizeof(unsigned int)));
-        CUDA_CHECK(cudaMemset(cd.pub, 0, sizeof(unsigned int)));
-        CUDA_CHECK(cudaMalloc((void **) &cd.expect, lru_ce_dev::MAX_DESC * sizeof(unsigned int)));
-        CUDA_CHECK(cudaMemset(cd.expect, 0, lru_ce_dev::MAX_DESC * sizeof(unsigned int)));
         cd.init = true;
         cd.worker = std::thread(ggml_cuda_lru_ce_worker, &cd);
         cd.worker.detach();
@@ -1768,36 +1684,6 @@ static bool ggml_cuda_lru_ce_fill(ggml_backend_cuda_context & ctx, const int32_t
     }
     lru_ce_dev & cd = ggml_cuda_lru_ce_dev(ctx.device, need);
     ggml_cuda_lru_ce_pending_wait(ctx, nullptr);
-    if (ggml_cuda_lru_ce_graph_enabled()) {
-        // the descriptor set: found by layer + descriptors, else appended (before the kernel that names it is launched)
-        int idx = -1;
-        const int nd = cd.n_desc.load(std::memory_order_relaxed);
-        for (int i = 0; i < nd && idx < 0; i++) {
-            const lru_ce_job & t = cd.desc_tab[i];
-            if (t.layer == layer && t.n_kinds == n && memcmp(t.d, descs.d, n * sizeof(lru_fill_desc)) == 0) idx = i;
-        }
-        if (idx < 0) {
-            GGML_ASSERT(nd < lru_ce_dev::MAX_DESC);
-            lru_ce_job & t = cd.desc_tab[nd];
-            t = lru_ce_job{};
-            t.n_kinds = n; t.layer = layer;
-            for (int k = 0; k < n; k++) t.d[k] = descs.d[k];
-            cd.n_desc.store(nd + 1, std::memory_order_release);
-            idx = nd;
-        }
-        k_lru_ce_publish_g<<<1, 256, 0, ctx.stream()>>>(fl, n_slot, cd.ring, cd.pub, cd.expect, idx);
-        cd.issued = 1;   // only "something was published" matters to ggml_cuda_lru_ce_sync_host in this mode
-        if (!prefetch) {
-            if (ggml_cuda_lru_ce_staged() && n == 3) {
-                cd.pend_pool[0] = descs.d[1].pool; cd.pend_ctr[0] = cd.done_k;     cd.pend_idx[0] = idx;
-                cd.pend_pool[1] = descs.d[0].pool; cd.pend_ctr[1] = cd.done_k + 1; cd.pend_idx[1] = idx;
-                cd.pend_pool[2] = descs.d[2].pool; cd.pend_ctr[2] = cd.done;       cd.pend_idx[2] = idx;
-            } else {
-                k_lru_ce_wait_g<<<1, 1, 0, ctx.stream()>>>(cd.done, cd.expect, idx, cd.pub);
-            }
-        }
-        return true;
-    }
     // bound the host's run-ahead: a stream waiting for copies stops the device, and a dispatch thread that keeps launching fills
     // the driver's queue and then blocks inside a launch holding the context lock, which the worker needs for its copies.
     // Waiting here (no CUDA call held) until the worker is at most 16 jobs behind keeps the queue short.
@@ -1842,19 +1728,7 @@ void ggml_cuda_lru_ce_sync_host(ggml_backend_cuda_context & ctx) {
         if (ggml_cuda_lru_ce_debug()) {
             fprintf(stderr, "lru_ce dev %d: host-slot sync waits for job %u\n", ctx.device, cd.issued);
         }
-        if (ggml_cuda_lru_ce_graph_enabled()) {
-            k_lru_ce_wait_g<<<1, 1, 0, ctx.stream()>>>(cd.wb_done, cd.expect, -1, cd.pub);
-        } else {
-            CU_CHECK(cuStreamWaitValue32((CUstream) ctx.stream(), (CUdeviceptr) cd.wb_done, cd.issued, CU_STREAM_WAIT_VALUE_GEQ));
-        }
-    }
-}
-
-// a replayed CUDA graph runs LRU_DECIDE without its launch-time bookkeeping: every host mirror of a state may be stale
-void ggml_cuda_lru_mirror_mark_all_dirty(ggml_backend_cuda_context & ctx) {
-    auto * m = (ggml_cuda_lru_mirror *) ctx.lru_mirror;
-    if (m != nullptr) {
-        for (auto & e : m->entries) e.dirty = true;
+        CU_CHECK(cuStreamWaitValue32((CUstream) ctx.stream(), (CUdeviceptr) cd.wb_done, cd.issued, CU_STREAM_WAIT_VALUE_GEQ));
     }
 }
 

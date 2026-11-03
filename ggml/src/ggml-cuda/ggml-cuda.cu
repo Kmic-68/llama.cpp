@@ -3412,10 +3412,8 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
         // p100-series MoE expert cache: ops whose work is decided on the host at launch time cannot be replayed (the prefill
         // assembly: host mirror + copy-engine DMA; the copy-engine fills: a host thread replays the fill lists)
-        // GGML_CUDA_LRU_CE_GRAPH: the copy-engine fills replay from a graph once the device has switched to them
         if (node->op == GGML_OP_LRU_ASSEMBLE ||
-                ((node->op == GGML_OP_LRU_FILL || node->op == GGML_OP_LRU_DECIDE) && ggml_cuda_lru_ce_enabled() &&
-                 !ggml_cuda_lru_ce_graphable(ggml_cuda_get_device()))) {
+                ((node->op == GGML_OP_LRU_FILL || node->op == GGML_OP_LRU_DECIDE) && ggml_cuda_lru_ce_enabled())) {
             use_cuda_graph = false;
         }
 
@@ -6294,9 +6292,6 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
-    if (use_cuda_graph) {
-        ggml_cuda_lru_mirror_mark_all_dirty(*cuda_ctx);
-    }
 
     // Mark everything this graph enqueued, so a later peer copy can order itself against the
     // results without having to wait on the compute stream (see copy_stream in the context).
