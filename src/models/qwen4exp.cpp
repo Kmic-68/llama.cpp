@@ -827,8 +827,24 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     // scatter the fresh pooled keys into their rep rows, then gather all n_pool of them by cell:
     // the older pools come from the rows earlier ubatches wrote
     ggml_build_forward_expand(gf, kpool_cache.scatter_pooled(pooled_new, inp_kpool->new_pool_rep));
-    ggml_tensor * pooled = kpool_cache.gather_pooled(inp_kpool->pool_cells);
-    pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, 1, n_pool);
+    // the indexer reads the pooled keys in place through pool_cells (src[4]) instead of a copy of every pool per step
+    // (128 MB per QSA layer per token at 262k); LLAMA_QSA_POOLED_INPLACE=0: the gather, as before
+    static const bool pooled_inplace = [] { const char * e = getenv("LLAMA_QSA_POOLED_INPLACE"); return !e || atoi(e) != 0; }();
+    ggml_tensor * pooled;
+    if (pooled_inplace) {
+        ggml_tensor * pv = kpool_cache.pooled_view();
+        GGML_ASSERT(pv->ne[1] >= n_pool);
+        pooled = ggml_view_3d(ctx0, pv, idx_dim, 1, n_pool, pv->nb[1], pv->nb[1], 0);
+    } else {
+        pooled = ggml_reshape_3d(ctx0, kpool_cache.gather_pooled(inp_kpool->pool_cells), idx_dim, 1, n_pool);
+    }
+    auto indexer = [&](ggml_tensor * qq, ggml_tensor * ww, ggml_tensor * mm) {
+        ggml_tensor * r = ggml_lightning_indexer(ctx0, qq, pooled, ww, mm);
+        if (pooled_inplace) {
+            r->src[4] = inp_kpool->pool_cells;
+        }
+        return r;
+    };
     cb(pooled, "indexer_k", il);
 
     ggml_tensor * q = build_lora_mm(model.layers[il].index_q_proj, cur);
@@ -855,7 +871,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
             ggml_tensor * wc = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_idx_h, nt), 1.0f/sqrtf((float) idx_dim));
             ggml_tensor * pm = ggml_view_2d(ctx0, inp_kpool->pool_mask, n_pool, nt, inp_kpool->pool_mask->nb[1],
                                             t0*inp_kpool->pool_mask->nb[1]);
-            ggml_tensor * sc = ggml_lightning_indexer(ctx0, qc, pooled, wc, pm); // [n_pool, nt]
+            ggml_tensor * sc = indexer(qc, wc, pm); // [n_pool, nt]
             res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, sc, il});
             cb(sc, "indexer_score", il);
             ggml_tensor * tk = ggml_top_k(ctx0, sc, n_top_pool);
@@ -874,7 +890,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
     // the reference sums the rectified head scores unweighted, scaled by 1/sqrt(head_dim),
     // which is the lightning indexer with every head weight set to that scale
     ggml_tensor * weights = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_idx_h, n_tokens), 1.0f/sqrtf((float) idx_dim));
-    ggml_tensor * score = ggml_lightning_indexer(ctx0, q, pooled, weights, inp_kpool->pool_mask); // [n_pool, n_tokens]
+    ggml_tensor * score = indexer(q, weights, inp_kpool->pool_mask); // [n_pool, n_tokens]
     res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
     cb(score, "indexer_score", il);
 
@@ -903,7 +919,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
                 ggml_tensor * wc = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_idx_h, nt), 1.0f/sqrtf((float) idx_dim));
                 ggml_tensor * pm = ggml_view_2d(ctx0, inp_kpool->pool_mask, n_pool, nt, inp_kpool->pool_mask->nb[1],
                                                 t0*inp_kpool->pool_mask->nb[1]);
-                sc = ggml_lightning_indexer(ctx0, qc, pooled, wc, pm); // [n_pool, nt]
+                sc = indexer(qc, wc, pm); // [n_pool, nt]
                 res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, sc, il});
                 cb(sc, "indexer_score", il);
                 tk = ggml_top_k(ctx0, sc, n_top_pool);

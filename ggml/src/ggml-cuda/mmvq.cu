@@ -260,7 +260,9 @@ static constexpr __host__ __device__ int p100_leg_nwarps1(ggml_type type, bool s
         case GGML_TYPE_Q5_1:   return small_m ? 2 : 1;
         case GGML_TYPE_IQ4_NL: return small_m ? 4 : 1;
         case GGML_TYPE_IQ4_XS: return small_m ? 2 : 1;
-        default:               return 2; // q4_1, q8_0: measured best at the default
+        // q8_0 few rows (Flash-Next's hyper-connection projections: 160 rows x 10240 per GPU): 4 warps on 1 row split the long K
+        case GGML_TYPE_Q8_0:   return small_m ? 4 : 2;
+        default:               return 2; // q4_1: measured best at the default
     }
 }
 static constexpr __host__ __device__ int p100_leg_rows1(ggml_type type, bool small_m) {
@@ -270,6 +272,7 @@ static constexpr __host__ __device__ int p100_leg_rows1(ggml_type type, bool sma
         case GGML_TYPE_Q5_1:
         case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_IQ4_XS: return small_m ? 2 : 4;
+        case GGML_TYPE_Q8_0:   return small_m ? 1 : 2;
         default:               return 2;
     }
 }
@@ -1747,6 +1750,11 @@ static void mul_mat_vec_q_switch_ncols_dst(
         // the 32-value types use small_k on the single-column path to mean "few rows" instead
         if (c_ncols_dst == 1 && (p100_leg_type(type) || p100_kq23_type(type) || type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K)) {
             use = nrows_x < P100_LEG_SMALL_M;
+            // GGML_CUDA_Q8_SMALLM=0: q8_0 keeps the default geometry for few rows (A/B)
+            static const bool q8_small = [] { const char * e = getenv("GGML_CUDA_Q8_SMALLM"); return e && atoi(e) != 0; }();   // =1: opt in
+            if (type == GGML_TYPE_Q8_0 && !q8_small) {
+                use = false;
+            }
         }
 #endif
 
@@ -2011,6 +2019,70 @@ static void mul_mat_vec_q_switch_type(
     }
 }
 
+// MoE expert matvec for very short rows (Flash-Next's down projection under the 2-GPU tensor split: iq4_nl, K = 320 per GPU =
+// 10 blocks = 180 bytes per row). The general kernel gives a row a warp and leaves most lanes idle there (~115 GB/s). Here a warp
+// stages 32 consecutive rows of its expert (contiguous) with coalesced 4-byte loads and each lane computes one row; the integer
+// block sums are the same as vec_dot_iq4_nl_q8_1's and each is scaled the same way, only the order of the per-block float adds
+// differs. GGML_CUDA_MOE_SMALLK=0: the general kernel.
+#define MOE_SK_WARPS 4
+#define MOE_SK_MAXB  16   // up to 16 blocks (K <= 512) per row: 4 warps x 32 rows x 16 x 18 B of shared memory
+static __constant__ int8_t moe_sk_kvalues[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
+
+static __global__ void __launch_bounds__(MOE_SK_WARPS*32, 4) k_moe_iq4nl_smallk(
+        const char * __restrict__ vx, const block_q8_1 * __restrict__ vy, const int32_t * __restrict__ ids, float * __restrict__ dst,
+        const int nblk, const int nrows, const size_t nb01, const size_t nb02,
+        const int64_t stride_col_y, const int64_t stride_channel_y, const int nchannels_y,
+        const int64_t stride_col_dst, const int64_t stride_channel_dst, const int64_t ids_stride) {
+    const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
+    const int c = blockIdx.y, t = blockIdx.z;
+    const int32_t e = ids[t*ids_stride + c];
+    if (e < 0) {
+        return;   // host-computed miss (slot -1)
+    }
+    extern __shared__ uint32_t moe_sk_smem[];
+    const int wwords = (int) (32*nb01/4);                     // one warp's 32 rows
+    uint32_t * xs = moe_sk_smem + warp*wwords;
+    uint32_t * ys = moe_sk_smem + MOE_SK_WARPS*wwords;        // the activation, nblk q8_1 blocks
+    __shared__ int kv[16];
+    if (threadIdx.x < 16) {
+        kv[threadIdx.x] = moe_sk_kvalues[threadIdx.x];
+    }
+    const block_q8_1 * y = vy + (c % nchannels_y)*stride_channel_y + t*stride_col_y;
+    for (int i = threadIdx.x; i < nblk*(int) (sizeof(block_q8_1)/4); i += blockDim.x) {
+        ys[i] = ((const uint32_t *) y)[i];
+    }
+    const int r0 = (blockIdx.x*MOE_SK_WARPS + warp)*32;
+    const uint32_t * src = (const uint32_t *) (vx + (size_t) e*nb02 + (size_t) r0*nb01);
+    const int nw = r0 + 32 <= nrows ? wwords : (int) ((nrows - r0 > 0 ? nrows - r0 : 0)*nb01/4);
+    for (int i = lane; i < nw; i += 32) {
+        xs[i] = __ldg(src + i);
+    }
+    __syncthreads();
+    const int row = r0 + lane;
+    if (row >= nrows) {
+        return;
+    }
+    const block_q8_1 * yb = (const block_q8_1 *) ys;
+    const uint8_t * xr = (const uint8_t *) xs + (size_t) lane*nb01;   // 180-byte rows: 2-byte aligned blocks
+    float acc = 0.0f;
+    for (int b = 0; b < nblk; b++) {
+        const uint16_t * bx = (const uint16_t *) (xr + b*18);
+        const float dx = __half2float(__ushort_as_half(bx[0]));
+        const int * q8 = (const int *) yb[b].qs;
+        int sumi = 0;
+#pragma unroll
+        for (int j = 0; j < 8; j++) {
+            const uint32_t w2 = bx[1 + j];                       // 2 bytes = 4 nibbles: values j*2, j*2+1 (low) and +16 (high)
+            const int lo0 = kv[w2 & 0xF], hi0 = kv[(w2 >> 4) & 0xF], lo1 = kv[(w2 >> 8) & 0xF], hi1 = kv[(w2 >> 12) & 0xF];
+            const char4 a = *(const char4 *) ((const int8_t *) q8 + 0 + 0) ; (void) a;
+            const int8_t * q = (const int8_t *) q8;
+            sumi += lo0*q[2*j] + lo1*q[2*j + 1] + hi0*q[2*j + 16] + hi1*q[2*j + 17];
+        }
+        acc += dx * __low2float(yb[b].ds) * (float) sumi;
+    }
+    dst[t*stride_col_dst + c*stride_channel_dst + row] = acc;
+}
+
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
@@ -2193,6 +2265,17 @@ void ggml_cuda_mul_mat_vec_q(
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
+    static const bool moe_smallk = [] { const char * e = getenv("GGML_CUDA_MOE_SMALLK"); return !e || atoi(e) != 0; }();
+    if (moe_smallk && ids && !fusion && src0->type == GGML_TYPE_IQ4_NL && ne00 % QK4_NL == 0 && ne00/QK4_NL <= MOE_SK_MAXB &&
+            src0->nb[1] == (size_t) (ne00/QK4_NL)*18 && src0->nb[1] % 4 == 0 && src0->nb[2] % 4 == 0 && (uintptr_t) src0->data % 4 == 0 &&
+            ggml_cuda_info().devices[dev].cc < GGML_CUDA_CC_VOLTA) {
+        const dim3 grid((unsigned) ((ne01 + 32*MOE_SK_WARPS - 1)/(32*MOE_SK_WARPS)), (unsigned) nchannels_dst, (unsigned) ncols_dst);
+        const size_t smem = (size_t) MOE_SK_WARPS*32*src0->nb[1] + (size_t) (ne00/QK4_NL)*sizeof(block_q8_1);
+        k_moe_iq4nl_smallk<<<grid, MOE_SK_WARPS*32, smem, stream>>>((const char *) src0->data, (const block_q8_1 *) src1_q8_1.get(), ids_d, dst_d,
+            (int) (ne00/QK4_NL), (int) ne01, src0->nb[1], src0->nb[2], stride_col_y, stride_channel_y, (int) nchannels_y,
+            stride_col_dst, stride_channel_dst, ids_stride);
+        return;
+    }
     mul_mat_vec_q_switch_type(
         src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,

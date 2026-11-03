@@ -9522,3 +9522,17 @@ The draft gguf (4.1 GB) is mostly its own experts; on the tensor split with -otd
 - Debug switches: LLAMA_RESERVE_TOP=N (largest reserved tensors), GGML_CUDA_TRACE_OPS=1 (every op before it runs).
 Next: VRAM for slots without giving up prefill (prefill expert ring instead of full-layer assembly; KV host streaming; balanced
 draft placement), then draft acceptance (Strata's coupled/Gumbel drafting), per-shape verify graphs + p_min.
+
+## 322 — decode kernels: short-row IQ4_NL MoE matvec, QSA pooled keys read in place (Flash-Next)
+
+- Expert down projection under the tensor split is iq4_nl with K = 320 per GPU (10 blocks, 180-byte rows); the general mmvq
+  gives a row a warp and leaves most lanes idle. New k_moe_iq4nl_smallk (mmvq.cu, Pascal, MUL_MAT_ID, K <= 512): a warp stages 32
+  rows of its expert with coalesced loads, one lane per row, value table in shared memory. test-backend-ops (new Flash-Next
+  cases, 150 experts, 10 used, per GPU): n=1 40.2 -> 27.2 us, n=4 145.5 -> 85.4 us; MUL_MAT_ID iq4_nl tests pass. Same integer
+  block sums and scaling as vec_dot_iq4_nl_q8_1, block adds in another order. Decode (150 slots, -ub 5, 2 x 128): 26.92 -> 28.86
+  t/s. GGML_CUDA_MOE_SMALLK=0: the general kernel.
+- The QSA indexer reads the pooled keys in place through pool_cells (src[4] of LIGHTNING_INDEXER, all kernels) instead of a
+  get_rows of every pool per step ([128, n_cells] f32 = 128 MB per QSA layer per token at 262k). Output identical (decode md5
+  equal with and without). LLAMA_QSA_POOLED_INPLACE=0: the gather.
+- Q8_0 small-M geometry (4 warps, 1 row): no gain at short context, changes rounding: opt-in only (GGML_CUDA_Q8_SMALLM=1).
+- Note: GGML_CUDA_OP_PROFILE inflates small kernels (per-op events); rank with nsys kernel times or test-backend-ops perf.
