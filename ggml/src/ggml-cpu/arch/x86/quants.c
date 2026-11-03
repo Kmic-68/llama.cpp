@@ -4170,3 +4170,128 @@ void ggml_vec_dot_iq4_xs_q8_K(int n, float * GGML_RESTRICT s, size_t bs, const v
     ggml_vec_dot_iq4_xs_q8_K_generic(n, s, bs, vx, bx, vy, by, nrc);
 #endif
 }
+
+// ggml_cpu_vec_dot_multi: one weight row against ny activation rows, the row decoded once (grid lookups, signs, scales) and
+// applied to every row (the MoE host misses of a verify window: an expert several of the window's tokens route to). Each
+// row's sum is accumulated in exactly the order of the single-row ggml_vec_dot_*, so the results are bit-identical to it.
+// Returns 0 when the type / size is not handled here (the caller falls back to vec_dot per row).
+#if defined(__AVX2__)
+#define GGML_VDM_MAX 8
+static void ggml_vec_dot_iq3_s_q8_K_multi(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, int ny) {
+    static const uint8_t k_mask1[32] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01, 0x01,
+                                        0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x02, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03, 0x03};
+    static const uint8_t k_mask2[32] = {0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80,
+                                        0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80};
+    const __m256i mask1 = _mm256_loadu_si256((const __m256i*)k_mask1);
+    const __m256i mask2 = _mm256_loadu_si256((const __m256i*)k_mask2);
+    const __m256i idx_shift = _mm256_set_epi32(1, 2, 3, 4, 5, 6, 7, 8);
+    const __m256i idx_mask  = _mm256_set1_epi32(256);
+    typedef union { __m256i vec[2]; uint32_t index[16]; } index_t;
+    index_t idx;
+
+    const block_iq3_s * GGML_RESTRICT x = vx;
+    const int nb = n / QK_K;
+    __m256 accumf[GGML_VDM_MAX];
+    for (int t = 0; t < ny; ++t) accumf[t] = _mm256_setzero_ps();
+    for (int i = 0; i < nb; ++i) {
+        const float dx = GGML_CPU_FP16_TO_FP32(x[i].d);
+        const uint8_t * GGML_RESTRICT qs = x[i].qs;
+        const uint8_t * GGML_RESTRICT qh = x[i].qh;
+        const uint16_t * GGML_RESTRICT signs = (const uint16_t *)x[i].signs;
+        __m256i sumi1[GGML_VDM_MAX], sumi2[GGML_VDM_MAX];
+        for (int t = 0; t < ny; ++t) { sumi1[t] = _mm256_setzero_si256(); sumi2[t] = _mm256_setzero_si256(); }
+        for (int ib32 = 0; ib32 < QK_K/32; ib32 += 2) {
+            const __m256i idx_l = _mm256_cvtepu8_epi16(_mm_loadu_si128((const __m128i *)qs)); qs += 16;
+            idx.vec[0] = _mm256_set1_epi32(qh[ib32+0]);
+            idx.vec[1] = _mm256_set1_epi32(qh[ib32+1]);
+            idx.vec[0] = _mm256_and_si256(_mm256_sllv_epi32(idx.vec[0], idx_shift), idx_mask);
+            idx.vec[1] = _mm256_and_si256(_mm256_sllv_epi32(idx.vec[1], idx_shift), idx_mask);
+            idx.vec[0] = _mm256_or_si256(idx.vec[0], _mm256_cvtepi16_epi32(_mm256_castsi256_si128(idx_l)));
+            idx.vec[1] = _mm256_or_si256(idx.vec[1], _mm256_cvtepi16_epi32(_mm256_extractf128_si256(idx_l, 1)));
+            const __m256i q2_1 = _mm256_set_epi32(
+                    iq3s_grid[idx.index[7]], iq3s_grid[idx.index[6]], iq3s_grid[idx.index[5]], iq3s_grid[idx.index[4]],
+                    iq3s_grid[idx.index[3]], iq3s_grid[idx.index[2]], iq3s_grid[idx.index[1]], iq3s_grid[idx.index[0]]);
+            const __m256i q2_2 = _mm256_set_epi32(
+                    iq3s_grid[idx.index[15]], iq3s_grid[idx.index[14]], iq3s_grid[idx.index[13]], iq3s_grid[idx.index[12]],
+                    iq3s_grid[idx.index[11]], iq3s_grid[idx.index[10]], iq3s_grid[idx.index[ 9]], iq3s_grid[idx.index[ 8]]);
+            __m256i aux256 = _mm256_set1_epi32(signs[0] | (signs[1] << 16));
+            aux256 = _mm256_and_si256(_mm256_shuffle_epi8(aux256,mask1), mask2);
+            const __m256i s2_1 = _mm256_cmpeq_epi8(aux256, mask2);
+            aux256 = _mm256_set1_epi32(signs[2] | (signs[3] << 16));
+            aux256 = _mm256_and_si256(_mm256_shuffle_epi8(aux256,mask1), mask2);
+            const __m256i s2_2 = _mm256_cmpeq_epi8(aux256, mask2);
+            signs += 4;
+            const uint16_t ls1 = x[i].scales[ib32/2] & 0xf;
+            const uint16_t ls2 = x[i].scales[ib32/2] >>  4;
+            const __m256i sc1 = _mm256_set1_epi16(2*ls1+1);
+            const __m256i sc2 = _mm256_set1_epi16(2*ls2+1);
+            for (int t = 0; t < ny; ++t) {
+                const int8_t * q8 = ((const block_q8_K *) vy[t])[i].qs + ib32*32;
+                const __m256i q8_1 = _mm256_loadu_si256((const __m256i *)q8);
+                const __m256i q8_2 = _mm256_loadu_si256((const __m256i *)(q8 + 32));
+                const __m256i q8s_1 = _mm256_sub_epi8(_mm256_xor_si256(s2_1, q8_1), s2_1);
+                const __m256i q8s_2 = _mm256_sub_epi8(_mm256_xor_si256(s2_2, q8_2), s2_2);
+                sumi1[t] = _mm256_add_epi32(sumi1[t], _mm256_madd_epi16(_mm256_maddubs_epi16(q2_1, q8s_1), sc1));
+                sumi2[t] = _mm256_add_epi32(sumi2[t], _mm256_madd_epi16(_mm256_maddubs_epi16(q2_2, q8s_2), sc2));
+            }
+        }
+        for (int t = 0; t < ny; ++t) {
+            const float d = dx * ((const block_q8_K *) vy[t])[i].d;
+            accumf[t] = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(_mm256_add_epi32(sumi1[t], sumi2[t])), accumf[t]);
+        }
+    }
+    for (int t = 0; t < ny; ++t) s[t] = hsum_float_8(accumf[t]);
+}
+
+static int ggml_vec_dot_iq4_nl_q8_0_multi(int n, float * GGML_RESTRICT s, const void * GGML_RESTRICT vx, const void * const * vy, int ny) {
+    const int nb = n / QK4_NL;
+    if (nb % 2 != 0) {
+        return 0;   // the single-row kernel finishes an odd block with scalar code: not mirrored here
+    }
+    const block_iq4_nl * GGML_RESTRICT x = vx;
+    const __m128i values128 = _mm_loadu_si128((const __m128i*)kvalues_iq4nl);
+    const __m128i m4b  = _mm_set1_epi8(0x0f);
+    const __m256i mone = _mm256_set1_epi16(1);
+    __m256 accum1[GGML_VDM_MAX], accum2[GGML_VDM_MAX];
+    for (int t = 0; t < ny; ++t) { accum1[t] = _mm256_setzero_ps(); accum2[t] = _mm256_setzero_ps(); }
+    for (int ib = 0; ib + 1 < nb; ib += 2) {
+        const __m128i q4bits_1 = _mm_loadu_si128((const __m128i*)x[ib + 0].qs);
+        const __m128i q4bits_2 = _mm_loadu_si128((const __m128i*)x[ib + 1].qs);
+        const __m256i q4b_1 = MM256_SET_M128I(_mm_shuffle_epi8(values128, _mm_and_si128(_mm_srli_epi16(q4bits_1, 4), m4b)),
+                                              _mm_shuffle_epi8(values128, _mm_and_si128(q4bits_1, m4b)));
+        const __m256i q4b_2 = MM256_SET_M128I(_mm_shuffle_epi8(values128, _mm_and_si128(_mm_srli_epi16(q4bits_2, 4), m4b)),
+                                              _mm_shuffle_epi8(values128, _mm_and_si128(q4bits_2, m4b)));
+        const __m256i ax_1 = _mm256_sign_epi8(q4b_1, q4b_1);
+        const __m256i ax_2 = _mm256_sign_epi8(q4b_2, q4b_2);
+        const float dx1 = GGML_CPU_FP16_TO_FP32(x[ib + 0].d), dx2 = GGML_CPU_FP16_TO_FP32(x[ib + 1].d);
+        for (int t = 0; t < ny; ++t) {
+            const block_q8_0 * y = (const block_q8_0 *) vy[t];
+            const __m256i q8b_1 = _mm256_loadu_si256((const __m256i *)y[ib + 0].qs);
+            const __m256i q8b_2 = _mm256_loadu_si256((const __m256i *)y[ib + 1].qs);
+            const __m256i p_1 = _mm256_madd_epi16(_mm256_maddubs_epi16(ax_1, _mm256_sign_epi8(q8b_1, q4b_1)), mone);
+            const __m256i p_2 = _mm256_madd_epi16(_mm256_maddubs_epi16(ax_2, _mm256_sign_epi8(q8b_2, q4b_2)), mone);
+            accum1[t] = _mm256_fmadd_ps(_mm256_set1_ps(GGML_CPU_FP16_TO_FP32(y[ib + 0].d)*dx1), _mm256_cvtepi32_ps(p_1), accum1[t]);
+            accum2[t] = _mm256_fmadd_ps(_mm256_set1_ps(GGML_CPU_FP16_TO_FP32(y[ib + 1].d)*dx2), _mm256_cvtepi32_ps(p_2), accum2[t]);
+        }
+    }
+    for (int t = 0; t < ny; ++t) s[t] = hsum_float_8(_mm256_add_ps(accum1[t], accum2[t]));
+    return 1;
+}
+#endif
+
+int ggml_cpu_vec_dot_multi(enum ggml_type type, int n, float * s, const void * vx, const void * const * vy, int ny) {
+#if defined(__AVX2__)
+    if (ny < 1 || ny > GGML_VDM_MAX) {
+        return 0;
+    }
+    if (type == GGML_TYPE_IQ3_S && n % QK_K == 0) {
+        ggml_vec_dot_iq3_s_q8_K_multi(n, s, vx, vy, ny);
+        return 1;
+    }
+    if (type == GGML_TYPE_IQ4_NL && n % QK4_NL == 0) {
+        return ggml_vec_dot_iq4_nl_q8_0_multi(n, s, vx, vy, ny);
+    }
+#endif
+    GGML_UNUSED(type); GGML_UNUSED(n); GGML_UNUSED(s); GGML_UNUSED(vx); GGML_UNUSED(vy); GGML_UNUSED(ny);
+    return 0;
+}

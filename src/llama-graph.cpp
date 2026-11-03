@@ -2189,7 +2189,10 @@ static bool llama_lru_tail_on() {
 
 static bool llama_lru_tail_kind(llama_moe_lru * lru, int il, int fk) {
     const ggml_type t = lru->pool_get(il, fk)->type;
-    return llama_lru_tail_on() && lru->is_exclusive() && (t == GGML_TYPE_IQ3_S || t == GGML_TYPE_IQ4_NL);
+    // LLAMA_MOE_LRU_TAIL_Q8=1 (experimental, off): Q8_0 kinds as tails too. The tile MUL_MAT_ID refuses a per-device half
+    // of a Q8_0 down row (340 bytes, not 16-aligned), so they assemble every expert
+    static const bool q8 = [] { const char * e = getenv("LLAMA_MOE_LRU_TAIL_Q8"); return e && atoi(e) != 0; }();
+    return llama_lru_tail_on() && lru->is_exclusive() && (t == GGML_TYPE_IQ3_S || t == GGML_TYPE_IQ4_NL || (q8 && t == GGML_TYPE_Q8_0));
 }
 
 // every kind of the layer assembles its tail only

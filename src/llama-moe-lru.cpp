@@ -886,24 +886,43 @@ void llama_moe_lru::host_process(int li) {
         }
     };
 
-    // gate and up: chunks of 64 rows per (entry, kind)
+    // the window's entries grouped by expert: an expert several tokens route to is decoded once for all of them
+    // (ggml_cpu_vec_dot_multi; LLAMA_MOE_LRU_HOST_MULTI=0: one vec_dot per entry and row, as before)
+    static const bool multi = [] { const char * e = getenv("LLAMA_MOE_LRU_HOST_MULTI"); return !e || atoi(e) != 0; }();
+    std::vector<std::vector<int>> groups;   // entries per distinct host slot
+    {
+        std::vector<std::pair<int64_t, int>> by_hs;
+        for (int e = 0; e < n_ent; e++) by_hs.push_back({ (int64_t) r->ent[3 * e + 2], e });
+        std::sort(by_hs.begin(), by_hs.end());
+        for (size_t i = 0; i < by_hs.size(); i++) {
+            if (!multi || i == 0 || by_hs[i].first != by_hs[i - 1].first || groups.back().size() >= 8) groups.emplace_back();
+            groups.back().push_back(by_hs[i].second);
+        }
+    }
+    const int n_grp = (int) groups.size();
+
+    // gate and up: chunks of 64 rows per (expert group, kind)
     const int rc = 64;
     const int n_rc = (int) ((n_ff + rc - 1) / rc);
-    run(n_ent * 2 * n_rc, [&](int j) {
-        const int e = j / (2 * n_rc), k = (j / n_rc) % 2, c = j % n_rc;
-        const int32_t * en = r->ent + 3 * e;
-        const int tok = en[0] / n_used;
-        const int64_t hs = en[2];
+    run(n_grp * 2 * n_rc, [&](int j) {
+        const int gi = j / (2 * n_rc), k = (j / n_rc) % 2, c = j % n_rc;
+        const std::vector<int> & grp = groups[gi];
+        const int ny = (int) grp.size();
+        const int64_t hs = r->ent[3 * grp[0] + 2];
         const ggml_tensor * t = k == 0 ? tg : tu;
         const auto * tr = k == 0 ? trg : tru;
         const size_t slice = t->nb[2] / n_split;
         const int64_t r_d = t->ne[1] / n_split;
-        float * dst = (k == 0 ? W.g.data() : W.u.data()) + (size_t) e * n_ff;
-        const void * y = W.qx.data() + tok * qx_row;
+        const void * ys[8];
+        for (int q = 0; q < ny; q++) ys[q] = W.qx.data() + (r->ent[3 * grp[q]] / n_used) * qx_row;
+        float sv[8];
         for (int64_t row = (int64_t) c * rc; row < std::min<int64_t>(n_ff, (int64_t) (c + 1) * rc); row++) {
             const int64_t d = row / r_d, lr = row % r_d;
             const char * w = (const char *) t->data + ((size_t) d * n_host + hs) * slice + (size_t) lr * t->nb[1];
-            tr->vec_dot((int) t->ne[0], dst + row, 0, w, 0, y, 0, 1);
+            if (!ggml_cpu_vec_dot_multi(t->type, (int) t->ne[0], sv, w, ys, ny)) {
+                for (int q = 0; q < ny; q++) tr->vec_dot((int) t->ne[0], sv + q, 0, w, 0, ys[q], 0, 1);
+            }
+            for (int q = 0; q < ny; q++) ((k == 0 ? W.g.data() : W.u.data()) + (size_t) grp[q] * n_ff)[row] = sv[q];
         }
     });
     // SwiGLU (silu(gate) * up, as ggml_swiglu_split), quantized for down
@@ -923,20 +942,24 @@ void llama_moe_lru::host_process(int li) {
     const size_t seg = td->nb[1] / n_split;
     const int64_t cols = td->ne[0] / n_split;
     const size_t qseg = ggml_row_size(trd->vec_dot_type, cols);
-    run(n_ent * n_dc, [&](int j) {
-        const int e = j / n_dc, c = j % n_dc;
-        const int64_t hs = r->ent[3 * e + 2];
-        float * out = r->out + (size_t) e * n_embd;
-        const uint8_t * y = W.qh.data() + e * qh_row;
+    run(n_grp * n_dc, [&](int j) {
+        const int gi = j / n_dc, c = j % n_dc;
+        const std::vector<int> & grp = groups[gi];
+        const int ny = (int) grp.size();
+        const int64_t hs = r->ent[3 * grp[0] + 2];
+        float acc[8], sd[8];
+        const void * ys[8];
         for (int64_t row = (int64_t) c * dc; row < std::min<int64_t>(n_out, (int64_t) (c + 1) * dc); row++) {
-            float acc = 0.0f;
+            for (int q = 0; q < ny; q++) acc[q] = 0.0f;
             for (int d = 0; d < n_split; d++) {
                 const char * w = (const char *) td->data + ((size_t) d * n_host + hs) * dslice + (size_t) row * seg;
-                float sd;
-                trd->vec_dot((int) cols, &sd, 0, w, 0, y + d * qseg, 0, 1);
-                acc += sd;
+                for (int q = 0; q < ny; q++) ys[q] = W.qh.data() + grp[q] * qh_row + d * qseg;
+                if (!ggml_cpu_vec_dot_multi(td->type, (int) cols, sd, w, ys, ny)) {
+                    for (int q = 0; q < ny; q++) trd->vec_dot((int) cols, sd + q, 0, w, 0, ys[q], 0, 1);
+                }
+                for (int q = 0; q < ny; q++) acc[q] += sd[q];
             }
-            out[row] = acc;
+            for (int q = 0; q < ny; q++) (r->out + (size_t) grp[q] * n_embd)[row] = acc[q];
         }
     });
 }

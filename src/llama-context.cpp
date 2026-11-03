@@ -2866,6 +2866,23 @@ ggml_cgraph * llama_context::graph_reserve(
         return nullptr;
     }
 
+    // LLAMA_RESERVE_TOP=N: the N largest tensors of the reserved graph (what sizes the compute buffer)
+    static const int reserve_top = [] { const char * e = getenv("LLAMA_RESERVE_TOP"); return e ? atoi(e) : 0; }();
+    if (reserve_top > 0 && !split_only) {
+        std::vector<std::pair<size_t, const ggml_tensor *>> v;
+        for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
+            const ggml_tensor * t = ggml_graph_node(gf, i);
+            if (t->view_src == nullptr) v.push_back({ ggml_nbytes(t), t });
+        }
+        std::sort(v.begin(), v.end(), [](const auto & a, const auto & b) { return a.first > b.first; });
+        LLAMA_LOG_WARN("reserve_top: %d tokens, %d nodes\n", (int) n_tokens, ggml_graph_n_nodes(gf));
+        for (int i = 0; i < reserve_top && i < (int) v.size(); i++) {
+            const ggml_tensor * t = v[i].second;
+            LLAMA_LOG_WARN("reserve_top: %8.1f MiB %-12s %-36s [%lld %lld %lld %lld]\n", v[i].first / 1048576.0, ggml_op_desc(t), t->name,
+                (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3]);
+        }
+    }
+
     return gf;
 }
 

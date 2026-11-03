@@ -9495,3 +9495,30 @@ same 0.017 both ways), under investigation.
 Fixed (same day): the nondeterminism was the gather path's unsorted top-k picks (radix select compacts with atomics, so the
 gathered cells came in a run-dependent order). Sorted ascending per query before the gather: KLD vs itself -0.000007 (the
 stored-logit floor), PPL 2.9430 vs the masked path's 2.9432 (-ub 3072, 2 x 4096). The masked path was deterministic already.
+
+## 321 — MTP decode on Flash-Next: slots are the lever; host-miss path fixed; multi-token CPU expert kernels (2026-11-03)
+
+Short prompt, 2 x 128 tokens, model-card sampling (quick-dec.sh). MTP sidecar draft:
+| config | decode t/s | drafts accepted |
+|---|---|---|
+| plain, 105 slots, -ub 256 | ~26 | - |
+| plain, 150 slots, -ub 5 | 27.28 | - |
+| MTP 3 drafts, 70 slots (draft fully on GPU) | 18.47 | 42% |
+| MTP 3, 95 slots, draft on CUDA1 + its experts on CPU (-devd CUDA1 -otd ffn_.*_exps=CPU) | 18.6 | 42% |
+| MTP 2, 95 slots, same | 20.82 | 53% |
+| MTP 2, 150 slots, -ub 5, same | 25.26 | 47% |
+Op profile of a 4-token verify window (70 slots): ~124 ms, of which the expert matvecs incl. fill waits ~47 ms, LRU_FILL ~21,
+LRU_DECIDE ~16 (it waits behind the PCIe-bound fills). A window of k tokens pulls ~k x the misses; at 70 slots ~425 MB per card
+per window. Slots per layer vs misses/token (routing trace): 70: 124, 105: 83.5, 150: 55.6, 190: 41.8, 250: 28.9.
+VRAM per card at 105 slots, -ub 256: expert slots ~5.8 GB, dense 2.84 GB, compute 1.70 GB (1.28 at -ub 8: a reserve of more than
+~5 tokens takes the assembly path, whose full-layer buffers are 850 MB [Q8_0 down] / 450 MB), KV 0.86 + indexer 0.43 GB.
+The draft gguf (4.1 GB) is mostly its own experts; on the tensor split with -otd its experts on CPU assert in the meta backend
+(non-contiguous copy), so the draft runs on CUDA1 alone.
+- Host-computed misses (LLAMA_MOE_LRU_HOST) crashed (illegal address): mmvq read pool[-1] for slot -1. Now skipped, and the
+  MUL_MAT_ID output zeroed while the mode is on (device 1's partial sums for host entries must be 0). Correct again (acceptance
+  45%), but slower here: MTP 2 x HOST=2 15.3 t/s. A Broadwell IQ3_S expert costs the CPU ~0.25 ms vs ~0.1 ms over PCIe.
+- ggml_cpu_vec_dot_multi (AVX2 IQ3_S x q8_K, IQ4_NL x q8_0): one weight row against <= 8 activation rows, decoded once, sums in
+  the single-row order; the host worker groups a window's entries by expert (LLAMA_MOE_LRU_HOST_MULTI=0 = per entry).
+- Debug switches: LLAMA_RESERVE_TOP=N (largest reserved tensors), GGML_CUDA_TRACE_OPS=1 (every op before it runs).
+Next: VRAM for slots without giving up prefill (prefill expert ring instead of full-layer assembly; KV host streaming; balanced
+draft placement), then draft acceptance (Strata's coupled/Gumbel drafting), per-shape verify graphs + p_min.

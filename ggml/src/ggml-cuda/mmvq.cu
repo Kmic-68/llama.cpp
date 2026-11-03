@@ -902,6 +902,10 @@ static __global__ void mul_mat_vec_q(
     uint32_t sample_dst;
 
     ggml_cuda_pdl_sync();
+    // MoE host-computed misses (LLAMA_MOE_LRU_HOST): slot -1, the host merge writes that entry's output; nothing to read here
+    if (!shared_expert && ncols_dst == 1 && ids && ids[channel_dst] < 0) {
+        return;
+    }
     channel_x  = shared_expert ? 0 : ncols_dst == 1 && ids ? ids[channel_dst] : fastdiv(channel_dst, channel_ratio);
     channel_y  = ncols_dst == 1 && ids ? fastmodulo(channel_dst, nchannels_y) : channel_dst;
     sample_dst = blockIdx.z;
@@ -1504,6 +1508,9 @@ static __global__ void mul_mat_vec_q_moe(
     }
 
     ggml_cuda_pdl_sync();
+    if (!shared_expert && ids[channel_dst + token_idx * ids_stride] < 0) {
+        return;   // MoE host-computed miss (slot -1), see above
+    }
     const uint32_t channel_x = shared_expert ? 0 : ids[channel_dst + token_idx * ids_stride];
     const uint32_t channel_y = fastmodulo(channel_dst, nchannels_y);
 

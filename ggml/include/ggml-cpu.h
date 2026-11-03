@@ -123,6 +123,10 @@ extern "C" {
 
     GGML_BACKEND_API const struct ggml_type_traits_cpu * ggml_get_type_traits_cpu(enum ggml_type type);
 
+    // one weight row of `type` against ny (<= 8) activation rows in its vec_dot_type, the row decoded once; bit-identical to ny
+    // vec_dot calls. Returns 0 when not handled (type / CPU / size): call vec_dot per row then.
+    GGML_BACKEND_API int ggml_cpu_vec_dot_multi(enum ggml_type type, int n, float * s, const void * vx, const void * const * vy, int ny);
+
     GGML_BACKEND_API void ggml_cpu_init(void);
 
     //

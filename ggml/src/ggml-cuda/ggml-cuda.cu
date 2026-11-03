@@ -2460,6 +2460,12 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     // p100-series MoE expert cache: wait for a pool still being filled by the copy engines (moe-lru.cu); a tail assembly
     // (pooled experts read from the pool) is understood only by the tile GEMM
     ggml_cuda_lru_ce_pending_wait(ctx, src0->data);
+    // MoE host-computed misses (LLAMA_MOE_LRU_HOST): their entries (slot -1) are skipped by the matvec, and must read zero: under a
+    // tensor split the host merge writes the whole sum on device 0 and the other devices' partial sums for them must be 0
+    static const bool lru_host = [] { const char * e = getenv("LLAMA_MOE_LRU_HOST"); return e && atoi(e) >= 0; }();
+    if (lru_host && src1->ne[2] <= 8) {
+        CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), ctx.stream()));
+    }
     if (src0->op == GGML_OP_LRU_ASSEMBLE && ggml_get_op_params_i32(src0, 5) != 0) {
         if (!ggml_cuda_tile_mm_id_try(ctx, src0, src1, ids, dst)) {
             GGML_ABORT("tail LRU assembly: the tile MUL_MAT_ID path refused this matmul (type %s, %lld tokens)",
@@ -2661,6 +2667,12 @@ static bool ggml_cuda_norm_chunked(ggml_backend_cuda_context & ctx, ggml_tensor 
 }
 
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
+    // GGML_CUDA_TRACE_OPS=1 (debug, with CUDA_LAUNCH_BLOCKING=1): every op before it runs, so a fault names its op
+    static const bool trace_ops = [] { const char * e = getenv("GGML_CUDA_TRACE_OPS"); return e && atoi(e) != 0; }();
+    if (trace_ops) {
+        fprintf(stderr, "op dev %d: %s %s [%lld %lld %lld] src0 %s\n", ctx.device, ggml_op_desc(dst), dst->name, (long long) dst->ne[0],
+                (long long) dst->ne[1], (long long) dst->ne[2], dst->src[0] ? dst->src[0]->name : "-");
+    }
     switch (dst->op) {
         case GGML_OP_ARGMAX:
             ggml_cuda_argmax(ctx, dst);

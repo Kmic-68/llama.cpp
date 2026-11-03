@@ -1337,3 +1337,11 @@ void quantize_row_iq4_xs(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, 
     assert(k % QK_K == 0);
     quantize_iq4_xs(x, y, 1, k, NULL);
 }
+
+// fallback where no arch file defines it (see ggml-cpu.h): not handled
+#if (defined(__GNUC__) || defined(__clang__)) && !defined(_WIN32)
+__attribute__((weak)) int ggml_cpu_vec_dot_multi(enum ggml_type type, int n, float * s, const void * vx, const void * const * vy, int ny) {
+    (void) type; (void) n; (void) s; (void) vx; (void) vy; (void) ny;
+    return 0;
+}
+#endif
