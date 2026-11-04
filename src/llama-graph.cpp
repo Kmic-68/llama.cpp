@@ -2775,7 +2775,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     }
 
     if (!weight_before_ffn) {
-        experts = ggml_mul(ctx0, experts, weights);
+        // prefill: weight in place, the [n_embd, n_expert_used, n_tokens] f32 expert outputs are the largest per-token buffers
+        // (300 MiB per 3072 tokens at n_embd 2560 x 10 used); LLAMA_MOE_MUL_INPLACE=0 keeps a separate tensor
+        static const bool mul_inplace = [] { const char * e = getenv("LLAMA_MOE_MUL_INPLACE"); return !e || atoi(e) != 0; }();
+        experts = mul_inplace && n_tokens > 32 ? ggml_mul_inplace(ctx0, experts, weights) : ggml_mul(ctx0, experts, weights);
         cb(experts, "ffn_moe_weighted", il);
     }
 

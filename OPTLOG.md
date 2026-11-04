@@ -9559,3 +9559,23 @@ draft placement), then draft acceptance (Strata's coupled/Gumbel drafting), per-
   (A/B against the previous library, same session): iq3_s 320x2560 b=1 12992 -> 11320 us, iq4_nl 2560x320 11987 -> 11835 us.
   Same arithmetic (identical prescale and sums). GGML_CUDA_TMM_XTOKEN=0: per-slot prep.
 - With decode stubbed the kernel reaches only ~5 TFLOPS (of ~18 fp16): the loop structure, not the IQ3_S decode (~20%), limits.
+
+## 325 — decode: short-row q8_0 matvec (hyper-connection up, Q8_0 expert down); prefill notes
+
+- nsys decode (150 slots, -ub 5, short prompt): ~3260 kernels per token per GPU, GPU busy ~70% under nsys; mul_mat_vec_q 13.2
+  ms/token. Short-K q8_0 matvecs ran at ~105-125 GB/s: hc_gate (q8_0 320 -> 10240, replicated) 2.7 ms/token, the Q8_0 expert down
+  (K = 320 per GPU) 0.38 ms/token.
+- k_q8_0_smallk (mmvq.cu, Pascal, K <= 320, plain or MUL_MAT_ID, <= 8 columns): a warp stages 32 rows, one lane per row, same
+  integer block sums and scaling as vec_dot_q8_0_q8_1 (float adds in another order). test-backend-ops: q8_0 10240x320 n=1
+  22.1 -> 12.2 us; MUL_MAT_ID q8_0 150 experts 2560x320 n=1 70.8 -> 36.0 us. At K = 640 only 2 warps fit and it lost (7.8 ->
+  10.2 us), hence K <= 320. Decode (150 slots, -ub 5, 262k ctx, 2 x 128): 26.38 -> 27.27 t/s. GGML_CUDA_Q8_SMALLK=0: general.
+  New eval cases (q8_0 MUL_MAT 10240x320, 2560x640, 100x64; MUL_MAT_ID 150x10 2560x320; n = 1, 3, 8) pass.
+- Prefill nsys (8k prompt, per 3072-token ubatch, GPU0): tile_mm 1.76 s, gemm_fold 0.85, allreduce 0.52 (f32 wire, 2 per layer:
+  the tensor-parallel minimum), QSA gather 0.46, fp32 sgemm 0.5 (hc_down M=320 under the fold threshold: cuBLAS fp32 already 6
+  TFLOPS, the fold kernel 5.6), FA 0.37, hc_post 0.24. GPUs ~93% busy during compute.
+- Host: set_inputs waits on the PLE scan in the first ubatches (~20 s per long prompt). Parallel readers do not help on ntfs-3g:
+  1 reader 1.5-1.6 GB/s, 2-8 readers (interleaved or segmented) 0.5-0.75 GB/s; an 8-segment scan took 52 s. Reverted.
+- tile_mm 80-row blocks (TM=5, M % 80 == 0): iq3_s +1%, iq4_nl -3%; kept (GGML_CUDA_TMM_TM=4 to disable).
+- Compute buffer at -ub 3072: 4570 MiB per card, live-set peak only ~2354 MiB (LLAMA_RESERVE_TOP now also prints the peak live set
+  and the buffer sizes); -ub 6144 wants 8 GB. Uniform tail-assembly sizes made it larger (4766): not the cause. In-place MoE
+  weighting (LLAMA_MOE_MUL_INPLACE) did not change it either (kept: removes a 300 MiB tensor).

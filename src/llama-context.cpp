@@ -914,7 +914,7 @@ void llama_context::sched_reserve() {
             backend_buf_exp_size[i] = ggml_backend_sched_get_buffer_size(sched.get(), backend);
         }
         if (backend_buf_exp_size[i] > 1) {
-            LLAMA_LOG_INFO("%s: %10s compute buffer size = %8.2f MiB\n", __func__,
+            llama_log_internal(getenv("LLAMA_RESERVE_TOP") ? GGML_LOG_LEVEL_WARN : GGML_LOG_LEVEL_INFO, "%s: %10s compute buffer size = %8.2f MiB\n", __func__,
                     ggml_backend_buft_name(buft),
                     backend_buf_exp_size[i] / 1024.0 / 1024.0);
         }
@@ -2867,6 +2867,36 @@ ggml_cgraph * llama_context::graph_reserve(
             const ggml_tensor * t = v[i].second;
             LLAMA_LOG_WARN("reserve_top: %8.1f MiB %-12s %-36s [%lld %lld %lld %lld]\n", v[i].first / 1048576.0, ggml_op_desc(t), t->name,
                 (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3]);
+        }
+        // live set at the peak (nodes only, a tensor lives from its node to its last consumer; ignores in-place reuse and
+        // fragmentation, so it approximates what ggml-alloc needs)
+        const int nn = ggml_graph_n_nodes(gf);
+        std::unordered_map<const ggml_tensor *, int> birth, death;
+        auto base_of = [](const ggml_tensor * t) { while (t->view_src) t = t->view_src; return t; };
+        for (int i = 0; i < nn; i++) {
+            const ggml_tensor * t = ggml_graph_node(gf, i);
+            if (t->view_src == nullptr && t->data == nullptr && !birth.count(t)) { birth[t] = i; death[t] = i; }
+            for (int j = 0; j < GGML_MAX_SRC; j++) {
+                if (!t->src[j]) continue;
+                const ggml_tensor * b = base_of(t->src[j]);
+                if (birth.count(b)) death[b] = i;
+            }
+            if (t->view_src) { const ggml_tensor * b = base_of(t); if (birth.count(b)) death[b] = std::max(death[b], i); }
+        }
+        std::vector<int64_t> delta(nn + 1, 0);
+        for (auto & [t, b] : birth) { delta[b] += ggml_nbytes(t); delta[death[t] + 1] -= ggml_nbytes(t); }
+        int64_t cur = 0, best = 0; int best_i = 0;
+        for (int i = 0; i < nn; i++) { cur += delta[i]; if (cur > best) { best = cur; best_i = i; } }
+        std::vector<std::pair<size_t, const ggml_tensor *>> live;
+        for (auto & [t, b] : birth) if (b <= best_i && death[t] >= best_i) live.push_back({ ggml_nbytes(t), t });
+        std::sort(live.begin(), live.end(), [](const auto & a, const auto & b) { return a.first > b.first; });
+        LLAMA_LOG_WARN("reserve_peak: %.1f MiB live at node %d (%s), %zu tensors\n", best / 1048576.0, best_i,
+            ggml_graph_node(gf, best_i)->name, live.size());
+        for (int i = 0; i < reserve_top && i < (int) live.size(); i++) {
+            const ggml_tensor * t = live[i].second;
+            LLAMA_LOG_WARN("reserve_peak: %8.1f MiB %-12s %-36s [%lld %lld %lld %lld] born %d dies %d\n", live[i].first / 1048576.0,
+                ggml_op_desc(t), t->name, (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
+                birth[t], death[t]);
         }
     }
 

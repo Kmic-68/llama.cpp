@@ -276,6 +276,7 @@ struct tile_mm_params {
     float        * dst;
     int64_t        s1;          // dst row stride (floats), MUL_MAT_ID
     const int    * ids_dst;     // compact row -> dst row
+    int            tm;          // MUL_MAT_ID: rows per thread (4: 64-row blocks, 5: 80-row blocks)
     const int    * xrow;        // MUL_MAT_ID: compact row -> XS/S row (activations prepped once per token), or null (per compact row)
     const int    * bounds;      // expert -> first compact row, [n_experts + 1]
     const int    * tiles;       // [ntiles][2] = (expert, first column of the expert's compact rows)
@@ -317,10 +318,10 @@ static __global__ void tile_mm_prep(const float * __restrict__ X, const int64_t 
 
 // TN >= 5 (80 / 96 columns) needs > 32 KB of shared memory, so only one block fits per SM anyway: let it use the registers
 // (with the 2-block bound it spilled; 65-column verify batches -- ngram-mod's 64-token drafts + 1 -- land here)
-template <ggml_type type, int TN, bool ID>
+template <ggml_type type, int TN, bool ID, int TM = 4>
 static __global__ void __launch_bounds__(256, TN >= 5 ? 1 : 2) tile_mm(const tile_mm_params prm) {
     using tr = tile_mm_traits<type>;
-    constexpr int TM = 4, BM = TMM_BM, BN = 16*TN, RPW = BM/8, RW = tr::RW, UV = tr::UV, SPU = UV/64;
+    constexpr int BM = 16*TM, BN = 16*TN, RPW = BM/8, RW = tr::RW, UV = tr::UV, SPU = UV/64;
     constexpr int XI = (BN*8 + 255)/256;
     constexpr int NRAW = tr::flat ? (BM*RW + 255)/256 : 2*RPW;
     extern __shared__ __align__(16) unsigned char tmm_smem[];
@@ -563,8 +564,22 @@ static __global__ void tile_mm_reduce(const float * __restrict__ P, float * __re
     }
 }
 
+template <ggml_type type, int TN, bool ID, int TM>
+static void tile_mm_launch_tm(const tile_mm_params & prm, const int splits_or_tiles, cudaStream_t stream) {
+    constexpr int BN = 16*TN, BM = 16*TM;
+    const size_t smem = (size_t) BM*tile_mm_traits<type>::RW*sizeof(uint32_t) + (size_t) (BM + BN)*TMM_LD*sizeof(half2);
+    const dim3 grid((prm.M + BM - 1)/BM, ID ? splits_or_tiles : (prm.N + BN - 1)/BN, ID ? 1 : splits_or_tiles);
+    tile_mm<type, TN, ID, TM><<<grid, 256, smem, stream>>>(prm);
+}
+
 template <ggml_type type, int TN, bool ID>
 static void tile_mm_launch(const tile_mm_params & prm, const int splits_or_tiles, cudaStream_t stream) {
+    if constexpr (ID && TN >= 3 && TN <= 4) {
+        if (prm.tm == 5) {   // 80-row blocks: more outputs per staged activation (MoE prefill, M % 80 == 0)
+            tile_mm_launch_tm<type, TN, ID, 5>(prm, splits_or_tiles, stream);
+            return;
+        }
+    }
     constexpr int BN = 16*TN;
     const size_t smem = (size_t) TMM_BM*tile_mm_traits<type>::RW*sizeof(uint32_t) + (size_t) (TMM_BM + BN)*TMM_LD*sizeof(half2);
     const dim3 grid((prm.M + TMM_BM - 1)/TMM_BM, ID ? splits_or_tiles : (prm.N + BN - 1)/BN, ID ? 1 : splits_or_tiles);
@@ -852,6 +867,8 @@ bool ggml_cuda_tile_mm_id_try(ggml_backend_cuda_context & ctx, const ggml_tensor
     prm.XS = xs.get(); prm.S = sc.get(); prm.dst = (float *) dst->data; prm.s1 = (int64_t) (dst->nb[1]/sizeof(float));
     prm.ids_dst = ids_dst.get(); prm.xrow = xtok ? ids_src1.get() : nullptr; prm.bounds = bounds.get(); prm.tiles = tiles.get() + 1; prm.ntiles = tiles.get();
     prm.M = (int) M; prm.K = (int) K; prm.N = 0; prm.nwin = nwin;
+    static const int tm_env = [] { const char * e = getenv("GGML_CUDA_TMM_TM"); return e ? atoi(e) : 5; }();
+    prm.tm = tm_env == 5 && M % 80 == 0 ? 5 : 4;
     tile_mm_dispatch<true>(type, tn, prm, max_tiles, stream);
     CUDA_CHECK(cudaGetLastError());
     return true;
