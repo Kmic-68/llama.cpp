@@ -319,14 +319,16 @@ __global__ void __launch_bounds__(NTH_S, 2) moe_small_f16(const uint8_t * __rest
 
 bool ggml_cuda_p60_moe_gemm(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
         const ggml_tensor * ids, ggml_tensor * dst) {
-    static const bool enabled = getenv("GGML_CUDA_P60_MEGA") != nullptr && atoi(getenv("GGML_CUDA_P60_MEGA")) != 0 &&
-        (getenv("GGML_CUDA_P60_MOE_GEMM") == nullptr || atoi(getenv("GGML_CUDA_P60_MOE_GEMM")) != 0);
+    // opt-in: GGML_CUDA_P60_MOE_GEMM=1
+    static const bool enabled = getenv("GGML_CUDA_P60_MOE_GEMM") != nullptr && atoi(getenv("GGML_CUDA_P60_MOE_GEMM")) != 0;
     if (!enabled || ggml_cuda_info().devices[ctx.device].cc != 600) {
         return false;
     }
     const int64_t K = src0->ne[0], M = src0->ne[1], n_experts = src0->ne[2];
     const int64_t n_used = ids->ne[0], n_tokens = ids->ne[1];
-    if ((src0->type != GGML_TYPE_Q4_K && src0->type != GGML_TYPE_Q5_K && src0->type != GGML_TYPE_Q6_K) || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+    // M == 0 / K == 0: a device without a slice of the experts under -sm tensor, left to MMQ
+    if (M == 0 || K == 0 ||
+            (src0->type != GGML_TYPE_Q4_K && src0->type != GGML_TYPE_Q5_K && src0->type != GGML_TYPE_Q6_K) || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
             ids->type != GGML_TYPE_I32 || K % 256 != 0 || M % BM != 0 || n_experts > 1024 || src0->ne[3] != 1 ||
             src1->ne[0] != K || src1->ne[3] != 1 || dst->ne[3] != 1 || src1->nb[0] != sizeof(float) || src1->nb[1] % 8 != 0 ||
             (src1->ne[1] != 1 && src1->ne[1] != n_used) || src1->ne[2] != n_tokens || src1->nb[2] % src1->nb[1] != 0 ||
