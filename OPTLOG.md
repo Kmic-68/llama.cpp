@@ -9590,6 +9590,11 @@ draft placement), then draft acceptance (Strata's coupled/Gumbel drafting), per-
   empties the borrowed ones first (inclusive copies, fill copies in only, bit 31 of the fill list). 128k decode from the same
   saved KV, seed 7: 85 slots 15.76 t/s -> 75 + 80 borrowed 19.41 t/s (+23%), generated text md5 identical (2b38a57509).
   80 + 80 with a fresh 128k prefill: guard-killed at GPU0 15317 (prefill pool growth ~750 MB on top of the static 14567).
+  75 + 80, head 512, fresh 128k prefill: prefill 356.2 t/s, decode 31.6 t/s, GPU0 peak 14697. CORRECTION: that run re-saved
+  the KV state, and on the new state the plain 85-slot config decodes at 30.54 t/s (loan 31.27, md5 identical e55db017ac).
+  The 15.8-19.4 t/s runs had ~2000 major faults per 128 tokens vs ~110-150 now: the decode of that continuation read PLE rows
+  (28.8 GB table, mmapped on ntfs-3g) from disk. So the loan's own gain at 128k is ~2.4%; the slow 128k decodes were PLE page
+  faults, not fills (the nsys fill-bound reading came from the same faulting state).
 - topk_moe: unrolled selects keep the per-lane arrays in registers (512 experts: 128 B stack -> 0), bit-exact, 578 eval cases.
 - probe.sh KV=1 (dec128.py): saves the 128k slot once (1.5 GB, 15 s), later decode tests restore it in ~2 s; md5 of the output.
 - Math check of 324/325 against the old math (env switches off, same build, 2 chunks): decode (-ub 1, q8_0 short-row) KLD
