@@ -9579,3 +9579,20 @@ draft placement), then draft acceptance (Strata's coupled/Gumbel drafting), per-
 - Compute buffer at -ub 3072: 4570 MiB per card, live-set peak only ~2354 MiB (LLAMA_RESERVE_TOP now also prints the peak live set
   and the buffer sizes); -ub 6144 wants 8 GB. Uniform tail-assembly sizes made it larger (4766): not the cause. In-place MoE
   weighting (LLAMA_MOE_MUL_INPLACE) did not change it either (kept: removes a 300 MiB tensor).
+
+## 326 — 128k decode: slot loan (opt-in), topk_moe in registers, 128k KV preset; math check of 324/325
+
+- 128k measured (139264 ctx, -ub 3072, 85 slots, model-card sampling): prefill 335.4 t/s, decode 16.27 t/s, GPU0 peak 15071.
+  nsys of 128k decode: k_lru_fill ~12 ms/token, compute stream idle ~half the time -> decode is fill-bound at 85 slots. The
+  4.6 GB/card compute buffer (sized by prefill) sits idle during decode; -ub 1024 still needs 3.0 GB (context-bound).
+- Slot loan (LLAMA_MOE_LRU_LEND=<slots per layer>, LLAMA_MOE_LRU_LEND_HEAD=<MiB>, default 768): pools in VMM chunks, the chunks
+  of each pool's slots >= n_base mapped again behind a head as the compute buffer. Decide path uses all slots; a larger batch
+  empties the borrowed ones first (inclusive copies, fill copies in only, bit 31 of the fill list). 128k decode from the same
+  saved KV, seed 7: 85 slots 15.76 t/s -> 75 + 80 borrowed 19.41 t/s (+23%), generated text md5 identical (2b38a57509).
+  80 + 80 with a fresh 128k prefill: guard-killed at GPU0 15317 (prefill pool growth ~750 MB on top of the static 14567).
+- topk_moe: unrolled selects keep the per-lane arrays in registers (512 experts: 128 B stack -> 0), bit-exact, 578 eval cases.
+- probe.sh KV=1 (dec128.py): saves the 128k slot once (1.5 GB, 15 s), later decode tests restore it in ~2 s; md5 of the output.
+- Math check of 324/325 against the old math (env switches off, same build, 2 chunks): decode (-ub 1, q8_0 short-row) KLD
+  0.0276, PPL(Q)/PPL(base) 0.991 +- 0.011; prefill (-ub 3072, tile_mm TM=5 + per-token prep + in-place weighting) KLD 0.0170,
+  ratio 0.996 +- 0.004. Both at or under the Flash-Next summation-order floor (~0.026), PPL not worse.
+- llama-perplexity with the LRU hung once after its final estimate (killed by pid; seen on the committed build).

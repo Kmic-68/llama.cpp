@@ -18,6 +18,9 @@ config finder, and made every default exact (see "Exactness").
 | decode-first: 145 slots, `-ub 256` | ~87 | 26.9 | ~14.4 GB |
 | balanced (finder pick for an agent workload) | ~500 | ~23-24 | ~14.3 GB |
 
+At 128k (139264 context, `-ub 3072`, measured 11-04): 85 slots prefill 335-400 t/s, decode 16.3 t/s. With the slot loan
+(below), 75 + 80 borrowed slots: decode 19.4 t/s, same output.
+
 Sampling is the model card's (temp 1.0, top-k 20, top-p 0.95, min-p 0). Upstream llama.cpp with
 `--n-cpu-moe` runs this model at a few t/s.
 
@@ -57,6 +60,16 @@ launch-bound (many small ops per token): 24.0 to 26.9 t/s. It is on for every Mo
 Q2_K_XL tg128 73.4 -> 83.9 t/s, pp512 -4%, outputs identical; wispoffates spotted it) (`GGML_META_THREADS=0` turns it off, `=1` forces it for any model). Dense models don't get it by default: on the 27B
 it skips the single-threaded path's matmul-overlapped prefill exchange (pp2048 497 vs 462 t/s) for the same decode
 speed and little VRAM at depth (~110 MiB per card at 128k).
+
+## Slot loan (opt-in)
+
+The compute buffer is sized by prefill (4.6 GB per card at `-ub 3072`, 128k context) and sits idle while decoding, when the
+cache needs the memory most. `LLAMA_MOE_LRU_LEND=N` adds N slots per layer whose memory is also the compute buffer: the pools
+are allocated in VMM chunks and ggml-cuda maps the borrowed chunks a second time, behind a small head
+(`LLAMA_MOE_LRU_LEND_HEAD`, MiB, default 768) that holds the decode graphs. Decode uses every slot; before a larger batch the
+borrowed slots are emptied (they hold copies, the experts keep their host slots), and refill as decode runs. Outputs are
+identical with and without it. It needs the exclusive cache with `GGML_CUDA_LRU_STASH=0`; give it about the compute buffer's
+size (N x per-slot bytes x layers) and take the base slot count down so prefill's own peak still fits.
 
 ## The config finder
 
@@ -99,5 +112,6 @@ Not ported (yet): his fp16 single-token matvec kernels (`mmvq-gp100`, `mmvq-h1`)
 | `LLAMA_UB_KV_BUDGET` | 0 | caps ubatch x context so a big `-ub` fits at full context |
 | `GGML_META_THREADS` | on for MoE models, else off | threaded two-GPU dispatch |
 | `GGML_META_AR_MAX_BYTES` | 32 MiB | largest in-kernel AllReduce |
+| `LLAMA_MOE_LRU_LEND`, `LLAMA_MOE_LRU_LEND_HEAD` | 0, 768 | slot loan: borrowed slots per layer, head MiB |
 
 `autoconfig.py` prints the full set for the chosen config.
