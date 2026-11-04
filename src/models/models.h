@@ -7,6 +7,9 @@
 // note: almost all graphs require at least sqrtf, so include cmath globally
 #include <cmath>
 #include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <unordered_map>
 #include <map>
 #include <thread>
 
@@ -2655,6 +2658,20 @@ struct llama_model_qwen4exp : public llama_model_base {
     // the PLE read-ahead threads of the last batch (prefetch_batch); joined before the next batch's and on destruction
     mutable std::vector<std::thread> ple_pf_threads;
     mutable std::atomic<bool> ple_pf_stop{false};
+
+    // PLE row cache of a large batch (prefetch_batch, LLAMA_PLE_SCAN_MIN tokens and up): its rows read with large sequential preads of
+    // the model file (ntfs-3g serves ~1.5 GB/s sequentially but only ~3k random page faults/s), copied compactly; set_input reads them
+    int ple_fd = -1;                       // dup of the shard's descriptor, -1: no scan
+    size_t ple_offs = 0;                   // the tensor's data offset in that file
+    mutable std::mutex ple_mtx;
+    mutable std::condition_variable ple_cv;
+    mutable std::unordered_map<int32_t, uint32_t> ple_pos;   // row -> slot in ple_data
+    mutable std::vector<uint8_t> ple_data;
+    mutable bool ple_scanning = false;
+    mutable std::atomic<size_t> ple_scanned{0};   // rows [0, ple_scanned) of the sorted batch rows are in ple_data
+    mutable std::thread ple_scan_thr;
+    // the bytes of PLE row r: from the cache (waiting for its scan) or the mapping
+    const uint8_t * ple_row(int32_t r) const;
 
     void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;

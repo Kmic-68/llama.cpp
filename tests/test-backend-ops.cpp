@@ -13146,6 +13146,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // Flash-Next QSA prefill at 128k depth: a 128-query chunk scores 32768 pools (4 heads) and keeps the top 512
+    test_cases.emplace_back(new test_lightning_indexer(128, 4, 32768, 128, 1, 1, GGML_TYPE_F16));
+    test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {32768, 128, 1, 1}, 512));
+
     // Flash-Next under a 2-GPU tensor split, per GPU: 150 pooled experts, 10 used; gate/up iq3_s 2560 -> 320, down iq4_nl 320 -> 2560
     for (int bs : {1, 4}) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_S,  GGML_TYPE_F32, 150, 10, true,  320,  bs, 2560));

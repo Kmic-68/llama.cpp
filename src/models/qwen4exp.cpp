@@ -5,6 +5,7 @@
 #include <thread>
 #if defined(__linux__)
 #include <sys/mman.h>
+#include <fcntl.h>
 #include <unistd.h>
 #endif
 #include "llama-memory-hybrid-idx.h"
@@ -227,6 +228,12 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
 
         per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
                                            { hparams.ple_head_dim, ple_rows }, TENSOR_READ_LAZY);
+#if defined(__linux__)
+        if (const auto * pw = ml.get_weight(ple_name.c_str()); pw != nullptr && ple_fd < 0) {
+            ple_fd = dup(ml.files[pw->idx]->file_id());
+            ple_offs = pw->offs;
+        }
+#endif
     }
 
     auto load_block = [&](int il, int flags) {
@@ -1427,10 +1434,13 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override {
         mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx)->get_attn();
-        return rows->ne[0] == (int64_t) model.hparams.ple_n_heads * params.ubatch.n_tokens;
+        const int64_t n = emb ? emb->ne[1] * model.hparams.ple_n_heads : rows->ne[0];
+        return n == (int64_t) model.hparams.ple_n_heads * params.ubatch.n_tokens;
     }
 
     ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens]
+    ggml_tensor * emb  = nullptr;   // F32 [ple_head_dim * ple_n_heads, n_tokens]: the rows dequantized on the host (LLAMA_PLE_HOST)
+    std::vector<float> emb_buf;
 
     const llama_model & model;
 
@@ -1502,9 +1512,21 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
         }
     }
 
-    {
-        ggml_tensor * ple = model.per_layer_tok_embd;
+    ggml_tensor * ple = model.per_layer_tok_embd;
+    if (emb != nullptr) {
+        // rows from the batch's scan cache (or the mapping), dequantized here
+        const auto & qm = static_cast<const llama_model_qwen4exp &>(model);
+        const int64_t hd = ple->ne[0];
+        const auto * tr = ggml_get_type_traits(ple->type);
+        emb_buf.resize((size_t) hd * idx.size());
+        for (size_t k = 0; k < idx.size(); ++k) {
+            tr->to_float(qm.ple_row(idx[k]), emb_buf.data() + k*hd, hd);
+        }
+        ggml_backend_tensor_set(emb, emb_buf.data(), 0, emb_buf.size()*sizeof(float));
+        return;
+    }
 
+    {
         const bool prefetch = model.can_prefetch.count(ple);
         if (prefetch) {
             llama_prefetch_rows(ple, idx.data(), idx.size());
@@ -1567,6 +1589,78 @@ void llama_model_qwen4exp::prefetch_batch(const llama_token * tokens, int64_t n_
             }
         }
     }
+    static const int64_t scan_min = [] { const char * e = getenv("LLAMA_PLE_SCAN_MIN"); return e ? atoll(e) : 0; }();
+#if defined(__linux__)
+    if (ple_fd >= 0 && scan_min > 0 && n_tokens >= scan_min) {
+        if (ple_scan_thr.joinable()) {
+            ple_scan_thr.join();
+        }
+        std::vector<int32_t> uniq(rows);
+        std::sort(uniq.begin(), uniq.end());
+        uniq.erase(std::unique(uniq.begin(), uniq.end()), uniq.end());
+        const size_t rb = ggml_row_size(ple->type, ple->ne[0]);
+        {
+            std::lock_guard<std::mutex> lk(ple_mtx);
+            ple_pos.clear();
+            ple_pos.reserve(uniq.size()*2);
+            for (size_t i = 0; i < uniq.size(); i++) ple_pos[uniq[i]] = (uint32_t) i;
+            ple_data.resize(uniq.size()*rb);
+            ple_scanning = true;
+            ple_scanned.store(0, std::memory_order_release);
+        }
+        const size_t nb1 = ple->nb[1];
+        // the first ubatch cannot wait for the scan (it reaches its rows only near the end of the table): 8 threads fault those in
+        // token order meanwhile, as for a small batch
+        {
+            ple_pf_stop = true;
+            for (auto & th : ple_pf_threads) th.join();
+            ple_pf_threads.clear();
+            ple_pf_stop = false;
+            const size_t n_first = std::min(rows.size(), (size_t) n_heads * 4096);
+            auto first = std::make_shared<std::vector<int32_t>>(rows.begin(), rows.begin() + n_first);
+            const char * base = (const char *) ple->data;
+            std::atomic<bool> * stop = &ple_pf_stop;
+            for (int t = 0; t < 8; ++t) {
+                ple_pf_threads.emplace_back([first, base, nb1, rb, t, stop]() {
+                    for (size_t i = (size_t) t; i < first->size() && !stop->load(std::memory_order_relaxed); i += 8) {
+                        const volatile char * p = base + (size_t) (*first)[i] * nb1;
+                        (void) p[0];
+                        (void) p[rb - 1];
+                    }
+                });
+            }
+        }
+        ple_scan_thr = std::thread([this, uniq = std::move(uniq), rb, nb1]() {
+            const size_t chunk = 8u << 20;
+            std::vector<uint8_t> buf(chunk);
+            size_t i = 0;
+            while (i < uniq.size()) {
+                const size_t start = ple_offs + (size_t) uniq[i]*nb1;
+                const ssize_t got = pread(ple_fd, buf.data(), chunk, (off_t) start);
+                if (got <= 0) {
+                    break;   // the rows left are read from the mapping by ple_row (not in the cache: see below)
+                }
+                size_t j = i;
+                for (; j < uniq.size(); j++) {
+                    const size_t o = ple_offs + (size_t) uniq[j]*nb1 - start;
+                    if (o + rb > (size_t) got) break;
+                    memcpy(ple_data.data() + j*rb, buf.data() + o, rb);
+                }
+                i = j;
+                ple_scanned.store(i, std::memory_order_release);
+                // the 28.8 GB a long prompt streams must not stay in the page cache (it pushed the desktop into swap)
+                posix_fadvise(ple_fd, (off_t) start, (off_t) got, POSIX_FADV_DONTNEED);
+            }
+            std::lock_guard<std::mutex> lk(ple_mtx);
+            if (i < uniq.size()) {   // a failed read: forget the rows not copied
+                for (size_t j = i; j < uniq.size(); j++) ple_pos.erase(uniq[j]);
+            }
+            ple_scanning = false;
+            ple_cv.notify_all();
+        });
+        return;
+    }
+#endif
     // madvise(WILLNEED) reads nothing ahead through ntfs-3g (FUSE): fault the pages in from 8 threads, in token order, while the
     // earlier ubatches compute (LLAMA_PLE_PREFETCH_THREADS, 0 = the madvise hint only)
     static const int n_thr = [] { const char * e = getenv("LLAMA_PLE_PREFETCH_THREADS"); return e ? atoi(e) : 8; }();
@@ -1603,6 +1697,27 @@ llama_model_qwen4exp::~llama_model_qwen4exp() {
     for (auto & th : ple_pf_threads) {
         th.join();
     }
+    if (ple_scan_thr.joinable()) {
+        ple_scan_thr.join();
+    }
+#if defined(__linux__)
+    if (ple_fd >= 0) {
+        close(ple_fd);
+    }
+#endif
+}
+
+const uint8_t * llama_model_qwen4exp::ple_row(int32_t r) const {
+    {
+        std::unique_lock<std::mutex> lk(ple_mtx);
+        auto it = ple_pos.find(r);
+        // a row the scan has copied comes from the cache; one it has not reached yet is read from the mapping now (no waiting
+        // for the whole table: the first ubatches of a batch overlap the scan)
+        if (it != ple_pos.end() && it->second < ple_scanned.load(std::memory_order_acquire)) {
+            return ple_data.data() + (size_t) it->second * ggml_row_size(per_layer_tok_embd->type, per_layer_tok_embd->ne[0]);
+        }
+    }
+    return (const uint8_t *) per_layer_tok_embd->data + (size_t) r * per_layer_tok_embd->nb[1];
 }
 
 // Read a conv history out of its own recurrent row and write the new tail back.
@@ -1668,6 +1783,17 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
     // the attention cells see every ubatch regardless of the layer types
     auto ple_inp = std::make_unique<llm_graph_input_qwen4exp_ple>(model, mctx_hyb->get_attn());
 
+    // LLAMA_PLE_HOST (default on): the rows are dequantized on the host into an input (from the scan cache of a large batch);
+    // =0: a CPU get_rows from the mapped table, as before
+    static const bool ple_host = [] { const char * e = getenv("LLAMA_PLE_HOST"); return e && atoi(e) != 0; }();
+    if (ple_host) {
+        ple_inp->emb = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.ple_head_dim * n_heads, n_tokens);
+        ggml_set_input(ple_inp->emb);
+        ggml_tensor * e = ple_inp->emb;
+        res->add_input(std::move(ple_inp));
+        cb(e, "ple_embd", -1);
+        return e;
+    }
     ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
     ggml_set_input(ple_inp->rows);
     ggml_tensor * rows = ple_inp->rows;

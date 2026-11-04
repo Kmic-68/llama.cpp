@@ -2853,22 +2853,9 @@ ggml_cgraph * llama_context::graph_reserve(
     this->n_input_tensors = llama_graph_n_input_tensors(gf);
     this->n_outputs = save_n_outputs;
 
-    // initialize scheduler with the specified graph
-    if (split_only) {
-        if (sizes) {
-            ggml_backend_sched_reserve_size(sched.get(), gf, sizes);
-        } else {
-            ggml_backend_sched_split_graph(sched.get(), gf);
-        }
-    } else if (!ggml_backend_sched_reserve(sched.get(), gf)) {
-        GGML_ASSERT(!sizes);
-        LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
-        return nullptr;
-    }
-
     // LLAMA_RESERVE_TOP=N: the N largest tensors of the reserved graph (what sizes the compute buffer)
     static const int reserve_top = [] { const char * e = getenv("LLAMA_RESERVE_TOP"); return e ? atoi(e) : 0; }();
-    if (reserve_top > 0 && !split_only) {
+    if (reserve_top > 0 && !split_only) {  // before the reserve, so an OOM still prints it
         std::vector<std::pair<size_t, const ggml_tensor *>> v;
         for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
             const ggml_tensor * t = ggml_graph_node(gf, i);
@@ -2881,6 +2868,19 @@ ggml_cgraph * llama_context::graph_reserve(
             LLAMA_LOG_WARN("reserve_top: %8.1f MiB %-12s %-36s [%lld %lld %lld %lld]\n", v[i].first / 1048576.0, ggml_op_desc(t), t->name,
                 (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3]);
         }
+    }
+
+    // initialize scheduler with the specified graph
+    if (split_only) {
+        if (sizes) {
+            ggml_backend_sched_reserve_size(sched.get(), gf, sizes);
+        } else {
+            ggml_backend_sched_split_graph(sched.get(), gf);
+        }
+    } else if (!ggml_backend_sched_reserve(sched.get(), gf)) {
+        GGML_ASSERT(!sizes);
+        LLAMA_LOG_ERROR("%s: failed to allocate compute buffers\n", __func__);
+        return nullptr;
     }
 
     return gf;

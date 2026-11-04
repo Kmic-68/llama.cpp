@@ -9536,3 +9536,14 @@ draft placement), then draft acceptance (Strata's coupled/Gumbel drafting), per-
   equal with and without). LLAMA_QSA_POOLED_INPLACE=0: the gather.
 - Q8_0 small-M geometry (4 warps, 1 row): no gain at short context, changes rounding: opt-in only (GGML_CUDA_Q8_SMALLM=1).
 - Note: GGML_CUDA_OP_PROFILE inflates small kernels (per-op events); rank with nsys kernel times or test-backend-ops perf.
+
+## 323 — 128k prefill: full ubatches at depth (321 -> 382 t/s), PLE scan cache (opt-in)
+
+- LLAMA_UB_KV_BUDGET (ubatch = budget / n_kv) was the main depth slowdown: each ubatch streams ~22.7 GB of experts per card
+  (~2.1 s fixed), so 1024-token ubatches at 128k pay that cost 3x as often. 90 slots, CTX 139264, budget 0 (full 3072 ubatches):
+  128k prefill 321.3 -> 382.4 t/s. 100 slots at that context runs GPU0 to 15.2 GB (over the guard), hence 90.
+- PLE scan cache (qwen4exp, LLAMA_PLE_SCAN_MIN=N tokens, default 0 = off): a thread preads the 28.8 GB PLE table sequentially
+  (8 MB chunks, fadvise DONTNEED) into a row cache, ple_row() falls back to the mmap; LLAMA_PLE_HOST=1 feeds the PLE rows as an
+  f32 input from set_input. With the shrunken ubatch it cut faults (1.17M -> 82K) but ran slower (288.6); full-ubatch run pending.
+- Opt-in, no gain: GGML_CUDA_PASCAL_FUSE_MMID (MUL_MAT_ID + GLU fusion on Pascal). LLAMA_RESERVE_TOP prints before the reserve.
+- test-backend-ops perf cases: Flash-Next lightning indexer (kv 32768) and TOP_K (32768 -> 512).
