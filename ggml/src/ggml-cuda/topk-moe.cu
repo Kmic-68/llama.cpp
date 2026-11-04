@@ -275,7 +275,10 @@ __global__ void topk_moe_cuda(const float *         logits,
             }
 
             if ((max_expert & (WARP_SIZE - 1)) == threadIdx.x) {
-                selection_wt[max_expert / WARP_SIZE] = -INFINITY;
+                // unrolled select: a dynamic index would put the whole array in local memory
+                { const int sel_ = max_expert / WARP_SIZE;
+#pragma unroll
+                for (int i_ = 0; i_ < experts_per_thread; i_++) { if (i_ == sel_) { selection_wt[i_] = -INFINITY; } } }
             }
         } else {
 #pragma unroll
@@ -298,12 +301,16 @@ __global__ void topk_moe_cuda(const float *         logits,
             }
 
             if ((max_expert & (WARP_SIZE - 1)) == threadIdx.x) {
-                wt[max_expert / WARP_SIZE] = -INFINITY;
+                { const int sel_ = max_expert / WARP_SIZE;
+#pragma unroll
+                for (int i_ = 0; i_ < experts_per_thread; i_++) { if (i_ == sel_) { wt[i_] = -INFINITY; } } }
             }
         }
 
         if ((k & (WARP_SIZE - 1)) == threadIdx.x) {
-            output_weights[k / WARP_SIZE] = max_val;
+            { const int sel_ = k / WARP_SIZE;
+#pragma unroll
+                for (int i_ = 0; i_ < experts_per_thread; i_++) { if (i_ == sel_) { output_weights[i_] = max_val; } } }
         }
 
         if ((max_expert & (WARP_SIZE - 1)) == threadIdx.x) {
