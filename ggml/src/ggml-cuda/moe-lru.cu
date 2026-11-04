@@ -56,7 +56,7 @@ static __global__ void k_lru_decide(
         ggml_lru_ctrl * ctrl, int layer, int log_dev, int log_dev_index, int remap,
         int tail, int32_t * keep, int tail_stats, unsigned long long * pass_fills,
         lru_stash_ctl * stash, int stash_alloc,
-        int host_max, int host_every, ggml_lru_host_req * hreq, const float * hx, int hx_stride, int n_embd) {
+        int host_max, int host_every, ggml_lru_host_req * hreq, const float * hx, int hx_stride, int n_embd, int lend_off) {
     const int lane = threadIdx.x;
     int32_t * owner    = state;                     // expert -> slot
     int32_t * slot_of  = state + n_expert;          // slot -> expert
@@ -65,6 +65,10 @@ static __global__ void k_lru_decide(
     int32_t * hexpert  = state + 2 * n_expert + 2 * n_slot + 4; // exclusive: host slot -> expert
     const int32_t t0   = state[n_expert + 2 * n_slot];
     const int n_total = n_used * n_tokens;
+    // slot loan (LLAMA_MOE_LRU_LEND): slots >= n_base are borrowed from the compute buffer; while lent out (prefill) only
+    // n_act = n_base are used. A borrowed slot holds a copy: its expert keeps its host slot, a fill copies in and writes nothing back
+    const int n_base = lend_off >= 0 ? state[lend_off] : n_slot;
+    const int n_act  = lend_off >= 0 ? state[lend_off + 1] : n_slot;
 
     if (remap) {   // exclusive, large batch: ids in the assembled [pool slots | host slots] layout, state untouched
         for (int i = lane; i < n_total; i += WARP_SIZE) {
@@ -164,7 +168,7 @@ static __global__ void k_lru_decide(
             continue;
         }
         int32_t bv = INT_MAX; int bs = n_slot;
-        for (int s = lane; s < n_slot; s += WARP_SIZE) {
+        for (int s = lane; s < n_act; s += WARP_SIZE) {
             const int32_t v = last_use[s];
             if (v < bv) { bv = v; bs = s; }
         }
@@ -180,7 +184,10 @@ static __global__ void k_lru_decide(
             if (prev >= 0) owner[prev] = -1;
             // exclusive: the incoming expert's host slot receives the victim (the fill swaps the two)
             int32_t h = e;
-            if (exclusive) {
+            const bool lent = best >= n_base;
+            if (exclusive && lent) {
+                h = (int32_t) ((uint32_t) hslot[e] | 0x80000000u);   // copy in only (bit 31)
+            } else if (exclusive) {
                 h = hslot[e];
                 hslot[e] = -1;
                 if (prev >= 0) { hslot[prev] = h; hexpert[h] = prev; }
@@ -211,7 +218,7 @@ static __global__ void k_lru_decide(
                 }
                 // victim stash: take a ring entry (none free -> the fill writes this victim back itself); host slot < 4096,
                 // ring slot + 1 in bits 12..29
-                if (stash_alloc && prev >= 0) {
+                if (stash_alloc && prev >= 0 && !lent) {
                     volatile lru_stash_ctl * vs = stash;
                     const uint32_t k = vs->counter;
                     if (k - vs->flushed < vs->cap) {
@@ -344,12 +351,13 @@ static __global__ void k_lru_fill(const int32_t * __restrict__ fill_list, int n_
         const int32_t s = fill_list[3 * j + 1];
         const int32_t hraw = fill_list[3 * j + 2];  // inclusive: the expert id (row of the model tensor)
         int32_t h = hraw & 0x3fffffff;
+        const bool lent = hraw < 0;                 // slot loan: a borrowed slot, copy in only
         int sl = 0;                                 // victim stash: ring slot + 1
         if (st.decode) {
             sl = (h >> 12) & 0x3ffff;
             h &= 0xfff;
         }
-        const bool swap = d.swap || ((hraw >> 30) & 1);   // hybrid refill: this device writes the victim back itself
+        const bool swap = !lent && (d.swap || ((hraw >> 30) & 1));   // hybrid refill: this device writes the victim back itself
         if (ctrl != nullptr) {
             lru_wait_content(ctrl, layer, h, fill_list[3 * j + 0]);
         }
@@ -1088,6 +1096,9 @@ void ggml_cuda_lru_decide(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int n_tokens = (int) ids->ne[1];
     int32_t * fill_list = (int32_t *) dst->data + (size_t) n_used * n_tokens;
     const int exclusive = ggml_nelements(state) >= 2 * (int64_t) n_expert + 2 * (int64_t) n_slot + 3;
+    // slot loan: [.. | hexpert | n_base, n_active] after the exclusive layout
+    const int64_t lend_x = 3 * (int64_t) n_expert + 2 * (int64_t) n_slot + 4;
+    const int lend_off = exclusive && ggml_nelements(state) >= lend_x + 2 ? (int) lend_x : -1;
     const int remap = ggml_get_op_params_i32(dst, 5);
     if (!remap) {
         ggml_cuda_lru_mirror_mark_dirty(ctx, state);
@@ -1139,7 +1150,7 @@ void ggml_cuda_lru_decide(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         k_lru_decide<<<1, WARP_SIZE, 0, pf.stream>>>(
             (const int32_t *) ids->data, (int32_t *) dst->data, (int32_t *) state->data, fill_list,
             n_used, n_tokens, n_expert, n_slot, ids_stride, exclusive, nullptr, layer, dev == 0, dev, 0,
-            0, nullptr, 0, nullptr, nullptr, 0, -1, 0, nullptr, nullptr, 0, 0);
+            0, nullptr, 0, nullptr, nullptr, 0, -1, 0, nullptr, nullptr, 0, 0, lend_off);
         pf.pending[layer] = 1;
         return;
     }
@@ -1148,7 +1159,7 @@ void ggml_cuda_lru_decide(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         k_lru_decide<<<1, WARP_SIZE, 0, ctx.stream()>>>(
             (const int32_t *) ids->data, (int32_t *) dst->data, (int32_t *) state->data, fill_list,
             n_used, n_tokens, n_expert, n_slot, ids_stride, exclusive, nullptr, layer, dev == 0, dev, 0,
-            0, nullptr, 0, nullptr, nullptr, 0, -1, 0, nullptr, nullptr, 0, 0);
+            0, nullptr, 0, nullptr, nullptr, 0, -1, 0, nullptr, nullptr, 0, 0, lend_off);
         return;
     }
     if (!remap && layer < (int) g_lru_pf[ctx.device].pending.size() && g_lru_pf[ctx.device].pending[layer]) {
@@ -1168,7 +1179,7 @@ void ggml_cuda_lru_decide(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         (int32_t *) state->data, fill_list,
         n_used, n_tokens, n_expert, n_slot, ids_stride, exclusive, remap ? nullptr : ctrl, layer, dev == 0, dev, remap,
         tail, keep, tail > 0 && tail_stats, ggml_cuda_pass_fill_counter(dev), stash, stash_alloc,
-        host_max, host_every, hreq, hx, hx_stride, n_embd);
+        host_max, host_every, hreq, hx, hx_stride, n_embd, lend_off);
 }
 
 // host-computed misses: wait until the host has finished the request, then write each listed expert output into its entry of
@@ -1526,7 +1537,7 @@ static void ggml_cuda_lru_ce_worker(lru_ce_dev * cd) {
                     const int32_t h = sl->list[3 * j + 2] & 0x3fffffff;
                     char * pool_e = d.pool + (size_t) s * d.estride;
                     char * host_e = d.src + (size_t) h * d.src_estride + d.src_off;
-                    if (d.swap) {
+                    if (d.swap && sl->list[3 * j + 2] >= 0) {   // bit 31: a borrowed slot (slot loan), nothing to write back
                         CUDA_CHECK(cudaMemcpyAsync(cd->scratch + (size_t) regions[j] * cd->region_size + koff, pool_e, bytes,
                                                    cudaMemcpyDeviceToDevice, cd->copy));
                     }
@@ -1540,12 +1551,13 @@ static void ggml_cuda_lru_ce_worker(lru_ce_dev * cd) {
             CUDA_CHECK(cudaStreamWaitEvent(cd->wb, cd->after_ev, 0));
             for (int j = 0; j < n; j++) {
                 const int32_t h = sl->list[3 * j + 2] & 0x3fffffff;
+                const bool lent = sl->list[3 * j + 2] < 0;
                 const int r = regions[j];
                 size_t off = (size_t) r * cd->region_size;
                 for (int k = 0; k < 3; k++) {
                     const lru_fill_desc & d = job.d[k];
                     const size_t bytes = d.n_rows * d.seg_bytes;
-                    if (d.swap) {
+                    if (d.swap && !lent) {
                         char * host_e = d.src + (size_t) h * d.src_estride + d.src_off;
                         CUDA_CHECK(cudaMemcpyAsync(host_e, cd->scratch + off, bytes, cudaMemcpyDeviceToHost, cd->wb));
                     }
@@ -1574,7 +1586,7 @@ static void ggml_cuda_lru_ce_worker(lru_ce_dev * cd) {
                     char * pool_e = d.pool + (size_t) s * d.estride;
                     char * host_e = d.src + (size_t) h * d.src_estride + d.src_off;
                     const size_t bytes = d.n_rows * d.seg_bytes;
-                    if (d.swap) {
+                    if (d.swap && sl->list[3 * j + 2] >= 0) {
                         CUDA_CHECK(cudaMemcpyAsync(cd->scratch + off, pool_e, bytes, cudaMemcpyDeviceToDevice, cd->copy));
                     }
                     CUDA_CHECK(cudaMemcpyAsync(pool_e, host_e, bytes, cudaMemcpyHostToDevice, cd->copy));
@@ -1592,12 +1604,13 @@ static void ggml_cuda_lru_ce_worker(lru_ce_dev * cd) {
             CUDA_CHECK(cudaStreamWaitEvent(cd->wb, cd->after_ev, 0));
             for (int j = j0; j < j1; j++) {
                 const int32_t h = sl->list[3 * j + 2] & 0x3fffffff;
+                const bool lent = sl->list[3 * j + 2] < 0;
                 const int r = regions[j - j0];
                 size_t off = (size_t) r * cd->region_size;
                 for (int k = 0; k < job.n_kinds; k++) {
                     const lru_fill_desc & d = job.d[k];
                     const size_t bytes = d.n_rows * d.seg_bytes;
-                    if (d.swap) {
+                    if (d.swap && !lent) {
                         char * host_e = d.src + (size_t) h * d.src_estride + d.src_off;
                         CUDA_CHECK(cudaMemcpyAsync(host_e, cd->scratch + off, bytes, cudaMemcpyDeviceToHost, cd->wb));
                     }

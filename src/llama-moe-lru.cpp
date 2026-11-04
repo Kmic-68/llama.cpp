@@ -403,6 +403,25 @@ llama_moe_lru::llama_moe_lru(const llama_model & model, const std::vector<ggml_b
             }
         }
     }
+    // slot loan (LLAMA_MOE_LRU_LEND=<slots per layer>): that many slots more per layer, whose memory is also the compute buffer
+    // (ggml-cuda maps it twice). Decode uses them; a larger batch empties them first. Needs the exclusive cache with copy-engine
+    // or SM fills, no disk refill, no host-computed misses, no victim stash.
+    std::vector<int> layer_base(layer_slots);
+    {
+        const char * el = getenv("LLAMA_MOE_LRU_LEND");
+        const int want = el ? atoi(el) : 0;
+        const char * es = getenv("GGML_CUDA_LRU_STASH");
+        if (want > 0 && (!exclusive_requested() || refill_requested() || getenv("LLAMA_MOE_LRU_HOST") != nullptr ||
+                         (es != nullptr && atoi(es) != 0) || lend_fn_map() == nullptr)) {
+            LLAMA_LOG_WARN("llama_moe_lru: LLAMA_MOE_LRU_LEND needs the exclusive cache, CUDA, GGML_CUDA_LRU_STASH=0, no disk "
+                           "refill and no LLAMA_MOE_LRU_HOST: off\n");
+        } else if (want > 0) {
+            lend_slots = want;
+            for (int li = 0; li < this->n_layers; li++) {
+                layer_slots[li] = std::min<int>(layer_base[li] + want, (int) n_expert - 1);
+            }
+        }
+    }
     const int slots_min = *std::min_element(layer_slots.begin(), layer_slots.end());
     const int slots_max = *std::max_element(layer_slots.begin(), layer_slots.end());
     this->n_slot_min = slots_min;
@@ -431,8 +450,10 @@ llama_moe_lru::llama_moe_lru(const llama_model & model, const std::vector<ggml_b
         per_layer & L = layers[li];
         L.buft = pending_buft[li];
         L.n_slot = layer_slots[li];
+        L.n_base = layer_base[li];
         const int64_t n_slot = L.n_slot;                          // this layer's slots (shadows the default)
-        const int64_t n_host = this->exclusive ? n_expert - n_slot : 0;
+        const int64_t n_base = lend_slots > 0 ? L.n_base : n_slot;   // slot loan: slots >= n_base are borrowed
+        const int64_t n_host = this->exclusive ? n_expert - n_base : 0;
 
         ggml_tensor * exps[N_KIND] = {
             model.layers[il].ffn_gate_exps,
@@ -463,11 +484,18 @@ llama_moe_lru::llama_moe_lru(const llama_model & model, const std::vector<ggml_b
         }
         // +tick +cum_ids +cum_fills (+ exclusive: expert -> host slot)
         // (+ refill: this device's log counter)
+        // (+ slot loan: n_base, n_active)
         L.state = ggml_new_tensor_1d(pctx.get(), GGML_TYPE_I32,
-                                     n_expert + 2 * (int64_t) n_slot + 3 + (this->exclusive ? 2 * n_expert + 1 : 0));
+                                     n_expert + 2 * (int64_t) n_slot + 3 + (this->exclusive ? 2 * n_expert + 1 : 0) + (lend_slots > 0 ? 2 : 0));
         ggml_format_name(L.state, "blk.%d.moe_lru_state", il);
 
+        if (lend_slots > 0) {
+            lend_fn_pools()((int) n_base);   // VMM chunks; the pool tensors record their borrowed chunks
+        }
         ggml_backend_buffer_t b = ggml_backend_alloc_ctx_tensors_from_buft(pctx.get(), L.buft);
+        if (lend_slots > 0) {
+            lend_fn_pools()(0);
+        }
         if (!b) {
             throw std::runtime_error("llama_moe_lru: pool alloc failed");
         }
@@ -475,9 +503,9 @@ llama_moe_lru::llama_moe_lru(const llama_model & model, const std::vector<ggml_b
         pool_ctxs.emplace_back(std::move(pctx));
 
         // owner = -1, slot owner = -1, last_use = 0, tick = 1, counters = 0
-        const int64_t n_state = n_expert + 2 * (int64_t) n_slot + 3 + (this->exclusive ? 2 * n_expert + 1 : 0);
+        const int64_t n_state = n_expert + 2 * (int64_t) n_slot + 3 + (this->exclusive ? 2 * n_expert + 1 : 0) + (lend_slots > 0 ? 2 : 0);
         std::vector<int32_t> h(n_state, -1);
-        for (int64_t i = n_expert + n_slot; i < n_expert + 2 * n_slot; i++) h[i] = 0;
+        for (int64_t i = n_expert + n_slot; i < n_expert + 2 * n_slot; i++) h[i] = i - n_expert - n_slot < n_base ? 0 : -1;   // borrowed: first
         h[n_expert + 2 * n_slot] = 1;      // tick
         h[n_expert + 2 * n_slot + 1] = 0;  // cum_ids
         h[n_expert + 2 * n_slot + 2] = 0;  // cum_fills
@@ -491,12 +519,12 @@ llama_moe_lru::llama_moe_lru(const llama_model & model, const std::vector<ggml_b
             std::vector<bool> taken(n_expert, false);
             if (it != prof.end()) {
                 for (int32_t e : it->second) {
-                    if ((int64_t) chosen.size() >= n_slot) break;
+                    if ((int64_t) chosen.size() >= n_base) break;
                     if (e >= 0 && e < n_expert && !taken[e]) { chosen.push_back(e); taken[e] = true; }
                 }
             }
             if (this->exclusive) {   // the exclusive pool must be full: pad with the lowest unused experts
-                for (int32_t e = 0; e < n_expert && (int64_t) chosen.size() < n_slot; e++) {
+                for (int32_t e = 0; e < n_expert && (int64_t) chosen.size() < n_base; e++) {
                     if (!taken[e]) { chosen.push_back(e); taken[e] = true; }
                 }
             }
@@ -504,7 +532,7 @@ llama_moe_lru::llama_moe_lru(const llama_model & model, const std::vector<ggml_b
         {
             int32_t * owner = h.data(), * slot_of = h.data() + n_expert;
             for (size_t r = 0; r < chosen.size(); r++) {
-                const int32_t s = (int32_t) (n_slot - 1 - (int64_t) r);
+                const int32_t s = (int32_t) (n_base - 1 - (int64_t) r);
                 owner[chosen[r]] = s;
                 slot_of[s] = chosen[r];
             }
@@ -514,7 +542,7 @@ llama_moe_lru::llama_moe_lru(const llama_model & model, const std::vector<ggml_b
                 const size_t es = exps[k]->nb[2];
                 std::vector<uint8_t> stage((size_t) n_slot * es, 0);
                 for (size_t r = 0; r < chosen.size(); r++) {
-                    memcpy(stage.data() + (size_t) (n_slot - 1 - (int64_t) r) * es, (const char *) exps[k]->data + (size_t) chosen[r] * es, es);
+                    memcpy(stage.data() + (size_t) (n_base - 1 - (int64_t) r) * es, (const char *) exps[k]->data + (size_t) chosen[r] * es, es);
                 }
                 // full pool layout; the meta buffer splits it per device
                 ggml_backend_tensor_set(L.pool[k], stage.data(), 0, stage.size());
@@ -533,6 +561,10 @@ llama_moe_lru::llama_moe_lru(const llama_model & model, const std::vector<ggml_b
             }
             GGML_ASSERT((int64_t) L.host_expert.size() == n_host);
             h[2 * n_expert + 2 * n_slot + 3] = 0;   // refill log counter
+            if (lend_slots > 0) {
+                h[3 * n_expert + 2 * n_slot + 4] = (int32_t) n_base;   // borrowed from here
+                h[3 * n_expert + 2 * n_slot + 5] = (int32_t) n_base;   // active: lent out until the context takes them
+            }
             for (int64_t hs = 0; hs < n_host; hs++) {
                 h[2 * n_expert + 2 * n_slot + 4 + hs] = L.host_expert[hs];   // host slot -> expert
             }
@@ -577,6 +609,13 @@ llama_moe_lru::llama_moe_lru(const llama_model & model, const std::vector<ggml_b
 #endif
         }
         ggml_backend_tensor_set(L.state, h.data(), 0, h.size() * 4);
+    }
+
+    if (lend_slots > 0) {
+        const char * eh = getenv("LLAMA_MOE_LRU_LEND_HEAD");   // MiB per device kept for decode graphs (default 768)
+        lend_head = (size_t) (eh ? atoi(eh) : 768) << 20;
+        lend_arena = lend_fn_map()(lend_head);
+        LLAMA_LOG_WARN("llama_moe_lru: slot loan: +%d slots per layer, arena %.1f MiB per device\n", lend_slots, lend_arena / 1048576.0);
     }
 
     // disk refill: control block in device-readable host memory + the refill thread. The done tally needs every device that
@@ -962,4 +1001,40 @@ void llama_moe_lru::host_process(int li) {
             for (int q = 0; q < ny; q++) (r->out + (size_t) grp[q] * n_embd)[row] = acc[q];
         }
     });
+}
+
+// ---------------------------------------------------------------------------------------------------------------------------
+// slot loan (LLAMA_MOE_LRU_LEND): the ggml-cuda entry points, and lending the borrowed slots out / taking them back
+static void * llama_moe_lru_cuda_fn(const char * name) {
+    ggml_backend_reg_t reg = ggml_backend_reg_by_name("CUDA");
+    return reg ? ggml_backend_reg_get_proc_address(reg, name) : nullptr;
+}
+llama_moe_lru::lend_pools_t   llama_moe_lru::lend_fn_pools()   { return (lend_pools_t)   llama_moe_lru_cuda_fn("ggml_backend_cuda_lend_pools"); }
+llama_moe_lru::lend_compute_t llama_moe_lru::lend_fn_compute() { return (lend_compute_t) llama_moe_lru_cuda_fn("ggml_backend_cuda_lend_compute"); }
+llama_moe_lru::lend_map_t     llama_moe_lru::lend_fn_map()     { return (lend_map_t)     llama_moe_lru_cuda_fn("ggml_backend_cuda_lend_map"); }
+llama_moe_lru::lend_active_t  llama_moe_lru::lend_fn_active()  { return (lend_active_t)  llama_moe_lru_cuda_fn("ggml_backend_cuda_lend_active"); }
+
+// on: decode takes the borrowed slots (they are empty). off: empty them (their experts still have their host slots) and stop
+// using them, before a batch whose buffers overwrite them. The caller has synchronized the backends.
+void llama_moe_lru::lend_set(bool on) {
+    if (lend_slots <= 0 || on == lend_on) {
+        return;
+    }
+    for (auto & L : layers) {
+        const int64_t ns = L.n_slot, nb = L.n_base;
+        const int64_t n_state = ggml_nelements(L.state);
+        std::vector<int32_t> h(n_state);
+        ggml_backend_tensor_get(L.state, h.data(), 0, n_state * 4);
+        int32_t * owner = h.data(), * slot_of = h.data() + n_expert, * last_use = h.data() + n_expert + ns;
+        for (int64_t s = nb; s < ns; s++) {
+            if (slot_of[s] >= 0) {
+                owner[slot_of[s]] = -1;
+                slot_of[s] = -1;
+            }
+            last_use[s] = -1;
+        }
+        h[3 * n_expert + 2 * ns + 5] = (int32_t) (on ? ns : nb);
+        ggml_backend_tensor_set(L.state, h.data(), 0, n_state * 4);
+    }
+    lend_on = on;
 }

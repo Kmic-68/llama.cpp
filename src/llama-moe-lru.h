@@ -54,6 +54,21 @@ struct llama_moe_lru {
     // true if the device can run the LRU ops; capability probe instead of
     // device-type filtering, so meta devices pass through (tensor split)
     static bool backend_supports(ggml_backend_dev_t dev);
+    // slot loan (LLAMA_MOE_LRU_LEND): ggml-cuda entry points (nullptr without CUDA)
+    typedef void   (*lend_pools_t)(int);
+    typedef void   (*lend_compute_t)(bool);
+    typedef size_t (*lend_map_t)(size_t);
+    typedef int    (*lend_active_t)(void);
+    static lend_pools_t   lend_fn_pools();
+    static lend_compute_t lend_fn_compute();
+    static lend_map_t     lend_fn_map();
+    static lend_active_t  lend_fn_active();
+    bool lend_enabled() const { return lend_slots > 0; }
+    bool lend_is_on() const { return lend_on; }
+    size_t lend_head_bytes() const { return lend_head; }
+    size_t lend_arena_bytes() const { return lend_arena; }
+    void lend_set(bool on);
+    void lend_disable() { lend_set(false); lend_slots = 0; }
 
     llama_moe_lru(const llama_model & model, const std::vector<ggml_backend_t> & gpu_backends, int n_slot);
 
@@ -92,6 +107,7 @@ private:
     struct per_layer {
         ggml_backend_buffer_type_t buft = nullptr; // this layer's device buft
         int n_slot = 0;                            // this layer's VRAM slots (per-layer budget or the default)
+        int n_base = 0;                            // slot loan: slots >= n_base are borrowed (= n_slot without a loan)
         ggml_tensor * pool[N_KIND] = {};   // [ne0, ne1, n_slot] in VRAM
         ggml_tensor * exps[N_KIND] = {};  // the kernels' source: expert weights in pinned host memory (exclusive: = hpool)
         ggml_tensor * hpool[N_KIND] = {}; // exclusive: [ne0, ne1, n_expert - n_slot] pinned host slots
@@ -103,6 +119,10 @@ private:
     };
 
     int n_layers = 0, n_slot = 0, n_slot_min = 0;
+    // slot loan (LLAMA_MOE_LRU_LEND)
+    int lend_slots = 0;
+    bool lend_on = false;
+    size_t lend_head = 0, lend_arena = 0;
     bool exclusive = false;
     int n_split = 1;   // devices an expert is sliced over (-sm tensor): the host pool keeps each device's slices contiguous
     // copy expert e of layer L (kind k) from the mapped model into host slot hs, scattered into the per-device regions

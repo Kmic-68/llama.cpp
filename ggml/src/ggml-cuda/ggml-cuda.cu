@@ -824,12 +824,200 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
 }
 
 
+// p100-series MoE slot loan (LLAMA_MOE_LRU_LEND, src/llama-moe-lru.cpp). The expert pools are allocated in VMM chunks; every chunk
+// that lies wholly inside the borrowed slots [n_base, n_slot) of a pool is mapped a second time, contiguously, behind a dedicated
+// head: that range is the compute buffer. Decode graphs stay inside the head and use every slot; before a larger batch the
+// borrowed slots are emptied (their experts keep their host slots) and the batch's buffers overwrite them.
+struct ggml_cuda_lend_vmm_buf {
+    CUdeviceptr va = 0;
+    size_t size = 0;
+    std::vector<CUmemGenericAllocationHandle> h;
+};
+struct ggml_cuda_lend_dev {
+    size_t gran = 0;
+    std::vector<ggml_cuda_lend_vmm_buf *> bufs;
+    std::vector<std::pair<CUdeviceptr, CUdeviceptr>> ranges;   // borrowed chunk ranges, granularity aligned
+    CUdeviceptr arena = 0;
+    size_t arena_size = 0, head = 0;
+    bool arena_used = false;
+};
+static ggml_cuda_lend_dev g_lend[GGML_CUDA_MAX_DEVICES];
+static int  g_lend_base    = 0;      // > 0: new CUDA buffers are VMM chunks; pool tensors in them lend slots >= g_lend_base
+static bool g_lend_compute = false;  // the compute buffer reservation is running: a buffer that fits takes the arena
+
+static CUmemAllocationProp ggml_cuda_lend_prop(int device) {
+    CUmemAllocationProp prop = {};
+    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
+    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+    prop.location.id = ggml_cuda_get_physical_device(device);
+    return prop;
+}
+
+static size_t ggml_cuda_lend_gran(int device) {
+    ggml_cuda_lend_dev & L = g_lend[device];
+    if (L.gran == 0) {
+        CUmemAllocationProp prop = ggml_cuda_lend_prop(device);
+        CU_CHECK(cuMemGetAllocationGranularity(&L.gran, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM));
+    }
+    return L.gran;
+}
+
+// read/write for this device and (GGML_CUDA_P2P) every peer that can reach it: the AllReduce reads peers' compute buffers
+static void ggml_cuda_lend_access(CUdeviceptr p, size_t size, int device) {
+    std::vector<CUmemAccessDesc> descs;
+    const int phys = ggml_cuda_get_physical_device(device);
+    for (int id = 0; id < ggml_cuda_info().device_count; ++id) {
+        const int idp = ggml_cuda_get_physical_device(id);
+        bool dup = false;
+        for (const auto & d : descs) {
+            dup |= d.location.id == idp;
+        }
+        if (dup) {
+            continue;
+        }
+        if (idp != phys) {
+            if (!ggml_cuda_p2p_enabled()) {
+                continue;
+            }
+            int can = 0;
+            CUDA_CHECK(cudaDeviceCanAccessPeer(&can, idp, phys));
+            if (!can) {
+                continue;
+            }
+        }
+        CUmemAccessDesc a = {};
+        a.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
+        a.location.id = idp;
+        a.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
+        descs.push_back(a);
+    }
+    CU_CHECK(cuMemSetAccess(p, size, descs.data(), descs.size()));
+}
+
+static ggml_cuda_lend_vmm_buf * ggml_cuda_lend_vmm_alloc(int device, size_t size) {
+    const size_t g = ggml_cuda_lend_gran(device);
+    size = (size + g - 1) / g * g;
+    auto * b = new ggml_cuda_lend_vmm_buf();
+    b->size = size;
+    CU_CHECK(cuMemAddressReserve(&b->va, size, g, 0, 0));
+    CUmemAllocationProp prop = ggml_cuda_lend_prop(device);
+    for (size_t off = 0; off < size; off += g) {
+        CUmemGenericAllocationHandle h;
+        if (cuMemCreate(&h, g, &prop, 0) != CUDA_SUCCESS) {
+            for (size_t i = 0; i < b->h.size(); i++) {
+                CU_CHECK(cuMemUnmap(b->va + i * g, g));
+                CU_CHECK(cuMemRelease(b->h[i]));
+            }
+            CU_CHECK(cuMemAddressFree(b->va, size));
+            delete b;
+            return nullptr;
+        }
+        CU_CHECK(cuMemMap(b->va + off, g, 0, h, 0));
+        b->h.push_back(h);
+    }
+    ggml_cuda_lend_access(b->va, size, device);
+    g_lend[device].bufs.push_back(b);
+    return b;
+}
+
+static void ggml_cuda_lend_vmm_free(int device, ggml_cuda_lend_vmm_buf * b) {
+    CU_CHECK(cuMemUnmap(b->va, b->size));
+    for (auto h : b->h) {
+        CU_CHECK(cuMemRelease(h));
+    }
+    CU_CHECK(cuMemAddressFree(b->va, b->size));
+    auto & v = g_lend[device].bufs;
+    v.erase(std::remove(v.begin(), v.end(), b), v.end());
+    delete b;
+}
+
+// a pool tensor in a VMM buffer: remember the chunks inside its borrowed slots
+static void ggml_cuda_lend_note_tensor(int device, const ggml_tensor * t) {
+    if (g_lend_base <= 0 || t->ne[2] <= g_lend_base || strstr(t->name, "moe_lru_pool") == nullptr) {
+        return;
+    }
+    const size_t g = ggml_cuda_lend_gran(device);
+    const CUdeviceptr a = (CUdeviceptr) t->data + (size_t) g_lend_base * t->nb[2];
+    const CUdeviceptr e = (CUdeviceptr) t->data + (size_t) t->ne[2] * t->nb[2];
+    const CUdeviceptr a2 = (a + g - 1) / g * g, e2 = e / g * g;
+    if (e2 > a2) {
+        g_lend[device].ranges.push_back({ a2, e2 });
+    }
+}
+
+void ggml_backend_cuda_lend_pools(int n_base) {
+    g_lend_base = n_base;
+}
+
+void ggml_backend_cuda_lend_compute(bool on) {
+    g_lend_compute = on;
+}
+
+// builds each device's arena ([head | borrowed chunks]); returns the smallest arena over the devices that have one (0: none)
+size_t ggml_backend_cuda_lend_map(size_t head) {
+    size_t mn = 0;
+    for (int d = 0; d < ggml_cuda_info().device_count; d++) {
+        ggml_cuda_lend_dev & L = g_lend[d];
+        if (L.ranges.empty() || L.arena != 0) {
+            continue;
+        }
+        ggml_cuda_set_device(d);
+        const size_t g = ggml_cuda_lend_gran(d);
+        const size_t hd = (head + g - 1) / g * g;
+        size_t total = hd;
+        for (const auto & r : L.ranges) {
+            total += r.second - r.first;
+        }
+        CU_CHECK(cuMemAddressReserve(&L.arena, total, g, 0, 0));
+        CUmemAllocationProp prop = ggml_cuda_lend_prop(d);
+        for (size_t off = 0; off < hd; off += g) {
+            CUmemGenericAllocationHandle h;
+            CU_CHECK(cuMemCreate(&h, g, &prop, 0));
+            CU_CHECK(cuMemMap(L.arena + off, g, 0, h, 0));
+            CU_CHECK(cuMemRelease(h));   // the mapping keeps it
+        }
+        size_t pos = hd;
+        for (const auto & r : L.ranges) {
+            for (CUdeviceptr c = r.first; c < r.second; c += g) {
+                ggml_cuda_lend_vmm_buf * owner = nullptr;
+                for (auto * b : L.bufs) {
+                    if (c >= b->va && c < b->va + b->size) {
+                        owner = b;
+                        break;
+                    }
+                }
+                GGML_ASSERT(owner != nullptr && (c - owner->va) % g == 0);
+                CU_CHECK(cuMemMap(L.arena + pos, g, 0, owner->h[(c - owner->va) / g], 0));
+                pos += g;
+            }
+        }
+        ggml_cuda_lend_access(L.arena, total, d);
+        L.arena_size = total;
+        L.head = hd;
+        mn = mn == 0 ? total : std::min(mn, total);
+        GGML_LOG_WARN("%s: device %d: slot loan arena %.1f MiB (head %.1f MiB, %zu borrowed ranges)\n", __func__, d,
+                      total / 1048576.0, hd / 1048576.0, L.ranges.size());
+    }
+    return mn;
+}
+
+// devices whose compute buffer is the arena
+int ggml_backend_cuda_lend_active(void) {
+    int n = 0;
+    for (int d = 0; d < ggml_cuda_info().device_count; d++) {
+        n += g_lend[d].arena_used;
+    }
+    return n;
+}
+
 // cuda buffer
 
 struct ggml_backend_cuda_buffer_context {
     int device;
     void * dev_ptr = nullptr;
     std::string name;
+    ggml_cuda_lend_vmm_buf * lend_vmm = nullptr;   // slot loan: VMM-chunked pool buffer
+    bool lend_arena = false;                       // slot loan: this is the compute buffer on the arena
 
     ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
         device(device), dev_ptr(dev_ptr),
@@ -837,7 +1025,15 @@ struct ggml_backend_cuda_buffer_context {
     }
 
     ~ggml_backend_cuda_buffer_context() {
-        CUDA_CHECK(cudaFree(dev_ptr));
+        if (lend_vmm != nullptr) {
+            ggml_cuda_set_device(device);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            ggml_cuda_lend_vmm_free(device, lend_vmm);
+        } else if (lend_arena) {
+            g_lend[device].arena_used = false;
+        } else {
+            CUDA_CHECK(cudaFree(dev_ptr));
+        }
     }
 };
 
@@ -861,6 +1057,9 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
     if (tensor->view_src != NULL) {
         assert(tensor->view_src->buffer->buft == buffer->buft);
         return GGML_STATUS_SUCCESS;
+    }
+    if (ctx->lend_vmm != nullptr) {
+        ggml_cuda_lend_note_tensor(ctx->device, tensor);
     }
 
     if (ggml_is_quantized(tensor->type) && tensor->view_src == nullptr && tensor->data != nullptr && ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
@@ -1016,6 +1215,26 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
     ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *)buft->context;
 
     ggml_cuda_set_device(buft_ctx->device);
+
+    if (g_lend_base > 0) {   // slot loan: a pool buffer in VMM chunks
+        ggml_cuda_lend_vmm_buf * b = ggml_cuda_lend_vmm_alloc(buft_ctx->device, size);
+        if (b == nullptr) {
+            GGML_LOG_ERROR("%s: allocating %.2f MiB on device %d: VMM chunks failed\n", __func__, size / 1024.0 / 1024.0, buft_ctx->device);
+            return nullptr;
+        }
+        ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(buft_ctx->device, (void *) b->va);
+        ctx->lend_vmm = b;
+        return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
+    }
+    {
+        ggml_cuda_lend_dev & L = g_lend[buft_ctx->device];
+        if (g_lend_compute && L.arena != 0 && !L.arena_used && size <= L.arena_size) {   // slot loan: the compute buffer
+            L.arena_used = true;
+            ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(buft_ctx->device, (void *) L.arena);
+            ctx->lend_arena = true;
+            return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
+        }
+    }
 
     void * dev_ptr;
     cudaError_t err = ggml_cuda_device_malloc(&dev_ptr, size, buft_ctx->device);
@@ -7755,6 +7974,18 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_copy_batch") == 0) {
         return (void *)ggml_backend_cuda_copy_batch;
+    }
+    if (strcmp(name, "ggml_backend_cuda_lend_pools") == 0) {
+        return (void *)ggml_backend_cuda_lend_pools;
+    }
+    if (strcmp(name, "ggml_backend_cuda_lend_compute") == 0) {
+        return (void *)ggml_backend_cuda_lend_compute;
+    }
+    if (strcmp(name, "ggml_backend_cuda_lend_map") == 0) {
+        return (void *)ggml_backend_cuda_lend_map;
+    }
+    if (strcmp(name, "ggml_backend_cuda_lend_active") == 0) {
+        return (void *)ggml_backend_cuda_lend_active;
     }
     return nullptr;
 }

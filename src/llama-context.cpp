@@ -796,6 +796,11 @@ void llama_context::sched_reserve() {
     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
 
     synchronize();
+    // slot loan: the compute buffers this reservation allocates take the pools' borrowed memory (ggml-cuda's arena)
+    const bool lend = lru && lru->lend_enabled();
+    if (lend) {
+        llama_moe_lru::lend_fn_compute()(true);
+    }
 
     const int64_t t_start_us = ggml_time_us();
 
@@ -935,6 +940,23 @@ void llama_context::sched_reserve() {
                 val(n_splits_pp, n_splits_tg).c_str(),
                 val(n_inputs_pp, n_inputs_tg).c_str(),
                 val(n_input_tensors_pp, n_input_tensors_tg).c_str());
+    }
+
+    if (lend) {
+        llama_moe_lru::lend_fn_compute()(false);
+        int n_gpu = 0;
+        for (auto * b : backend_ptrs) {
+            ggml_backend_dev_t d = ggml_backend_get_device(b);
+            n_gpu += d && ggml_backend_dev_type(d) == GGML_BACKEND_DEVICE_TYPE_GPU;
+        }
+        const int n_act = llama_moe_lru::lend_fn_active()();
+        if (n_act == 0) {
+            LLAMA_LOG_WARN("%s: slot loan: the compute buffer does not fit the arena (%.1f MiB): loan off\n", __func__,
+                           lru->lend_arena_bytes() / 1048576.0);
+            lru->lend_disable();
+        } else {
+            LLAMA_LOG_WARN("%s: slot loan: compute buffer on the arena on %d device(s)\n", __func__, n_act);
+        }
     }
 
     const int64_t t_end_us = ggml_time_us();
@@ -1651,6 +1673,29 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
+        // slot loan: a graph that runs with the borrowed slots in use must stay inside the arena's head
+        if (lru && lru->lend_is_on()) {
+            size_t top = 0;
+            auto note = [&](const ggml_tensor * t) {
+                if (t && t->data && t->buffer && !t->view_src && ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+                        !ggml_backend_buffer_is_host(t->buffer)) {
+                    top = std::max(top, (size_t) ((const char *) t->data - (const char *) ggml_backend_buffer_get_base(t->buffer)) + ggml_nbytes(t));
+                }
+            };
+            for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
+                const ggml_tensor * n = ggml_graph_node(gf, i);
+                note(n);
+                for (int j = 0; j < GGML_MAX_SRC; j++) {
+                    note(n->src[j]);
+                }
+            }
+            if (top > lru->lend_head_bytes()) {
+                LLAMA_LOG_WARN("%s: slot loan: a %u-token graph needs %.1f MiB of compute buffer, the head has %.1f "
+                               "(LLAMA_MOE_LRU_LEND_HEAD): loan off\n", __func__, ubatch.n_tokens, top / 1048576.0,
+                               lru->lend_head_bytes() / 1048576.0);
+                lru->lend_disable();
+            }
+        }
 
         gf_res_prev_active = res;
     }
@@ -2158,6 +2203,15 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
             LLAMA_LOG_WARN("decode_prof: between ubatches %.1f ms\n", (ggml_time_us() - t_after_prev) / 1000.0);
         }
         const int64_t tpu0 = dprof2 ? ggml_time_us() : 0;
+        // slot loan: the decide path (every expert of the batch fits the pools) uses the borrowed slots; a larger batch's buffers
+        // overwrite them, so they are emptied before it
+        if (lru && lru->lend_enabled()) {
+            const bool want = (int64_t) ubatch.n_tokens * model.hparams.n_expert_used() <= lru->n_slots_min();
+            if (want != lru->lend_is_on()) {
+                synchronize();
+                lru->lend_set(want);
+            }
+        }
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
         if (dprof2 && ubatch.n_tokens > 1) {
             LLAMA_LOG_WARN("decode_prof: process_ubatch %.1f ms\n", (ggml_time_us() - tpu0) / 1000.0);
