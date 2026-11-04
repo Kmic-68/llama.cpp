@@ -37,6 +37,7 @@ Perplexity 2.6101, all-fp32 2.6095; at this size perplexity can't separate them,
 | [FINDINGS.md](FINDINGS.md) | what worked, what failed, what transfers to other Pascal cards, and the measurement traps |
 | [BUILD.md](BUILD.md) | building from source and verifying a build |
 | [THREE-GPU.md](THREE-GPU.md) | measurements on three P100s from a contributor: NCCL, graphs, cancel latency |
+| [AMD-BOARD.md](AMD-BOARD.md) | measurements on two P100s in an AMD board from a contributor: `iommu=pt` for `-sm tensor`, tags vs branch |
 | [`../OPTLOG.md`](../OPTLOG.md) | the full record: every attempt, kept or reverted, with numbers |
 
 Windows: [PhoenixGames105/llama.cpp](https://github.com/PhoenixGames105/llama.cpp) is a community port of this fork
