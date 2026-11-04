@@ -9547,3 +9547,15 @@ draft placement), then draft acceptance (Strata's coupled/Gumbel drafting), per-
   f32 input from set_input. With the shrunken ubatch it cut faults (1.17M -> 82K) but ran slower (288.6); full-ubatch run pending.
 - Opt-in, no gain: GGML_CUDA_PASCAL_FUSE_MMID (MUL_MAT_ID + GLU fusion on Pascal). LLAMA_RESERVE_TOP prints before the reserve.
 - test-backend-ops perf cases: Flash-Next lightning indexer (kv 32768) and TOP_K (32768 -> 512).
+
+## 324 — tile MUL_MAT_ID: activations prepped once per token, fetched a step ahead (prefill gate/up -13%)
+
+- PLE scan cache with full ubatches (90 slots, CTX 139264, budget 0, LLAMA_PLE_HOST=1 LLAMA_PLE_SCAN_MIN=8192): 128k prefill
+  382.4 -> 400.1 t/s, major faults 1.17M -> 65K. Now the probe.sh default (still opt-in in the code).
+- tile_mm (MoE prefill GEMM, Flash-Next 512 experts, 3072 tokens, per GPU): nsys split for iq3_s gate: GEMM 10.9 ms, activation
+  prep 1.47 ms (each token converted once per slot, 10x), ids helper 0.5 ms. Gate/up share one activation row (nch == 1): prep
+  each token once and give the GEMM the row through ids_src1 (row offsets resolved once per block; looking them up per fetch cost
+  +15%). The next step's activations and window scales load into registers during the current step. test-backend-ops perf
+  (A/B against the previous library, same session): iq3_s 320x2560 b=1 12992 -> 11320 us, iq4_nl 2560x320 11987 -> 11835 us.
+  Same arithmetic (identical prescale and sums). GGML_CUDA_TMM_XTOKEN=0: per-slot prep.
+- With decode stubbed the kernel reaches only ~5 TFLOPS (of ~18 fp16): the loop structure, not the IQ3_S decode (~20%), limits.

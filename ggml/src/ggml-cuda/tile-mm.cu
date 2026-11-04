@@ -276,6 +276,7 @@ struct tile_mm_params {
     float        * dst;
     int64_t        s1;          // dst row stride (floats), MUL_MAT_ID
     const int    * ids_dst;     // compact row -> dst row
+    const int    * xrow;        // MUL_MAT_ID: compact row -> XS/S row (activations prepped once per token), or null (per compact row)
     const int    * bounds;      // expert -> first compact row, [n_experts + 1]
     const int    * tiles;       // [ntiles][2] = (expert, first column of the expert's compact rows)
     const int    * ntiles;
@@ -347,8 +348,10 @@ static __global__ void __launch_bounds__(256, TN >= 5 ? 1 : 2) tile_mm(const til
         N    = prm.bounds[e + 1] - base;
         W    = e < prm.split ? (const unsigned char *) prm.W2 + e*prm.expert_bytes
                              : (const unsigned char *) W + (e - prm.split)*prm.expert_bytes;
-        XS  += (int64_t) base*K;
-        S   += (int64_t) base*nwin;
+        if (!prm.xrow) {
+            XS += (int64_t) base*K;
+            S  += (int64_t) base*nwin;
+        }
         u0 = 0;
         u1 = nu;
     } else {
@@ -386,8 +389,32 @@ static __global__ void __launch_bounds__(256, TN >= 5 ? 1 : 2) tile_mm(const til
         }
     }
 
+    // this thread's activation rows (fixed for the block): XS offsets of its XI staged columns and S offsets of its TN columns
+    const int * xrow = ID ? prm.xrow : nullptr;
+    int64_t xoff[XI], soff[TN];
+#pragma unroll
+    for (int v = 0; v < XI; ++v) {
+        const int it = t + 256*v, n = n0 + it % BN;
+        xoff[v] = it < BN*8 && n < N ? (int64_t) (xrow ? __ldg(xrow + base + n) : n)*K + 8*(it / BN) : -1;
+    }
+#pragma unroll
+    for (int j = 0; j < TN; ++j) {
+        const int n = n0 + cg*TN + j;
+        soff[j] = n < N ? (int64_t) (xrow ? __ldg(xrow + base + n) : n)*nwin : -1;
+    }
+    // the next step's activations and window scales, in registers
+    uint4 xr[XI];
+    float swr[TN];
+#define TMM_XFETCH(kk) do {                                                                                           \
+        _Pragma("unroll") for (int v = 0; v < XI; ++v) {                                                              \
+            xr[v] = xoff[v] >= 0 ? __ldg((const uint4 *) (XS + xoff[v] + (kk))) : make_uint4(0, 0, 0, 0);            \
+        }                                                                                                             \
+        _Pragma("unroll") for (int j = 0; j < TN; ++j) {                                                              \
+            swr[j] = soff[j] >= 0 ? S[soff[j] + (kk)/TMM_WIN]*(1.0f/1024.0f) : 0.0f;                                  \
+        } } while (0)
     if (u0 < u1) {
         TMM_FETCH(u0);
+        TMM_XFETCH(u0*UV);
     }
     for (int u = u0; u < u1; ++u) {
         __syncthreads();                               // the previous unit is done with Rs
@@ -421,26 +448,32 @@ static __global__ void __launch_bounds__(256, TN >= 5 ? 1 : 2) tile_mm(const til
 #pragma unroll 2
             for (int r = wid; r < BM; r += 8) {
                 const unsigned char * rb = (const unsigned char *) (Rs + r*RW) + (tr::aligned ? 0 : Roff[r]);
+                #ifdef TMM_STUB
+                Ws[r*TMM_LD + lane] = __halves2half2(__ushort_as_half(rb[lane] | 0x3c00), __ushort_as_half(0x3c00));
+#else
                 Ws[r*TMM_LD + lane] = m0 + r < M ? tile_mm_decode<type>(rb, st, lane) : __float2half2_rn(0.0f);
+#endif
             }
             const int k0 = u*UV + st*64;
-            {   // activations: small and L2-resident, rotated by one k-pair inside each group of 4
+            {   // activations: small and L2-resident, rotated by one k-pair inside each group of 4; fetched one step ahead
 #pragma unroll
                 for (int v = 0; v < XI; ++v) {
-                    const int it = t + 256*v, c = it % BN, q = it / BN, n = n0 + c;
+                    const int it = t + 256*v, c = it % BN, q = it / BN;
                     if (it < BN*8) {
-                        const uint4 x = n < N ? __ldg((const uint4 *) (XS + (int64_t) n*K + k0 + 8*q)) : make_uint4(0, 0, 0, 0);
+                        const uint4 x = xr[v];
                         *(uint4 *) (Xs + c*TMM_LD + 4*q) = make_uint4(x.y, x.z, x.w, x.x);
                     }
                 }
             }
-            __syncthreads();
             float sw[TN];
 #pragma unroll
             for (int j = 0; j < TN; ++j) {
-                const int n = n0 + cg*TN + j;
-                sw[j] = n < N ? S[(int64_t) n*nwin + k0/TMM_WIN]*(1.0f/1024.0f) : 0.0f;
+                sw[j] = swr[j];
             }
+            if (k0 + 64 < u1*UV) {
+                TMM_XFETCH(k0 + 64);
+            }
+            __syncthreads();
             half2 acc[TM][TN];
 #pragma unroll
             for (int i = 0; i < TM; ++i) {
@@ -479,6 +512,7 @@ static __global__ void __launch_bounds__(256, TN >= 5 ? 1 : 2) tile_mm(const til
         }
     }
 #undef TMM_FETCH
+#undef TMM_XFETCH
 #pragma unroll
     for (int j = 0; j < TN; ++j) {
         const int n = n0 + cg*TN + j;
@@ -790,10 +824,14 @@ bool ggml_cuda_tile_mm_id_try(ggml_backend_cuda_context & ctx, const ggml_tensor
     ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), total);
     ggml_cuda_pool_alloc<int32_t> bounds(ctx.pool(), n_experts + 1);
     ggml_cuda_pool_alloc<int32_t> tiles(ctx.pool(), 2*max_tiles + 1);
-    ggml_cuda_pool_alloc<__half>  xs(ctx.pool(), total*K);
-    ggml_cuda_pool_alloc<float>   sc(ctx.pool(), total*nwin);
     const int si1  = (int) (ids->nb[1]/sizeof(int32_t));
     const int sis1 = (int) (src1->nb[2]/src1->nb[1]);
+    // one activation row shared by the slots (gate/up): prep each token once, the GEMM finds it through ids_src1
+    static const bool per_token = [] { const char * e = getenv("GGML_CUDA_TMM_XTOKEN"); return !e || atoi(e) != 0; }();
+    const bool xtok = per_token && nch == 1 && sis1 == 1;
+    const int64_t nx = xtok ? n_tokens : total;
+    ggml_cuda_pool_alloc<__half>  xs(ctx.pool(), nx*K);
+    ggml_cuda_pool_alloc<float>   sc(ctx.pool(), nx*nwin);
     // skipped slots (id -1, [TAG_MUL_MAT_ID_SKIP]) get no column: the gather below still walks all `total` compact columns,
     // so the unused tail must hold valid indices, and their dst rows are zeroed (the GEMM never writes them)
     CUDA_CHECK(cudaMemsetAsync(ids_src1.get(), 0, total*sizeof(int32_t), stream));
@@ -804,15 +842,15 @@ bool ggml_cuda_tile_mm_id_try(ggml_backend_cuda_context & ctx, const ggml_tensor
                                    (int) n_used, (int) nch, si1, sis1, /*write_inverse =*/ false, stream);
     tile_mm_id_tiles<<<1, 1, 0, stream>>>(bounds.get(), (int) n_experts, bn, tiles.get() + 1, tiles.get());
     {
-        const dim3 pb(WARP_SIZE, 4), pg((nwin + 3)/4, (unsigned) total);
-        tile_mm_prep<<<pg, pb, 0, stream>>>((const float *) src1->data, (int64_t) (src1->nb[1]/sizeof(float)), ids_src1.get(), xs.get(),
+        const dim3 pb(WARP_SIZE, 4), pg((nwin + 3)/4, (unsigned) nx);
+        tile_mm_prep<<<pg, pb, 0, stream>>>((const float *) src1->data, (int64_t) (src1->nb[1]/sizeof(float)), xtok ? nullptr : ids_src1.get(), xs.get(),
                                             sc.get(), (int) K, nwin);
     }
     tile_mm_params prm = {};
     prm.W = zc_base ? zc_base : src0->data; prm.row_bytes = (int64_t) src0->nb[1]; prm.expert_bytes = (int64_t) src0->nb[2];
     prm.W2 = tpool ? tpool->data : nullptr; prm.split = tpool ? (int) tpool->ne[2] : 0;
     prm.XS = xs.get(); prm.S = sc.get(); prm.dst = (float *) dst->data; prm.s1 = (int64_t) (dst->nb[1]/sizeof(float));
-    prm.ids_dst = ids_dst.get(); prm.bounds = bounds.get(); prm.tiles = tiles.get() + 1; prm.ntiles = tiles.get();
+    prm.ids_dst = ids_dst.get(); prm.xrow = xtok ? ids_src1.get() : nullptr; prm.bounds = bounds.get(); prm.tiles = tiles.get() + 1; prm.ntiles = tiles.get();
     prm.M = (int) M; prm.K = (int) K; prm.N = 0; prm.nwin = nwin;
     tile_mm_dispatch<true>(type, tn, prm, max_tiles, stream);
     CUDA_CHECK(cudaGetLastError());
