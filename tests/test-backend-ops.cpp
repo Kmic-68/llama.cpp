@@ -5505,6 +5505,139 @@ struct test_gated_delta_net_cache_fusion : public test_case {
     }
 };
 
+// one gated delta net decode layer as qwen35 builds it (conv state, conv, l2 norms, gate, state read, gated norm),
+// in the same node order, so the CUDA backend can fuse the chain; both caches are read at row `row` and written at row `head`
+struct test_gdn_decode_fusion : public test_case {
+    const int64_t H_k;
+    const int64_t H_v;
+    const int64_t S;
+    const int64_t n_t;
+    const int64_t n_seqs;
+    const int     row;
+    const int     head;
+
+    ggml_tensor * conv_cpy  = nullptr;
+    ggml_tensor * state_cpy = nullptr;
+    ggml_tensor * out       = nullptr;
+
+    static constexpr int64_t d_conv  = 4;
+    static constexpr int64_t n_cells = 3;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GDN_DECODE_FUSION";
+    }
+
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { out, conv_cpy, state_cpy }; }
+
+    std::string vars() override {
+        return VARS_TO_STR7(H_k, H_v, S, n_t, n_seqs, row, head);
+    }
+
+    test_gdn_decode_fusion(int64_t H_k = 4, int64_t H_v = 12, int64_t S = 128, int64_t n_t = 1, int64_t n_seqs = 1,
+            int row = 1, int head = 1)
+        : H_k(H_k), H_v(H_v), S(S), n_t(n_t), n_seqs(n_seqs), row(row), head(head) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t nr = 2*H_k*S + H_v*S; // conv channels
+        const float eps = 1e-6f;
+
+        ggml_tensor * x          = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, nr, n_t, n_seqs);
+        ggml_tensor * conv_w     = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_conv, nr);
+        ggml_tensor * conv_cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (d_conv - 1)*nr, n_cells);
+        ggml_tensor * ssm_cache  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, S*S*H_v, n_cells);
+        ggml_tensor * ids        = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs);
+        ggml_tensor * alpha      = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, H_v, n_t, n_seqs);
+        ggml_tensor * b          = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H_v, n_t, n_seqs);
+        ggml_tensor * dt         = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H_v);
+        ggml_tensor * A          = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H_v);
+        ggml_tensor * z          = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H_v, n_t, n_seqs);
+        ggml_tensor * norm_w     = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, S);
+        ggml_set_name(x, "x");
+        ggml_set_name(conv_w, "conv_w");
+        ggml_set_name(conv_cache, "conv_cache");
+        ggml_set_name(ssm_cache, "ssm_cache");
+        ggml_set_name(ids, "ids");
+        ggml_set_name(alpha, "alpha");
+        ggml_set_name(b, "b");
+        ggml_set_name(dt, "dt");
+        ggml_set_name(A, "A");
+        ggml_set_name(z, "z");
+        ggml_set_name(norm_w, "norm_w");
+
+        // conv state: gather, append the new tokens, store the last d_conv - 1 columns, conv + silu
+        ggml_tensor * conv_states = ggml_reshape_3d(ctx, ggml_get_rows(ctx, conv_cache, ids), d_conv - 1, nr, n_seqs);
+        ggml_tensor * conv_input  = ggml_concat(ctx, conv_states, ggml_transpose(ctx, x), 0);
+        ggml_tensor * conv_last   = ggml_view_3d(ctx, conv_input, d_conv - 1, nr, n_seqs, conv_input->nb[1], conv_input->nb[2],
+                ggml_row_size(conv_input->type, n_t));
+        conv_cpy = ggml_cpy(ctx, conv_last, ggml_view_2d(ctx, conv_cache, (d_conv - 1)*nr, n_seqs, conv_cache->nb[1], head*conv_cache->nb[1]));
+        if (mode == MODE_TEST) {
+            ggml_build_forward_expand(gf, conv_cpy);
+        }
+        ggml_tensor * conv = ggml_silu(ctx, ggml_ssm_conv(ctx, conv_input, conv_w));
+        if (mode == MODE_TEST) {
+            ggml_build_forward_expand(gf, conv);
+        }
+
+        const size_t nb1 = ggml_row_size(conv->type, nr);
+        ggml_tensor * q = ggml_view_4d(ctx, conv, S, H_k, n_t, n_seqs, ggml_row_size(conv->type, S), nb1, nb1*n_t, 0);
+        ggml_tensor * k = ggml_view_4d(ctx, conv, S, H_k, n_t, n_seqs, ggml_row_size(conv->type, S), nb1, nb1*n_t,
+                ggml_row_size(conv->type, H_k*S));
+        ggml_tensor * v = ggml_view_4d(ctx, conv, S, H_v, n_t, n_seqs, ggml_row_size(conv->type, S), nb1, nb1*n_t,
+                ggml_row_size(conv->type, 2*H_k*S));
+
+        // l2 norms as build_gdn_l2_norm, gate and beta
+        q = ggml_scale(ctx, ggml_rms_norm(ctx, q, eps/S), 1.0f/sqrtf(S));
+        k = ggml_scale(ctx, ggml_rms_norm(ctx, k, eps/S), 1.0f/sqrtf(S));
+        ggml_tensor * g = ggml_mul(ctx, ggml_softplus(ctx, ggml_add(ctx, alpha, dt)), A);
+        g = ggml_reshape_4d(ctx, g, 1, H_v, n_t, n_seqs);
+        ggml_tensor * beta = ggml_sigmoid(ctx, b);
+        if (mode == MODE_TEST) {
+            ggml_build_forward_expand(gf, q);
+            ggml_build_forward_expand(gf, k);
+            ggml_build_forward_expand(gf, g);
+            ggml_build_forward_expand(gf, beta);
+        }
+
+        // state read right before the delta net, new state stored back
+        ggml_tensor * s   = ggml_reshape_4d(ctx, ggml_get_rows(ctx, ssm_cache, ids), S, S, H_v, n_seqs);
+        ggml_tensor * gdn = ggml_gated_delta_net(ctx, q, k, v, g, beta, s, 1);
+        ggml_tensor * o   = ggml_view_4d(ctx, gdn, S, H_v, n_t, n_seqs, ggml_row_size(gdn->type, S),
+                ggml_row_size(gdn->type, S*H_v), ggml_row_size(gdn->type, S*H_v*n_t), 0);
+        ggml_tensor * new_state = ggml_view_2d(ctx, gdn, S*S*H_v, n_seqs, ggml_row_size(gdn->type, S*S*H_v),
+                ggml_row_size(gdn->type, S*H_v*n_t*n_seqs));
+        state_cpy = ggml_cpy(ctx, new_state, ggml_view_2d(ctx, ssm_cache, S*S*H_v, n_seqs, ssm_cache->nb[1], head*ssm_cache->nb[1]));
+        if (mode == MODE_TEST) {
+            ggml_build_forward_expand(gf, state_cpy);
+        }
+
+        // gated norm
+        out = ggml_mul(ctx, ggml_mul(ctx, ggml_rms_norm(ctx, o, eps), norm_w), ggml_silu(ctx, z));
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (ggml_is_view_op(t->op)) { continue; }
+            if (strcmp(t->name, "ids") == 0) {
+                std::vector<int32_t> data(n_seqs);
+                for (int64_t i = 0; i < n_seqs; i++) {
+                    data[i] = (row + i) % n_cells;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, n_seqs * sizeof(int32_t));
+            } else if (strcmp(t->name, "A") == 0) {
+                init_tensor_uniform(t, -2.0f, -0.1f);
+            } else if (strcmp(t->name, "ssm_cache") == 0) {
+                init_tensor_uniform(t, -0.1f, 0.1f);
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_GATED_LINEAR_ATTN
 struct test_gla : public test_case {
     const ggml_type type;
@@ -12856,6 +12989,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 2048, 1, 2));
     // Keep the WebGPU dispatch below 65535 workgroups (32 per token for this shape).
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 16, 128, 2047, 2, 3));
+
+    // decode chain of a qwen35 delta net layer (the CUDA backend fuses it for one sequence and up to 32 tokens)
+    for (int64_t n_t : { 1, 2, 4, 8, 33, 70 }) {
+        test_cases.emplace_back(new test_gdn_decode_fusion(4, 12, 128, n_t));
+    }
+    test_cases.emplace_back(new test_gdn_decode_fusion(16, 48, 128, 1));
+    test_cases.emplace_back(new test_gdn_decode_fusion(16, 32, 128, 1, 1, /*row=*/0, /*head=*/1));
+    test_cases.emplace_back(new test_gdn_decode_fusion(16, 32, 128, 3, 1, /*row=*/2, /*head=*/0));
+    test_cases.emplace_back(new test_gdn_decode_fusion(4, 12, 128, 1, /*n_seqs=*/2));
+    test_cases.emplace_back(new test_gdn_decode_fusion(4, 12, 128, 4, /*n_seqs=*/2));
+    test_cases.emplace_back(new test_gdn_decode_fusion(4, 8, 64, 1));
+    test_cases.emplace_back(new test_gdn_decode_fusion(4, 8, 64, 5));
+    test_cases.emplace_back(new test_gdn_decode_fusion(8, 8, 32, 1));
 
     // K > 1: output keeps the last min(n_tokens, K) per-token snapshots, ordered most-recent-first
     // (slot 0 = final state, slot s = state s tokens back).
