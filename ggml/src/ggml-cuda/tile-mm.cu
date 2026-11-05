@@ -87,6 +87,17 @@ template <> struct tile_mm_traits<GGML_TYPE_Q4_0> {
     static constexpr bool flat    = true;   // 9-word rows: stage the tile as one flat list (~3 rows per warp load, not 1)
 };
 
+// two-block Q8_0 units for K % 128 == 64, e.g. Flash-Next's per-device Q8_0 expert down (K 640 -> 320 = 10 blocks, 340-byte rows): 68
+// bytes = 17 words, 4-aligned (an even block count), one 64-value step per unit, decoded as Q8_0. Lets those layers use tail assemblies.
+static constexpr ggml_type TMM_Q8_0_U2 = (ggml_type) (GGML_TYPE_COUNT + 2);
+template <> struct tile_mm_traits<TMM_Q8_0_U2> {
+    static constexpr int  UV      = 2*QK8_0;
+    static constexpr int  RW      = 17;
+    static constexpr int  UB      = 2*sizeof(block_q8_0);
+    static constexpr bool aligned = true;
+    static constexpr bool flat    = true;
+};
+
 // p100-series 10-07: expert banks of 2-bit qwen4exp builds (Sakura: IQ2_S / IQ2_XXS / IQ1_M gate+up, Q2_0 down), which otherwise
 // prefill through MMQ's emulated DP4A. All flat (rows of 9..21 words); the 66 / 82-byte IQ2 blocks are 2-aligned and staged from the
 // aligned-down address like q6_K.
@@ -189,7 +200,7 @@ static __device__ __forceinline__ half2 tile_mm_decode(const unsigned char * rb,
             q1 |= ((qhw >> (8 + s)) & 1) << 4;
         }
         return __floats2half2_rn(d*q0 - dmin, d*q1 - dmin);
-    } else if constexpr (type == GGML_TYPE_Q8_0) {
+    } else if constexpr (type == GGML_TYPE_Q8_0 || type == TMM_Q8_0_U2) {
         // block 2st + j/16 of the unit, quants 2*(j%16), +1
         const unsigned char * b = rb + (2*st + (lane >> 4))*sizeof(block_q8_0);
         const float    d  = __half2float(*(const __half *) b)*1024.0f;
@@ -600,6 +611,10 @@ static void tile_mm_launch_tn(const int tn, const tile_mm_params & prm, const in
 
 template <bool ID>
 static void tile_mm_dispatch(const ggml_type type, const int tn, const tile_mm_params & prm, const int splits_or_tiles, cudaStream_t stream) {
+    if (type == GGML_TYPE_Q8_0 && prm.K % (4*QK8_0) != 0) {   // K % 128 == 64: two-block units
+        tile_mm_launch_tn<TMM_Q8_0_U2, ID>(tn, prm, splits_or_tiles, stream);
+        return;
+    }
     if (type == GGML_TYPE_Q2_0 && prm.K % (2*QK2_0) != 0) {   // odd block count per row: one-block units
         tile_mm_launch_tn<TMM_Q2_0_B1, ID>(tn, prm, splits_or_tiles, stream);
         return;
@@ -681,7 +696,9 @@ static bool tmm_weights_ok(const ggml_tensor * src0) {
                    ((uintptr_t) src0->data % 4) == 0 && src0->nb[2] % 4 == 0;
         case GGML_TYPE_Q8_0:
             // units of four blocks: K % 128 keeps every row 4-aligned (even block count) and the units whole
-            return q80_on && K % (4*QK8_0) == 0 && src0->nb[1] == (size_t) (K/QK8_0)*sizeof(block_q8_0) &&
+            // (K % 128 == 64: two-block units, GGML_CUDA_TILE_Q8_0_U2=0 refuses them)
+            return q80_on && (K % (4*QK8_0) == 0 || (K % (2*QK8_0) == 0 && tmm_env_on("GGML_CUDA_TILE_Q8_0_U2"))) &&
+                   src0->nb[1] == (size_t) (K/QK8_0)*sizeof(block_q8_0) &&
                    ((uintptr_t) src0->data % 4) == 0 && src0->nb[2] % 4 == 0;
         case GGML_TYPE_Q4_0:
             // units of two blocks: K % 64 keeps every row 4-aligned
@@ -721,7 +738,7 @@ static bool tmm_weights_ok(const ggml_tensor * src0) {
 
 static int tmm_uv(const ggml_type type, const int64_t K) {
     switch (type) {
-        case GGML_TYPE_Q8_0: return tile_mm_traits<GGML_TYPE_Q8_0>::UV;
+        case GGML_TYPE_Q8_0: return K % (4*QK8_0) == 0 ? tile_mm_traits<GGML_TYPE_Q8_0>::UV : tile_mm_traits<TMM_Q8_0_U2>::UV;
         case GGML_TYPE_Q4_0: return tile_mm_traits<GGML_TYPE_Q4_0>::UV;
         case GGML_TYPE_IQ4_NL: return tile_mm_traits<GGML_TYPE_IQ4_NL>::UV;
         case GGML_TYPE_Q2_0: return K % (2*QK2_0) == 0 ? tile_mm_traits<GGML_TYPE_Q2_0>::UV : tile_mm_traits<TMM_Q2_0_B1>::UV;

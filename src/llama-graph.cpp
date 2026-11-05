@@ -2189,9 +2189,9 @@ static bool llama_lru_tail_on() {
 
 static bool llama_lru_tail_kind(llama_moe_lru * lru, int il, int fk) {
     const ggml_type t = lru->pool_get(il, fk)->type;
-    // LLAMA_MOE_LRU_TAIL_Q8=1 (experimental, off): Q8_0 kinds as tails too. The tile MUL_MAT_ID refuses a per-device half
-    // of a Q8_0 down row (340 bytes, not 16-aligned), so they assemble every expert
-    static const bool q8 = [] { const char * e = getenv("LLAMA_MOE_LRU_TAIL_Q8"); return e && atoi(e) != 0; }();
+    // Q8_0 kinds as tails too (the tile MUL_MAT_ID takes a per-device half of a Q8_0 down row, 340 bytes, in two-block units):
+    // those layers then prefetch like the rest (128k prefill ubatch 437.8 -> 462.7 t/s). LLAMA_MOE_LRU_TAIL_Q8=0: full assemblies
+    static const bool q8 = [] { const char * e = getenv("LLAMA_MOE_LRU_TAIL_Q8"); return !e || atoi(e) != 0; }();
     return llama_lru_tail_on() && lru->is_exclusive() && (t == GGML_TYPE_IQ3_S || t == GGML_TYPE_IQ4_NL || (q8 && t == GGML_TYPE_Q8_0));
 }
 
