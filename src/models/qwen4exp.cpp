@@ -1784,7 +1784,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_conv_state_at(
                 conv_states_all->nb[1],
                 (slot * mem_size + kv_head) * row_size);
 
-        ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_cont(ctx0, tail), dst));
+        // p100-series: the copy reads the strided tail itself (a cont first was one more kernel per layer and token).
+        // LLAMA_CONV_TAIL_CONT=1: the old cont + copy
+        static const bool tail_cont = [] { const char * e = getenv("LLAMA_CONV_TAIL_CONT"); return e && atoi(e) != 0; }();
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, tail_cont ? ggml_cont(ctx0, tail) : tail, dst));
     }
 
     return conv_input;
