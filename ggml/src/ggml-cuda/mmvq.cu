@@ -253,6 +253,12 @@ static constexpr __host__ __device__ bool p100_leg_type(ggml_type type) {
            type == GGML_TYPE_Q8_0 || type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_IQ4_XS;
 }
 #define P100_LEG_SMALL_M 2048
+#ifndef P100_IQ3S_ROWS
+#define P100_IQ3S_ROWS 2
+#endif
+#ifndef P100_IQ3S_NWARPS
+#define P100_IQ3S_NWARPS 2
+#endif
 static constexpr __host__ __device__ int p100_leg_nwarps1(ggml_type type, bool small_m) {
     switch (type) {
         case GGML_TYPE_Q4_0:   return small_m ? 4 : 1;
@@ -262,6 +268,7 @@ static constexpr __host__ __device__ int p100_leg_nwarps1(ggml_type type, bool s
         case GGML_TYPE_IQ4_XS: return small_m ? 2 : 1;
         // q8_0 few rows (Flash-Next's hyper-connection projections: 160 rows x 10240 per GPU): 4 warps on 1 row split the long K
         case GGML_TYPE_Q8_0:   return small_m ? 4 : 2;
+        case GGML_TYPE_IQ3_S:  return P100_IQ3S_NWARPS;
         default:               return 2; // q4_1: measured best at the default
     }
 }
@@ -273,6 +280,7 @@ static constexpr __host__ __device__ int p100_leg_rows1(ggml_type type, bool sma
         case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_IQ4_XS: return small_m ? 2 : 4;
         case GGML_TYPE_Q8_0:   return small_m ? 1 : 2;
+        case GGML_TYPE_IQ3_S:  return P100_IQ3S_ROWS;
         default:               return 2;
     }
 }

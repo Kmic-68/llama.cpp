@@ -1,3 +1,4 @@
+#include "ggml-qsa.h"
 #include "models.h"
 #include "llama-impl.h"
 
@@ -930,6 +931,19 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
                 res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, sc, il});
                 cb(sc, "indexer_score", il);
                 tk = ggml_top_k(ctx0, sc, n_top_pool);
+            }
+            // p100-series: one fused op per output builds the indices and the mask below (the same values, ~20 fewer kernels per
+            // layer and chunk). LLAMA_QSA_FUSED_SEL=0: the unfused graph
+            static const bool fused_sel = [] { const char * e = getenv("LLAMA_QSA_FUSED_SEL"); return !e || atoi(e) != 0; }();
+            if (fused_sel) {
+                ggml_tensor * tlv = ggml_view_2d(ctx0, inp_kpool->tail_idxs, inp_kpool->tail_idxs->ne[0], nt,
+                                                 inp_kpool->tail_idxs->nb[1], t0*inp_kpool->tail_idxs->nb[1]);
+                ggml_tensor * gi = ggml_qsa_gather_sel(ctx0, tk, sc, inp_kpool->pool_idxs, tlv, (int) n_kv, (int) n_gpad, 0, GGML_TYPE_I32);
+                ggml_tensor * gm = ggml_qsa_gather_sel(ctx0, tk, sc, inp_kpool->pool_idxs, tlv, (int) n_kv, (int) n_gpad, 1, kq_mask->type);
+                cb(gi, "qsa_gather_idx", il);
+                cb(gm, "qsa_gather_mask", il);
+                qsa_g.push_back({gi, gm, t0, nt});
+                continue;
             }
             // the radix top-k returns its picks in a run-dependent order (atomic compaction): sorted ascending, the gathered cells
             // come in cache order every run, as the masked path reads them (an unsorted gather read KLD 0.018 against itself)

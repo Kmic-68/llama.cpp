@@ -78,6 +78,7 @@
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
 #include "ggml-cuda/top-k-mask.cuh"
+#include "ggml-qsa.h"
 #include "ggml.h"
 
 #include <algorithm>
@@ -7707,6 +7708,9 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_LIGHTNING_INDEXER:
             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
         case GGML_OP_TOP_K_MASK:
+            if (ggml_get_op_params_i32(op, 0) == GGML_QSA_SEL_MAGIC) {
+                return true;
+            }
             return op->type == GGML_TYPE_F16 || op->type == GGML_TYPE_F32;
 
         default:

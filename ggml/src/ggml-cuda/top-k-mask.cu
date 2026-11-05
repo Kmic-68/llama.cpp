@@ -1,5 +1,6 @@
 #include "top-k-mask.cuh"
 #include "convert.cuh"
+#include "ggml-qsa.h"
 
 #define CUDA_TOP_K_MASK_BLOCK_SIZE 512
 
@@ -127,7 +128,94 @@ static void top_k_mask_cuda(ggml_backend_cuda_context & ctx, ggml_tensor * dst) 
             vec);
 }
 
+// p100-series: fused QSA gather selection (ggml-qsa.h). One block per token: the picked pools sorted ascending in shared memory
+// (bitonic, padded with INT_MAX), then one thread per output cell, with the unfused graph's float operations.
+template <typename T, int MODE>
+static __global__ void qsa_gather_sel_kernel(
+        const int32_t * __restrict__ top_k, const float * __restrict__ score, const int32_t * __restrict__ pidx,
+        const int32_t * __restrict__ tail, T * __restrict__ dst,
+        const int n_top, const int n_top_pad, const int kpool, const int n_tail, const int n_gpad, const int n_kv,
+        const int64_t s_tk1, const int64_t s_sc1, const int64_t s_pi1, const int64_t s_tl1, const int64_t s_d1) {
+    extern __shared__ int32_t sorted[];
+    const int t = blockIdx.x;
+    for (int i = threadIdx.x; i < n_top_pad; i += blockDim.x) {
+        sorted[i] = i < n_top ? top_k[t*s_tk1 + i] : INT_MAX;
+    }
+    __syncthreads();
+    for (int k = 2; k <= n_top_pad; k *= 2) {
+        for (int j = k/2; j > 0; j /= 2) {
+            for (int i = threadIdx.x; i < n_top_pad; i += blockDim.x) {
+                const int ixj = i ^ j;
+                if (ixj > i) {
+                    const int32_t a = sorted[i], b = sorted[ixj];
+                    if (((i & k) == 0) == (a > b)) {
+                        sorted[i] = b;
+                        sorted[ixj] = a;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+    const int n_pc = kpool*n_top;
+    for (int j = threadIdx.x; j < n_gpad; j += blockDim.x) {
+        float cellf = 0.0f, live = 0.0f;
+        if (j < n_pc) {
+            const int32_t p = sorted[j/kpool];
+            cellf = (float) pidx[p*s_pi1 + j%kpool];
+            live = fminf(fmaxf(1.0f*score[t*s_sc1 + p] + 1.0f, 0.0f), 1.0f);
+        } else if (j < n_pc + n_tail) {
+            cellf = (float) tail[t*s_tl1 + (j - n_pc)];
+            live = fminf(fmaxf(-1.0f*cellf + (float) n_kv, 0.0f), 1.0f);
+        }
+        if constexpr (MODE == 0) {
+            dst[t*s_d1 + j] = (T) int32_t(cellf*live);
+        } else {
+            dst[t*s_d1 + j] = ggml_cuda_cast<T>(logf(live));
+        }
+    }
+}
+
+static void ggml_cuda_op_qsa_gather_sel(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * top_k = dst->src[0];
+    const ggml_tensor * score = dst->src[1];
+    const ggml_tensor * pidx  = dst->src[2];
+    const ggml_tensor * tail  = dst->src[3];
+    const int mode = ggml_get_op_params_i32(dst, 1);
+    const int n_kv = ggml_get_op_params_i32(dst, 2);
+    const int n_top = (int) top_k->ne[0];
+    int n_top_pad = 1;
+    while (n_top_pad < n_top) {
+        n_top_pad *= 2;
+    }
+    const int nt = (int) top_k->ne[1];
+    const size_t si = sizeof(int32_t);
+    const int64_t s_d1 = mode == 0 ? dst->nb[1] / ggml_type_size(dst->type) : dst->nb[3] / ggml_type_size(dst->type);
+    const dim3 block_dims(256, 1, 1), grid_dims(nt, 1, 1);
+    const size_t smem = n_top_pad*sizeof(int32_t);
+    GGML_ASSERT(smem <= 48*1024);
+    const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(grid_dims, block_dims, smem, ctx.stream());
+#define QSA_SEL_ARGS (const int32_t *) top_k->data, (const float *) score->data, (const int32_t *) pidx->data, (const int32_t *) tail->data
+#define QSA_SEL_TAIL n_top, n_top_pad, (int) pidx->ne[0], (int) tail->ne[0], (int) dst->ne[0], n_kv, \
+            (int64_t) (top_k->nb[1]/si), (int64_t) (score->nb[1]/sizeof(float)), (int64_t) (pidx->nb[1]/si), (int64_t) (tail->nb[1]/si), s_d1
+    if (mode == 0) {
+        GGML_ASSERT(dst->type == GGML_TYPE_I32);
+        ggml_cuda_kernel_launch(qsa_gather_sel_kernel<int32_t, 0>, lp, QSA_SEL_ARGS, (int32_t *) dst->data, QSA_SEL_TAIL);
+    } else if (dst->type == GGML_TYPE_F16) {
+        ggml_cuda_kernel_launch(qsa_gather_sel_kernel<half, 1>, lp, QSA_SEL_ARGS, (half *) dst->data, QSA_SEL_TAIL);
+    } else {
+        GGML_ASSERT(dst->type == GGML_TYPE_F32);
+        ggml_cuda_kernel_launch(qsa_gather_sel_kernel<float, 1>, lp, QSA_SEL_ARGS, (float *) dst->data, QSA_SEL_TAIL);
+    }
+#undef QSA_SEL_ARGS
+#undef QSA_SEL_TAIL
+}
+
 void ggml_cuda_op_top_k_mask(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    if (ggml_get_op_params_i32(dst, 0) == GGML_QSA_SEL_MAGIC) {
+        ggml_cuda_op_qsa_gather_sel(ctx, dst);
+        return;
+    }
     switch (dst->type) {
         case GGML_TYPE_F16:
             top_k_mask_cuda<half>(ctx, dst);

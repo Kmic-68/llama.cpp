@@ -158,15 +158,48 @@ static __global__ void top_k_radix_select(
     histogram[tid] = count;
     __syncthreads();
 
-    if (tid == 0) {
+    // p100-series: the bin walk in one warp (a serial walk of 256 bins in thread 0 cost ~14 us per pass). Same result as
+    //   bin = NBINS - 1; while (bin > 0 && histogram[bin] < rank) rank -= histogram[bin--];
+    // lane l holds bins [l*BPL, l*BPL + BPL); the walk stops in the highest lane whose bins and all above reach rank
+    // (lane 0 when none does: the walk then ends at bin 0)
+    static_assert(NBINS % WARP_SIZE == 0, "bins per lane");
+    constexpr int BPL = NBINS / WARP_SIZE;
+    if (tid < WARP_SIZE) {
+        const int lane = tid;
         top_k_radix_state state = states[row];
-        int bin = NBINS - 1;
-        while (bin > 0 && histogram[bin] < state.rank) {
-            state.rank -= histogram[bin--];
+        int c[BPL];
+        int sum = 0;
+#pragma unroll
+        for (int j = 0; j < BPL; ++j) {
+            c[j] = histogram[lane*BPL + j];
+            sum += c[j];
         }
-        state.prefix |= (uint32_t) bin << shift;
-        state.prefix_mask |= (uint32_t) (NBINS - 1) << shift;
-        states[row] = state;
+        int suf = sum;   // bins >= lane*BPL
+#pragma unroll
+        for (int off = 1; off < WARP_SIZE; off *= 2) {
+            const int v = __shfl_down_sync(0xffffffffu, suf, off);
+            if (lane + off < WARP_SIZE) {
+                suf += v;
+            }
+        }
+        const unsigned reach = __ballot_sync(0xffffffffu, suf >= state.rank);
+        const int target = reach ? 31 - __clz((int) reach) : 0;
+        if (lane == target) {
+            int rank = state.rank - (suf - sum);   // minus the bins above this lane
+            int bin = lane*BPL + BPL - 1;
+#pragma unroll
+            for (int j = BPL - 1; j >= 0; --j) {
+                bin = lane*BPL + j;
+                if (bin == 0 || c[j] >= rank) {
+                    break;
+                }
+                rank -= c[j];
+            }
+            state.rank = rank;
+            state.prefix |= (uint32_t) bin << shift;
+            state.prefix_mask |= (uint32_t) (NBINS - 1) << shift;
+            states[row] = state;
+        }
     }
 }
 

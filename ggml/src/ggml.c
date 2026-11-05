@@ -7,6 +7,7 @@
 #include "ggml-threading.h"
 #include "ggml-cpu.h"
 #include "ggml.h"
+#include "ggml-qsa.h"
 
 // FIXME: required here for quantization functions
 #include "ggml-quants.h"
@@ -6912,6 +6913,42 @@ struct ggml_tensor * ggml_top_k_mask(
     result->src[2] = score;
     result->src[3] = blocks;
     result->src[4] = extra;
+
+    return result;
+}
+
+// p100-series: fused QSA gather selection, see ggml-qsa.h
+struct ggml_tensor * ggml_qsa_gather_sel(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * top_k,
+        struct ggml_tensor  * score,
+        struct ggml_tensor  * pool_idxs,
+        struct ggml_tensor  * tail,
+        int                   n_kv,
+        int                   n_gpad,
+        int                   mode,
+        enum ggml_type        mtype) {
+    GGML_ASSERT(top_k->type == GGML_TYPE_I32 && score->type == GGML_TYPE_F32);
+    GGML_ASSERT(pool_idxs->type == GGML_TYPE_I32 && tail->type == GGML_TYPE_I32);
+    GGML_ASSERT(top_k->ne[2] == 1 && top_k->ne[3] == 1);
+    GGML_ASSERT(score->ne[1] == top_k->ne[1] && tail->ne[1] == top_k->ne[1]);
+    GGML_ASSERT(pool_idxs->ne[1] == score->ne[0]);
+    GGML_ASSERT(top_k->nb[0] == sizeof(int32_t) && score->nb[0] == sizeof(float));
+    GGML_ASSERT(pool_idxs->nb[0] == sizeof(int32_t) && tail->nb[0] == sizeof(int32_t));
+    GGML_ASSERT(pool_idxs->ne[0]*top_k->ne[0] + tail->ne[0] <= n_gpad);
+    GGML_ASSERT(mode == 0 || mtype == GGML_TYPE_F16 || mtype == GGML_TYPE_F32);
+
+    const int64_t nt = top_k->ne[1];
+    struct ggml_tensor * result = mode == 0 ? ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_gpad, nt)
+                                            : ggml_new_tensor_4d(ctx, mtype, n_gpad, 1, 1, nt);
+    const int32_t params[] = { GGML_QSA_SEL_MAGIC, mode, n_kv };
+    ggml_set_op_params(result, params, sizeof(params));
+
+    result->op     = GGML_OP_TOP_K_MASK;
+    result->src[0] = top_k;
+    result->src[1] = score;
+    result->src[2] = pool_idxs;
+    result->src[3] = tail;
 
     return result;
 }

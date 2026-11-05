@@ -1,4 +1,5 @@
 #include "ops.h"
+#include "ggml-qsa.h"
 
 #include "ggml-cpu.h"
 #include "ggml-impl.h"
@@ -11757,9 +11758,52 @@ void ggml_compute_forward_dsv4_hc_post(
 
 // ggml_compute_forward_top_k_mask
 
+// p100-series: fused QSA gather selection (ggml-qsa.h), the reference: the same float operations as the unfused graph
+static void ggml_compute_forward_qsa_gather_sel(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * top_k = dst->src[0];
+    const ggml_tensor * score = dst->src[1];
+    const ggml_tensor * pidx  = dst->src[2];
+    const ggml_tensor * tail  = dst->src[3];
+    const int32_t mode = ggml_get_op_params_i32(dst, 1);
+    const int32_t n_kv = ggml_get_op_params_i32(dst, 2);
+    const int64_t n_top = top_k->ne[0], kpool = pidx->ne[0], n_tail = tail->ne[0], n_gpad = dst->ne[0];
+    const int64_t nt = top_k->ne[1];
+    std::vector<int32_t> sorted(n_top);
+    for (int64_t t = params->ith; t < nt; t += params->nth) {
+        for (int64_t i = 0; i < n_top; ++i) {
+            sorted[i] = *(const int32_t *) ((const char *) top_k->data + i*top_k->nb[0] + t*top_k->nb[1]);
+        }
+        std::sort(sorted.begin(), sorted.end());
+        for (int64_t j = 0; j < n_gpad; ++j) {
+            float cellf = 0.0f, live = 0.0f;
+            if (j < kpool*n_top) {
+                const int32_t p = sorted[j/kpool];
+                cellf = (float) *(const int32_t *) ((const char *) pidx->data + (j%kpool)*pidx->nb[0] + p*pidx->nb[1]);
+                const float sc = *(const float *) ((const char *) score->data + p*score->nb[0] + t*score->nb[1]);
+                live = fminf(fmaxf(sc*1.0f + 1.0f, 0.0f), 1.0f);
+            } else if (j < kpool*n_top + n_tail) {
+                cellf = (float) *(const int32_t *) ((const char *) tail->data + (j - kpool*n_top)*tail->nb[0] + t*tail->nb[1]);
+                live = fminf(fmaxf(cellf*-1.0f + (float) n_kv, 0.0f), 1.0f);
+            }
+            char * d = (char *) dst->data + j*dst->nb[0] + t*(mode == 0 ? dst->nb[1] : dst->nb[3]);
+            if (mode == 0) {
+                *(int32_t *) d = (int32_t) (cellf*live);
+            } else if (dst->type == GGML_TYPE_F16) {
+                *(ggml_fp16_t *) d = GGML_CPU_FP32_TO_FP16(logf(live));
+            } else {
+                *(float *) d = logf(live);
+            }
+        }
+    }
+}
+
 void ggml_compute_forward_top_k_mask(
         const ggml_compute_params * params,
         ggml_tensor * dst) {
+    if (ggml_get_op_params_i32(dst, 0) == GGML_QSA_SEL_MAGIC) {
+        ggml_compute_forward_qsa_gather_sel(params, dst);
+        return;
+    }
     const ggml_tensor * mask   = dst->src[0];
     const ggml_tensor * top_k  = dst->src[1];
     const ggml_tensor * score  = dst->src[2];
