@@ -1082,6 +1082,8 @@ struct llm_graph_context {
     // LRU_ASSEMBLE nodes created one pooled layer ahead (build_moe_ffn of the previous layer), so the backend can assemble
     // them on a side stream while that layer and the next attention compute: layer -> {gate, up, down}
     mutable std::map<int, std::array<ggml_tensor *, 3>> lru_asm_ahead;
+    // p100-series: the first pooled layer's expert assembly at the start of a large batch's graph (overlaps the first attention)
+    void build_lru_prefetch_first() const;
     // LLAMA_MOE_LRU_PF: decode prefetch of the next pooled layer's predicted experts: layer -> {prefetch decide, predicted ids}
     mutable std::map<int, std::array<ggml_tensor *, 2>> lru_pf_ahead;
     // independent work (e.g. a shared expert) expanded right after the LRU fills of the next build_moe_ffn, ahead of its expert

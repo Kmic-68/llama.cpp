@@ -2211,6 +2211,27 @@ static ggml_tensor * llama_lru_assemble(ggml_context * ctx0, llama_moe_lru * lru
                 : ggml_lru_assemble_ext (ctx0, lru->state_get(il), lru->exps_get(il, fk), pool, n_expert, lru->ctrl(), lru->pool_index(il));
 }
 
+// LLAMA_MOE_LRU_PF_FIRST=1 (opt-in: measured slower, 433.6 vs ~460 t/s on a 128k prefill ubatch). Every later pooled layer's assembly is put into the graph by the layer before it (prefetch); the
+// first one had nothing before it, so each prefill ubatch started with the copy engines' whole first-layer transfer exposed.
+void llm_graph_context::build_lru_prefetch_first() const {
+    static const bool on = [] { const char * e = getenv("LLAMA_MOE_LRU_PF_FIRST"); return e && atoi(e) != 0; }();
+    if (!on || lru == nullptr || !lru->prefetch() || cparams.warmup || n_tokens == 0 ||
+            (int64_t) n_tokens * n_expert_used <= lru->n_slots_min()) {
+        return;
+    }
+    const int nx = lru->next_pooled(-1);
+    if (nx < 0 || !lru->pooled(nx) || lru_asm_ahead.find(nx) != lru_asm_ahead.end() ||
+            (llama_lru_tail_on() && !llama_lru_tail_layer(lru, nx))) {
+        return;
+    }
+    std::array<ggml_tensor *, 3> nxt;
+    for (int fk = 0; fk < 3; fk++) {
+        nxt[fk] = llama_lru_assemble(ctx0, lru, nx, fk, hparams.n_expert);
+        ggml_build_forward_expand(gf, nxt[fk]);
+    }
+    lru_asm_ahead[nx] = nxt;
+}
+
 ggml_tensor * llm_graph_context::build_moe_ffn(
          ggml_tensor * cur,
          ggml_tensor * gate_inp,
