@@ -624,6 +624,19 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
             return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0);
         }
 
+        // p100-series: qwen4exp's shared expert splits like the routed experts (gate/up by rows, down by K): its output is then a
+        // partial sum like theirs and joins the same reduction, instead of every device computing all of it. LLAMA_SPLIT_SHEXP=1 (opt-in: 31.1 vs ~34 t/s at 128k decode, the meta backend reduces it on its own)
+        static const bool split_shexp = [] { const char * e = getenv("LLAMA_SPLIT_SHEXP"); return e && atoi(e) != 0; }();
+        if (split_shexp && ud->model->arch == LLM_ARCH_QWEN4EXP) {
+            if (std::regex_match(tensor_name, pattern_ffn_up_shexp_weight) ||
+                    std::regex_match(tensor_name, pattern_ffn_gate_shexp_weight)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_1, "ffn_down_shexp.weight");
+            }
+            if (std::regex_match(tensor_name, pattern_ffn_down_shexp_weight)) {
+                return get_tensor_config_impl(GGML_BACKEND_SPLIT_AXIS_0, "ffn_down_shexp.weight");
+            }
+        }
+
         // FFN
         if (std::regex_match(tensor_name, pattern_ffn_up_weight) || std::regex_match(tensor_name, pattern_ffn_gate_weight) ||
                 std::regex_match(tensor_name, pattern_moe_lru_pool_up_gate)) {
@@ -883,6 +896,10 @@ struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const str
                 std::regex_match(tensor_name, pattern_ffn_up_shexp_weight) ||
                 std::regex_match(tensor_name, pattern_ffn_gate_shexp_weight) ||
                 std::regex_match(tensor_name, pattern_ffn_down_shexp_weight)) {
+            if (ud->model->arch == LLM_ARCH_QWEN4EXP && std::regex_search(tensor_name, std::regex("shexp"))) {
+                GGML_ASSERT(segments.size() == 1);
+                return {blck_size};   // n_ff_shexp = 640: 320 per device (a granularity of 128 would split it 384 / 256)
+            }
             const int64_t blck_size_perf = std::lcm(blck_size, 128);
             GGML_ASSERT(segments.size() == 1);
             return {blck_size_perf};
