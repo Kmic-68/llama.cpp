@@ -118,17 +118,15 @@ static __global__ void dsv4_hc_pre_f32(
         int64_t sd1,
         float   scale) {
     ggml_cuda_pdl_lc();
-    const int64_t ir = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    const int64_t nr = n_embd * n_tokens;
+    // p100-series: a 2D grid (embd blocks, token) instead of 64-bit div/mod per element
+    const int64_t i0 = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t it = blockIdx.y;
 
-    if (ir >= nr) {
+    if (i0 >= n_embd) {
         return;
     }
 
     ggml_cuda_pdl_sync();
-
-    const int64_t i0 = ir % n_embd;
-    const int64_t it = ir / n_embd;
 
     float sum = 0.0f;
     for (int64_t ih = 0; ih < hc; ++ih) {
@@ -263,9 +261,9 @@ void ggml_cuda_op_dsv4_hc_pre(ggml_backend_cuda_context & ctx, ggml_tensor * dst
     const bool  gated = ggml_get_op_params_i32(dst, 1) != 0;
 
     const int block_size = 256;
-    const int64_t nr = n_embd * n_tokens;
+    GGML_ASSERT(n_tokens <= 65535);
     const dim3 block_dims(block_size, 1, 1);
-    const dim3 grid_dims((nr + block_size - 1) / block_size, 1, 1);
+    const dim3 grid_dims((n_embd + block_size - 1) / block_size, n_tokens, 1);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
 
     auto kernel = gated ? dsv4_hc_pre_f32<true> : dsv4_hc_pre_f32<false>;
