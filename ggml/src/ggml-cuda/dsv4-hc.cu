@@ -172,18 +172,16 @@ static __global__ void dsv4_hc_post_f32(
         float gate_scale_in,
         float gate_scale_out) {
     ggml_cuda_pdl_lc();
-    const int64_t ir = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    const int64_t nr = n_embd * hc * n_tokens;
+    // p100-series: a 3D grid (embd blocks, stream, token) instead of 64-bit div/mod per element
+    const int64_t i0   = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t idst = blockIdx.y;
+    const int64_t it   = blockIdx.z;
 
-    if (ir >= nr) {
+    if (i0 >= n_embd) {
         return;
     }
 
     ggml_cuda_pdl_sync();
-
-    const int64_t i0   = ir % n_embd;
-    const int64_t idst = (ir / n_embd) % hc;
-    const int64_t it   = ir / (n_embd * hc);
 
     float p = post[idst*sp0 + it*sp1];
     if constexpr (gated) {
@@ -313,9 +311,9 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     const int64_t hc       = residual->ne[1];
 
     const int block_size = 256;
-    const int64_t nr = n_embd * hc * n_tokens;
+    GGML_ASSERT(hc <= 65535 && n_tokens <= 65535);
     const dim3 block_dims(block_size, 1, 1);
-    const dim3 grid_dims((nr + block_size - 1) / block_size, 1, 1);
+    const dim3 grid_dims((n_embd + block_size - 1) / block_size, hc, n_tokens);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
 
     auto kernel = comb ? (gated ? dsv4_hc_post_f32<true,  true> : dsv4_hc_post_f32<true,  false>)
