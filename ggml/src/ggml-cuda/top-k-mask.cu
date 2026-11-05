@@ -136,27 +136,25 @@ static __global__ void qsa_gather_sel_kernel(
         const int32_t * __restrict__ tail, T * __restrict__ dst,
         const int n_top, const int n_top_pad, const int kpool, const int n_tail, const int n_gpad, const int n_kv,
         const int64_t s_tk1, const int64_t s_sc1, const int64_t s_pi1, const int64_t s_tl1, const int64_t s_d1) {
-    extern __shared__ int32_t sorted[];
+    // the picks are distinct pool numbers: each one's place in ascending order is the count of smaller picks (one barrier,
+    // no sorting network)
+    extern __shared__ int32_t smem_sel[];
+    int32_t * picks  = smem_sel;
+    int32_t * sorted = smem_sel + n_top_pad;
     const int t = blockIdx.x;
-    for (int i = threadIdx.x; i < n_top_pad; i += blockDim.x) {
-        sorted[i] = i < n_top ? top_k[t*s_tk1 + i] : INT_MAX;
+    for (int i = threadIdx.x; i < n_top; i += blockDim.x) {
+        picks[i] = top_k[t*s_tk1 + i];
     }
     __syncthreads();
-    for (int k = 2; k <= n_top_pad; k *= 2) {
-        for (int j = k/2; j > 0; j /= 2) {
-            for (int i = threadIdx.x; i < n_top_pad; i += blockDim.x) {
-                const int ixj = i ^ j;
-                if (ixj > i) {
-                    const int32_t a = sorted[i], b = sorted[ixj];
-                    if (((i & k) == 0) == (a > b)) {
-                        sorted[i] = b;
-                        sorted[ixj] = a;
-                    }
-                }
-            }
-            __syncthreads();
+    for (int i = threadIdx.x; i < n_top; i += blockDim.x) {
+        const int32_t v = picks[i];
+        int r = 0;
+        for (int j = 0; j < n_top; ++j) {
+            r += picks[j] < v;
         }
+        sorted[r] = v;
     }
+    __syncthreads();
     const int n_pc = kpool*n_top;
     for (int j = threadIdx.x; j < n_gpad; j += blockDim.x) {
         float cellf = 0.0f, live = 0.0f;
@@ -192,7 +190,7 @@ static void ggml_cuda_op_qsa_gather_sel(ggml_backend_cuda_context & ctx, ggml_te
     const size_t si = sizeof(int32_t);
     const int64_t s_d1 = mode == 0 ? dst->nb[1] / ggml_type_size(dst->type) : dst->nb[3] / ggml_type_size(dst->type);
     const dim3 block_dims(256, 1, 1), grid_dims(nt, 1, 1);
-    const size_t smem = n_top_pad*sizeof(int32_t);
+    const size_t smem = 2*n_top_pad*sizeof(int32_t);
     GGML_ASSERT(smem <= 48*1024);
     const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(grid_dims, block_dims, smem, ctx.stream());
 #define QSA_SEL_ARGS (const int32_t *) top_k->data, (const float *) score->data, (const int32_t *) pidx->data, (const int32_t *) tail->data
