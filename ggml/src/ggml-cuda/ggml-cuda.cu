@@ -84,6 +84,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <unistd.h>
 #include <charconv>
 #include <cinttypes>
 #include <condition_variable>
@@ -4911,6 +4912,23 @@ static bool ggml_cuda_try_gdn_state_gather(const ggml_cgraph * cgraph, int i) {
     ggml_cuda_gdn_gather_register(gdn, (const float *) node->src[0]->data, (const int32_t *) node->src[1]->data,
                                   node->src[0]->nb[1] / sizeof(float));
     return true;
+}
+
+// p100-series measuring aid: GGML_CUDA_AB_FILE=<path>: ggml_cuda_ab_alt() is true while that file exists (checked every 50 ms),
+// so an A/B of a code path can alternate inside one server (dec128.py ABFILE). Off (false) without the variable.
+bool ggml_cuda_ab_alt() {
+    static const char * path = getenv("GGML_CUDA_AB_FILE");
+    if (path == nullptr) {
+        return false;
+    }
+    static std::atomic<int64_t> last_us{0};
+    static std::atomic<bool> val{false};
+    const int64_t now = ggml_time_us();
+    if (now - last_us.load(std::memory_order_relaxed) > 50000) {
+        last_us.store(now, std::memory_order_relaxed);
+        val.store(access(path, F_OK) == 0, std::memory_order_relaxed);
+    }
+    return val.load(std::memory_order_relaxed);
 }
 
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
