@@ -2461,9 +2461,13 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 if (n_used != node->ne[1] || id + 2*n_used-1 >= cgraph->n_nodes) {
                     return idr;
                 }
+                // p100-series: an in-place MUL is itself a view of the expert outputs, and ggml collapses a view of a view to the
+                // root, so its views name the root (prefill weighs the experts in place: without this the AllReduce ran on the
+                // [n_embd, n_expert_used, n_tokens] tensor, 300 MiB per layer per 3072-token ubatch, before the sum)
+                const ggml_tensor * view_root = (node->view_src != nullptr && node->view_offs == 0) ? node->view_src : node;
                 for (int32_t k = 0; k < n_used; k++) {
                     ggml_tensor * next = cgraph->nodes[id+1];
-                    if (next->op != GGML_OP_VIEW || next->view_src != node || next->view_offs != k*node->nb[1] ||
+                    if (next->op != GGML_OP_VIEW || (next->view_src != node && next->view_src != view_root) || next->view_offs != k*node->nb[1] ||
                             next->ne[0] != node->ne[0] || next->ne[1] != node->ne[2] || next->nb[1] != node->nb[2] ||
                             ggml_node_get_use_count(cgraph, id+1) != 1) {
                         return idr;
