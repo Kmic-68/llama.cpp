@@ -2564,7 +2564,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             }
             // tail mode: no prefetch into or out of a layer with fully assembled kinds (the Q8_0-down layers): the compute buffer
             // is sized by the largest pair of live assemblies, and two tail layers are about the size of one full layer
-            const bool pf_ok = !llama_lru_tail_on() || (llama_lru_tail_layer(lru, il) && nx < (int) hparams.n_layer() && llama_lru_tail_layer(lru, nx));
+            // LLAMA_MOE_LRU_PF_ALL=1: prefetch those too (a larger compute buffer: one full layer more)
+            static const bool pf_all = [] { const char * e = getenv("LLAMA_MOE_LRU_PF_ALL"); return e && atoi(e) != 0; }();
+            const bool pf_ok = pf_all || !llama_lru_tail_on() || (llama_lru_tail_layer(lru, il) && nx < (int) hparams.n_layer() && llama_lru_tail_layer(lru, nx));
             if (pf_ok && nx < (int) hparams.n_layer() && lru_asm_ahead.find(nx) == lru_asm_ahead.end()) {
                 std::array<ggml_tensor *, 3> nxt;
                 for (int fk = 0; fk < 3; fk++) {

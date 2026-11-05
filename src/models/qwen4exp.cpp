@@ -1404,7 +1404,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
 
         ffn_shexp = ggml_mul(ctx0, ffn_shexp, shared_gate);
         cb(ffn_shexp, "ffn_shexp_gated", il);
-        moe_overlap = ffn_shexp;
+        // with the shared expert split across devices (LLAMA_SPLIT_SHEXP=1) it goes after the routed experts instead, right before
+        // the add: the meta backend then reduces both partial sums in one AllReduce (AllReduce(a) + AllReduce(b) = AllReduce(a + b))
+        static const bool split_shexp = [] { const char * e = getenv("LLAMA_SPLIT_SHEXP"); return e && atoi(e) != 0; }();
+        if (!split_shexp) {
+            moe_overlap = ffn_shexp;
+        }
     }
 
     ggml_tensor * moe_out =
