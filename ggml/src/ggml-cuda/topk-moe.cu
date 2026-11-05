@@ -344,6 +344,79 @@ __global__ void topk_moe_cuda(const float *         logits,
     }
 }
 
+// p100-series: 512 experts, a few rows (decode). The single-warp kernel above runs n_expert_used dependent argmax rounds over 16
+// values per lane (~15 us on sm_60). Here warp 0 runs the same prologue (softmax / sigmoid / sqrt-softplus, NaN sanitising), then
+// 512 threads sort (value desc, index asc) in shared memory: the first n_expert_used are the rounds' picks in round order (each
+// round takes the largest value, the lowest expert on ties). The weight sum is accumulated per owning lane in round order and
+// warp-reduced as above, so ids and weights are bit-identical. No bias, no groups, no delayed softmax.
+__global__ void __launch_bounds__(512) topk_moe_512_sort(const float * logits, float * weights, int32_t * ids, const int n_rows,
+        const int n_expert_used, const float clamp_val, const float scale_val, const topk_moe_config config) {
+    constexpr int NE = 512, EPT = NE / WARP_SIZE;
+    const int row = blockIdx.x, tid = threadIdx.x, lane = tid % WARP_SIZE, warp = tid / WARP_SIZE;
+    logits += (int64_t) NE * row;
+    weights += (int64_t) n_expert_used * row;
+    ids += (int64_t) NE * row;
+    __shared__ float sv[NE];
+    __shared__ int   si[NE];
+    if (warp == 0) {
+        float wt[EPT];
+#pragma unroll
+        for (int i = 0; i < EPT; i++) {
+            wt[i] = logits[i*WARP_SIZE + lane];
+        }
+        if (config.use_sigmoid) {
+            sigmoid_warp_inplace<EPT, false>(wt, NE, lane);
+        } else if (config.use_sqrt_softplus) {
+            sqrt_softplus_warp_inplace<EPT, false>(wt, NE, lane);
+        } else {
+            softmax_warp_inplace<EPT, false>(wt, NE, lane);
+        }
+#pragma unroll
+        for (int i = 0; i < EPT; i++) {
+            sv[i*WARP_SIZE + lane] = __isnanf(wt[i]) ? -FLT_MAX : wt[i];
+        }
+    }
+    __syncthreads();   // ids may alias logits: every read is done
+    si[tid] = tid;
+    __syncthreads();
+    for (int k = 2; k <= NE; k *= 2) {
+        for (int j = k/2; j > 0; j /= 2) {
+            const int ixj = tid ^ j;
+            if (ixj > tid) {
+                const float a = sv[tid], b = sv[ixj];
+                const int  ia = si[tid], ib = si[ixj];
+                const bool a_first = a > b || (a == b && ia < ib);
+                if (((tid & k) == 0) != a_first) {
+                    sv[tid] = b; sv[ixj] = a;
+                    si[tid] = ib; si[ixj] = ia;
+                }
+            }
+            __syncthreads();
+        }
+    }
+    if (warp == 0) {
+        float wt_sum = 0.0f;
+        for (int k = 0; k < n_expert_used; k++) {
+            if ((si[k] & (WARP_SIZE - 1)) == lane && config.with_norm) {
+                wt_sum += sv[k];
+            }
+        }
+        for (int k = lane; k < n_expert_used; k += WARP_SIZE) {
+            ids[k] = si[k];
+        }
+        float inv_sum = 1.0f;
+        if (config.with_norm) {
+            wt_sum  = warp_reduce_sum(wt_sum);
+            wt_sum  = max(wt_sum, clamp_val);
+            inv_sum = 1.0f / wt_sum;
+        }
+        for (int k = lane; k < n_expert_used; k += WARP_SIZE) {
+            const float w = config.with_norm ? sv[k] * inv_sum : sv[k];
+            weights[k] = w * scale_val;
+        }
+    }
+}
+
 template<bool has_bias>
 static void launch_topk_moe_cuda(ggml_backend_cuda_context & ctx,
                                  const float *               logits,
@@ -367,6 +440,15 @@ static void launch_topk_moe_cuda(ggml_backend_cuda_context & ctx,
 #if defined(GGML_USE_HIP) && HIP_VERSION < 60300000
     GGML_ASSERT(config.n_groups == 0 && "expert groups fusion is not supported on this HIP version");
 #endif
+
+    // p100-series: the sorting kernel for 512 experts and a few rows, opt-in (GGML_CUDA_TOPK_MOE_SORT=1): measured slower on sm_60
+    // (21 us vs 16.5 us per call at 128k decode: 45 block barriers cost more than the argmax rounds)
+    static const bool sort512 = [] { const char * e = getenv("GGML_CUDA_TOPK_MOE_SORT"); return e && atoi(e) != 0; }();
+    if (sort512 && !has_bias && n_expert == 512 && n_rows <= 8 && config.n_groups == 0 && !config.delayed_softmax &&
+            n_expert_used <= 512) {
+        topk_moe_512_sort<<<n_rows, 512, 0, stream>>>(logits, weights, ids, n_rows, n_expert_used, clamp_val, scale_val, config);
+        return;
+    }
 
     switch (n_expert) {
         case 1:

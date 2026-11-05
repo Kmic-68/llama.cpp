@@ -2467,7 +2467,8 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     // GGML_CUDA_PASCAL_FUSE_MMID=1 (dense MUL_MAT stays unfused)
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     static const bool pascal_mmid = [] { const char * e = getenv("GGML_CUDA_PASCAL_FUSE_MMID"); return e && atoi(e) != 0; }();
-    if (cc <= GGML_CUDA_CC_PASCAL && !(pascal_mmid && tensor->op == GGML_OP_MUL_MAT_ID)) {
+    static const bool pascal_mm = [] { const char * e = getenv("GGML_CUDA_PASCAL_FUSE_MM"); return e && atoi(e) != 0; }();
+    if (cc <= GGML_CUDA_CC_PASCAL && !(pascal_mmid && tensor->op == GGML_OP_MUL_MAT_ID) && !(pascal_mm && tensor->op == GGML_OP_MUL_MAT)) {
         return false;
     }
     //we only support fusion for ncols_dst = 1
@@ -4746,6 +4747,12 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
         return true;
     }
 
+    // p100-series: SCALE -> SILU (ggml_cuda_op_scale_silu checks types and contiguity)
+    if (ops.size() == 2 && ops.begin()[0] == GGML_OP_SCALE && ops.begin()[1] == GGML_OP_UNARY
+     && unary_ops.size() == 1 && unary_ops.begin()[0] == GGML_UNARY_OP_SILU) {
+        return ggml_get_unary_op(cgraph->nodes[node_idx + 1]) == GGML_UNARY_OP_SILU;
+    }
+
     if (ops.size() == 3 && ops.begin()[0] == GGML_OP_SCALE && ops.begin()[1] == GGML_OP_UNARY && ops.begin()[2] == GGML_OP_SCALE
      && unary_ops.size() == 1 && unary_ops.begin()[0] == GGML_UNARY_OP_TANH) {
         const ggml_tensor *scale  = cgraph->nodes[node_idx];
@@ -5975,6 +5982,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE }, { GGML_UNARY_OP_TANH })) {
         ggml_cuda_op_softcap(*cuda_ctx, cgraph->nodes[i + 2], node);
         return 2;
+    }
+
+    // p100-series: SCALE -> SILU (GGML_CUDA_FUSE_SCALE_SILU=0: off)
+    static const bool fuse_scale_silu = [] { const char * e = getenv("GGML_CUDA_FUSE_SCALE_SILU"); return !e || atoi(e) != 0; }();
+    if (fuse_scale_silu && ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU }) &&
+            ggml_cuda_op_scale_silu(*cuda_ctx, node, cgraph->nodes[i + 1])) {
+        return 1;
     }
 
     return 0;

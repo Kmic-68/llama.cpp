@@ -809,6 +809,32 @@ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary
     }
 }
 
+/* p100-series: fused SCALE -> SILU (qwen4exp's hyper-connection: silu(down(x) / hc)), the scale kernel's and the silu kernel's
+   operations in turn, so the result is bit-identical. */
+static __global__ void scale_silu_f32(const float * x, float * dst, const float scale, const float bias, const int n) {
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    const float t = scale == 0.0f ? bias : scale * x[i] + bias;
+    dst[i] = op_silu(t);
+}
+
+bool ggml_cuda_op_scale_silu(ggml_backend_cuda_context & ctx, ggml_tensor * sc, ggml_tensor * silu) {
+    const ggml_tensor * x = sc->src[0];
+    if (ggml_get_unary_op(silu) != GGML_UNARY_OP_SILU || x->type != GGML_TYPE_F32 || sc->type != GGML_TYPE_F32 ||
+            silu->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || !ggml_is_contiguous(sc) || !ggml_is_contiguous(silu) ||
+            ggml_nelements(x) > INT_MAX) {
+        return false;
+    }
+    float scale, bias;
+    memcpy(&scale, (const float *) sc->op_params + 0, sizeof(float));
+    memcpy(&bias,  (const float *) sc->op_params + 1, sizeof(float));
+    const int n = (int) ggml_nelements(x);
+    scale_silu_f32<<<(n + 255)/256, 256, 0, ctx.stream()>>>((const float *) x->data, (float *) silu->data, scale, bias, n);
+    return true;
+}
+
 /* fused ADD (row bias) -> SOFTPLUS -> MUL (row scale): the delta net's gate, softplus(alpha + dt) * a.
    Each value goes through exactly the unfused kernels' operations (op_add, op_softplus, op_mul), so the
    result is bit-identical. */
