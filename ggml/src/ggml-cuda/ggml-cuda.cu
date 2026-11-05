@@ -4794,6 +4794,11 @@ static bool ggml_cuda_try_gdn_state_gather(const ggml_cgraph * cgraph, int i) {
             node->src[0]->nb[0] != sizeof(float) || !ggml_is_contiguous(node) || !ggml_is_contiguous(node->src[1]) ||
             node->ne[2] != 1 || node->ne[3] != 1 || node->src[0]->ne[2] != 1 || node->src[0]->ne[3] != 1 ||
             node->src[1]->ne[0] != node->ne[1]) {
+        static const bool dbg = getenv("GGML_CUDA_GDN_GATHER_DEBUG") != nullptr;
+        if (dbg && node->op == GGML_OP_GET_ROWS && strstr(node->src[0]->name, "cache_s")) {
+            fprintf(stderr, "gdn gather %s: shape/type checks fail (flags %d, ne %lld %lld %lld, src0 ne2 %lld)\n", node->name, node->flags,
+                    (long long) node->ne[0], (long long) node->ne[1], (long long) node->ne[2], (long long) node->src[0]->ne[2]);
+        }
         return false;
     }
     // one sequence only: with several, the delta net's blocks for one sequence can read a state row
@@ -4855,9 +4860,17 @@ static bool ggml_cuda_try_gdn_state_gather(const ggml_cgraph * cgraph, int i) {
             gdn_j = j;
             continue;
         }
+        static const bool dbg = getenv("GGML_CUDA_GDN_GATHER_DEBUG") != nullptr;
+        if (dbg) {
+            fprintf(stderr, "gdn gather %s: consumer %s %s blocks it\n", node->name, ggml_op_desc(n), n->name);
+        }
         return false; // any other consumer needs the gathered copy
     }
     if (gdn == nullptr) {
+        static const bool dbg = getenv("GGML_CUDA_GDN_GATHER_DEBUG") != nullptr;
+        if (dbg) {
+            fprintf(stderr, "gdn gather %s: no consumer found\n", node->name);
+        }
         return false;
     }
     // The consumer reads the index tensor when it runs, not when this GET_ROWS would have. The graph allocator frees
@@ -4866,7 +4879,15 @@ static bool ggml_cuda_try_gdn_state_gather(const ggml_cgraph * cgraph, int i) {
     // decode at depth >= 1024). Skip the gather only while a later node still uses the index; otherwise copy as usual.
     {
         const ggml_tensor * ids = node->src[1];
-        bool live = false;
+        // a graph input (or a view of one) is never freed by the graph allocator
+        bool live = (ids->flags & GGML_TENSOR_FLAG_INPUT) || (ids->view_src && (ids->view_src->flags & GGML_TENSOR_FLAG_INPUT));
+        // the scheduler's copy of a split input ("<backend>#<name>#<copy>", op NONE) is flagged input + output so the allocator
+        // never reuses it; under the meta backend the per-device tensor this graph sees lost the flags, and the graph it gets is
+        // one segment, so no later user is visible here either
+        if (!live && ids->op == GGML_OP_NONE && ids->view_src == nullptr) {
+            const char * h1 = strchr(ids->name, '#');
+            live = h1 != nullptr && strchr(h1 + 1, '#') != nullptr;
+        }
         for (int k = gdn_j + 1; k < cgraph->n_nodes && !live; ++k) {
             const ggml_tensor * n = cgraph->nodes[k];
             if (n->view_src == ids) {
@@ -4879,6 +4900,11 @@ static bool ggml_cuda_try_gdn_state_gather(const ggml_cgraph * cgraph, int i) {
             }
         }
         if (!live) {
+            static const bool dbg = getenv("GGML_CUDA_GDN_GATHER_DEBUG") != nullptr;
+            if (dbg) {
+                fprintf(stderr, "gdn gather %s: index %s not live after the consumer (flags %d op %s view_src %p usage %d)\n", node->name, ids->name,
+                        ids->flags, ggml_op_desc(ids), (const void *) ids->view_src, ids->buffer ? (int) ggml_backend_buffer_get_usage(ids->buffer) : -1);
+            }
             return false;
         }
     }

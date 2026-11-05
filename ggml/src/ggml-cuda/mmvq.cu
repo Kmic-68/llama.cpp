@@ -2062,8 +2062,23 @@ static __global__ void __launch_bounds__(MOE_SK_WARPS*32, 4) k_moe_iq4nl_smallk(
     const int r0 = (blockIdx.x*MOE_SK_WARPS + warp)*32;
     const uint32_t * src = (const uint32_t *) (vx + (size_t) e*nb02 + (size_t) r0*nb01);
     const int nw = r0 + 32 <= nrows ? wwords : (int) ((nrows - r0 > 0 ? nrows - r0 : 0)*nb01/4);
-    for (int i = lane; i < nw; i += 32) {
-        xs[i] = __ldg(src + i);
+    {   // all loads in flight before the shared-memory stores (a load-store pair per trip serialised the latencies)
+        constexpr int U = 8;
+        int i = lane;
+        for (; i + 32*(U - 1) < nw; i += 32*U) {
+            uint32_t r[U];
+#pragma unroll
+            for (int u = 0; u < U; ++u) {
+                r[u] = __ldg(src + i + 32*u);
+            }
+#pragma unroll
+            for (int u = 0; u < U; ++u) {
+                xs[i + 32*u] = r[u];
+            }
+        }
+        for (; i < nw; i += 32) {
+            xs[i] = __ldg(src + i);
+        }
     }
     __syncthreads();
     const int row = r0 + lane;
@@ -2120,8 +2135,23 @@ static __global__ void __launch_bounds__(128, 4) k_q8_0_smallk(
     const int r0 = (blockIdx.x*nwarps + warp)*32;
     const uint32_t * src = (const uint32_t *) (vx + (size_t) e*nb02 + (size_t) r0*nb01);
     const int nw = r0 + 32 <= nrows ? wwords : (int) ((nrows - r0 > 0 ? nrows - r0 : 0)*nb01/4);
-    for (int i = lane; i < nw; i += 32) {
-        xs[i] = __ldg(src + i);
+    {   // all loads in flight before the shared-memory stores (a load-store pair per trip serialised the latencies)
+        constexpr int U = 8;
+        int i = lane;
+        for (; i + 32*(U - 1) < nw; i += 32*U) {
+            uint32_t r[U];
+#pragma unroll
+            for (int u = 0; u < U; ++u) {
+                r[u] = __ldg(src + i + 32*u);
+            }
+#pragma unroll
+            for (int u = 0; u < U; ++u) {
+                xs[i + 32*u] = r[u];
+            }
+        }
+        for (; i < nw; i += 32) {
+            xs[i] = __ldg(src + i);
+        }
     }
     __syncthreads();
     const int row = r0 + lane;
