@@ -2223,6 +2223,28 @@ static __global__ void __launch_bounds__(128, 4) k_q8_0_smallk(
     dst[t*stride_col_dst + c*stride_channel_dst + row] = acc;
 }
 
+// quantize_q8_1 of SWIGLU(x, g) (rows of ne00 values, padded with zeros to ne0): the operations of unary_gated_op_kernel<op_silu>
+// then quantize_q8_1, so the q8_1 blocks are bit-identical to the unfused pair
+static __global__ void quantize_q8_1_swiglu(const float * __restrict__ x, const float * __restrict__ g, block_q8_1 * __restrict__ y,
+        const int64_t o0, const int64_t o1, const int64_t ne00, const int64_t ne0) {
+    const int64_t i0 = (int64_t) blockDim.x*blockIdx.x + threadIdx.x;
+    if (i0 >= ne0) {
+        return;
+    }
+    const int64_t row = blockIdx.y;
+    const float xi = i0 < ne00 ? ggml_cuda_op_silu_single(x[row*o0 + i0]) * g[row*o1 + i0] : 0.0f;
+    float amax = fabsf(xi);
+    float sum  = xi;
+    amax = warp_reduce_max<QK8_1>(amax);
+    sum  = warp_reduce_sum<QK8_1>(sum);
+    const float d = amax / 127.0f;
+    const int64_t i_cont = row*ne0 + i0;
+    y[i_cont / QK8_1].qs[i_cont % QK8_1] = amax == 0.0f ? 0 : roundf(xi / d);
+    if (i_cont % QK8_1 == 0) {
+        y[i_cont / QK8_1].ds = make_half2(d, sum);
+    }
+}
+
 static bool moe_smallk_on() {
     static const bool on = [] { const char * e = getenv("GGML_CUDA_MOE_SMALLK"); return !e || atoi(e) != 0; }();
     return on;
@@ -2362,6 +2384,7 @@ void ggml_cuda_mul_mat_vec_q(
 
     // a SWIGLU handed over by ggml_cuda_try_fuse (ggml_cuda_mmvq_set_glu): applied inside the IQ4_NL short-row kernel when that
     // runs, else computed here before anything reads src1
+    ggml_tensor * glu_q = nullptr;
     if (mmvq_glu_tl != nullptr) {
         ggml_tensor * glu = mmvq_glu_tl;
         mmvq_glu_tl = nullptr;
@@ -2391,7 +2414,12 @@ void ggml_cuda_mul_mat_vec_q(
                 xg, gg, o0, o1);
             return;
         }
-        ggml_cuda_op_swiglu(ctx, glu);
+        if (src1 == glu && g0->type == GGML_TYPE_F32 && (!g1 || g1->type == GGML_TYPE_F32) && ggml_is_contiguous(glu) &&
+                ne12 == 1 && ne13 == 1 && ne11a == ne11) {
+            glu_q = glu;   // quantized from its inputs below
+        } else {
+            ggml_cuda_op_swiglu(ctx, glu);
+        }
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
@@ -2409,7 +2437,7 @@ void ggml_cuda_mul_mat_vec_q(
                           ctx.mmvq_q8_1_need[dev] == q8_1_bytes &&
                           ctx.mmvq_q8_1_ptr [dev] != nullptr;
 
-    if (!q8_1_hit) {
+    if (!q8_1_hit || glu_q) {
         if (ctx.mmvq_q8_1_cap[dev] < q8_1_bytes) {
             if (ctx.mmvq_q8_1_ptr[dev] != nullptr) {
                 CUDA_CHECK(cudaFree(ctx.mmvq_q8_1_ptr[dev]));
@@ -2428,7 +2456,23 @@ void ggml_cuda_mul_mat_vec_q(
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, nullptr, (char *) ctx.mmvq_q8_1_ptr[dev], src0->type, ne10, s11, s12, s13, ne10_padded, ne11a, ne12, ne13, stream);
+        if (glu_q) {
+            const ggml_tensor * g0 = glu_q->src[0];
+            const ggml_tensor * g1 = glu_q->src[1];
+            const float * xg = (const float *) g0->data;
+            const float * gg = g1 ? (const float *) g1->data : xg;
+            if (!g1) {
+                const int32_t swapped = ((const int32_t *) glu_q->op_params)[1];
+                xg += swapped ? ne10 : 0;
+                gg += swapped ? 0 : ne10;
+            }
+            const int64_t o0 = g0->nb[1]/sizeof(float);
+            const int64_t o1 = g1 ? g1->nb[1]/sizeof(float) : o0;
+            const dim3 nb((unsigned) ((ne10_padded + CUDA_QUANTIZE_BLOCK_SIZE - 1)/CUDA_QUANTIZE_BLOCK_SIZE), (unsigned) ne11a, 1);
+            quantize_q8_1_swiglu<<<nb, CUDA_QUANTIZE_BLOCK_SIZE, 0, stream>>>(xg, gg, (block_q8_1 *) ctx.mmvq_q8_1_ptr[dev], o0, o1, ne10, ne10_padded);
+        } else {
+            quantize_row_q8_1_cuda(src1_d, nullptr, (char *) ctx.mmvq_q8_1_ptr[dev], src0->type, ne10, s11, s12, s13, ne10_padded, ne11a, ne12, ne13, stream);
+        }
 
         ctx.mmvq_q8_1_src1[dev] = src1;
         ctx.mmvq_q8_1_data[dev] = src1_d;

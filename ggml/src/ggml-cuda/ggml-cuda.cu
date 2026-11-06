@@ -4941,15 +4941,32 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         if (fuse_down != 0 && node->op == GGML_OP_GLU && ggml_get_glu_op(node) == GGML_GLU_OP_SWIGLU && node->type == GGML_TYPE_F32 &&
                 i + 1 < cgraph->n_nodes && (fuse_down == 2 ? ggml_cuda_ab_alt() : true)) {
             ggml_tensor * mm = cgraph->nodes[i + 1];
-            if (mm->op == GGML_OP_MUL_MAT_ID && mm->src[1] == node && mm->src[0]->type == GGML_TYPE_IQ4_NL && mm->ne[2] == 1 &&
-                    ggml_node_get_use_count(cgraph, i) == 1 && !(node->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            // MUL_MAT_ID (routed experts, one token) or a one-column quantized MUL_MAT (shared-expert down, GDN output): the
+            // latter's SWIGLU goes into the q8_1 quantization
+            const bool is_id = mm->op == GGML_OP_MUL_MAT_ID && mm->ne[2] == 1;
+            const bool is_mm = mm->op == GGML_OP_MUL_MAT && mm->ne[1] == 1 && ggml_is_quantized(mm->src[0]->type);
+            if ((is_id || is_mm) && mm->src[1] == node && ggml_node_get_use_count(cgraph, i) == 1 &&
+                    !(node->flags & GGML_TENSOR_FLAG_OUTPUT)) {
                 ggml_cuda_mmvq_set_glu(node);
-                ggml_cuda_mul_mat_id(*cuda_ctx, mm);
+                if (is_id) {
+                    ggml_cuda_mul_mat_id(*cuda_ctx, mm);
+                } else {
+                    ggml_cuda_mul_mat(*cuda_ctx, mm->src[0], mm->src[1], mm);
+                }
                 if (!ggml_cuda_mmvq_take_glu_consumed()) {
                     // the matmul did not go through mmvq: it read a stale src1, redo it after the SWIGLU
+                    static bool warned = false;
+                    if (!warned) {
+                        warned = true;
+                        GGML_LOG_WARN("%s: SWIGLU handover not taken by %s (%s), redone unfused\n", __func__, mm->name, ggml_op_name(mm->op));
+                    }
                     ggml_cuda_op_swiglu(*cuda_ctx, node);
                     cuda_ctx->mmvq_q8_1_src1[ggml_cuda_get_device()] = nullptr;
-                    ggml_cuda_mul_mat_id(*cuda_ctx, mm);
+                    if (is_id) {
+                        ggml_cuda_mul_mat_id(*cuda_ctx, mm);
+                    } else {
+                        ggml_cuda_mul_mat(*cuda_ctx, mm->src[0], mm->src[1], mm);
+                    }
                 }
                 return 1;
             }
