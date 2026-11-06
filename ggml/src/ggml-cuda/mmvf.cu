@@ -630,6 +630,92 @@ static void mul_mat_vec_f_cuda(
         stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
 }
 
+
+// p100-series: f32 matvec with few rows and long K (Flash-Next hc inject 10240 -> 4, GDN alpha/beta 2560 -> 24 per GPU). The
+// general kernel gives a row one block, so 4-24 blocks run on 56 SMs. Here each row is cut into chunks, one block per chunk;
+// the last block to finish adds the chunk partials of every row in chunk order (deterministic, run to run). Differs from the
+// general kernel only in fp32 summation order. GGML_CUDA_MMVF_FEWROWS=0: off, =ab: follows GGML_CUDA_AB_FILE.
+bool ggml_cuda_ab_alt();
+
+#define MMVF_FR_THREADS   128
+#define MMVF_FR_MAX_ROWS  64
+#define MMVF_FR_MAX_CHUNK 32
+static __global__ void __launch_bounds__(MMVF_FR_THREADS) k_mmvf_fewrows(
+        const float * __restrict__ x, const float * __restrict__ y, float * __restrict__ dst, float * __restrict__ partial,
+        unsigned int * __restrict__ done, const int ncols4, const int64_t stride_row4, const int nchunks, const int chunk4, const int nrows) {
+    const int row = blockIdx.x / nchunks;
+    const int ch  = blockIdx.x - row*nchunks;
+    const int i0  = ch*chunk4;
+    const int i1  = min(ncols4, i0 + chunk4);
+    const float4 * xr = (const float4 *) x + row*stride_row4;
+    const float4 * y4 = (const float4 *) y;
+    float sum = 0.0f;
+    for (int i = i0 + (int) threadIdx.x; i < i1; i += MMVF_FR_THREADS) {
+        const float4 a = xr[i];
+        const float4 b = y4[i];
+        sum += a.x*b.x + a.y*b.y + a.z*b.z + a.w*b.w;
+    }
+    sum = warp_reduce_sum(sum);
+    __shared__ float ws[MMVF_FR_THREADS/WARP_SIZE];
+    __shared__ bool is_last;
+    if (threadIdx.x % WARP_SIZE == 0) {
+        ws[threadIdx.x / WARP_SIZE] = sum;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float t = 0.0f;
+#pragma unroll
+        for (int w = 0; w < MMVF_FR_THREADS/WARP_SIZE; ++w) {
+            t += ws[w];
+        }
+        partial[blockIdx.x] = t;
+        __threadfence();
+        is_last = atomicAdd(done, 1u) == gridDim.x - 1;
+    }
+    __syncthreads();
+    if (!is_last) {
+        return;
+    }
+    __threadfence();
+    for (int r = threadIdx.x; r < nrows; r += MMVF_FR_THREADS) {
+        float t = 0.0f;
+        for (int c = 0; c < nchunks; ++c) {
+            t += __ldcg(partial + r*nchunks + c);
+        }
+        dst[r] = t;
+    }
+    if (threadIdx.x == 0) {
+        *done = 0;
+    }
+}
+
+static bool mmvf_fewrows(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    static const int env = [] { const char * e = getenv("GGML_CUDA_MMVF_FEWROWS"); return !e ? 1 : strcmp(e, "ab") == 0 ? 2 : atoi(e) != 0; }();
+    const int64_t ne00 = src0->ne[0], ne01 = src0->ne[1];
+    if (!(env == 2 ? ggml_cuda_ab_alt() : env != 0) || src0->type != GGML_TYPE_F32 || ne01 > MMVF_FR_MAX_ROWS || ne00 < 2048 || ne00 % 4 != 0 ||
+            src1->ne[1] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 || src0->ne[2] != 1 || src0->ne[3] != 1 ||
+            src0->nb[1] % 16 != 0 || (uintptr_t) src0->data % 16 != 0 || (uintptr_t) src1->data % 16 != 0 ||
+            !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst) || src0->nb[0] != sizeof(float)) {
+        return false;
+    }
+    static float        * part_dev[GGML_CUDA_MAX_DEVICES] = {};
+    static unsigned int * done_dev[GGML_CUDA_MAX_DEVICES] = {};
+    const int dev = ggml_cuda_get_device();
+    if (done_dev[dev] == nullptr) {
+        CUDA_CHECK(cudaMalloc(&part_dev[dev], MMVF_FR_MAX_ROWS*MMVF_FR_MAX_CHUNK*sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&done_dev[dev], sizeof(unsigned int)));
+        CUDA_CHECK(cudaMemset(done_dev[dev], 0, sizeof(unsigned int)));
+    }
+    const int ncols4  = (int) (ne00/4);
+    // ~128 blocks in all, each chunk at least 256 float4
+    int nchunks = (int) std::max<int64_t>(1, std::min<int64_t>(MMVF_FR_MAX_CHUNK, std::min<int64_t>(128/ne01, ncols4/256)));
+    const int chunk4 = (ncols4 + nchunks - 1)/nchunks;
+    nchunks = (ncols4 + chunk4 - 1)/chunk4;
+    k_mmvf_fewrows<<<(unsigned) (ne01*nchunks), MMVF_FR_THREADS, 0, ctx.stream()>>>((const float *) src0->data, (const float *) src1->data,
+        (float *) dst->data, part_dev[dev], done_dev[dev], ncols4, (int64_t) (src0->nb[1]/16), nchunks, chunk4, (int) ne01);
+    return true;
+}
+
 void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
     const ggml_cuda_mm_fusion_args_host * fusion) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
@@ -649,6 +735,10 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
     GGML_ASSERT(        nb10       == ts_src1);
     GGML_ASSERT(!ids || ids->nb[0] == ggml_type_size(ids->type));
     GGML_ASSERT(        nb0        == ts_dst);
+
+    if (!ids && !fusion && ggml_cuda_info().devices[ggml_cuda_get_device()].cc < GGML_CUDA_CC_VOLTA && mmvf_fewrows(ctx, src0, src1, dst)) {
+        return;
+    }
 
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
     const enum ggml_prec prec = fast_fp16_available(cc) ? ggml_prec(dst->op_params[0]) : GGML_PREC_F32;
