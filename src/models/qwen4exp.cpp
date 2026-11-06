@@ -1560,7 +1560,7 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
 // cache's tokens are not consulted): only a read-ahead hint, a wrong row costs a useless read, never a wrong result. The rows
 // sit in a lazily mapped tensor: set_input's own prefetch comes right before the read; this one runs a whole batch ahead, so with
 // a batch of several ubatches the later ubatches' rows load while the earlier ones compute (prefill: ~49k random rows per 3072-token
-// ubatch, ~3 s through ntfs-3g). LLAMA_PLE_PREFETCH=0: off.
+// ubatch, ~3 s through a FUSE filesystem). LLAMA_PLE_PREFETCH=0: off.
 void llama_model_qwen4exp::prefetch_batch(const llama_token * tokens, int64_t n_tokens) const {
     static const bool on = [] { const char * e = getenv("LLAMA_PLE_PREFETCH"); return !e || atoi(e) != 0; }();
     ggml_tensor * ple = per_layer_tok_embd;
@@ -1668,7 +1668,7 @@ void llama_model_qwen4exp::prefetch_batch(const llama_token * tokens, int64_t n_
                 }
                 i = j;
                 ple_scanned.store(i, std::memory_order_release);
-                // the 28.8 GB a long prompt streams must not stay in the page cache (it pushed the desktop into swap)
+                // the 28.8 GB a long prompt streams must not stay in the page cache (it pushed the system into swap)
                 posix_fadvise(ple_fd, (off_t) start, (off_t) got, POSIX_FADV_DONTNEED);
             }
             std::lock_guard<std::mutex> lk(ple_mtx);
@@ -1681,7 +1681,7 @@ void llama_model_qwen4exp::prefetch_batch(const llama_token * tokens, int64_t n_
         return;
     }
 #endif
-    // madvise(WILLNEED) reads nothing ahead through ntfs-3g (FUSE): fault the pages in from 8 threads, in token order, while the
+    // madvise(WILLNEED) reads nothing ahead through a FUSE filesystem: fault the pages in from 8 threads, in token order, while the
     // earlier ubatches compute (LLAMA_PLE_PREFETCH_THREADS, 0 = the madvise hint only)
     static const int n_thr = [] { const char * e = getenv("LLAMA_PLE_PREFETCH_THREADS"); return e ? atoi(e) : 8; }();
     if (n_thr <= 0) {

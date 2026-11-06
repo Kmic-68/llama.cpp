@@ -9447,7 +9447,7 @@ Speed, 131072-token prompt + 1024 generated, model-card sampling, -ub 3072, pref
 | masked (before) | 105 | 241.2 | 15.66 | 609 | 14975 / 14315 |
 | gather (kept) | 100 | 261.4 | 16.86 | 562 | 14977 / 14319 |
 | Strata 0.1.41, other machine (DDR3) | - | 606.1 | 27.4 | 254 | - |
-At 105 slots the gather build hits the GPU0 guard (15187 > 15150): its reserved compute buffer is ~160 MiB larger.
+At 105 slots the gather build needs 15187 MiB on GPU0, over the VRAM budget: its reserved compute buffer is ~160 MiB larger.
 Open: trim that buffer; the expert path (decode 22 t/s already at 7K) and the prefill expert stream are the big gaps
 (steps 2 and 4). Found on the way: the expert cache hangs on one card (-sm none, main thread spins, GPU idle).
 
@@ -9463,7 +9463,7 @@ nsys: without it the same config decodes at ~26 t/s (38.5 ms/token).
 - GGML_CUDA_LRU_CE_GRAPH (device job counter, flag waits, persistent worker): works eagerly (23.4 under the old worker
   timing), deadlocks with graphs: the CE worker's CUDA calls stall while a dispatch thread captures, and a capture lock
   turns it into a cross-device cycle (dev0 capture waits on dev1's exchange, dev1's GPU on dev0's, dev0's GPU on fills).
-  Not worth it for <= 4.5 ms; patch kept at /mnt/fast/p100-scratch/moe/ce-graph-full.patch. Dropped.
+  Not worth it for <= 4.5 ms; dropped.
 Conclusion: short-context decode (~26 t/s) is already near Strata's 128K figure (27.4); the decode gap is depth cost
 (16.9 t/s at 128K = +21 ms/token). Next: profile decode at 128K.
 
@@ -9475,7 +9475,7 @@ LLAMA_UBATCH_PROFILE_EVERY, LLAMA_INPUT_PROF, GGML_META_PROF.
 - nsys of a 5-ubatch prefill: GPUs busy 55%; one ~3 s stall per ubatch. Not graph build (150-370 ms), inputs (<130 ms), meta
   rebuild (~35 ms) or between ubatches (5 ms): the per-layer-embedding table (per_layer_token_embd, IQ4_NL [160, 320M], 28.8 GB,
   lazily mmapped) is read by a CPU get_rows, 16 hashed rows per token = ~49k random rows per 3072-token ubatch, ~24k major faults,
-  through ntfs-3g (FUSE, ~2.7-3.6k faults/s). The rows were madvise(WILLNEED)'d in set_input, right before the read.
+  through a FUSE filesystem (~2.7-3.6k faults/s). The rows were madvise(WILLNEED)'d in set_input, right before the read.
   Now: llama_model::prefetch_batch (qwen4exp) hashes the whole batch's rows at decode start and faults them in from 8 threads
   (model-owned, joined) while the earlier ubatches compute; needs -b > -ub (server -b 32768). madvise WILLNEED alone: no gain
   (FUSE reads nothing ahead); MADV_RANDOM: no change (kept, harmless); 16 threads = 8 (FUSE-bound). LLAMA_PLE_PREFETCH=0 off.
@@ -9489,7 +9489,7 @@ LLAMA_UBATCH_PROFILE_EVERY, LLAMA_INPUT_PROF, GGML_META_PROF.
 | + kernels, remap (-b 3072) | 287.4 | 17.38 | 486 |
 | + PLE read-ahead (-b 32768) | 321.3 | 17.2 | 438 |
 30k probe: 317 -> 393.5 (-b 12288) -> 416.8 (-b 30720). The PLE reads still cap prefill on this disk (~1.12M faults in 408 s at
-128k); mounting /mnt/fast with the in-kernel ntfs3 driver instead of ntfs-3g would remove most of it (user-side).
+128k); keeping the model on a faster (non-FUSE) filesystem would remove most of it.
 Found: prefill is not deterministic run to run (same build, -ub 3072, 2 x 4096: KLD 0.018 vs itself; the remap A/B reads the
 same 0.017 both ways), under investigation.
 Fixed (same day): the nondeterminism was the gather path's unsorted top-k picks (radix select compacts with atomics, so the
@@ -9541,7 +9541,7 @@ draft placement), then draft acceptance (Strata's coupled/Gumbel drafting), per-
 
 - LLAMA_UB_KV_BUDGET (ubatch = budget / n_kv) was the main depth slowdown: each ubatch streams ~22.7 GB of experts per card
   (~2.1 s fixed), so 1024-token ubatches at 128k pay that cost 3x as often. 90 slots, CTX 139264, budget 0 (full 3072 ubatches):
-  128k prefill 321.3 -> 382.4 t/s. 100 slots at that context runs GPU0 to 15.2 GB (over the guard), hence 90.
+  128k prefill 321.3 -> 382.4 t/s. 100 slots at that context runs GPU0 to 15.2 GB (over the VRAM budget), hence 90.
 - PLE scan cache (qwen4exp, LLAMA_PLE_SCAN_MIN=N tokens, default 0 = off): a thread preads the 28.8 GB PLE table sequentially
   (8 MB chunks, fadvise DONTNEED) into a row cache, ple_row() falls back to the mmap; LLAMA_PLE_HOST=1 feeds the PLE rows as an
   f32 input from set_input. With the shrunken ubatch it cut faults (1.17M -> 82K) but ran slower (288.6); full-ubatch run pending.
@@ -9573,7 +9573,7 @@ draft placement), then draft acceptance (Strata's coupled/Gumbel drafting), per-
 - Prefill nsys (8k prompt, per 3072-token ubatch, GPU0): tile_mm 1.76 s, gemm_fold 0.85, allreduce 0.52 (f32 wire, 2 per layer:
   the tensor-parallel minimum), QSA gather 0.46, fp32 sgemm 0.5 (hc_down M=320 under the fold threshold: cuBLAS fp32 already 6
   TFLOPS, the fold kernel 5.6), FA 0.37, hc_post 0.24. GPUs ~93% busy during compute.
-- Host: set_inputs waits on the PLE scan in the first ubatches (~20 s per long prompt). Parallel readers do not help on ntfs-3g:
+- Host: set_inputs waits on the PLE scan in the first ubatches (~20 s per long prompt). Parallel readers do not help on a FUSE filesystem:
   1 reader 1.5-1.6 GB/s, 2-8 readers (interleaved or segmented) 0.5-0.75 GB/s; an 8-segment scan took 52 s. Reverted.
 - tile_mm 80-row blocks (TM=5, M % 80 == 0): iq3_s +1%, iq4_nl -3%; kept (GGML_CUDA_TMM_TM=4 to disable).
 - Compute buffer at -ub 3072: 4570 MiB per card, live-set peak only ~2354 MiB (LLAMA_RESERVE_TOP now also prints the peak live set
@@ -9589,11 +9589,11 @@ draft placement), then draft acceptance (Strata's coupled/Gumbel drafting), per-
   of each pool's slots >= n_base mapped again behind a head as the compute buffer. Decide path uses all slots; a larger batch
   empties the borrowed ones first (inclusive copies, fill copies in only, bit 31 of the fill list). 128k decode from the same
   saved KV, seed 7: 85 slots 15.76 t/s -> 75 + 80 borrowed 19.41 t/s (+23%), generated text md5 identical (2b38a57509).
-  80 + 80 with a fresh 128k prefill: guard-killed at GPU0 15317 (prefill pool growth ~750 MB on top of the static 14567).
+  80 + 80 with a fresh 128k prefill: over the VRAM limit at GPU0 15317 (prefill pool growth ~750 MB on top of the static 14567).
   75 + 80, head 512, fresh 128k prefill: prefill 356.2 t/s, decode 31.6 t/s, GPU0 peak 14697. CORRECTION: that run re-saved
   the KV state, and on the new state the plain 85-slot config decodes at 30.54 t/s (loan 31.27, md5 identical e55db017ac).
   The 15.8-19.4 t/s runs had ~2000 major faults per 128 tokens vs ~110-150 now: the decode of that continuation read PLE rows
-  (28.8 GB table, mmapped on ntfs-3g) from disk. So the loan's own gain at 128k is ~2.4%; the slow 128k decodes were PLE page
+  (28.8 GB table, mmapped from a FUSE filesystem) from disk. So the loan's own gain at 128k is ~2.4%; the slow 128k decodes were PLE page
   faults, not fills (the nsys fill-bound reading came from the same faulting state).
 - topk_moe: unrolled selects keep the per-lane arrays in registers (512 experts: 128 B stack -> 0), bit-exact, 578 eval cases.
 - probe.sh KV=1 (dec128.py): saves the 128k slot once (1.5 GB, 15 s), later decode tests restore it in ~2 s; md5 of the output.
@@ -9637,6 +9637,18 @@ Opt-in or rejected (slower or no gain at 128k):
 Where decode time goes (nsys, 128k, per token per GPU): dense q8_0 matvecs ~6.9 ms, IQ3_S gate/up ~2.4, expert fills ~2.0,
 hc up ~2.0, q8_1 quantize ~1.5, IQ4_NL down ~1.3, AllReduce ~1.1, top-k ~1.0, indexer ~1.0, rms_norm ~1.4; ~3400 kernels per
 token, most of them 3-10 us.
+
+Later on 11-05 (decode, all bit-identical unless noted; 128k decode ABBA within one server, 16 passes where marked):
+- SCALE -> SILU -> hc up (q8_0, K = 320) in one kernel: silu and the q8_1 quantization inside the short-row kernel.
+- SWIGLU -> IQ4_NL routed-expert down in one kernel; SWIGLU -> one-column quantized MUL_MAT (shared-expert down, GDN output)
+  quantizes straight from the SWIGLU inputs: 34.04 vs 33.17 (16 passes).
+- Split-K f32 matvec for few rows and long K (hc inject 10240 -> 4, GDN alpha/beta 2560 -> 24): 34.02 vs 33.60 (fp32 order
+  differs, deterministic).
+- RMS_NORM -> MUL writes the next matvec's q8_1 activation into mmvq's cache (hc down): 33.22 vs 32.93 (16 passes).
+- The cached q8_1 activation is reused across weight types (shared + routed expert gate/up quantize once): 33.57 vs 33.29.
+- Short-row kernels stage weights with 16-byte loads: 34.32 vs 33.77 (16 passes).
+- All defaults, saved 128k KV, 6 passes: 34.31 t/s (33.9-34.4), md5 unchanged (e55db017ac). Rejected: 256-thread rms_norm
+  for 1024-4096 columns (no gain).
 
 27B gates on this build: tg256 33.50 +- 0.11 t/s, PPL 2.6093 +- 0.0198 (ppl-orig.txt, -c 4096, q4_0 KV), peak GPU0 14605 /
 GPU1 14083 MiB.

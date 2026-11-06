@@ -2660,7 +2660,7 @@ struct llama_model_qwen4exp : public llama_model_base {
     mutable std::atomic<bool> ple_pf_stop{false};
 
     // PLE row cache of a large batch (prefetch_batch, LLAMA_PLE_SCAN_MIN tokens and up): its rows read with large sequential preads of
-    // the model file (ntfs-3g serves ~1.5 GB/s sequentially but only ~3k random page faults/s), copied compactly; set_input reads them
+    // the model file (a FUSE filesystem serves ~1.5 GB/s sequentially but only ~3k random page faults/s), copied compactly; set_input reads them
     int ple_fd = -1;                       // dup of the shard's descriptor, -1: no scan
     size_t ple_offs = 0;                   // the tensor's data offset in that file
     mutable std::mutex ple_mtx;
