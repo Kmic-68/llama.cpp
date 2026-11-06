@@ -1082,3 +1082,65 @@ bool ggml_cuda_op_rms_norm_mul_silu_gate(ggml_backend_cuda_context & ctx, ggml_t
     CUDA_CHECK(cudaGetLastError());
     return true;
 }
+
+// p100-series: rms_norm_f32<block_size, true>'s register path (rows of 1024..8192 values, a [ncols] or per-row weight), which
+// also writes the q8_1 blocks of its output (flat over the rows) with quantize_q8_1's operations on the stored values: the
+// next one-column quantized MUL_MAT needs no quantize launch. Bit-identical to the unfused pair.
+template <int block_size>
+static __global__ void rms_norm_mul_q8_f32(const float * x, float * dst, const int ncols, const int64_t stride_row, const float eps,
+        const float * mul, const int64_t mul_stride_row, block_q8_1 * q8) {
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    x   += row*stride_row;
+    mul += row*mul_stride_row;
+    dst += (int64_t) row*ncols;
+    constexpr int max_regs = 8;
+    extern __shared__ float s_sum[];
+    float xv[max_regs];
+    float tmp = 0.0f;
+#pragma unroll
+    for (int u = 0; u < max_regs; ++u) {
+        const int col = tid + u*block_size;
+        xv[u] = col < ncols ? x[col] : 0.0f;
+        tmp += xv[u] * xv[u];
+    }
+    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
+    const float mean  = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+#pragma unroll
+    for (int u = 0; u < max_regs; ++u) {
+        const int col = tid + u*block_size;
+        if (col < ncols) {   // ncols % 32 == 0: whole warps
+            const float v = scale * xv[u] * mul[col];
+            dst[col] = v;
+            float amax = fabsf(v);
+            float sum  = v;
+            amax = warp_reduce_max<QK8_1>(amax);
+            sum  = warp_reduce_sum<QK8_1>(sum);
+            const float d = amax / 127.0f;
+            const int64_t ic = (int64_t) row*ncols + col;
+            q8[ic / QK8_1].qs[ic % QK8_1] = amax == 0.0f ? 0 : roundf(v / d);
+            if (ic % QK8_1 == 0) {
+                q8[ic / QK8_1].ds = make_half2(d, sum);
+            }
+        }
+    }
+}
+
+bool ggml_cuda_op_rms_norm_mul_q8(ggml_backend_cuda_context & ctx, ggml_tensor * rms, ggml_tensor * mul_tensor, block_q8_1 * q8) {
+    const ggml_tensor * x = rms->src[0];
+    const ggml_tensor * w = mul_tensor->src[0] == rms ? mul_tensor->src[1] : mul_tensor->src[0];
+    const int64_t ncols = x->ne[0];
+    if (x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || mul_tensor->type != GGML_TYPE_F32 || ncols < 1024 || ncols > 8192 ||
+            ncols % QK8_1 != 0 || x->ne[2] != 1 || x->ne[3] != 1 || x->nb[0] != sizeof(float) || w->ne[0] != ncols ||
+            (ggml_nelements(w) != ncols && ggml_nelements(w) != ncols*x->ne[1]) ||
+            !ggml_is_contiguous(w) || !ggml_is_contiguous(mul_tensor) || !ggml_are_same_shape(mul_tensor, rms)) {
+        return false;
+    }
+    float eps = 0.0f;
+    memcpy(&eps, rms->op_params, sizeof(float));
+    rms_norm_mul_q8_f32<1024><<<(unsigned) x->ne[1], 1024, 32*sizeof(float), ctx.stream()>>>((const float *) x->data,
+        (float *) mul_tensor->data, (int) ncols, (int64_t) (x->nb[1]/sizeof(float)), eps, (const float *) w->data,
+        ggml_nelements(w) == ncols ? (int64_t) 0 : (int64_t) ncols, q8);
+    return true;
+}

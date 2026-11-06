@@ -5827,6 +5827,30 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
+        // p100-series: when a one-column quantized MUL_MAT reads the result next, the norm also writes its q8_1 activation
+        // (GGML_CUDA_NORM_Q8=0: off, =ab: only while GGML_CUDA_AB_FILE exists)
+        static const int norm_q8 = [] { const char * e = getenv("GGML_CUDA_NORM_Q8"); return !e ? 1 : strcmp(e, "ab") == 0 ? 2 : atoi(e) != 0; }();
+        ggml_tensor * mul = cgraph->nodes[i + 1];
+        if (norm_q8 != 0 && (norm_q8 == 2 ? ggml_cuda_ab_alt() : true) &&
+                ggml_cuda_info().devices[ggml_cuda_get_device()].cc < GGML_CUDA_CC_VOLTA) {
+            for (int j = i + 2; j < cgraph->n_nodes && j < i + 6; ++j) {
+                ggml_tensor * t = cgraph->nodes[j];
+                if (t->op != GGML_OP_MUL_MAT || t->src[1]->data != mul->data) {
+                    continue;
+                }
+                const ggml_tensor * s1 = t->src[1];
+                if (ggml_is_quantized(t->src[0]->type) && s1->type == GGML_TYPE_F32 && ggml_is_contiguous(s1) && s1->ne[1] == 1 &&
+                        s1->ne[2] == 1 && s1->ne[3] == 1 && s1->ne[0] == ggml_nelements(mul) && s1->ne[0] % MATRIX_ROW_PADDING == 0 &&
+                        t->ne[1] == 1) {
+                    block_q8_1 * q8 = ggml_cuda_mmvq_q8_1_reserve(*cuda_ctx, s1);
+                    if (ggml_cuda_op_rms_norm_mul_q8(*cuda_ctx, node, mul, q8)) {
+                        ggml_cuda_mmvq_q8_1_mark(*cuda_ctx, s1, t->src[0]->type);
+                        return 1;
+                    }
+                }
+                break;
+            }
+        }
         ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
         return 1;
     }

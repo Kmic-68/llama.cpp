@@ -2688,3 +2688,34 @@ bool ggml_cuda_q8_smallk_scale_silu(ggml_backend_cuda_context & ctx, const ggml_
         (int) (ne00/QK8_0), (int) ne01, src0->nb[1], src0->nb[2], 0, 0, 1, 0, 0, 0, (const float *) x->data, scale, bias);
     return true;
 }
+
+// p100-series: a producer (rms_norm_mul_q8) writes the q8_1 activation of the next one-column MUL_MAT straight into the
+// quantized-activation cache; mmvq then finds it (same keys as its own quantization would set)
+static size_t mmvq_q8_1_bytes_for(const ggml_tensor * src1) {
+    const int64_t ne10_padded = GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING);
+    return src1->ne[3]*src1->ne[2] * src1->ne[1]*ne10_padded * sizeof(block_q8_1)/QK8_1;
+}
+
+block_q8_1 * ggml_cuda_mmvq_q8_1_reserve(ggml_backend_cuda_context & ctx, const ggml_tensor * src1) {
+    const int dev = ggml_cuda_get_device();
+    const size_t q8_1_bytes = mmvq_q8_1_bytes_for(src1);
+    if (ctx.mmvq_q8_1_cap[dev] < q8_1_bytes) {
+        if (ctx.mmvq_q8_1_ptr[dev] != nullptr) {
+            CUDA_CHECK(cudaFree(ctx.mmvq_q8_1_ptr[dev]));
+            ctx.mmvq_q8_1_ptr[dev] = nullptr;
+        }
+        CUDA_CHECK(cudaMalloc(&ctx.mmvq_q8_1_ptr[dev], q8_1_bytes + 16));
+        ctx.mmvq_q8_1_cap[dev] = q8_1_bytes;
+        ctx.mmvq_q8_1_epoch++;
+    }
+    ctx.mmvq_q8_1_src1[dev] = nullptr;   // invalid until marked
+    return (block_q8_1 *) ctx.mmvq_q8_1_ptr[dev];
+}
+
+void ggml_cuda_mmvq_q8_1_mark(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, ggml_type type_src0) {
+    const int dev = ggml_cuda_get_device();
+    ctx.mmvq_q8_1_src1[dev] = src1;
+    ctx.mmvq_q8_1_data[dev] = (const float *) src1->data;
+    ctx.mmvq_q8_1_type[dev] = type_src0;
+    ctx.mmvq_q8_1_need[dev] = mmvq_q8_1_bytes_for(src1);
+}

@@ -29,3 +29,6 @@ bool ggml_cuda_q8_smallk_scale_silu(ggml_backend_cuda_context & ctx, const ggml_
 // computes it first; take_glu_consumed() is false when mmvq never ran (the caller must run the SWIGLU and redo the matmul)
 void ggml_cuda_mmvq_set_glu(ggml_tensor * glu);
 bool ggml_cuda_mmvq_take_glu_consumed();
+
+block_q8_1 * ggml_cuda_mmvq_q8_1_reserve(ggml_backend_cuda_context & ctx, const ggml_tensor * src1);
+void ggml_cuda_mmvq_q8_1_mark(ggml_backend_cuda_context & ctx, const ggml_tensor * src1, ggml_type type_src0);
