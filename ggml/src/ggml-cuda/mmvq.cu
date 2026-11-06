@@ -286,6 +286,8 @@ static constexpr __host__ __device__ int p100_leg_rows1(ggml_type type, bool sma
 }
 #endif
 
+bool ggml_cuda_ab_alt();
+
 enum mmvq_parameter_table_id {
     MMVQ_PARAMETERS_GENERIC = 0,
     MMVQ_PARAMETERS_TURING,
@@ -1758,9 +1760,9 @@ static void mul_mat_vec_q_switch_ncols_dst(
         // the 32-value types use small_k on the single-column path to mean "few rows" instead
         if (c_ncols_dst == 1 && (p100_leg_type(type) || p100_kq23_type(type) || type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K)) {
             use = nrows_x < P100_LEG_SMALL_M;
-            // GGML_CUDA_Q8_SMALLM=0: q8_0 keeps the default geometry for few rows (A/B)
-            static const bool q8_small = [] { const char * e = getenv("GGML_CUDA_Q8_SMALLM"); return e && atoi(e) != 0; }();   // =1: opt in
-            if (type == GGML_TYPE_Q8_0 && !q8_small) {
+            // on by default (+3% decode at 128K, hc down 10240 -> 320); =0: off; =ab: follows GGML_CUDA_AB_FILE (on while the file exists)
+            static const int q8_small = [] { const char * e = getenv("GGML_CUDA_Q8_SMALLM"); return !e ? 1 : strcmp(e, "ab") == 0 ? 2 : atoi(e) != 0; }();
+            if (type == GGML_TYPE_Q8_0 && !(q8_small == 2 ? ggml_cuda_ab_alt() : q8_small != 0)) {
                 use = false;
             }
         }

@@ -13167,6 +13167,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
     // Flash-Next decode, short-row q8_0 (hyper-connection up 320 -> 10240, Q8_0 expert down 320 -> 2560)
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 10240, 1, 320, {1, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 320, 1, 10240, {1, 1}, {1, 1}));   // hyper-connection down
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 2560, 1, 640, {1, 1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 150, 10, false, 2560, 1, 320));
     // ... and its prefill (the tile GEMM's two-block Q8_0 units, K = 320)
