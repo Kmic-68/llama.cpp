@@ -2034,6 +2034,68 @@ static void mul_mat_vec_q_switch_type(
 // stages 32 consecutive rows of its expert (contiguous) with coalesced 4-byte loads and each lane computes one row; the integer
 // block sums are the same as vec_dot_iq4_nl_q8_1's and each is scaled the same way, only the order of the per-block float adds
 // differs. GGML_CUDA_MOE_SMALLK=0: the general kernel.
+bool ggml_cuda_ab_alt();
+
+// a warp stages nw words of its rows into shared memory, all loads in flight before the stores (a load-store pair per trip
+// serialised the latencies). 16-byte loads when src and nw allow (4x the bytes in flight: these kernels run one or two blocks
+// per SM, so the bytes in flight per load bound them). GGML_CUDA_SK_V16=0: 4-byte loads only, =ab: follows GGML_CUDA_AB_FILE.
+static __device__ __forceinline__ void sk_stage(const uint32_t * __restrict__ src, uint32_t * xs, const int nw, const int lane, const bool v16) {
+    int i = lane;
+    if (v16 && ((uintptr_t) src & 15) == 0 && (nw & 3) == 0) {
+        const uint4 * s4 = (const uint4 *) src;
+        uint4 * x4 = (uint4 *) xs;
+        const int nw4 = nw/4;
+        constexpr int U = 8;
+        for (; i + 32*(U - 1) < nw4; i += 32*U) {
+            uint4 r[U];
+#pragma unroll
+            for (int u = 0; u < U; ++u) {
+                r[u] = __ldg(s4 + i + 32*u);
+            }
+#pragma unroll
+            for (int u = 0; u < U; ++u) {
+                x4[i + 32*u] = r[u];
+            }
+        }
+        {
+            uint4 r[U];
+#pragma unroll
+            for (int u = 0; u < U; ++u) {
+                if (i + 32*u < nw4) {
+                    r[u] = __ldg(s4 + i + 32*u);
+                }
+            }
+#pragma unroll
+            for (int u = 0; u < U; ++u) {
+                if (i + 32*u < nw4) {
+                    x4[i + 32*u] = r[u];
+                }
+            }
+        }
+        return;
+    }
+    constexpr int U = 8;
+    for (; i + 32*(U - 1) < nw; i += 32*U) {
+        uint32_t r[U];
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            r[u] = __ldg(src + i + 32*u);
+        }
+#pragma unroll
+        for (int u = 0; u < U; ++u) {
+            xs[i + 32*u] = r[u];
+        }
+    }
+    for (; i < nw; i += 32) {
+        xs[i] = __ldg(src + i);
+    }
+}
+
+static bool sk_v16_on() {
+    static const int env = [] { const char * e = getenv("GGML_CUDA_SK_V16"); return !e ? 1 : strcmp(e, "ab") == 0 ? 2 : atoi(e) != 0; }();
+    return env == 2 ? ggml_cuda_ab_alt() : env != 0;
+}
+
 #define MOE_SK_WARPS 4
 #define MOE_SK_MAXB  16   // up to 16 blocks (K <= 512) per row: 4 warps x 32 rows x 16 x 18 B of shared memory
 static __constant__ int8_t moe_sk_kvalues[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
@@ -2046,7 +2108,7 @@ static __global__ void __launch_bounds__(MOE_SK_WARPS*32, 4) k_moe_iq4nl_smallk(
         const char * __restrict__ vx, const block_q8_1 * __restrict__ vy, const int32_t * __restrict__ ids, float * __restrict__ dst,
         const int nblk, const int nrows, const size_t nb01, const size_t nb02,
         const int64_t stride_col_y, const int64_t stride_channel_y, const int nchannels_y,
-        const int64_t stride_col_dst, const int64_t stride_channel_dst, const int64_t ids_stride,
+        const int64_t stride_col_dst, const int64_t stride_channel_dst, const int64_t ids_stride, const bool v16,
         const float * __restrict__ xg = nullptr, const float * __restrict__ gg = nullptr, const int64_t o0 = 0, const int64_t o1 = 0) {
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     const int c = blockIdx.y, t = blockIdx.z;
@@ -2087,24 +2149,7 @@ static __global__ void __launch_bounds__(MOE_SK_WARPS*32, 4) k_moe_iq4nl_smallk(
     const int r0 = (blockIdx.x*MOE_SK_WARPS + warp)*32;
     const uint32_t * src = (const uint32_t *) (vx + (size_t) e*nb02 + (size_t) r0*nb01);
     const int nw = r0 + 32 <= nrows ? wwords : (int) ((nrows - r0 > 0 ? nrows - r0 : 0)*nb01/4);
-    {   // all loads in flight before the shared-memory stores (a load-store pair per trip serialised the latencies)
-        constexpr int U = 8;
-        int i = lane;
-        for (; i + 32*(U - 1) < nw; i += 32*U) {
-            uint32_t r[U];
-#pragma unroll
-            for (int u = 0; u < U; ++u) {
-                r[u] = __ldg(src + i + 32*u);
-            }
-#pragma unroll
-            for (int u = 0; u < U; ++u) {
-                xs[i + 32*u] = r[u];
-            }
-        }
-        for (; i < nw; i += 32) {
-            xs[i] = __ldg(src + i);
-        }
-    }
+    sk_stage(src, xs, nw, lane, v16);
     __syncthreads();
     const int row = r0 + lane;
     if (row >= nrows) {
@@ -2146,7 +2191,7 @@ static __global__ void __launch_bounds__(128, 4) k_q8_0_smallk(
         const char * __restrict__ vx, const block_q8_1 * __restrict__ vy, const int32_t * __restrict__ ids, float * __restrict__ dst,
         const int nblk, const int nrows, const size_t nb01, const size_t nb02,
         const int64_t stride_col_y, const int64_t stride_channel_y, const int nchannels_y,
-        const int64_t stride_col_dst, const int64_t stride_channel_dst, const int64_t ids_stride,
+        const int64_t stride_col_dst, const int64_t stride_channel_dst, const int64_t ids_stride, const bool v16,
         const float * __restrict__ xf = nullptr, const float scale = 0.0f, const float bias = 0.0f) {
     const int nwarps = blockDim.x / 32, warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     const int c = blockIdx.y, t = blockIdx.z;
@@ -2182,24 +2227,7 @@ static __global__ void __launch_bounds__(128, 4) k_q8_0_smallk(
     const int r0 = (blockIdx.x*nwarps + warp)*32;
     const uint32_t * src = (const uint32_t *) (vx + (size_t) e*nb02 + (size_t) r0*nb01);
     const int nw = r0 + 32 <= nrows ? wwords : (int) ((nrows - r0 > 0 ? nrows - r0 : 0)*nb01/4);
-    {   // all loads in flight before the shared-memory stores (a load-store pair per trip serialised the latencies)
-        constexpr int U = 8;
-        int i = lane;
-        for (; i + 32*(U - 1) < nw; i += 32*U) {
-            uint32_t r[U];
-#pragma unroll
-            for (int u = 0; u < U; ++u) {
-                r[u] = __ldg(src + i + 32*u);
-            }
-#pragma unroll
-            for (int u = 0; u < U; ++u) {
-                xs[i + 32*u] = r[u];
-            }
-        }
-        for (; i < nw; i += 32) {
-            xs[i] = __ldg(src + i);
-        }
-    }
+    sk_stage(src, xs, nw, lane, v16);
     __syncthreads();
     const int row = r0 + lane;
     if (row >= nrows) {
@@ -2418,7 +2446,7 @@ void ggml_cuda_mul_mat_vec_q(
             k_moe_iq4nl_smallk<true><<<grid, MOE_SK_WARPS*32, smem, stream>>>((const char *) src0->data, nullptr, ids_d, dst_d,
                 (int) (ne00/QK4_NL), (int) ne01, src0->nb[1], src0->nb[2], 0, 0, (int) ne11,
                 (int64_t) (dst->nb[2]/ts_dst), (int64_t) (dst->nb[1]/ts_dst), (int64_t) (ids->nb[1]/ggml_type_size(ids->type)),
-                xg, gg, o0, o1);
+                sk_v16_on(), xg, gg, o0, o1);
             return;
         }
         if (src1 == glu && g0->type == GGML_TYPE_F32 && (!g1 || g1->type == GGML_TYPE_F32) && ggml_is_contiguous(glu) &&
@@ -2518,7 +2546,7 @@ void ggml_cuda_mul_mat_vec_q(
         const size_t smem = (size_t) MOE_SK_WARPS*32*src0->nb[1] + (size_t) (ne00/QK4_NL)*sizeof(block_q8_1);
         k_moe_iq4nl_smallk<false><<<grid, MOE_SK_WARPS*32, smem, stream>>>((const char *) src0->data, (const block_q8_1 *) src1_q8_1.get(), ids_d, dst_d,
             (int) (ne00/QK4_NL), (int) ne01, src0->nb[1], src0->nb[2], stride_col_y, stride_channel_y, (int) nchannels_y,
-            stride_col_dst, stride_channel_dst, ids_stride);
+            stride_col_dst, stride_channel_dst, ids_stride, sk_v16_on());
         return;
     }
     static const bool q8_smallk = [] { const char * e = getenv("GGML_CUDA_Q8_SMALLK"); return !e || atoi(e) != 0; }();
@@ -2533,7 +2561,7 @@ void ggml_cuda_mul_mat_vec_q(
         const size_t smem = (size_t) nwarps*32*src0->nb[1] + (size_t) (ne00/QK8_0)*sizeof(block_q8_1);
         k_q8_0_smallk<false><<<grid, nwarps*32, smem, stream>>>((const char *) src0->data, (const block_q8_1 *) src1_q8_1.get(), ids_d, dst_d,
             (int) (ne00/QK8_0), (int) ne01, src0->nb[1], src0->nb[2], stride_col_y, stride_channel_y, (int) nchannels_y,
-            stride_col_dst, stride_channel_dst, ids_stride);
+            stride_col_dst, stride_channel_dst, ids_stride, sk_v16_on());
     } else
     mul_mat_vec_q_switch_type(
         src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
@@ -2692,7 +2720,7 @@ bool ggml_cuda_q8_smallk_scale_silu(ggml_backend_cuda_context & ctx, const ggml_
     const dim3 grid((unsigned) ((ne01 + 32*nwarps - 1)/(32*nwarps)), 1, 1);
     const size_t smem = (size_t) nwarps*32*src0->nb[1] + (size_t) (ne00/QK8_0)*sizeof(block_q8_1);
     k_q8_0_smallk<true><<<grid, nwarps*32, smem, ctx.stream()>>>((const char *) src0->data, nullptr, nullptr, (float *) mm->data,
-        (int) (ne00/QK8_0), (int) ne01, src0->nb[1], src0->nb[2], 0, 0, 1, 0, 0, 0, (const float *) x->data, scale, bias);
+        (int) (ne00/QK8_0), (int) ne01, src0->nb[1], src0->nb[2], 0, 0, 1, 0, 0, 0, sk_v16_on(), (const float *) x->data, scale, bias);
     return true;
 }
 
