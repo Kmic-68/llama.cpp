@@ -11672,6 +11672,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 8, 1, false, 512, 1, 256));
     }
 
+    // cc 6.0 fp16 expert GEMM (GGML_CUDA_P60_MOE_GEMM=1) at the shapes of a 512-wide expert split over 2 devices
+    // (gate/up m 256 k 2048, src1 broadcast; down m 2048 k 256): 8, 32 and 128 pairs per expert reach the small-batch
+    // kernel, the 32-pair tile and the 64-pair x 128-row tile
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K}) {
+        for (int n : {64, 256, 1024}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 64, 8, true,   256, n, 2048));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 64, 8, false, 2048, n,  256));
+        }
+    }
+
     for (ggml_type type_a : other_types) {
         for (ggml_type type_b : {GGML_TYPE_F32}) {
             if (ggml_blck_size(type_a) != 256) {

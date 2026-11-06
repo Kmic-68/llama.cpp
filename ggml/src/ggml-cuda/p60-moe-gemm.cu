@@ -1,0 +1,406 @@
+#include "p60-moe-gemm.cuh"
+#include "mmid.cuh"
+
+// Expert matmuls (MUL_MAT_ID) for prompt processing on sm_60 with fp16 math. sm_60 has no dp4a, so MMQ's int8 dot
+// products are emulated (~2.5 TFLOPS on these shapes); here weights are dequantized to fp16 in shared memory and
+// multiplied with HFMA2 (~7 TFLOPS).
+//   1. mm_ids_helper: (token, slot) pairs sorted by expert, their src1 / dst rows, per-expert bounds
+//   2. the src1 rows of the pairs, gathered in that order, converted to fp16
+//   3. one block turns the expert bounds into a list of tiles (expert, first pair, pairs) - no host sync
+//   4. a block computes BM rows x BN pairs of one expert: per 64-wide K step the weight tile is dequantized into
+//      shared memory as k-pairs (half2 of k, k + 1), so one 128-bit load gives 4 rows or 4 pairs; HFMA2 over the
+//      step, then the half2 accumulators are flushed to fp32.
+
+namespace {
+
+constexpr int BM = 64, BK = 64, KP = BK / 2, NTH = 256;
+
+struct moe_job { int expert, p0, np; };
+
+// exact int -> float for 0 <= q < 2^23 without the quarter-rate I2F: q in the mantissa of 2^23, minus 2^23
+__device__ __forceinline__ float p60_i2f(int q) {
+    return __int_as_float(0x4B000000 | q) - 8388608.0f;
+}
+
+__device__ __forceinline__ void p60_scale_min_k4(int j, const uint8_t * q, int & d, int & m) {
+    if (j < 4) { d = q[j] & 63; m = q[j + 4] & 63; }
+    else { d = (q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4); m = (q[j + 4] >> 4) | ((q[j] >> 6) << 4); }
+}
+
+// src1 rows of the sorted pairs -> fp16 [pair][K]
+__global__ void moe_gather_f16(const char * __restrict__ src1, int64_t nb11, const int32_t * __restrict__ ids_src1, int K,
+        half2 * __restrict__ xs) {
+    const int p = blockIdx.x;
+    const float2 * x = (const float2 *) (src1 + (int64_t) ids_src1[p] * nb11);
+    half2 * o = xs + (int64_t) p * (K / 2);
+    for (int i = threadIdx.x; i < K / 2; i += blockDim.x) {
+        const float2 v = x[i];
+        o[i] = __floats2half2_rn(v.x, v.y);
+    }
+}
+
+// expert bounds -> tiles of up to BN pairs; one block of n_experts (<= 1024) threads
+__global__ void moe_jobs(const int32_t * __restrict__ bounds, int n_experts, int BN, moe_job * __restrict__ jobs, int * __restrict__ njobs) {
+    __shared__ int cnt[1024];
+    const int e = threadIdx.x;
+    const int n = e < n_experts ? bounds[e + 1] - bounds[e] : 0;
+    const int nt = (n + BN - 1) / BN;
+    cnt[e] = nt;
+    __syncthreads();
+    // inclusive scan (Hillis-Steele)
+    for (int o = 1; o < blockDim.x; o <<= 1) {
+        const int v = e >= o ? cnt[e - o] : 0;
+        __syncthreads();
+        cnt[e] += v;
+        __syncthreads();
+    }
+    const int first = cnt[e] - nt;
+    for (int t = 0; t < nt; t++) {
+        jobs[first + t] = { e, bounds[e] + t * BN, min(BN, n - t * BN) };
+    }
+    if (e == blockDim.x - 1) {
+        *njobs = cnt[e];
+    }
+}
+
+// TYPE: GGML_TYPE_Q4_K (144 B / 256), GGML_TYPE_Q5_K (176 B / 256) or GGML_TYPE_Q6_K (210 B / 256)
+// BN: pairs per tile (64, 32 or 16: fewer when experts get few tokens, e.g. short prompts)
+// BMT: rows per tile (64 or 128; 128 halves the weight-side shared-memory loads per HFMA2)
+template <int TYPE, int BN, int BMT>
+__global__ void __launch_bounds__(NTH, 2) moe_gemm_f16(const uint8_t * __restrict__ W, int64_t row_bytes, int64_t exp_bytes, int K,
+        const half2 * __restrict__ X, const moe_job * __restrict__ jobs, const int * __restrict__ njobs,
+        const int32_t * __restrict__ ids_dst, char * __restrict__ dst, int64_t nb1) {
+    __shared__ __align__(16) half2 AP[KP][BMT];  // weights: AP[kp][row]
+    __shared__ __align__(16) half2 BP[KP][BN];   // activations: BP[kp][pair]
+    if ((int) blockIdx.x >= *njobs) {
+        return;
+    }
+    const moe_job jb = jobs[blockIdx.x];
+    const int m0 = blockIdx.y * BMT;
+    constexpr int PPT = BN / 16;           // pairs per thread
+    constexpr int RPT = BMT / 16;          // rows per thread
+    constexpr int TPP = NTH / BN, KPT = KP / TPP; // activation loader: threads per pair, k-pairs per thread
+    const int tid = threadIdx.x, tx = tid & 15, ty = tid >> 4;
+    const uint8_t * Wexp = W + (int64_t) jb.expert * exp_bytes;
+    constexpr int SBB = TYPE == GGML_TYPE_Q4_K ? 144 : TYPE == GGML_TYPE_Q5_K ? 176 : 210, QS = TYPE == GGML_TYPE_Q4_K ? 16 : 48;
+
+    float acc[RPT][PPT];
+#pragma unroll
+    for (int i = 0; i < RPT; i++)
+#pragma unroll
+        for (int j = 0; j < PPT; j++) acc[i][j] = 0.f;
+
+    const int lr = tid >> 2, lp = tid & 3;          // weight loader: row, 8 bytes of qs (16 weights)
+    const int bpair = tid / TPP, bq = tid % TPP;    // activation loader: pair, KPT k-pairs
+
+    for (int k0 = 0; k0 < K; k0 += BK) {
+#pragma unroll
+        for (int rr = 0; rr < BMT / 64; rr++) {
+            if constexpr (TYPE == GGML_TYPE_Q6_K) {
+                // 210 B superblocks (2 B aligned): step j covers y[64 j ..]: half n = j / 2, upper nibbles / qh bits 4-7
+                // for odd j; first 32 weights from ql[64 n + l], the next 32 from ql[64 n + 32 + l], l = 8 lp + e
+                const int sb = k0 / 256, j = (k0 % 256) / 64, n = j >> 1, odd = j & 1;
+                const uint8_t * blk = Wexp + (int64_t) (m0 + lr + 64 * rr) * row_bytes + sb * SBB;
+                const unsigned short * ql0 = (const unsigned short *) (blk + 64 * n + 8 * lp);
+                const unsigned short * ql1 = (const unsigned short *) (blk + 64 * n + 32 + 8 * lp);
+                const unsigned short * qhp = (const unsigned short *) (blk + 128 + 32 * n + 8 * lp);
+                uint8_t a0[8], a1[8], hh[8];
+    #pragma unroll
+                for (int e = 0; e < 4; e++) {
+                    const unsigned short u0 = ql0[e], u1 = ql1[e], uh = qhp[e];
+                    a0[2 * e] = u0 & 0xFF; a0[2 * e + 1] = u0 >> 8;
+                    a1[2 * e] = u1 & 0xFF; a1[2 * e + 1] = u1 >> 8;
+                    hh[2 * e] = uh & 0xFF; hh[2 * e + 1] = uh >> 8;
+                }
+                const int is = lp >> 1;
+                const int8_t * sc = (const int8_t *) (blk + 192 + 8 * n + 4 * odd);
+                const float d = __half2float(*(const half *) (blk + 208));
+                const float dl = d * sc[is], dh = d * sc[is + 2];
+                const int sh = 4 * odd;
+                float lo[8], hi[8];
+    #pragma unroll
+                for (int e = 0; e < 8; e++) {
+                    const int q0 = ((a0[e] >> sh) & 0xF) | (((hh[e] >> sh) & 3) << 4);
+                    const int q1 = ((a1[e] >> sh) & 0xF) | (((hh[e] >> (sh + 2)) & 3) << 4);
+                    lo[e] = dl * (q0 - 32);
+                    hi[e] = dh * (q1 - 32);
+                }
+    #pragma unroll
+                for (int e = 0; e < 8; e += 2) {
+                    AP[(8 * lp + e) / 2][lr + 64 * rr]      = __floats2half2_rn(lo[e], lo[e + 1]);
+                    AP[(32 + 8 * lp + e) / 2][lr + 64 * rr] = __floats2half2_rn(hi[e], hi[e + 1]);
+                }
+            } else {
+                const int sb = k0 / 256, j = (k0 % 256) / 64;
+                const uint8_t * blk = Wexp + (int64_t) (m0 + lr + 64 * rr) * row_bytes + sb * SBB;
+                const float d = __half2float(*(const half *) blk), dmin = __half2float(*(const half *) (blk + 2));
+                int s0, mn0, s1, mn1;
+                p60_scale_min_k4(2 * j, blk + 4, s0, mn0);
+                p60_scale_min_k4(2 * j + 1, blk + 4, s1, mn1);
+                const float d0 = d * s0, c0 = dmin * mn0, d1 = d * s1, c1 = dmin * mn1;
+                const uint2 q8 = *(const uint2 *) (blk + QS + 32 * j + 8 * lp);
+                const uint8_t * qb = (const uint8_t *) &q8;
+                unsigned hb0 = 0, hb1 = 0;
+                if constexpr (TYPE == GGML_TYPE_Q5_K) {
+                    const uint2 h8 = *(const uint2 *) (blk + 16 + 8 * lp);
+                    const uint8_t * hbb = (const uint8_t *) &h8;
+    #pragma unroll
+                    for (int e = 0; e < 8; e++) {
+                        hb0 |= ((hbb[e] >> (2 * j)) & 1u) << e;
+                        hb1 |= ((hbb[e] >> (2 * j + 1)) & 1u) << e;
+                    }
+                }
+                float lo[8], hi[8];
+    #pragma unroll
+                for (int e = 0; e < 8; e++) {
+                    int ql = qb[e] & 0xF, qh = qb[e] >> 4;
+                    if constexpr (TYPE == GGML_TYPE_Q5_K) { ql |= ((hb0 >> e) & 1) << 4; qh |= ((hb1 >> e) & 1) << 4; }
+                    lo[e] = d0 * ql - c0;
+                    hi[e] = d1 * qh - c1;
+                }
+    #pragma unroll
+                for (int e = 0; e < 8; e += 2) {
+                    AP[(8 * lp + e) / 2][lr + 64 * rr]      = __floats2half2_rn(lo[e], lo[e + 1]);
+                    AP[(32 + 8 * lp + e) / 2][lr + 64 * rr] = __floats2half2_rn(hi[e], hi[e + 1]);
+                }
+            }
+        }
+        {
+            if (bpair < jb.np) {
+                const half2 * src = X + (int64_t) (jb.p0 + bpair) * (K / 2) + k0 / 2 + KPT * bq;
+                half2 hv[KPT];
+                if constexpr (KPT % 4 == 0) {
+#pragma unroll
+                    for (int e = 0; e < KPT; e += 4) *(uint4 *) &hv[e] = *(const uint4 *) (src + e);
+                } else {
+#pragma unroll
+                    for (int e = 0; e < KPT; e += 2) *(uint2 *) &hv[e] = *(const uint2 *) (src + e);
+                }
+#pragma unroll
+                for (int e = 0; e < KPT; e++) BP[KPT * bq + e][bpair] = hv[e];
+            } else {
+#pragma unroll
+                for (int e = 0; e < KPT; e++) BP[KPT * bq + e][bpair] = __float2half2_rn(0.f);
+            }
+        }
+        __syncthreads();
+        half2 h[RPT][PPT];
+#pragma unroll
+        for (int i = 0; i < RPT; i++)
+#pragma unroll
+            for (int j = 0; j < PPT; j++) h[i][j] = __float2half2_rn(0.f);
+#pragma unroll 8
+        for (int kp = 0; kp < KP; kp++) {
+            half2 ah[RPT];
+#pragma unroll
+            for (int i = 0; i < RPT; i += 4) *(uint4 *) &ah[i] = *(const uint4 *) &AP[kp][RPT * ty + i];
+            half2 bh[PPT];
+            if constexpr (PPT == 4) {
+                *(uint4 *) bh = *(const uint4 *) &BP[kp][4 * tx];
+            } else if constexpr (PPT == 2) {
+                *(uint2 *) bh = *(const uint2 *) &BP[kp][2 * tx];
+            } else {
+                bh[0] = BP[kp][tx];
+            }
+#pragma unroll
+            for (int i = 0; i < RPT; i++)
+#pragma unroll
+                for (int j = 0; j < PPT; j++) h[i][j] = __hfma2(ah[i], bh[j], h[i][j]);
+        }
+#pragma unroll
+        for (int i = 0; i < RPT; i++)
+#pragma unroll
+            for (int j = 0; j < PPT; j++) { const float2 f = __half22float2(h[i][j]); acc[i][j] += f.x + f.y; }
+        __syncthreads();
+    }
+#pragma unroll
+    for (int j = 0; j < PPT; j++) {
+        const int p = PPT * tx + j;
+        if (p < jb.np) {
+            float * o = (float *) (dst + (int64_t) ids_dst[jb.p0 + p] * nb1) + m0 + RPT * ty;
+#pragma unroll
+            for (int i = 0; i < RPT; i += 4) *(float4 *) (o + i) = make_float4(acc[i][j], acc[i + 1][j], acc[i + 2][j], acc[i + 3][j]);
+        }
+    }
+}
+
+// Few pairs per expert (short prompts): one thread per weight row dequantizes its row into registers, the tile's pairs
+// sit in shared memory. Same math as moe_gemm_f16 per (row, pair): per 64-wide K step a HFMA2 chain over k-pairs 0..31
+// in order, then acc += h.x + h.y, so results are bit-identical; only the padding work of 16+ pair tiles is gone.
+// Q4_K / Q5_K only (Q6_K superblocks are 2 B aligned). All loads of a superblock are issued before its math.
+constexpr int NTH_S = 256;
+
+template <int TYPE, int NP>
+__global__ void __launch_bounds__(NTH_S, 2) moe_small_f16(const uint8_t * __restrict__ W, int64_t row_bytes, int64_t exp_bytes, int K,
+        const half2 * __restrict__ X, const moe_job * __restrict__ jobs, const int * __restrict__ njobs,
+        const int32_t * __restrict__ ids_dst, char * __restrict__ dst, int64_t nb1) {
+    static_assert(TYPE == GGML_TYPE_Q4_K || TYPE == GGML_TYPE_Q5_K, "Q4_K / Q5_K only");
+    __shared__ __align__(16) half2 XS[NP][128];  // pairs x one 256-wide superblock of K
+    if ((int) blockIdx.x >= *njobs) {
+        return;
+    }
+    const moe_job jb = jobs[blockIdx.x];
+    const int row = blockIdx.y * NTH_S + threadIdx.x;
+    const uint8_t * Wrow = W + (int64_t) jb.expert * exp_bytes + (int64_t) row * row_bytes;
+    constexpr int SBB = TYPE == GGML_TYPE_Q4_K ? 144 : 176, QS = TYPE == GGML_TYPE_Q4_K ? 16 : 48;
+
+    float acc[NP];
+#pragma unroll
+    for (int p = 0; p < NP; p++) acc[p] = 0.f;
+
+#pragma unroll 1
+    for (int sb = 0; sb < K / 256; sb++) {
+        const uint8_t * blk = Wrow + sb * SBB;
+        uint4 hdr = *(const uint4 *) blk;  // d, dmin, scales
+        uint4 qv[8], hv[2];
+#pragma unroll
+        for (int i = 0; i < 8; i++) qv[i] = *(const uint4 *) (blk + QS + 16 * i);
+        if constexpr (TYPE == GGML_TYPE_Q5_K) {
+            hv[0] = *(const uint4 *) (blk + 16);
+            hv[1] = *(const uint4 *) (blk + 32);
+        }
+        __syncthreads();
+        for (int i = threadIdx.x; i < NP * 128; i += NTH_S) {
+            const int p = i / 128, c = i % 128;
+            XS[p][c] = p < jb.np ? X[(int64_t) (jb.p0 + p) * (K / 2) + sb * 128 + c] : __float2half2_rn(0.f);
+        }
+        __syncthreads();
+        const uint8_t * hb = (const uint8_t *) &hdr;
+        const float d = __half2float(*(const half *) hb), dmin = __half2float(*(const half *) (hb + 2));
+        const uint8_t * hq = (const uint8_t *) hv;
+#pragma unroll
+        for (int j = 0; j < 4; j++) {
+            int s0, mn0, s1, mn1;
+            p60_scale_min_k4(2 * j, hb + 4, s0, mn0);
+            p60_scale_min_k4(2 * j + 1, hb + 4, s1, mn1);
+            const float d0 = d * s0, c0 = dmin * mn0, d1 = d * s1, c1 = dmin * mn1;
+            const uint8_t * qb = (const uint8_t *) &qv[2 * j];
+            half2 w[32];
+#pragma unroll
+            for (int b = 0; b < 32; b += 2) {
+                int ql0 = qb[b] & 0xF, qh0 = qb[b] >> 4, ql1 = qb[b + 1] & 0xF, qh1 = qb[b + 1] >> 4;
+                if constexpr (TYPE == GGML_TYPE_Q5_K) {
+                    ql0 |= ((hq[b] >> (2 * j)) & 1) << 4;     qh0 |= ((hq[b] >> (2 * j + 1)) & 1) << 4;
+                    ql1 |= ((hq[b + 1] >> (2 * j)) & 1) << 4; qh1 |= ((hq[b + 1] >> (2 * j + 1)) & 1) << 4;
+                }
+                w[b / 2]      = __floats2half2_rn(d0 * p60_i2f(ql0) - c0, d0 * p60_i2f(ql1) - c0);
+                w[16 + b / 2] = __floats2half2_rn(d1 * p60_i2f(qh0) - c1, d1 * p60_i2f(qh1) - c1);
+            }
+            // all NP chains, interleaved (padding pairs are zero and never stored)
+            half2 h[NP];
+#pragma unroll
+            for (int p = 0; p < NP; p++) h[p] = __float2half2_rn(0.f);
+#pragma unroll
+            for (int kp = 0; kp < 32; kp += 4) {
+#pragma unroll
+                for (int p = 0; p < NP; p++) {
+                    half2 xv[4];
+                    *(uint4 *) xv = *(const uint4 *) &XS[p][32 * j + kp];
+#pragma unroll
+                    for (int e = 0; e < 4; e++) h[p] = __hfma2(w[kp + e], xv[e], h[p]);
+                }
+            }
+#pragma unroll
+            for (int p = 0; p < NP; p++) {
+                const float2 f = __half22float2(h[p]);
+                acc[p] += f.x + f.y;
+            }
+        }
+    }
+#pragma unroll
+    for (int p = 0; p < NP; p++) {
+        if (p < jb.np) {
+            ((float *) (dst + (int64_t) ids_dst[jb.p0 + p] * nb1))[row] = acc[p];
+        }
+    }
+}
+
+} // namespace
+
+bool ggml_cuda_p60_moe_gemm(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+        const ggml_tensor * ids, ggml_tensor * dst) {
+    // opt-in: GGML_CUDA_P60_MOE_GEMM=1
+    static const bool enabled = getenv("GGML_CUDA_P60_MOE_GEMM") != nullptr && atoi(getenv("GGML_CUDA_P60_MOE_GEMM")) != 0;
+    if (!enabled || ggml_cuda_info().devices[ctx.device].cc != 600) {
+        return false;
+    }
+    const int64_t K = src0->ne[0], M = src0->ne[1], n_experts = src0->ne[2];
+    const int64_t n_used = ids->ne[0], n_tokens = ids->ne[1];
+    // M == 0 / K == 0: a device without a slice of the experts under -sm tensor, left to MMQ
+    if (M == 0 || K == 0 ||
+            (src0->type != GGML_TYPE_Q4_K && src0->type != GGML_TYPE_Q5_K && src0->type != GGML_TYPE_Q6_K) || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 ||
+            ids->type != GGML_TYPE_I32 || K % 256 != 0 || M % BM != 0 || n_experts > 1024 || src0->ne[3] != 1 ||
+            src1->ne[0] != K || src1->ne[3] != 1 || dst->ne[3] != 1 || src1->nb[0] != sizeof(float) || src1->nb[1] % 8 != 0 ||
+            (src1->ne[1] != 1 && src1->ne[1] != n_used) || src1->ne[2] != n_tokens || src1->nb[2] % src1->nb[1] != 0 ||
+            dst->ne[0] != M || dst->ne[1] != n_used || dst->ne[2] != n_tokens || dst->nb[0] != sizeof(float) ||
+            dst->nb[2] != dst->nb[1] * n_used || dst->nb[1] % 16 != 0 || ((uintptr_t) dst->data) % 16 != 0 ||
+            src0->nb[1] != (size_t) K / 256 * (src0->type == GGML_TYPE_Q4_K ? 144 : src0->type == GGML_TYPE_Q5_K ? 176 : 210) ||
+            src0->nb[2] != src0->nb[1] * M ||
+            ids->nb[0] != sizeof(int32_t)) {
+        return false;
+    }
+    cudaStream_t stream = ctx.stream();
+    const int64_t n_pairs = n_tokens * n_used;
+
+    ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), n_pairs);
+    ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), n_pairs);
+    ggml_cuda_pool_alloc<int32_t> bounds(ctx.pool(), n_experts + 1);
+    const int si1  = ids->nb[1] / sizeof(int32_t);
+    const int sis1 = src1->nb[2] / src1->nb[1];
+    ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), bounds.get(),
+        n_experts, n_tokens, n_used, src1->ne[1], si1, sis1, /*write_inverse =*/ false, stream);
+
+    ggml_cuda_pool_alloc<half2> xs(ctx.pool(), n_pairs * K / 2);
+    moe_gather_f16<<<n_pairs, 256, 0, stream>>>((const char *) src1->data, src1->nb[1], ids_src1.get(), (int) K, xs.get());
+
+    // tile width from the average pairs per expert (short prompts give experts few tokens)
+    const int64_t avg = n_pairs / n_experts;
+
+    // GGML_CUDA_P60_MOE_SMALL=0 off; _NP pairs per tile (4, 8, 16), used while avg pairs per expert < _AVG (Q4_K, half for Q5_K)
+    static const int small_on  = getenv("GGML_CUDA_P60_MOE_SMALL")     ? atoi(getenv("GGML_CUDA_P60_MOE_SMALL"))     : 1;
+    static const int small_np  = getenv("GGML_CUDA_P60_MOE_SMALL_NP")  ? atoi(getenv("GGML_CUDA_P60_MOE_SMALL_NP"))  : 8;
+    static const int small_avg = getenv("GGML_CUDA_P60_MOE_SMALL_AVG") ? atoi(getenv("GGML_CUDA_P60_MOE_SMALL_AVG")) : 24;
+    const int small_lim = src0->type == GGML_TYPE_Q4_K ? small_avg : small_avg / 2;
+    if (small_on && avg < small_lim && M % NTH_S == 0 && src0->type != GGML_TYPE_Q6_K && (small_np == 4 || small_np == 8 || small_np == 16)) {
+        const int max_jobs = (int) ((n_pairs + small_np - 1) / small_np + n_experts);
+        ggml_cuda_pool_alloc<moe_job> jobs(ctx.pool(), max_jobs);
+        ggml_cuda_pool_alloc<int> njobs(ctx.pool(), 1);
+        int nthr = 32;
+        while (nthr < n_experts) {
+            nthr *= 2;
+        }
+        moe_jobs<<<1, nthr, 0, stream>>>(bounds.get(), (int) n_experts, small_np, jobs.get(), njobs.get());
+        using kfn = void (*)(const uint8_t *, int64_t, int64_t, int, const half2 *, const moe_job *, const int *, const int32_t *, char *, int64_t);
+#define P60_MOE_SMALL_K(TYPE) { moe_small_f16<TYPE, 4>, moe_small_f16<TYPE, 8>, moe_small_f16<TYPE, 16> }
+        static const kfn kern[2][3] = { P60_MOE_SMALL_K(GGML_TYPE_Q4_K), P60_MOE_SMALL_K(GGML_TYPE_Q5_K) };
+#undef P60_MOE_SMALL_K
+        const int ti = src0->type == GGML_TYPE_Q4_K ? 0 : 1;
+        const int ni = small_np == 4 ? 0 : small_np == 8 ? 1 : 2;
+        kern[ti][ni]<<<dim3(max_jobs, M / NTH_S), NTH_S, 0, stream>>>((const uint8_t *) src0->data, src0->nb[1], src0->nb[2], (int) K,
+            xs.get(), jobs.get(), njobs.get(), ids_dst.get(), (char *) dst->data, dst->nb[1]);
+        CUDA_CHECK(cudaGetLastError());
+        return true;
+    }
+
+    const int bn = avg >= 40 ? 64 : avg >= 12 ? 32 : 16;
+    const int max_jobs = (int) ((n_pairs + bn - 1) / bn + n_experts);
+    ggml_cuda_pool_alloc<moe_job> jobs(ctx.pool(), max_jobs);
+    ggml_cuda_pool_alloc<int> njobs(ctx.pool(), 1);
+    int nthr = 32;
+    while (nthr < n_experts) {
+        nthr *= 2;
+    }
+    moe_jobs<<<1, nthr, 0, stream>>>(bounds.get(), (int) n_experts, bn, jobs.get(), njobs.get());
+
+    const int bmt = bn == 64 && M % 128 == 0 ? 128 : 64;
+    const dim3 grid(max_jobs, M / bmt);
+    using kfn = void (*)(const uint8_t *, int64_t, int64_t, int, const half2 *, const moe_job *, const int *, const int32_t *, char *, int64_t);
+#define P60_MOE_GEMM_K(TYPE) { moe_gemm_f16<TYPE, 64, 128>, moe_gemm_f16<TYPE, 64, 64>, moe_gemm_f16<TYPE, 32, 64>, moe_gemm_f16<TYPE, 16, 64> }
+    static const kfn kern[3][4] = { P60_MOE_GEMM_K(GGML_TYPE_Q4_K), P60_MOE_GEMM_K(GGML_TYPE_Q5_K), P60_MOE_GEMM_K(GGML_TYPE_Q6_K) };
+#undef P60_MOE_GEMM_K
+    const int ti = src0->type == GGML_TYPE_Q4_K ? 0 : src0->type == GGML_TYPE_Q5_K ? 1 : 2;
+    kern[ti][bn == 64 ? (bmt == 128 ? 0 : 1) : bn == 32 ? 2 : 3]<<<grid, NTH, 0, stream>>>((const uint8_t *) src0->data, src0->nb[1], src0->nb[2], (int) K,
+        xs.get(), jobs.get(), njobs.get(), ids_dst.get(), (char *) dst->data, dst->nb[1]);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
