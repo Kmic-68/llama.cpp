@@ -18,8 +18,9 @@ config finder, and made every default exact (see "Exactness").
 | decode-first: 145 slots, `-ub 256` | ~87 | 26.9 | ~14.4 GB |
 | balanced (finder pick for an agent workload) | ~500 | ~23-24 | ~14.3 GB |
 
-At 128k (139264 context, `-ub 3072`, measured 11-04): 85 slots prefill 335-400 t/s, decode 30.5 t/s; with the slot loan
-(below), 75 + 80 borrowed slots: prefill 356 t/s, decode 31.3 t/s, same output. Decode drops to ~16 t/s when the generated
+At 128k (139264 context, `-ub 3072`, 75 + 80 borrowed slots with the slot loan below, copy-engine fills, measured 11-05):
+prefill 489 t/s for a full 131072-token prompt, decode 32-34 t/s, GPU0 peak ~14.4 GB. Decode speed depends on the text
+being generated: a continuation that keeps missing the expert cache decodes at ~25 t/s even with the loan. Decode drops to ~16 t/s when the generated
 tokens' per-layer-embedding rows are not in the page cache (the PLE table is read from disk; watch major faults).
 
 Sampling is the model card's (temp 1.0, top-k 20, top-p 0.95, min-p 0). Upstream llama.cpp with

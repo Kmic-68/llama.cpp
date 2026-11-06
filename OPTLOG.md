@@ -9601,3 +9601,42 @@ draft placement), then draft acceptance (Strata's coupled/Gumbel drafting), per-
   0.0276, PPL(Q)/PPL(base) 0.991 +- 0.011; prefill (-ub 3072, tile_mm TM=5 + per-token prep + in-place weighting) KLD 0.0170,
   ratio 0.996 +- 0.004. Both at or under the Flash-Next summation-order floor (~0.026), PPL not worse.
 - llama-perplexity with the LRU hung once after its final estimate (killed by pid; seen on the committed build).
+
+## 327 — Flash-Next 128k: prefill 489 t/s, decode 32-34 t/s (11-04/05)
+
+128k = 139264 context, `-ub 3072`, 75 slots + 80 borrowed (slot loan), copy-engine fills, tail assembly, Q8_0 kinds as tails.
+Full 131072-token prompt: prefill 489.2 t/s (11-03: 335-400), decode 32.8 t/s; decode-only reruns of the saved 128k KV state
+32.8-34.2 t/s (11-03: 31.3), generated-text md5 identical (e55db017ac). GPU0 peak 14397 MiB, GPU1 13875 MiB.
+
+Kept (commits since 326):
+- QSA gather selection fused into one op (`ggml_qsa_gather_sel`, ~20 ops per attention layer -> 1), rank by counting.
+- Radix top-k: warp-parallel bin walk, then histogram + select in one launch per pass (12 -> 6 launches per top-k).
+- SCALE -> SILU fused (hyper-connection low rank); conv-state tail copied without a cont; GDN state gather skipped under the
+  meta backend; short-row matvecs stage with all loads in flight.
+- Meta backend: the MoE AllReduce waits past an in-place router weighting (it used to reduce the [n_embd, n_used, n_tokens]
+  expert outputs, 300 MiB per layer, before the sum). Prefill ubatch at depth 332.6 -> 419.3 t/s. Math check (same build,
+  GGML_META_AR_VIEW_ROOT=0 as base, -c 3072, 2 chunks, -ub 3072): KLD 0.0045, PPL(Q)/PPL(base) 0.9992 +- 0.0023, same top p
+  98.2%: under the Flash-Next summation-order floor (~0.026).
+- dsv4 hc_post / hc_pre: 2D/3D grids instead of 64-bit div/mod (prefill ubatch 431.1 -> 437.8 t/s, md5 identical).
+- tile_mm: two-block Q8_0 units (K % 128 == 64, the Q8_0 expert down at K = 320); Q8_0 expert kinds assemble as tails by
+  default, so those layers prefetch too.
+- mmvq: q8_0 few-row geometry (4 warps on 1 row) on by default (hc down 10240 -> 320): 128k decode ABBA 32.78 vs 31.80
+  (GGML_CUDA_Q8_SMALLM=0 restores the old geometry, =ab follows GGML_CUDA_AB_FILE).
+- GGML_CUDA_AB_FILE: runtime A/B switch (a file's presence) for ABBA within one server; dec128.py ABFILE/REPEAT/SEED/PFX.
+
+Opt-in or rejected (slower or no gain at 128k):
+- LLAMA_SPLIT_SHEXP=1 (shared expert split across GPUs: separate AllReduce), LLAMA_MOE_LRU_PF_ALL=1, LLAMA_MOE_LRU_PF_FIRST=1,
+  GGML_CUDA_TOPK_MOE_SORT=1, GGML_CUDA_PASCAL_FUSE_MM=1, CUDA graphs, MTP (loses even at short context: 23.1 vs 23.9),
+  layer split (28.5 t/s), predictive prefetch, multi-entry q8_1 cache.
+- LLAMA_QSA_GCHUNK=256: prefill 475.1 vs 489.2 t/s.
+- IQ3_S expert matvec geometry 8 rows x 4 warps (ABBA 31.53 vs 32.48) and 1 row x 2 warps (30.78 vs 31.35): default 2 x 2 stays.
+- Short-row (smallk) kernels: 24 loads per trip with a predicated tail (no change), 1 warp per block (31.45 vs 32.24).
+- Dense q8_0 matvec (Flash-Next GDN qkv/gate, ssm_out, attn_q; ~420 GB/s): 4 rows x 2 warps and 2 x 4 both slower in
+  test-backend-ops perf (e.g. 5120x2560 36.3 -> 37.9 / 37.1 us).
+
+Where decode time goes (nsys, 128k, per token per GPU): dense q8_0 matvecs ~6.9 ms, IQ3_S gate/up ~2.4, expert fills ~2.0,
+hc up ~2.0, q8_1 quantize ~1.5, IQ4_NL down ~1.3, AllReduce ~1.1, top-k ~1.0, indexer ~1.0, rms_norm ~1.4; ~3400 kernels per
+token, most of them 3-10 us.
+
+27B gates on this build: tg256 33.50 +- 0.11 t/s, PPL 2.6093 +- 0.0198 (ppl-orig.txt, -c 4096, q4_0 KV), peak GPU0 14605 /
+GPU1 14083 MiB.
