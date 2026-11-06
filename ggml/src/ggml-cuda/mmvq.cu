@@ -2245,6 +2245,13 @@ static __global__ void quantize_q8_1_swiglu(const float * __restrict__ x, const 
     }
 }
 
+// the q8_1 activation does not depend on src0's type (quantize_row_q8_1_cuda ignores it): a matmul of another weight type
+// over the same src1 reuses it (the shared expert's and the routed experts' gate/up). GGML_CUDA_Q8_1_ANYTYPE=0: off, =ab
+static bool q8_1_any_type() {
+    static const int env = [] { const char * e = getenv("GGML_CUDA_Q8_1_ANYTYPE"); return !e ? 1 : strcmp(e, "ab") == 0 ? 2 : atoi(e) != 0; }();
+    return env == 2 ? ggml_cuda_ab_alt() : env != 0;
+}
+
 static bool moe_smallk_on() {
     static const bool on = [] { const char * e = getenv("GGML_CUDA_MOE_SMALLK"); return !e || atoi(e) != 0; }();
     return on;
@@ -2433,7 +2440,7 @@ void ggml_cuda_mul_mat_vec_q(
 
     const bool q8_1_hit = ctx.mmvq_q8_1_src1[dev] == src1 &&
                           ctx.mmvq_q8_1_data[dev] == src1_d &&
-                          ctx.mmvq_q8_1_type[dev] == src0->type &&
+                          (ctx.mmvq_q8_1_type[dev] == src0->type || q8_1_any_type()) &&
                           ctx.mmvq_q8_1_need[dev] == q8_1_bytes &&
                           ctx.mmvq_q8_1_ptr [dev] != nullptr;
 
