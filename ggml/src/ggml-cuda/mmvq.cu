@@ -2115,11 +2115,16 @@ static __global__ void __launch_bounds__(MOE_SK_WARPS*32, 4) k_moe_iq4nl_smallk(
 // of the per-block float adds differs. Plain MUL_MAT (ids == nullptr: one expert, channel 0) or MUL_MAT_ID.
 // GGML_CUDA_Q8_SMALLK=0: the general kernel.
 #define Q8_SK_MAXB 10   // K <= 320 (at K = 640 only 2 warps fit and the general kernel is faster)
+// FX: the activation is f32 x and the kernel applies silu(scale*x + bias) and quantizes it to q8_1 itself, with exactly the
+// operations of scale_silu_f32 and quantize_q8_1 (bit-identical result): the hyper-connection SCALE -> SILU -> MUL_MAT in one
+// launch instead of three.
+template <bool FX>
 static __global__ void __launch_bounds__(128, 4) k_q8_0_smallk(
         const char * __restrict__ vx, const block_q8_1 * __restrict__ vy, const int32_t * __restrict__ ids, float * __restrict__ dst,
         const int nblk, const int nrows, const size_t nb01, const size_t nb02,
         const int64_t stride_col_y, const int64_t stride_channel_y, const int nchannels_y,
-        const int64_t stride_col_dst, const int64_t stride_channel_dst, const int64_t ids_stride) {
+        const int64_t stride_col_dst, const int64_t stride_channel_dst, const int64_t ids_stride,
+        const float * __restrict__ xf = nullptr, const float scale = 0.0f, const float bias = 0.0f) {
     const int nwarps = blockDim.x / 32, warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     const int c = blockIdx.y, t = blockIdx.z;
     const int32_t e = ids ? ids[t*ids_stride + c] : 0;
@@ -2130,9 +2135,26 @@ static __global__ void __launch_bounds__(128, 4) k_q8_0_smallk(
     const int wwords = (int) (32*nb01/4);                     // one warp's 32 rows
     uint32_t * xs = q8_sk_smem + warp*wwords;
     uint32_t * ys = q8_sk_smem + nwarps*wwords;               // the activation, nblk q8_1 blocks
-    const block_q8_1 * y = vy + (ids ? (c % nchannels_y)*stride_channel_y : 0) + t*stride_col_y;
-    for (int i = threadIdx.x; i < nblk*(int) (sizeof(block_q8_1)/4); i += blockDim.x) {
-        ys[i] = ((const uint32_t *) y)[i];
+    if constexpr (FX) {
+        block_q8_1 * yq = (block_q8_1 *) ys;
+        for (int b = warp; b < nblk; b += nwarps) {
+            const float tv = scale == 0.0f ? bias : scale * xf[32*b + lane] + bias;
+            const float xi = ggml_cuda_op_silu_single(tv);
+            float amax = fabsf(xi);
+            float sum  = xi;
+            amax = warp_reduce_max<QK8_1>(amax);
+            sum  = warp_reduce_sum<QK8_1>(sum);
+            const float d = amax / 127.0f;
+            yq[b].qs[lane] = amax == 0.0f ? 0 : roundf(xi / d);
+            if (lane == 0) {
+                yq[b].ds = make_half2(d, sum);
+            }
+        }
+    } else {
+        const block_q8_1 * y = vy + (ids ? (c % nchannels_y)*stride_channel_y : 0) + t*stride_col_y;
+        for (int i = threadIdx.x; i < nblk*(int) (sizeof(block_q8_1)/4); i += blockDim.x) {
+            ys[i] = ((const uint32_t *) y)[i];
+        }
     }
     const int r0 = (blockIdx.x*nwarps + warp)*32;
     const uint32_t * src = (const uint32_t *) (vx + (size_t) e*nb02 + (size_t) r0*nb01);
@@ -2381,7 +2403,7 @@ void ggml_cuda_mul_mat_vec_q(
         const int nwarps = (int) std::max<size_t>(1, std::min<size_t>(4, (size_t) 45056 / (32*src0->nb[1])));
         const dim3 grid((unsigned) ((ne01 + 32*nwarps - 1)/(32*nwarps)), (unsigned) (ids ? nchannels_dst : 1), (unsigned) ncols_dst);
         const size_t smem = (size_t) nwarps*32*src0->nb[1] + (size_t) (ne00/QK8_0)*sizeof(block_q8_1);
-        k_q8_0_smallk<<<grid, nwarps*32, smem, stream>>>((const char *) src0->data, (const block_q8_1 *) src1_q8_1.get(), ids_d, dst_d,
+        k_q8_0_smallk<false><<<grid, nwarps*32, smem, stream>>>((const char *) src0->data, (const block_q8_1 *) src1_q8_1.get(), ids_d, dst_d,
             (int) (ne00/QK8_0), (int) ne01, src0->nb[1], src0->nb[2], stride_col_y, stride_channel_y, (int) nchannels_y,
             stride_col_dst, stride_channel_dst, ids_stride);
     } else
@@ -2518,4 +2540,30 @@ static void ggml_cuda_mul_mat_vec_q_chunks(ggml_backend_cuda_context & ctx, cons
         ggml_cuda_mul_mat_vec_q(ctx, src0, &s1, nullptr, &d);
         c0 += w;
     }
+}
+
+// p100-series: SCALE -> SILU -> MUL_MAT (q8_0, K <= 320, one column) in one launch (k_q8_0_smallk<true>); false when not eligible.
+bool ggml_cuda_q8_smallk_scale_silu(ggml_backend_cuda_context & ctx, const ggml_tensor * sc, const ggml_tensor * silu, ggml_tensor * mm) {
+    const ggml_tensor * src0 = mm->src[0];
+    const ggml_tensor * x    = sc->src[0];
+    const int dev = ggml_cuda_get_device();
+    if (mm->op != GGML_OP_MUL_MAT || mm->src[1] != silu || ggml_get_unary_op(silu) != GGML_UNARY_OP_SILU ||
+            src0->type != GGML_TYPE_Q8_0 || x->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32 ||
+            !ggml_is_contiguous(x) || !ggml_is_contiguous(silu) || !ggml_is_contiguous(mm) ||
+            silu->ne[1] != 1 || silu->ne[2] != 1 || silu->ne[3] != 1 || src0->ne[2] != 1 || src0->ne[3] != 1 ||
+            src0->ne[0] != silu->ne[0] || src0->ne[0] % QK8_0 != 0 || src0->ne[0]/QK8_0 > Q8_SK_MAXB ||
+            src0->nb[1] != (size_t) (src0->ne[0]/QK8_0)*sizeof(block_q8_0) || src0->nb[1] % 4 != 0 || (uintptr_t) src0->data % 4 != 0 ||
+            ggml_cuda_info().devices[dev].cc >= GGML_CUDA_CC_VOLTA) {
+        return false;
+    }
+    float scale, bias;
+    memcpy(&scale, (const float *) sc->op_params + 0, sizeof(float));
+    memcpy(&bias,  (const float *) sc->op_params + 1, sizeof(float));
+    const int64_t ne00 = src0->ne[0], ne01 = src0->ne[1];
+    const int nwarps = (int) std::max<size_t>(1, std::min<size_t>(4, (size_t) 45056 / (32*src0->nb[1])));
+    const dim3 grid((unsigned) ((ne01 + 32*nwarps - 1)/(32*nwarps)), 1, 1);
+    const size_t smem = (size_t) nwarps*32*src0->nb[1] + (size_t) (ne00/QK8_0)*sizeof(block_q8_1);
+    k_q8_0_smallk<true><<<grid, nwarps*32, smem, ctx.stream()>>>((const char *) src0->data, nullptr, nullptr, (float *) mm->data,
+        (int) (ne00/QK8_0), (int) ne01, src0->nb[1], src0->nb[2], 0, 0, 1, 0, 0, 0, (const float *) x->data, scale, bias);
+    return true;
 }

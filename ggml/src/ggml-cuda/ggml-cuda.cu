@@ -6030,6 +6030,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     // p100-series: SCALE -> SILU (GGML_CUDA_FUSE_SCALE_SILU=0: off)
     static const bool fuse_scale_silu = [] { const char * e = getenv("GGML_CUDA_FUSE_SCALE_SILU"); return !e || atoi(e) != 0; }();
+    // ... and with the q8_0 short-row matvec that consumes it (hyper-connection up): GGML_CUDA_FUSE_HC_UP=0: off
+    // (=ab: only while GGML_CUDA_AB_FILE exists)
+    static const int fuse_hc_up = [] { const char * e = getenv("GGML_CUDA_FUSE_HC_UP"); return !e ? 1 : strcmp(e, "ab") == 0 ? 2 : atoi(e) != 0; }();
+    if (fuse_scale_silu && (fuse_hc_up == 2 ? ggml_cuda_ab_alt() : fuse_hc_up != 0) && i + 2 < cgraph->n_nodes &&
+            ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU }) &&
+            ggml_node_get_use_count(cgraph, i + 1) == 1 && !(cgraph->nodes[i + 1]->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+            ggml_cuda_q8_smallk_scale_silu(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2])) {
+        return 2;
+    }
     if (fuse_scale_silu && ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU }) &&
             ggml_cuda_op_scale_silu(*cuda_ctx, node, cgraph->nodes[i + 1])) {
         return 1;
