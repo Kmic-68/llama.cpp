@@ -24,3 +24,8 @@ bool ggml_cuda_mul_mat_vec_q_chunked(ggml_backend_cuda_context & ctx, const ggml
 bool ggml_cuda_mul_mat_vec_q_chunked_strided(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
 
 bool ggml_cuda_q8_smallk_scale_silu(ggml_backend_cuda_context & ctx, const ggml_tensor * sc, const ggml_tensor * silu, ggml_tensor * mm);
+
+// p100-series: hand a SWIGLU (dst = the next MUL_MAT_ID's src1) to mmvq, which applies it in the IQ4_NL short-row kernel or
+// computes it first; take_glu_consumed() is false when mmvq never ran (the caller must run the SWIGLU and redo the matmul)
+void ggml_cuda_mmvq_set_glu(ggml_tensor * glu);
+bool ggml_cuda_mmvq_take_glu_consumed();

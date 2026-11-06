@@ -2038,11 +2038,16 @@ static void mul_mat_vec_q_switch_type(
 #define MOE_SK_MAXB  16   // up to 16 blocks (K <= 512) per row: 4 warps x 32 rows x 16 x 18 B of shared memory
 static __constant__ int8_t moe_sk_kvalues[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 13, 25, 38, 53, 69, 89, 113};
 
+// FX: the activation is SWIGLU(x, g) of the f32 inputs (rows of 32*nblk values, row = t*nchannels_y + c % nchannels_y), applied
+// and quantized to q8_1 in the kernel with exactly the operations of unary_gated_op_kernel<op_silu> and quantize_q8_1
+// (bit-identical): the routed experts' SWIGLU -> down projection in one launch instead of three.
+template <bool FX>
 static __global__ void __launch_bounds__(MOE_SK_WARPS*32, 4) k_moe_iq4nl_smallk(
         const char * __restrict__ vx, const block_q8_1 * __restrict__ vy, const int32_t * __restrict__ ids, float * __restrict__ dst,
         const int nblk, const int nrows, const size_t nb01, const size_t nb02,
         const int64_t stride_col_y, const int64_t stride_channel_y, const int nchannels_y,
-        const int64_t stride_col_dst, const int64_t stride_channel_dst, const int64_t ids_stride) {
+        const int64_t stride_col_dst, const int64_t stride_channel_dst, const int64_t ids_stride,
+        const float * __restrict__ xg = nullptr, const float * __restrict__ gg = nullptr, const int64_t o0 = 0, const int64_t o1 = 0) {
     const int warp = threadIdx.x / 32, lane = threadIdx.x % 32;
     const int c = blockIdx.y, t = blockIdx.z;
     const int32_t e = ids[t*ids_stride + c];
@@ -2057,9 +2062,27 @@ static __global__ void __launch_bounds__(MOE_SK_WARPS*32, 4) k_moe_iq4nl_smallk(
     if (threadIdx.x < 16) {
         kv[threadIdx.x] = moe_sk_kvalues[threadIdx.x];
     }
-    const block_q8_1 * y = vy + (c % nchannels_y)*stride_channel_y + t*stride_col_y;
-    for (int i = threadIdx.x; i < nblk*(int) (sizeof(block_q8_1)/4); i += blockDim.x) {
-        ys[i] = ((const uint32_t *) y)[i];
+    if constexpr (FX) {
+        block_q8_1 * yq = (block_q8_1 *) ys;
+        const int64_t arow = (int64_t) t*nchannels_y + c % nchannels_y;
+        for (int b = warp; b < nblk; b += MOE_SK_WARPS) {
+            const int64_t col = 32*b + lane;
+            const float xi = ggml_cuda_op_silu_single(xg[arow*o0 + col]) * gg[arow*o1 + col];
+            float amax = fabsf(xi);
+            float sum  = xi;
+            amax = warp_reduce_max<QK8_1>(amax);
+            sum  = warp_reduce_sum<QK8_1>(sum);
+            const float d = amax / 127.0f;
+            yq[b].qs[lane] = amax == 0.0f ? 0 : roundf(xi / d);
+            if (lane == 0) {
+                yq[b].ds = make_half2(d, sum);
+            }
+        }
+    } else {
+        const block_q8_1 * y = vy + (c % nchannels_y)*stride_channel_y + t*stride_col_y;
+        for (int i = threadIdx.x; i < nblk*(int) (sizeof(block_q8_1)/4); i += blockDim.x) {
+            ys[i] = ((const uint32_t *) y)[i];
+        }
     }
     const int r0 = (blockIdx.x*MOE_SK_WARPS + warp)*32;
     const uint32_t * src = (const uint32_t *) (vx + (size_t) e*nb02 + (size_t) r0*nb01);
@@ -2200,6 +2223,27 @@ static __global__ void __launch_bounds__(128, 4) k_q8_0_smallk(
     dst[t*stride_col_dst + c*stride_channel_dst + row] = acc;
 }
 
+static bool moe_smallk_on() {
+    static const bool on = [] { const char * e = getenv("GGML_CUDA_MOE_SMALLK"); return !e || atoi(e) != 0; }();
+    return on;
+}
+
+// p100-series: SWIGLU -> MUL_MAT_ID handover (one host thread per device under the meta backend: thread-local)
+static thread_local ggml_tensor * mmvq_glu_tl          = nullptr;
+static thread_local bool          mmvq_glu_consumed_tl = false;
+
+void ggml_cuda_mmvq_set_glu(ggml_tensor * glu) {
+    mmvq_glu_tl          = glu;
+    mmvq_glu_consumed_tl = false;
+}
+
+bool ggml_cuda_mmvq_take_glu_consumed() {
+    const bool r = mmvq_glu_consumed_tl;
+    mmvq_glu_tl          = nullptr;
+    mmvq_glu_consumed_tl = false;
+    return r;
+}
+
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
@@ -2316,6 +2360,40 @@ void ggml_cuda_mul_mat_vec_q(
         return;
     }
 
+    // a SWIGLU handed over by ggml_cuda_try_fuse (ggml_cuda_mmvq_set_glu): applied inside the IQ4_NL short-row kernel when that
+    // runs, else computed here before anything reads src1
+    if (mmvq_glu_tl != nullptr) {
+        ggml_tensor * glu = mmvq_glu_tl;
+        mmvq_glu_tl = nullptr;
+        mmvq_glu_consumed_tl = true;
+        const ggml_tensor * g0 = glu->src[0];
+        const ggml_tensor * g1 = glu->src[1];
+        if (src1 == glu && ids && !fusion && moe_smallk_on() && src0->type == GGML_TYPE_IQ4_NL && ne00 % QK4_NL == 0 &&
+                ne00/QK4_NL <= MOE_SK_MAXB && src0->nb[1] == (size_t) (ne00/QK4_NL)*18 && src0->nb[1] % 4 == 0 &&
+                src0->nb[2] % 4 == 0 && (uintptr_t) src0->data % 4 == 0 && ne2 == 1 && ne10 == ne00 &&
+                g0->type == GGML_TYPE_F32 && (!g1 || g1->type == GGML_TYPE_F32) && ggml_is_contiguous(glu) &&
+                ggml_cuda_info().devices[ggml_cuda_get_device()].cc < GGML_CUDA_CC_VOLTA) {
+            const float * xg = (const float *) g0->data;
+            const float * gg = g1 ? (const float *) g1->data : xg;
+            const int32_t swapped = ((const int32_t *) glu->op_params)[1];
+            if (!g1) {
+                const int64_t nc = g0->ne[0]/2;
+                xg += swapped ? nc : 0;
+                gg += swapped ? 0 : nc;
+            }
+            const int64_t o0 = g0->nb[1]/sizeof(float);
+            const int64_t o1 = g1 ? g1->nb[1]/sizeof(float) : o0;
+            const dim3 grid((unsigned) ((ne01 + 32*MOE_SK_WARPS - 1)/(32*MOE_SK_WARPS)), (unsigned) ne1, 1);
+            const size_t smem = (size_t) MOE_SK_WARPS*32*src0->nb[1] + (size_t) (ne00/QK4_NL)*sizeof(block_q8_1);
+            k_moe_iq4nl_smallk<true><<<grid, MOE_SK_WARPS*32, smem, stream>>>((const char *) src0->data, nullptr, ids_d, dst_d,
+                (int) (ne00/QK4_NL), (int) ne01, src0->nb[1], src0->nb[2], 0, 0, (int) ne11,
+                (int64_t) (dst->nb[2]/ts_dst), (int64_t) (dst->nb[1]/ts_dst), (int64_t) (ids->nb[1]/ggml_type_size(ids->type)),
+                xg, gg, o0, o1);
+            return;
+        }
+        ggml_cuda_op_swiglu(ctx, glu);
+    }
+
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
     const size_t  q8_1_bytes  = ne13*ne12 * ne11a*ne10_padded * sizeof(block_q8_1)/QK8_1;
 
@@ -2382,13 +2460,12 @@ void ggml_cuda_mul_mat_vec_q(
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
-    static const bool moe_smallk = [] { const char * e = getenv("GGML_CUDA_MOE_SMALLK"); return !e || atoi(e) != 0; }();
-    if (moe_smallk && ids && !fusion && src0->type == GGML_TYPE_IQ4_NL && ne00 % QK4_NL == 0 && ne00/QK4_NL <= MOE_SK_MAXB &&
+    if (moe_smallk_on() && ids && !fusion && src0->type == GGML_TYPE_IQ4_NL && ne00 % QK4_NL == 0 && ne00/QK4_NL <= MOE_SK_MAXB &&
             src0->nb[1] == (size_t) (ne00/QK4_NL)*18 && src0->nb[1] % 4 == 0 && src0->nb[2] % 4 == 0 && (uintptr_t) src0->data % 4 == 0 &&
             ggml_cuda_info().devices[dev].cc < GGML_CUDA_CC_VOLTA) {
         const dim3 grid((unsigned) ((ne01 + 32*MOE_SK_WARPS - 1)/(32*MOE_SK_WARPS)), (unsigned) nchannels_dst, (unsigned) ncols_dst);
         const size_t smem = (size_t) MOE_SK_WARPS*32*src0->nb[1] + (size_t) (ne00/QK4_NL)*sizeof(block_q8_1);
-        k_moe_iq4nl_smallk<<<grid, MOE_SK_WARPS*32, smem, stream>>>((const char *) src0->data, (const block_q8_1 *) src1_q8_1.get(), ids_d, dst_d,
+        k_moe_iq4nl_smallk<false><<<grid, MOE_SK_WARPS*32, smem, stream>>>((const char *) src0->data, (const block_q8_1 *) src1_q8_1.get(), ids_d, dst_d,
             (int) (ne00/QK4_NL), (int) ne01, src0->nb[1], src0->nb[2], stride_col_y, stride_channel_y, (int) nchannels_y,
             stride_col_dst, stride_channel_dst, ids_stride);
         return;

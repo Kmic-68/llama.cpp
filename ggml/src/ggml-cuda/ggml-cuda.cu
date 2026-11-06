@@ -4933,6 +4933,29 @@ bool ggml_cuda_ab_alt() {
 
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
+    // p100-series: routed experts' SWIGLU -> IQ4_NL down projection (one token): the SWIGLU is applied inside the short-row
+    // kernel (mmvq.cu, bit-identical). GGML_CUDA_FUSE_MOE_DOWN=0: off, =ab: only while GGML_CUDA_AB_FILE exists
+    {
+        static const int fuse_down = [] { const char * e = getenv("GGML_CUDA_FUSE_MOE_DOWN"); return !e ? 1 : strcmp(e, "ab") == 0 ? 2 : atoi(e) != 0; }();
+        ggml_tensor * node = cgraph->nodes[i];
+        if (fuse_down != 0 && node->op == GGML_OP_GLU && ggml_get_glu_op(node) == GGML_GLU_OP_SWIGLU && node->type == GGML_TYPE_F32 &&
+                i + 1 < cgraph->n_nodes && (fuse_down == 2 ? ggml_cuda_ab_alt() : true)) {
+            ggml_tensor * mm = cgraph->nodes[i + 1];
+            if (mm->op == GGML_OP_MUL_MAT_ID && mm->src[1] == node && mm->src[0]->type == GGML_TYPE_IQ4_NL && mm->ne[2] == 1 &&
+                    ggml_node_get_use_count(cgraph, i) == 1 && !(node->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                ggml_cuda_mmvq_set_glu(node);
+                ggml_cuda_mul_mat_id(*cuda_ctx, mm);
+                if (!ggml_cuda_mmvq_take_glu_consumed()) {
+                    // the matmul did not go through mmvq: it read a stale src1, redo it after the SWIGLU
+                    ggml_cuda_op_swiglu(*cuda_ctx, node);
+                    cuda_ctx->mmvq_q8_1_src1[ggml_cuda_get_device()] = nullptr;
+                    ggml_cuda_mul_mat_id(*cuda_ctx, mm);
+                }
+                return 1;
+            }
+        }
+    }
+
     // p100-series MoE expert cache: the gate/up/down LRU fills of a layer (same fill list, consecutive) in one launch (always:
     // the copy-engine path needs the three kinds together)
     {
