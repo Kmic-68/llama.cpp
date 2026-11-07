@@ -106,7 +106,7 @@ __device__ __forceinline__ float ggml_cuda_op_sigmoid_single(float x) {
 }
 
 __device__ __forceinline__ float ggml_cuda_op_softplus_single(float x) {
-    return (x > 20.0f) ? x : logf(1.0f + expf(x));
+    return (x > 20.0f) ? x : log1pf(expf(x)); // upstream 74bca3950: log1pf
 }
 
 __device__ __forceinline__ float ggml_cuda_op_gelu_single(float x) {
@@ -130,4 +130,19 @@ __device__ __forceinline__ float ggml_cuda_op_swiglu_clamp_single(float gate, fl
     up = fmaxf(fminf(up, limit), -limit);
 
     return ggml_cuda_op_silu_single(gate) * up;
+}
+
+__device__ __forceinline__ float ggml_cuda_op_glu_single(ggml_glu_op op, float gate, float up, float limit) {
+    switch (op) {
+        case GGML_GLU_OP_SWIGLU:
+            return up * ggml_cuda_op_silu_single(gate);
+        case GGML_GLU_OP_GEGLU:
+            return up * ggml_cuda_op_gelu_single(gate);
+        case GGML_GLU_OP_SWIGLU_OAI:
+            return ggml_cuda_op_swiglu_oai_single(gate, up);
+        case GGML_GLU_OP_SWIGLU_CLAMP:
+            return ggml_cuda_op_swiglu_clamp_single(gate, up, limit);
+        default:
+            return up * gate;
+    }
 }

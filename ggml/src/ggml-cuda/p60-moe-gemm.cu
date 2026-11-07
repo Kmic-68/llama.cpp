@@ -4,9 +4,9 @@
 // Expert matmuls (MUL_MAT_ID) for prompt processing on sm_60 with fp16 math. sm_60 has no dp4a, so MMQ's int8 dot
 // products are emulated (~2.5 TFLOPS on these shapes); here weights are dequantized to fp16 in shared memory and
 // multiplied with HFMA2 (~7 TFLOPS).
-//   1. mm_ids_helper: (token, slot) pairs sorted by expert, their src1 / dst rows, per-expert bounds
+//   1. mm_ids_helper: (token, slot) pairs sorted by expert, their src1 / dst rows, tiles of up to BN pairs
 //   2. the src1 rows of the pairs, gathered in that order, converted to fp16
-//   3. one block turns the expert bounds into a list of tiles (expert, first pair, pairs) - no host sync
+//   3. the tiles become jobs (expert, first pair, pairs) - no host sync
 //   4. a block computes BM rows x BN pairs of one expert: per 64-wide K step the weight tile is dequantized into
 //      shared memory as k-pairs (half2 of k, k + 1), so one 128-bit load gives 4 rows or 4 pairs; HFMA2 over the
 //      step, then the half2 accumulators are flushed to fp32.
@@ -39,27 +39,17 @@ __global__ void moe_gather_f16(const char * __restrict__ src1, int64_t nb11, con
     }
 }
 
-// expert bounds -> tiles of up to BN pairs; one block of n_experts (<= 1024) threads
-__global__ void moe_jobs(const int32_t * __restrict__ bounds, int n_experts, int BN, moe_job * __restrict__ jobs, int * __restrict__ njobs) {
-    __shared__ int cnt[1024];
-    const int e = threadIdx.x;
-    const int n = e < n_experts ? bounds[e + 1] - bounds[e] : 0;
-    const int nt = (n + BN - 1) / BN;
-    cnt[e] = nt;
-    __syncthreads();
-    // inclusive scan (Hillis-Steele)
-    for (int o = 1; o < blockDim.x; o <<= 1) {
-        const int v = e >= o ? cnt[e - o] : 0;
-        __syncthreads();
-        cnt[e] += v;
-        __syncthreads();
+// mm_ids_helper's tile list (tile width BN, upstream #31047) -> jobs. Every entry is written by the helper; an
+// entry may be empty (np 0) and is skipped by the kernels. The tiling does not change the math: each output
+// (pair, row) is still one block's sum over K in the same order.
+__global__ void moe_jobs(const ggml_cuda_mm_id_tile_spec * __restrict__ tiles, int ntj, moe_job * __restrict__ jobs, int * __restrict__ njobs) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < ntj) {
+        const ggml_cuda_mm_id_tile_spec t = tiles[i];
+        jobs[i] = { t.expert, t.col_low, t.col_high - t.col_low };
     }
-    const int first = cnt[e] - nt;
-    for (int t = 0; t < nt; t++) {
-        jobs[first + t] = { e, bounds[e] + t * BN, min(BN, n - t * BN) };
-    }
-    if (e == blockDim.x - 1) {
-        *njobs = cnt[e];
+    if (i == 0) {
+        *njobs = ntj;
     }
 }
 
@@ -76,6 +66,9 @@ __global__ void __launch_bounds__(NTH, 2) moe_gemm_f16(const uint8_t * __restric
         return;
     }
     const moe_job jb = jobs[blockIdx.x];
+    if (jb.np <= 0) {
+        return; // block-uniform
+    }
     const int m0 = blockIdx.y * BMT;
     constexpr int PPT = BN / 16;           // pairs per thread
     constexpr int RPT = BMT / 16;          // rows per thread
@@ -240,6 +233,9 @@ __global__ void __launch_bounds__(NTH_S, 2) moe_small_f16(const uint8_t * __rest
         return;
     }
     const moe_job jb = jobs[blockIdx.x];
+    if (jb.np <= 0) {
+        return; // block-uniform
+    }
     const int row = blockIdx.y * NTH_S + threadIdx.x;
     const uint8_t * Wrow = W + (int64_t) jb.expert * exp_bytes + (int64_t) row * row_bytes;
     constexpr int SBB = TYPE == GGML_TYPE_Q4_K ? 144 : 176, QS = TYPE == GGML_TYPE_Q4_K ? 16 : 48;
@@ -342,17 +338,6 @@ bool ggml_cuda_p60_moe_gemm(ggml_backend_cuda_context & ctx, const ggml_tensor *
     cudaStream_t stream = ctx.stream();
     const int64_t n_pairs = n_tokens * n_used;
 
-    ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), n_pairs);
-    ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), n_pairs);
-    ggml_cuda_pool_alloc<int32_t> bounds(ctx.pool(), n_experts + 1);
-    const int si1  = ids->nb[1] / sizeof(int32_t);
-    const int sis1 = src1->nb[2] / src1->nb[1];
-    ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), bounds.get(),
-        n_experts, n_tokens, n_used, src1->ne[1], si1, sis1, /*write_inverse =*/ false, stream);
-
-    ggml_cuda_pool_alloc<half2> xs(ctx.pool(), n_pairs * K / 2);
-    moe_gather_f16<<<n_pairs, 256, 0, stream>>>((const char *) src1->data, src1->nb[1], ids_src1.get(), (int) K, xs.get());
-
     // tile width from the average pairs per expert (short prompts give experts few tokens)
     const int64_t avg = n_pairs / n_experts;
 
@@ -361,15 +346,29 @@ bool ggml_cuda_p60_moe_gemm(ggml_backend_cuda_context & ctx, const ggml_tensor *
     static const int small_np  = getenv("GGML_CUDA_P60_MOE_SMALL_NP")  ? atoi(getenv("GGML_CUDA_P60_MOE_SMALL_NP"))  : 8;
     static const int small_avg = getenv("GGML_CUDA_P60_MOE_SMALL_AVG") ? atoi(getenv("GGML_CUDA_P60_MOE_SMALL_AVG")) : 24;
     const int small_lim = src0->type == GGML_TYPE_Q4_K ? small_avg : small_avg / 2;
-    if (small_on && avg < small_lim && M % NTH_S == 0 && src0->type != GGML_TYPE_Q6_K && (small_np == 4 || small_np == 8 || small_np == 16)) {
-        const int max_jobs = (int) ((n_pairs + small_np - 1) / small_np + n_experts);
-        ggml_cuda_pool_alloc<moe_job> jobs(ctx.pool(), max_jobs);
-        ggml_cuda_pool_alloc<int> njobs(ctx.pool(), 1);
-        int nthr = 32;
-        while (nthr < n_experts) {
-            nthr *= 2;
-        }
-        moe_jobs<<<1, nthr, 0, stream>>>(bounds.get(), (int) n_experts, small_np, jobs.get(), njobs.get());
+    const bool small = small_on && avg < small_lim && M % NTH_S == 0 && src0->type != GGML_TYPE_Q6_K &&
+        (small_np == 4 || small_np == 8 || small_np == 16);
+    const int bn = small ? small_np : avg >= 40 ? 64 : avg >= 12 ? 32 : 16;
+
+    // (token, slot) pairs sorted by expert and cut into tiles of up to bn pairs
+    const int ntj = (int) ((n_pairs + bn - 1) / bn + n_experts);
+    ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), n_pairs);
+    ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), n_pairs);
+    ggml_cuda_pool_alloc<ggml_cuda_mm_id_tile_spec> tiles(ctx.pool(), ntj);
+    const int si1  = ids->nb[1] / sizeof(int32_t);
+    const int sis1 = src1->nb[2] / src1->nb[1];
+    ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), tiles.get(),
+        n_experts, n_tokens, n_used, src1->ne[1], bn, si1, sis1, /*write_inverse =*/ false, stream);
+
+    ggml_cuda_pool_alloc<half2> xs(ctx.pool(), n_pairs * K / 2);
+    moe_gather_f16<<<n_pairs, 256, 0, stream>>>((const char *) src1->data, src1->nb[1], ids_src1.get(), (int) K, xs.get());
+
+    const int max_jobs = ntj;
+    ggml_cuda_pool_alloc<moe_job> jobs(ctx.pool(), max_jobs);
+    ggml_cuda_pool_alloc<int> njobs(ctx.pool(), 1);
+    moe_jobs<<<(ntj + 255) / 256, 256, 0, stream>>>(tiles.get(), ntj, jobs.get(), njobs.get());
+
+    if (small) {
         using kfn = void (*)(const uint8_t *, int64_t, int64_t, int, const half2 *, const moe_job *, const int *, const int32_t *, char *, int64_t);
 #define P60_MOE_SMALL_K(TYPE) { moe_small_f16<TYPE, 4>, moe_small_f16<TYPE, 8>, moe_small_f16<TYPE, 16> }
         static const kfn kern[2][3] = { P60_MOE_SMALL_K(GGML_TYPE_Q4_K), P60_MOE_SMALL_K(GGML_TYPE_Q5_K) };
@@ -381,16 +380,6 @@ bool ggml_cuda_p60_moe_gemm(ggml_backend_cuda_context & ctx, const ggml_tensor *
         CUDA_CHECK(cudaGetLastError());
         return true;
     }
-
-    const int bn = avg >= 40 ? 64 : avg >= 12 ? 32 : 16;
-    const int max_jobs = (int) ((n_pairs + bn - 1) / bn + n_experts);
-    ggml_cuda_pool_alloc<moe_job> jobs(ctx.pool(), max_jobs);
-    ggml_cuda_pool_alloc<int> njobs(ctx.pool(), 1);
-    int nthr = 32;
-    while (nthr < n_experts) {
-        nthr *= 2;
-    }
-    moe_jobs<<<1, nthr, 0, stream>>>(bounds.get(), (int) n_experts, bn, jobs.get(), njobs.get());
 
     const int bmt = bn == 64 && M % 128 == 0 ? 128 : 64;
     const dim3 grid(max_jobs, M / bmt);

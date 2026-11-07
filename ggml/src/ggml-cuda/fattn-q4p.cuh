@@ -231,6 +231,7 @@ static __global__ void flash_attn_ext_q4p(
         const char * __restrict__ mask,
         const char * __restrict__ sinks,
         const int  * __restrict__ KV_max,
+        const int  * __restrict__ KV_rows, // never set here: kv_rows attention is MMA-only (ggml_cuda_get_best_fattn_kernel)
         float      * __restrict__ dst,
         float2     * __restrict__ dst_meta,
         const float scale,
@@ -1179,10 +1180,10 @@ static __global__ void flash_attn_ext_q4p(
                 make_float2(m_s[tid]*LN2, lsum);
         }
     }
-    GGML_UNUSED_VARS(sinks, KV_max, max_bias, m0, m1, n_head_log2, logit_softcap, ne00, ne03, ne10, ne12, ne13,
+    GGML_UNUSED_VARS(sinks, KV_max, KV_rows, max_bias, m0, m1, n_head_log2, logit_softcap, ne00, ne03, ne10, ne12, ne13,
         ne31, ne32, nb32);
 #else
-    GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, dst, dst_meta, scale, max_bias, m0, m1, n_head_log2,
+    GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, KV_rows, dst, dst_meta, scale, max_bias, m0, m1, n_head_log2,
         logit_softcap, ne00, ne01, ne02, ne03, nb01, nb02, nb03, ne10, ne11, ne12, ne13, nb11, nb12, nb13,
         nb21, nb22, nb23, ne31, ne32, ne33, nb31, nb32, nb33);
     NO_DEVICE_CODE;
