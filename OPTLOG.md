@@ -9416,3 +9416,45 @@ Correction (11-01, release gate on 27B Q6_K, all q6_K): q6_K at 1 column on the 
   -ub 4: PPL(Q) 3.998090 / 3.988525, identical to p100-optimizations; Q2_K_XL 35B-A3B identical. Op profile: -1.2 % op
   time at decode. GDN_DECODE_FUSION gains mat-vec-produced alpha/b cases.
 - 27B Q6_K gate, prefill: PPL(Q) 2.609315 (identical) with #18 on and off.
+
+## 329 — upstream merge ca89968a2 (312 commits, 10-24 .. 11-06) (2026-11-06): kept
+
+13 conflicted files; how each overlap was resolved is in the merge commit message. Breaks the textual merge hid,
+all caught by the build: the q4p FA kernel lacked upstream's new `KV_rows` kernel argument, the qwen35 MTP K/V-only
+path used the old single K/V rotation (now per layer, #31073), and upstream's own MTP get_state/set_state
+duplicated ours (ours kept: position + row). Upstream's kv_rows attention (#29510) is MMA-only, so on sm_60 the
+probe declines it and our compact/dense mask path runs as before. Upstream's MoE layout rewrite (#31047) replaced
+our repeated-expert-id handling in MMQ/MMF (upstream keeps those tests disabled); the opt-in fp16 MoE GEMM
+(#19) was ported to its tile list (MUL_MAT_ID 949/949 with and without GGML_CUDA_P60_MOE_GEMM=1).
+
+Math, against saved logits of the pre-merge build (5ea43a7d9), 27B, -ctk/-ctv q4_0:
+
+| case | base PPL | merge PPL(Q) | KLD | same top | merge with 74bca3950 reverted |
+|---|---|---|---|---|---|
+| Q6_K -c 4096 x 8 | 2.7264 | 2.724466 | 0.001151 | 98.82 % | 2.726440, KLD -0.000006, 100 % |
+| Q6_K -c 512 x 8 -ub 1 | 3.9981 | 4.001762 | 0.002988 | 97.89 % | 3.998090, KLD 0, 100 % |
+| Q6_K -c 512 x 8 -ub 4 | 3.9885 | 3.994078 | 0.000885 | 98.92 % | |
+| Q5_K_M -c 512 x 8 -ub 1 | 4.0306 | 4.025916 | 0.001478 | 98.43 % | |
+
+Two upstream changes move numbers, both accuracy fixes, both kept:
+- 74bca3950 softplus `logf(1 + expf(x))` -> `log1pf(expf(x))` (CPU reference changed too): the Qwen3.8 GDN gate.
+  Against the fp32 reference (Q5_K_M -ub 1, rv/f32ref.kld, itself made with the old formula): KLD 0.001713 vs
+  0.001779 (+-0.00017), so no worse even on a reference biased toward the old formula.
+- 8fc037672 (#31247) q8_1 correction sum from the quantized values: reaches only the MTP head, whose weights are
+  Q4_0 (blk.64.*). The target is untouched (Q5_K_M -c 4096 x 8 vs an fp32 reference: identical, KLD 0.001219, with
+  and without it). Greedy MTP drafts give byte-identical text and acceptance to the base; the draft probabilities
+  move (spec log identical to the base with #31247 reverted). Simulated Q4_0 x q8_1 dot, K 5120: RMS error vs the
+  exact dot 0.58 with the quantized sum, 1.44 with the float sum. Sampled-draft (temp 1.0) texts differ from the
+  base for that reason only.
+Server (qwen-server flags at -c 65536): 3 chat turns, slot save / erase / restore, a branching turn (checkpoint
+restore + the kept-current shortcut); no-MTP greedy and greedy-draft MTP texts identical to the base.
+
+Speed, 27B Q6_K, ABBA twice (first run on warm cards, second on cold):
+
+| run | base tg256 | merge tg256 | base pp2048 | merge pp2048 |
+|---|---|---|---|---|
+| warm (rv6 um um rv6) | 29.15 | 29.35 | 450.6 | 450.7 |
+| cold (um rv6 rv6 um) | 32.52 | 32.66 | 495.3 | 497.2 |
+
+Gate on the merge (cold cards): tg256 33.39 +- 0.16, PPL 2.6086 (pre-merge 2.6093), full op suite 20062/20062 on
+both CUDA devices.
