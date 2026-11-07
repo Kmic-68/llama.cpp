@@ -9652,3 +9652,16 @@ Later on 11-05 (decode, all bit-identical unless noted; 128k decode ABBA within 
 
 27B gates on this build: tg256 33.50 +- 0.11 t/s, PPL 2.6093 +- 0.0198 (ppl-orig.txt, -c 4096, q4_0 KV), peak GPU0 14605 /
 GPU1 14083 MiB.
+
+## 328 — 27B decode on p100-moe: Q5_K_M broken by the SWIGLU handover fallback (fixed) (11-06)
+
+Decode-path check (`llama-perplexity -c 512 -ub 1`, gate corpus) against p100-optimizations 83a7f0839, the first one run
+on this branch: prefill perplexity cannot see the one-column kernels.
+- 27B Q5_K_M: PPL 494039 vs 2.6502. f762f3743's SWIGLU -> one-column MUL_MAT handover is declined by the dense FFN down
+  (q5_K takes the fp16 one-column path); the fallback redid the SWIGLU but kept mmvq-f16's cached activation of the stale
+  src1. Fixed: the fallback also invalidates that cache, and a weight that declined once is not offered again (the
+  first version ran that matmul twice per token). Q5_K_M decode PPL 2.6502, identical to p100-optimizations.
+- 27B Q6_K: decode PPL(Q) 3.9884 vs 3.9981 (KLD 0.0029 at -ub 1, identical at -ub 4). Both differences are summation
+  order: GGML_CUDA_Q8_SMALLM (q8_0 few-row geometry) and GGML_CUDA_MMVF_FEWROWS (f32 few-row matvec, the GDN alpha/beta);
+  with both =0 the result is identical to p100-optimizations. Not judged against an fp32 reference.
+- 27B Q6_K prefill (gate): PPL(Q) 2.609315, identical to p100-optimizations.

@@ -1,3 +1,4 @@
+#include <unordered_set>
 #include "ggml-cuda.h"
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
@@ -4945,8 +4946,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             // latter's SWIGLU goes into the q8_1 quantization
             const bool is_id = mm->op == GGML_OP_MUL_MAT_ID && mm->ne[2] == 1;
             const bool is_mm = mm->op == GGML_OP_MUL_MAT && mm->ne[1] == 1 && ggml_is_quantized(mm->src[0]->type);
+            // weights whose matmul once declined the handover (another path, e.g. the fp16 one-column path of q5_K):
+            // not offered again, so that matmul is not run twice per token (one host thread per device: thread-local)
+            static thread_local std::unordered_set<const ggml_tensor *> declined;
             if ((is_id || is_mm) && mm->src[1] == node && ggml_node_get_use_count(cgraph, i) == 1 &&
-                    !(node->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                    !(node->flags & GGML_TENSOR_FLAG_OUTPUT) && declined.find(mm->src[0]) == declined.end()) {
                 ggml_cuda_mmvq_set_glu(node);
                 if (is_id) {
                     ggml_cuda_mul_mat_id(*cuda_ctx, mm);
@@ -4960,8 +4964,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                         warned = true;
                         GGML_LOG_WARN("%s: SWIGLU handover not taken by %s (%s), redone unfused\n", __func__, mm->name, ggml_op_name(mm->op));
                     }
+                    declined.insert(mm->src[0]);
                     ggml_cuda_op_swiglu(*cuda_ctx, node);
+                    // both activation caches may hold a conversion of the stale src1 (the fp16 one broke the 27B
+                    // Q5_K_M at decode: PPL 2.65 -> 494039, its one-column q5_K matmul declines the handover)
                     cuda_ctx->mmvq_q8_1_src1[ggml_cuda_get_device()] = nullptr;
+                    ggml_cuda_mmvq_f16_invalidate(*cuda_ctx);
                     if (is_id) {
                         ggml_cuda_mul_mat_id(*cuda_ctx, mm);
                     } else {
