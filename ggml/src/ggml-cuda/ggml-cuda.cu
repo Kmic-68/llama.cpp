@@ -3807,11 +3807,16 @@ static bool ggml_cuda_memory_overlaps(const ggml_tensor * a, const ggml_tensor *
 }
 
 // The decode pre-ops of gated_delta_net (S_v = 128, one sequence, up to 32 tokens) run inside its kernel:
-//   q, k: scale(rms_norm(x)) (build_gdn_l2_norm), g = softplus(alpha + dt) * A, beta = sigmoid(b), state = get_rows(cache)
-// RMS_NORM(q) SCALE RMS_NORM(k) SCALE [MUL_MAT|CONT] ADD SOFTPLUS MUL [MUL_MAT|CONT] SIGMOID GET_ROWS GATED_DELTA_NET,
-// views between. The producers of alpha and b (the optional nodes) are run first. The alpha/beta mat-vec + gate fusion of
-// the Q6_K path and the gather of the state rows are separate paths that only apply when this one does not.
+//   q, k: scale(rms_norm(x)) (build_gdn_l2_norm), state = get_rows(cache)
+// RMS_NORM(q) SCALE RMS_NORM(k) SCALE GET_ROWS GATED_DELTA_NET, views between. The gate and beta are computed before
+// the chain on their usual path (the models build them first, where the gate/beta mat-vec fusion takes both), so the
+// only arithmetic moved into the kernel is the l2 norm, done in the order of the rms_norm kernel (bit-identical).
 // GGML_CUDA_FUSE_GDN_PRE=0 disables.
+//
+// The submitted version also folded the gate and sigmoid(beta) and ran the alpha and b mat-vecs ahead of the plan.
+// The allocator had put b in alpha's buffer (free again after the skipped ADD), so b overwrote alpha before the
+// kernel read it: KLD 0.09-0.22 at decode, invisible to prefill perplexity and to a test whose alpha and b are inputs.
+// The kernel output still runs ahead of the plan, so it must not overlap anything the kernel reads.
 static int ggml_cuda_try_gdn_fusion(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
     static const bool enabled = [] {
         const char * s = getenv("GGML_CUDA_FUSE_GDN_PRE");
@@ -3820,36 +3825,22 @@ static int ggml_cuda_try_gdn_fusion(ggml_backend_cuda_context * cuda_ctx, ggml_c
     if (!enabled || cgraph->nodes[i]->op != GGML_OP_RMS_NORM || ggml_cuda_info().devices[cuda_ctx->device].warp_size != 32) {
         return 0;
     }
-    constexpr int n_win = 14;
+    constexpr int n_win = 8;
     int idx[n_win];
     idx[0] = i;
     const int n = 1 + ggml_cuda_next_real_nodes(cgraph, i, idx + 1, n_win - 1);
     auto at = [&](int p) { return p < n ? cgraph->nodes[idx[p]] : nullptr; };
 
-    ggml_tensor * pre[4];
-    int n_pre = 0;
-    int p = 4;
-    auto take_pre = [&]() {
-        while (at(p) && (at(p)->op == GGML_OP_MUL_MAT || at(p)->op == GGML_OP_CONT) && n_pre < 4) {
-            pre[n_pre++] = at(p++);
-        }
-    };
-    const ggml_tensor * rq = at(0);
-    const ggml_tensor * sq = at(1);
-    const ggml_tensor * rk = at(2);
-    const ggml_tensor * sk = at(3);
-    take_pre();
-    const ggml_tensor * add = at(p++);
-    const ggml_tensor * sp  = at(p++);
-    const ggml_tensor * mul = at(p++);
-    take_pre();
-    const ggml_tensor * sig  = at(p++);
-    const ggml_tensor * rows = at(p++);
-    ggml_tensor *       gdn  = at(p++);
-    if (!gdn) {
+    const ggml_tensor * rq   = at(0);
+    const ggml_tensor * sq   = at(1);
+    const ggml_tensor * rk   = at(2);
+    const ggml_tensor * sk   = at(3);
+    const ggml_tensor * rows = at(4);
+    ggml_tensor *       gdn  = at(5);
+    if (!gdn || !rows) {
         return 0;
     }
-    const int last = idx[p - 1];
+    const int last = idx[5];
 
     if (!ggml_cuda_gdn_state_rows_ok(rows, gdn) || gdn->src[2]->ne[0] != 128 || gdn->src[3]->ne[0] != 1) {
         return 0;
@@ -3869,45 +3860,18 @@ static int ggml_cuda_try_gdn_fusion(ggml_backend_cuda_context * cuda_ctx, ggml_c
         return 0;
     }
 
-    // g = softplus(alpha + dt) * A with dt and A per head
-    const ggml_tensor * alpha = add->src[0];
-    const ggml_tensor * dt    = add->src[1];
-    const ggml_tensor * A     = mul->src[1];
-    const int64_t       H     = gdn->src[2]->ne[1];
-    if (add->op != GGML_OP_ADD || sp->op != GGML_OP_UNARY || ggml_get_unary_op(sp) != GGML_UNARY_OP_SOFTPLUS ||
-        mul->op != GGML_OP_MUL || sp->src[0] != add || mul->src[0] != sp || gdn->src[3]->view_src != mul ||
-        alpha->type != GGML_TYPE_F32 || dt->type != GGML_TYPE_F32 || A->type != GGML_TYPE_F32 ||
-        add->type != GGML_TYPE_F32 || sp->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 ||
-        !ggml_is_contiguous(alpha) || alpha->ne[0] != H || ggml_nelements(alpha) != ggml_nelements(gdn->src[3]) ||
-        !ggml_is_contiguous(dt) || ggml_nelements(dt) != H || !ggml_is_contiguous(A) || ggml_nelements(A) != H ||
-        !ggml_are_same_shape(alpha, add) || !ggml_are_same_shape(alpha, mul)) {
-        return 0;
-    }
-
-    // beta = sigmoid(b)
-    const ggml_tensor * b = sig->src[0];
-    if (sig->op != GGML_OP_UNARY || ggml_get_unary_op(sig) != GGML_UNARY_OP_SIGMOID || gdn->src[4] != sig ||
-        sig->type != GGML_TYPE_F32 || b->type != GGML_TYPE_F32 || !ggml_is_contiguous(b) ||
-        !ggml_are_same_shape(b, sig)) {
-        return 0;
-    }
-
     for (int j = i; j < last; ++j) {
         if (!ggml_cuda_uses_within(cgraph, j, i + 1, last)) {
             return 0;
         }
     }
-    for (int j = 0; j < n_pre; ++j) {
-        if (!(pre[j]->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+
+    // the kernel output is written ahead of the plan: disjoint from q, k, v, g and beta
+    for (int r = 0; r < 5; ++r) {
+        const ggml_tensor * t = r == 0 ? q : r == 1 ? k : gdn->src[r];
+        if (ggml_cuda_memory_overlaps(gdn, t)) {
             return 0;
         }
-    }
-
-    // the kernel runs ahead of the planned position of its output: that memory may be the one of alpha or b
-    // (freed after their last use here) or of q and k, which the kernel still reads
-    if (ggml_cuda_memory_overlaps(gdn, alpha) || ggml_cuda_memory_overlaps(gdn, b) ||
-        ggml_cuda_memory_overlaps(gdn, q) || ggml_cuda_memory_overlaps(gdn, k)) {
-        return 0;
     }
 
     ggml_cuda_gated_delta_net_fused_cache cache;
@@ -3915,15 +3879,8 @@ static int ggml_cuda_try_gdn_fusion(ggml_backend_cuda_context * cuda_ctx, ggml_c
     ggml_cuda_gdn_set_state_rows(cache, rows);
     cache.q        = q;
     cache.k        = k;
-    cache.alpha    = alpha;
-    cache.b        = b;
-    cache.dt       = (const float *) dt->data;
-    cache.A        = (const float *) A->data;
     cache.l2_eps   = ggml_get_op_params_f32(rq, 0);
     cache.l2_scale = ggml_get_op_params_f32(sq, 0);
-    for (int j = 0; j < n_pre; ++j) {
-        GGML_ASSERT(ggml_cuda_compute_forward(*cuda_ctx, pre[j]));
-    }
     ggml_cuda_op_gated_delta_net_fused_cache(*cuda_ctx, gdn, cache);
     return last - i + skip;
 }

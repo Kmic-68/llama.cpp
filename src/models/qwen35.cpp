@@ -457,11 +457,12 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
     cb(k_conv, "k_conv_predelta", il);
     cb(v_conv, "v_conv_predelta", il);
 
-    // read the state right before the delta net (backends can fuse the read into it)
-    ggml_build_forward_expand(gf, q_conv);
-    ggml_build_forward_expand(gf, k_conv);
+    // gate and beta first, next to each other (backends fuse both mat-vecs and their epilogues), then the
+    // q/k norms and the state read right before the delta net (backends can fuse those into it)
     ggml_build_forward_expand(gf, gate);
     ggml_build_forward_expand(gf, beta);
+    ggml_build_forward_expand(gf, q_conv);
+    ggml_build_forward_expand(gf, k_conv);
 
     ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);

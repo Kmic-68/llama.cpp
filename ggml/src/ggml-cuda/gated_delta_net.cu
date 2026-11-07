@@ -11,23 +11,35 @@
 #endif
 
 // l2 norm of one 128-wide head held as 4 values per lane (index r * 32 + lane): scale_out * (x * rsqrt(mean(x^2) + eps)),
-// the rms_norm + scale of build_gdn_l2_norm
+// the rms_norm + scale of build_gdn_l2_norm. Same reduction order and expressions as rms_norm_f32_warp (do_scale), which
+// the unfused graph runs for these rows: each 32-wide chunk reduced across the warp, then the chunk sums -> bit-identical.
 template <int rows_per_lane>
-static __device__ __forceinline__ void gdn_l2_norm_128(float * x, const float eps, const float scale_out, const int ncols) {
-    float ss = 0.0f;
+static __device__ __forceinline__ void gdn_l2_norm_128(float * x, const float eps, const float scale_out, const float bias_out) {
+    constexpr int ncols = 32*rows_per_lane;
+    const int lane = threadIdx.x;
+    float ws[rows_per_lane];
 #pragma unroll
     for (int r = 0; r < rows_per_lane; r++) {
-        ss += x[r] * x[r];
+        float t = 0.0f;
+        t += x[r] * x[r];
+        ws[r] = warp_reduce_sum<32>(t);
     }
-    ss = warp_reduce_sum<32>(ss);
-    const float scale = rsqrtf(ss / ncols + eps);
+    float v2 = 0.0f;
 #pragma unroll
     for (int r = 0; r < rows_per_lane; r++) {
-        x[r] = scale_out * (scale * x[r]);
+        v2 = lane == r ? ws[r] : v2;
+    }
+    const float tmp   = warp_reduce_sum<32>(v2);
+    const float mean  = tmp / ncols;
+    const float scale = rsqrtf(mean + eps);
+#pragma unroll
+    for (int r = 0; r < rows_per_lane; r++) {
+        const float y = scale * x[r];
+        x[r] = scale_out * y + bias_out;
     }
 }
 
-// fuse_in: q and k come before their l2 norm, g is alpha with g = softplus(alpha + dt) * A, beta is taken before its sigmoid
+// fuse_in: q and k come before their l2 norm (in the rms_norm kernel's order: bit-identical)
 // (S_v = 128, 32-wide warps, not KDA; ggml_cuda_gated_delta_net_fused_cache)
 template <int S_v, bool KDA, bool keep_rs_t, bool fuse_in = false>
 __global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * P100_GDN_NWARPS, 2)
@@ -58,11 +70,9 @@ gated_delta_net_cuda(const float * q,
                                      int           K,
                                      const int32_t * s_idx,
                                      int64_t       s_row,
-                                     const float * dt,
-                                     const float * A,
                                      float         l2_eps,
                                      float         l2_scale,
-                                     int           l2_ncols) {
+                                     float         l2_bias) {
     const uint32_t h_idx    = blockIdx.x;
     const uint32_t sequence = blockIdx.y;
     // each warp owns one column, using warp-level primitives to reduce across rows
@@ -155,17 +165,14 @@ gated_delta_net_cuda(const float * q,
 
             if constexpr (fuse_in) {
                 if constexpr (S_v == 128 && warp_size == 32) {
-                    gdn_l2_norm_128<rows_per_lane>(k_reg, l2_eps, l2_scale, l2_ncols);
-                    gdn_l2_norm_128<rows_per_lane>(q_reg, l2_eps, l2_scale, l2_ncols);
-                    g_val    = expf(ggml_cuda_op_softplus_single(*g_t + dt[h_idx]) * A[h_idx]);
-                    beta_val = ggml_cuda_op_sigmoid_single(*b_t);
+                    gdn_l2_norm_128<rows_per_lane>(k_reg, l2_eps, l2_scale, l2_bias);
+                    gdn_l2_norm_128<rows_per_lane>(q_reg, l2_eps, l2_scale, l2_bias);
                 } else {
                     NO_DEVICE_CODE;
                 }
-            } else {
-                g_val    = expf(*g_t);
-                beta_val = *b_t;
             }
+            g_val    = expf(*g_t);
+            beta_val = *b_t;
             v_val    = *v_t;
 
             q_t += sq2;
@@ -289,11 +296,9 @@ gated_delta_net_cuda(const float * q,
 
 // optional in-kernel pre-ops (fuse_in), see ggml_cuda_gated_delta_net_fused_cache
 struct gdn_fused_in_args {
-    const float * dt       = nullptr;
-    const float * A        = nullptr;
     float         l2_eps   = 0.0f;
     float         l2_scale = 0.0f;
-    int           l2_ncols = 0;
+    float         l2_bias  = 0.0f; // the SCALE's bias (0: checked by the matcher), kept as a value like rms_norm_f32_warp's
 };
 
 template <bool KDA, bool keep_rs_t, bool fuse_in = false>
@@ -324,7 +329,7 @@ static void launch_gated_delta_net(
             q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
             n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
             sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_idx, s_row,
-            fin.dt, fin.A, fin.l2_eps, fin.l2_scale, fin.l2_ncols);
+            fin.l2_eps, fin.l2_scale, fin.l2_bias);
         return;
     }
     switch (S_v) {
@@ -333,21 +338,21 @@ static void launch_gated_delta_net(
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_idx, s_row,
-                fin.dt, fin.A, fin.l2_eps, fin.l2_scale, fin.l2_ncols);
+                fin.l2_eps, fin.l2_scale, fin.l2_bias);
             break;
         case 32:
             ggml_cuda_kernel_launch(gated_delta_net_cuda<32, KDA, keep_rs_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_idx, s_row,
-                fin.dt, fin.A, fin.l2_eps, fin.l2_scale, fin.l2_ncols);
+                fin.l2_eps, fin.l2_scale, fin.l2_bias);
             break;
         case 64: {
             ggml_cuda_kernel_launch(gated_delta_net_cuda<64, KDA, keep_rs_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_idx, s_row,
-                fin.dt, fin.A, fin.l2_eps, fin.l2_scale, fin.l2_ncols);
+                fin.l2_eps, fin.l2_scale, fin.l2_bias);
             break;
         }
         case 128: {
@@ -355,7 +360,7 @@ static void launch_gated_delta_net(
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K, s_idx, s_row,
-                fin.dt, fin.A, fin.l2_eps, fin.l2_scale, fin.l2_ncols);
+                fin.l2_eps, fin.l2_scale, fin.l2_bias);
             break;
         }
         default:
@@ -402,7 +407,7 @@ bool ggml_cuda_gdn_alt(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_alt_
 
 static void ggml_cuda_op_gated_delta_net_impl(
         ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_cuda_gated_delta_net_fused_cache * cache) {
-    // with fuse_in the kernel takes q, k, alpha and beta before their pre-ops (same layout)
+    // with fuse_in the kernel takes q and k before their l2 norm (same layout)
     const bool fuse_in = cache != nullptr && cache->q != nullptr;
 
     const ggml_tensor * src_q     = fuse_in ? cache->q : dst->src[0];
@@ -435,19 +440,14 @@ static void ggml_cuda_op_gated_delta_net_impl(
     const float * q_d = (const float *) src_q->data;
     const float * k_d = (const float *) src_k->data;
     const float * v_d = (const float *) src_v->data;
-    const float * g_d = (const float *) (fuse_in ? cache->alpha : src_g)->data;
-    const float * b_d = (const float *) (fuse_in ? cache->b : src_beta)->data;
+    const float * g_d = (const float *) src_g->data;
+    const float * b_d = (const float *) src_beta->data;
 
     gdn_fused_in_args fin;
     if (fuse_in) {
         GGML_ASSERT(!kda && S_v == 128 && neq0 == 128);
-        GGML_ASSERT(ggml_nelements(cache->alpha) == ggml_nelements(src_g) && ggml_is_contiguous(cache->alpha));
-        GGML_ASSERT(ggml_are_same_shape(cache->b, src_beta) && ggml_is_contiguous(cache->b));
-        fin.dt       = cache->dt;
-        fin.A        = cache->A;
         fin.l2_eps   = cache->l2_eps;
         fin.l2_scale = cache->l2_scale;
-        fin.l2_ncols = (int) neq0;
     }
 
     const float * s_d   = (const float *) src_state->data;

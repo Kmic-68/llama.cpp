@@ -5515,6 +5515,7 @@ struct test_gdn_decode_fusion : public test_case {
     const int64_t n_seqs;
     const int     row;
     const int     head;
+    const ggml_type mm_type;
 
     ggml_tensor * conv_cpy  = nullptr;
     ggml_tensor * state_cpy = nullptr;
@@ -5531,13 +5532,16 @@ struct test_gdn_decode_fusion : public test_case {
     bool run_whole_graph() override { return true; }
     std::vector<ggml_tensor *> fusion_test_nodes() override { return { out, conv_cpy, state_cpy }; }
 
+    // quantized alpha/b mat-vecs: CPU and CUDA quantize the activations differently
+    double max_nmse_err() override { return mm_type == GGML_TYPE_COUNT || mm_type == GGML_TYPE_F32 ? 1e-7 : 5e-4; }
+
     std::string vars() override {
-        return VARS_TO_STR7(H_k, H_v, S, n_t, n_seqs, row, head);
+        return VARS_TO_STR7(H_k, H_v, S, n_t, n_seqs, row, head) + (mm_type == GGML_TYPE_COUNT ? std::string() : ",mm=" + std::string(ggml_type_name(mm_type)));
     }
 
     test_gdn_decode_fusion(int64_t H_k = 4, int64_t H_v = 12, int64_t S = 128, int64_t n_t = 1, int64_t n_seqs = 1,
-            int row = 1, int head = 1)
-        : H_k(H_k), H_v(H_v), S(S), n_t(n_t), n_seqs(n_seqs), row(row), head(head) {}
+            int row = 1, int head = 1, ggml_type mm_type = GGML_TYPE_COUNT)
+        : H_k(H_k), H_v(H_v), S(S), n_t(n_t), n_seqs(n_seqs), row(row), head(head), mm_type(mm_type) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         const int64_t nr = 2*H_k*S + H_v*S; // conv channels
@@ -5548,8 +5552,21 @@ struct test_gdn_decode_fusion : public test_case {
         ggml_tensor * conv_cache = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (d_conv - 1)*nr, n_cells);
         ggml_tensor * ssm_cache  = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, S*S*H_v, n_cells);
         ggml_tensor * ids        = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, n_seqs);
-        ggml_tensor * alpha      = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, H_v, n_t, n_seqs);
-        ggml_tensor * b          = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H_v, n_t, n_seqs);
+        ggml_tensor * alpha;
+        ggml_tensor * b;
+        if (mm_type != GGML_TYPE_COUNT) {
+            // as in the models: alpha and b are mat-vecs of the layer input
+            const int64_t n_embd = 256;
+            ggml_tensor * cur = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_t*n_seqs);
+            ggml_tensor * w_a = ggml_new_tensor_2d(ctx, mm_type, n_embd, H_v);
+            ggml_tensor * w_b = ggml_new_tensor_2d(ctx, mm_type, n_embd, H_v);
+            ggml_set_name(cur, "cur");
+            b     = ggml_reshape_4d(ctx, ggml_mul_mat(ctx, w_b, cur), 1, H_v, n_t, n_seqs);
+            alpha = ggml_reshape_3d(ctx, ggml_mul_mat(ctx, w_a, cur), H_v, n_t, n_seqs);
+        } else {
+            alpha = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, H_v, n_t, n_seqs);
+            b     = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, H_v, n_t, n_seqs);
+        }
         ggml_tensor * dt         = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H_v);
         ggml_tensor * A          = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, H_v);
         ggml_tensor * z          = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, S, H_v, n_t, n_seqs);
@@ -5594,10 +5611,10 @@ struct test_gdn_decode_fusion : public test_case {
         g = ggml_reshape_4d(ctx, g, 1, H_v, n_t, n_seqs);
         ggml_tensor * beta = ggml_sigmoid(ctx, b);
         if (mode == MODE_TEST) {
+            ggml_build_forward_expand(gf, g); // the models build gate and beta first
+            ggml_build_forward_expand(gf, beta);
             ggml_build_forward_expand(gf, q);
             ggml_build_forward_expand(gf, k);
-            ggml_build_forward_expand(gf, g);
-            ggml_build_forward_expand(gf, beta);
         }
 
         // state read right before the delta net, new state stored back
@@ -13005,6 +13022,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_gdn_decode_fusion(4, 12, 128, n_t));
     }
     test_cases.emplace_back(new test_gdn_decode_fusion(16, 48, 128, 1));
+    for (ggml_type t : { GGML_TYPE_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q6_K }) {
+        test_cases.emplace_back(new test_gdn_decode_fusion(16, 48, 128, 1, 1, 1, 1, t));
+        test_cases.emplace_back(new test_gdn_decode_fusion(16, 32, 128, 4, 1, 1, 1, t));
+    }
     test_cases.emplace_back(new test_gdn_decode_fusion(16, 32, 128, 1, 1, /*row=*/0, /*head=*/1));
     test_cases.emplace_back(new test_gdn_decode_fusion(16, 32, 128, 3, 1, /*row=*/2, /*head=*/0));
     test_cases.emplace_back(new test_gdn_decode_fusion(4, 12, 128, 1, /*n_seqs=*/2));

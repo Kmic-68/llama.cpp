@@ -9399,3 +9399,20 @@ Correction (11-01, release gate on 27B Q6_K, all q6_K): q6_K at 1 column on the 
 (integer) vs 28.57 (fp16), ABBA x2; kernel-level the two are even. Default back to integer for q6_K at 1 column
 (GGML_CUDA_MMVQ_F16_Q6_MIN=2; =1 opts in for accuracy). q5_K keeps fp16 at 1 column: Q5_K_M decode KLD vs fp32
 0.00300 -> 0.00178, tg256 hot 29.4 -> 31.5.
+
+## 328 — community PRs #18, #19, #20 (11-06)
+
+- **#20** (maxlawrie, AMD board docs): not taken as a document; its IOMMU finding is a QUICKSTART footnote (iommu=pt).
+- **#19** (KaneQuah / Mrinohk, opt-in fp16 MoE prefill GEMM, `GGML_CUDA_P60_MOE_GEMM=1`): merged as submitted. Math,
+  Qwen3.6-35B-A3B requantized to Q4_K_M (no local model has K-quant experts), -c 4096 x 6, KLD against an fp32-math
+  version of the same GEMM: MMQ (default) 0.0184 / 0.0195 (ub 2048 / 512), PR 0.0135 / 0.0138, fp16 chains flushed every
+  8 or 4 k-pairs 0.0134-0.0137 (noise floor; not kept). The fp16 GEMM is closer to exact than MMQ's q8_1 activations.
+  Its small-batch kernel is bit-identical to the tile kernel (PPL(Q) equal to 6 places). Off by default: 27B unaffected.
+- **#18** (KaneQuah, GDN decode pre-ops in the GDN kernel): as submitted it corrupted decode (27B Q6_K -ub 1: KLD 0.088,
+  same top 90.0 %; Qwen3.6-35B-A3B one GPU: KLD 0.22). Its perplexity check ran at -ub 512, where it never fires. The
+  alpha and b mat-vecs ran ahead of the allocator's plan and b landed in alpha's buffer (free after the skipped ADD).
+  Reworked: the models build gate and beta first (their mat-vec fusion takes both), the kernel folds only the q/k l2
+  norms, in rms_norm_f32_warp's reduction order, and its output may not overlap anything it reads. 27B Q6_K -ub 1 and
+  -ub 4: PPL(Q) 3.998090 / 3.988525, identical to p100-optimizations; Q2_K_XL 35B-A3B identical. Op profile: -1.2 % op
+  time at decode. GDN_DECODE_FUSION gains mat-vec-produced alpha/b cases.
+- 27B Q6_K gate, prefill: PPL(Q) 2.609315 (identical) with #18 on and off.

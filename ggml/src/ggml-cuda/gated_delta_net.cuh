@@ -11,14 +11,9 @@ struct ggml_cuda_gated_delta_net_fused_cache {
     const int *   state_ids        = nullptr;
     int64_t       state_row_stride = 0; // in floats
 
-    // optional pre-ops done in the kernel (S_v = 128): q, k before l2_scale * rms_norm(x, l2_eps),
-    // alpha with g = softplus(alpha + dt) * A, b with beta = sigmoid(b)
+    // optional pre-op done in the kernel (S_v = 128): q, k before l2_scale * rms_norm(x, l2_eps)
     const ggml_tensor * q        = nullptr;
     const ggml_tensor * k        = nullptr;
-    const ggml_tensor * alpha    = nullptr;
-    const ggml_tensor * b        = nullptr;
-    const float *       dt       = nullptr;
-    const float *       A        = nullptr;
     float               l2_eps   = 0.0f;
     float               l2_scale = 0.0f;
 };
