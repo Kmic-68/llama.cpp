@@ -74,7 +74,7 @@ creative writing. Cards that have been under sustained load read ~5-10% lower.
 | `--spec-draft-n-max 4 --spec-draft-p-min 0.2` | draft up to 4 tokens; stop below 20% confidence. Use 3 if you mostly work past ~150k context |
 | `-ngld 99 -ubd 64 -ctkd q4_0 -ctvd q4_0` | the draft layer on the GPU, with its own small ubatch and a q4_0 cache. Without `-ubd 64` the draft runs out of memory at full context |
 | `--temp 1.0 --top-k 20 --top-p 0.95 --min-p 0.0` | the model card's sampling. The gguf doesn't carry min-p, so without the flag llama.cpp's 0.05 applies |
-| `GGML_CUDA_P2P=1` | direct copies between the cards instead of through host memory[^iommu] |
+| `GGML_CUDA_P2P=1` | direct copies between the cards instead of through host memory[^iommu][^plx] |
 | `GGML_CUDA_GRAPHS_PRE_VOLTA=3` | CUDA graphs for the single-token MTP draft steps only. Full graphs (`1`) run out of VRAM at full context |
 | `LLAMA_SPEC_SAMPLE_TEMP=1.0 LLAMA_SPEC_DRAFT_TOPK=20` | the draft samples instead of taking its top token, and the verify uses the speculative-sampling rule. The output distribution is unchanged; more drafts get accepted |
 
@@ -125,3 +125,12 @@ read up to 20% low. To check accuracy, run `tools/gate.sh`; perplexity should la
     In the default translated mode, `nvidia-smi topo -p2p r` can report OK while peer writes are
     dropped (`AMD-Vi: IO_PAGE_FAULT` in `dmesg`). Booting with `iommu=pt` fixed it on an X370 board
     ([PR #20](https://github.com/Kmic-68/llama.cpp/pull/20), measured on the 8 Oct tag).
+
+[^plx]: The same hang can happen on an Intel board where the cards sit behind a PLX switch, with
+    `iommu=pt` already set, and the cause is different: `GGML_CUDA_P2P=1` itself corrupts the peer
+    copies. On 4x Tesla P100-PCIE-16GB behind a PEX8748 Gen3 switch, tensor-split decode hung forever
+    (both cards 100%, ~40 W) and `-sm layer` completed at ~10 t/s but printed garbage. A
+    Llama-3.2-1B control reproduced the garbage on the same pair, each card solo was fine (~257 t/s),
+    and unsetting `GGML_CUDA_P2P` made everything coherent: ~47 t/s per 2-card pair with MTP on
+    Qwen3.8-27B Q6_K (30 t/s without), build `bbad6fcfb`. Same binary, model and flags every time;
+    only the env var changed.
