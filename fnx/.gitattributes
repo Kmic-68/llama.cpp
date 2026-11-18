@@ -1,0 +1,3 @@
+# Every file is stored byte for byte: three of the engine's upstream files have CRLF line endings, and the sources must
+# stay identical to the production engine's (docs/PROVENANCE.md has their SHA-256). Our own files use LF.
+* -text
