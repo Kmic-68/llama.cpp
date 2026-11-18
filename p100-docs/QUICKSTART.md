@@ -78,6 +78,17 @@ creative writing. Cards that have been under sustained load read ~5-10% lower.
 | `GGML_CUDA_GRAPHS_PRE_VOLTA=3` | CUDA graphs for the single-token MTP draft steps only. Full graphs (`1`) run out of VRAM at full context |
 | `LLAMA_SPEC_SAMPLE_TEMP=1.0 LLAMA_SPEC_DRAFT_TOPK=20` | the draft samples instead of taking its top token, and the verify uses the speculative-sampling rule. The output distribution is unchanged; more drafts get accepted |
 
+## Coding agents
+
+Agent clients such as OpenCode send many requests that share a long prefix (system prompt, tool
+definitions, earlier turns) and differ after it. By default the server checkpoints the recurrent
+state only near the end of each prompt, so a request that branches earlier rolls back and
+reprocesses the shared part. `LLAMA_CKPT_USER_SPLIT=1` also checkpoints at user-message
+boundaries. In a user's A/B with OpenCode it cut time to first token from ~1.55 s to ~0.57 s.
+It is off by default because plain chat pays for the extra checkpoint on every turn (~0.4 s on a
+short turn). With `-np 1`, the client's automatic title requests are separate prompts in the same
+slot and push the conversation out of the cache; turning them off helped too.
+
 ## VRAM
 
 Figures are **per card**, at a full 262k context, with nothing else on the GPU. GPU0 is the
