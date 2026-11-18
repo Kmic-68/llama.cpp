@@ -1628,6 +1628,13 @@ struct ggml_backend_cuda_context {
     // the other GPU of a two-GPU tensor split (set when the P2P all-reduce comes up)
     ggml_backend_cuda_context * xchg_peer = nullptr;
 
+    // GDN state gather (ggml_cuda_try_gdn_state_gather): when nothing after the consumer keeps the index tensor
+    // alive, its row index is copied here (one slot per skipped gather in a graph) so the consumer never reads
+    // memory the allocator has already handed to a later tensor
+    static constexpr int gdn_idx_snap_cap = 1024;
+    int32_t * gdn_idx_snap   = nullptr;
+    int       gdn_idx_snap_n = 0;
+
     cudaStream_t peer_copy_stream() {
         if (copy_stream == nullptr) {
             ggml_cuda_set_device(device);

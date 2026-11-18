@@ -9665,3 +9665,23 @@ on this branch: prefill perplexity cannot see the one-column kernels.
   order: GGML_CUDA_Q8_SMALLM (q8_0 few-row geometry) and GGML_CUDA_MMVF_FEWROWS (f32 few-row matvec, the GDN alpha/beta);
   with both =0 the result is identical to p100-optimizations. Not judged against an fp32 reference.
 - 27B Q6_K prefill (gate): PPL(Q) 2.609315, identical to p100-optimizations.
+
+## 330 — p100-moe: -sm tensor decode crash on Qwen3.6-35B-A3B (GDN state gather read a reused index) (11-18)
+
+Reported against p100-optimizations ae35056eb (llama-bench -sm tensor, tg128 after a depth restore: illegal address on
+device 1, 14 of 14 runs, two machines). That build predates 72a97be54, which fixed exactly this on p100-optimizations
+(build-rv6: pp512/tg32 at d2048 run). p100-moe crashed too, and earlier: tg32 at depth 0 already. Cause: aff8f78d2 counted
+the scheduler's split-input copy ("Meta(CUDA0,CUDA1)#rs_s_copy#0") as live because the scheduler flags those input +
+output, but it does that only with pipeline parallelism (n_copies > 1). llama-bench under -sm tensor has one copy, the
+flags are 0, and the allocator reused the index memory before the GDN kernel read it (GGML_CUDA_GDN_GATHER=0 ran; reading
+in place with the GET_ROWS still run crashed; registering but ignoring the index did not). The INPUT-flag test was unsound
+too: ggml-alloc protects only outputs.
+
+Now: live = output-flagged or a later user in the graph; otherwise the 4-byte row index is copied into a persistent
+per-context buffer and the kernel reads that (keeps aff8f78d2's skipped 1 MiB copy per GDN layer).
+- q36 Q4_K_M, 2 cards, -sm tensor, GRAPHS_PRE_VOLTA=3: pp512/tg128 at d0/2048/16384 all run: 1024/78.7, 966/78.2,
+  897/75.0 t/s.
+- Decode path (-c 512 -ub 1, 2 chunks, gate corpus): 4.4557 three runs. With GGML_CUDA_Q8_SMALLM=0 GGML_CUDA_MMVF_FEWROWS=0:
+  [1]2.9589 [2]4.4416, identical to p100-optimizations (build-rv6), so the in-place read is exact.
+- Open: GGML_CUDA_GDN_GATHER=0 on p100-moe is not run-to-run deterministic at -ub 1 under -sm tensor (4.4268, 4.4739);
+  the default path is. p100-optimizations is (4.4416 twice).

@@ -782,6 +782,11 @@ static std::atomic<int> ggml_cuda_lock_counter;
 
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     ggml_cuda_lru_ctx_free(*this);   // p100-series MoE expert cache (moe-lru.cu)
+    if (gdn_idx_snap != nullptr) {
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaFree(gdn_idx_snap));
+        gdn_idx_snap = nullptr;
+    }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         if (mmvq_q8_1_ptr[i] != nullptr) {
             ggml_cuda_set_device(i);
@@ -4785,7 +4790,7 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
 // GET_ROWS that gathers recurrent states whose only consumer, through reshape views, is a gated delta
 // net's state input: skip it and let the kernel read the rows in place (gated_delta_net.cuh).
 // GGML_CUDA_GDN_GATHER=0 turns it off.
-static bool ggml_cuda_try_gdn_state_gather(const ggml_cgraph * cgraph, int i) {
+static bool ggml_cuda_try_gdn_state_gather(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int i) {
     static const bool enabled = [] {
         const char * s = getenv("GGML_CUDA_GDN_GATHER");
         return !s || atoi(s) != 0;
@@ -4878,18 +4883,16 @@ static bool ggml_cuda_try_gdn_state_gather(const ggml_cgraph * cgraph, int i) {
     // The consumer reads the index tensor when it runs, not when this GET_ROWS would have. The graph allocator frees
     // the index after its last consumer in the graph, which is this GET_ROWS for the last recurrent layer: the memory
     // is then reused before the consumer runs and it reads a garbage row (illegal address, 4claps' Qwen3.6-35B-A3B
-    // decode at depth >= 1024). Skip the gather only while a later node still uses the index; otherwise copy as usual.
+    // decode at depth >= 1024). Read the index in place only while it provably stays live; otherwise snapshot it.
+    const int32_t * idx_d = (const int32_t *) node->src[1]->data;
     {
         const ggml_tensor * ids = node->src[1];
-        // a graph input (or a view of one) is never freed by the graph allocator
-        bool live = (ids->flags & GGML_TENSOR_FLAG_INPUT) || (ids->view_src && (ids->view_src->flags & GGML_TENSOR_FLAG_INPUT));
-        // the scheduler's copy of a split input ("<backend>#<name>#<copy>", op NONE) is flagged input + output so the allocator
-        // never reuses it; under the meta backend the per-device tensor this graph sees lost the flags, and the graph it gets is
-        // one segment, so no later user is visible here either
-        if (!live && ids->op == GGML_OP_NONE && ids->view_src == nullptr) {
-            const char * h1 = strchr(ids->name, '#');
-            live = h1 != nullptr && strchr(h1 + 1, '#') != nullptr;
-        }
+        // Only an output (or a view of one) is safe from reuse: ggml-alloc frees input-flagged tensors after their last
+        // consumer too, and the scheduler flags its split-input copies ("<backend>#<name>#<copy>") input + output only
+        // with pipeline parallelism (n_copies > 1). Under -sm tensor with one copy, the meta backend's per-device graph
+        // is one segment and its index copy is ordinary memory: treating it as live read a reused row index in the
+        // first decode (illegal address, Qwen3.6-35B-A3B tg on 2 cards). So: live = output or a later user in this graph.
+        bool live = (ids->flags & GGML_TENSOR_FLAG_OUTPUT) || (ids->view_src && (ids->view_src->flags & GGML_TENSOR_FLAG_OUTPUT));
         for (int k = gdn_j + 1; k < cgraph->n_nodes && !live; ++k) {
             const ggml_tensor * n = cgraph->nodes[k];
             if (n->view_src == ids) {
@@ -4902,16 +4905,31 @@ static bool ggml_cuda_try_gdn_state_gather(const ggml_cgraph * cgraph, int i) {
             }
         }
         if (!live) {
+            // Not provably live: keep the in-place read, but give the consumer its own copy of the (one-sequence) index,
+            // a 4-byte device copy instead of the 1 MiB state GET_ROWS. The buffer is per context and persistent, so a
+            // captured CUDA graph replays the same addresses; slots are handed out in graph order and reset per graph.
             static const bool dbg = getenv("GGML_CUDA_GDN_GATHER_DEBUG") != nullptr;
-            if (dbg) {
-                fprintf(stderr, "gdn gather %s: index %s not live after the consumer (flags %d op %s view_src %p usage %d)\n", node->name, ids->name,
-                        ids->flags, ggml_op_desc(ids), (const void *) ids->view_src, ids->buffer ? (int) ggml_backend_buffer_get_usage(ids->buffer) : -1);
+            const int64_t n_idx = ggml_nelements(ids);
+            if (cuda_ctx->gdn_idx_snap == nullptr) {
+                cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
+                CUDA_CHECK(cudaStreamIsCapturing(cuda_ctx->stream(), &st));
+                if (st == cudaStreamCaptureStatusNone) {
+                    ggml_cuda_set_device(cuda_ctx->device);
+                    CUDA_CHECK(cudaMalloc(&cuda_ctx->gdn_idx_snap, ggml_backend_cuda_context::gdn_idx_snap_cap * sizeof(int32_t)));
+                }
             }
-            return false;
+            if (cuda_ctx->gdn_idx_snap == nullptr || cuda_ctx->gdn_idx_snap_n + n_idx > ggml_backend_cuda_context::gdn_idx_snap_cap) {
+                if (dbg) {
+                    fprintf(stderr, "gdn gather %s: index %s not live after the consumer and no snapshot slot\n", node->name, ids->name);
+                }
+                return false;
+            }
+            idx_d = cuda_ctx->gdn_idx_snap + cuda_ctx->gdn_idx_snap_n;
+            cuda_ctx->gdn_idx_snap_n += (int) n_idx;
+            CUDA_CHECK(cudaMemcpyAsync((void *) idx_d, ids->data, n_idx * sizeof(int32_t), cudaMemcpyDeviceToDevice, cuda_ctx->stream()));
         }
     }
-    ggml_cuda_gdn_gather_register(gdn, (const float *) node->src[0]->data, (const int32_t *) node->src[1]->data,
-                                  node->src[0]->nb[1] / sizeof(float));
+    ggml_cuda_gdn_gather_register(gdn, (const float *) node->src[0]->data, idx_d, node->src[0]->nb[1] / sizeof(float));
     return true;
 }
 
@@ -6467,7 +6485,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 const bool known_no_fuse = fce_valid && fce->no_fuse[i];
 
-                if (!known_no_fuse && node->op == GGML_OP_GET_ROWS && ggml_cuda_try_gdn_state_gather(cgraph, i)) {
+                if (!known_no_fuse && node->op == GGML_OP_GET_ROWS && ggml_cuda_try_gdn_state_gather(cuda_ctx, cgraph, i)) {
                     continue; // the gated delta net reads the rows in place
                 }
 
@@ -6638,6 +6656,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_mmvq_f16_invalidate(*cuda_ctx);
     ggml_cuda_conv_decode_pending().clear();
     ggml_cuda_gdn_gather_reset();
+    cuda_ctx->gdn_idx_snap_n = 0; // slots are reused in stream order by the next graph
     cuda_ctx->xchg.data = nullptr;
 
     ggml_cuda_set_device(cuda_ctx->device);
