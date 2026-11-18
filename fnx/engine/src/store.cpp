@@ -32,6 +32,10 @@ constexpr size_t VA_RESERVE = (size_t) 512 << 30;   // a location's range in the
 // small enough that the last, part-used chunk of a location wastes little (cards: <256 MiB)
 constexpr size_t DEV_CHUNK = (size_t) 256 << 20, HOST_CHUNK = (size_t) 1 << 30;
 
+#if CUDA_VERSION < 12020  // CUDA 12.0/12.1 headers lack these; the 580 driver takes them (values from 12.6's cuda.h)
+#define CU_DEVICE_ATTRIBUTE_HOST_NUMA_ID ((CUdevice_attribute) 134)
+#define CU_MEM_LOCATION_TYPE_HOST_NUMA ((CUmemLocationType) 0x3)
+#endif
 void cu(CUresult r, const std::string& what) {
     if (r == CUDA_SUCCESS) return;
     const char* s = nullptr;

@@ -22,10 +22,10 @@ __device__ __forceinline__ int fnx_dp4a_c(int a, int b, int c) {
 }
 __device__ __forceinline__ int fnx_dp4a_vmad(int a, int b, int c) {
 #if defined(__CUDA_ARCH__)
-    asm("vmad.s32.s32.s32 %0, %1.b0, %2.b0, %0;" : "+&r"(c) : "r"(a), "r"(b));
-    asm("vmad.s32.s32.s32 %0, %1.b1, %2.b1, %0;" : "+&r"(c) : "r"(a), "r"(b));
-    asm("vmad.s32.s32.s32 %0, %1.b2, %2.b2, %0;" : "+&r"(c) : "r"(a), "r"(b));
-    asm("vmad.s32.s32.s32 %0, %1.b3, %2.b3, %0;" : "+&r"(c) : "r"(a), "r"(b));
+    asm("vmad.s32.s32.s32 %0, %1.b0, %2.b0, %0;" : "+r"(c) : "r"(a), "r"(b));
+    asm("vmad.s32.s32.s32 %0, %1.b1, %2.b1, %0;" : "+r"(c) : "r"(a), "r"(b));
+    asm("vmad.s32.s32.s32 %0, %1.b2, %2.b2, %0;" : "+r"(c) : "r"(a), "r"(b));
+    asm("vmad.s32.s32.s32 %0, %1.b3, %2.b3, %0;" : "+r"(c) : "r"(a), "r"(b));
     return c;
 #else
     return fnx_dp4a_c(a, b, c);
@@ -43,13 +43,13 @@ __device__ __forceinline__ int fnx_dp4a_xmad(int a, int b, int c) {
         "mov.b32 {bl,bh}, %2;\n\t"
         "mad.wide.s16 %0, al, bl, %0;\n\t"
         "mad.wide.s16 %0, ah, bh, %0;\n\t}"
-        : "+&r"(c) : "r"(a01), "r"(b01));
+        : "+r"(c) : "r"(a01), "r"(b01));
     asm("{ .reg .s16 al,ah,bl,bh;\n\t"
         "mov.b32 {al,ah}, %1;\n\t"
         "mov.b32 {bl,bh}, %2;\n\t"
         "mad.wide.s16 %0, al, bl, %0;\n\t"
         "mad.wide.s16 %0, ah, bh, %0;\n\t}"
-        : "+&r"(c) : "r"(a23), "r"(b23));
+        : "+r"(c) : "r"(a23), "r"(b23));
     return c;
 #else
     return fnx_dp4a_c(a, b, c);

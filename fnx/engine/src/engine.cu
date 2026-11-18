@@ -156,7 +156,8 @@ Engine::Engine(Model& m, int max_ctx, int lanes) : m_(m), max_ctx_(max_ctx) {
     // and the extra lanes' blocks. Int8 rows: the context's pages as many as fit in their f16 bytes (the smallest ratio
     // of the cards': every card has the same pages)
     int ctx_pages = max_ctx / KVP_POS + 2;
-    if (kv_q8()) {
+    // FNX_KV8_EXACT=1 (local): int8 pages for the context only, no f16-bytes inflation
+    if (kv_q8() && !env_int("FNX_KV8_EXACT", 0)) {
         double ratio = 1e9;
         for (int cc = 0; cc < NCARD; ++cc) ratio = std::min(ratio, (double) kvp_page(cc, false) / kvp_page(cc, true));
         ctx_pages = (int) (ctx_pages * ratio);
