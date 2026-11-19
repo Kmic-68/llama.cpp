@@ -22,6 +22,9 @@
              FNX_EXPERT_DYN_GIB=13, --max-context 262144 without YaRN, --conversation-cache-mib 2000
 --coder      FNX_EXPERT_MASK=engine/data/coder_mask.txt: the router picks only from the 256 experts a layer that
              ISTA-DASLab's Coder release keeps (README, "Coder"); faster, lossy, for code
+--fast       the fast UD-Q4_K_XL (docs/GUIDE.md, "Fast UD-Q4_K_XL"; --model q4_k_xl only): the Coder mask as --coder plus
+             FNX_ROUTE_PRIOR=1.0 and FNX_ONEHOP=2. LOSSY: answers are worded differently from the exact profile and
+             instructions in other languages than English may be ignored; for code and English
 
 Every path the config names is checked; a missing one is reported and nothing is written. Anything else (the context
 length, other switches) is edited in the written JSON; docs/SWITCHES.md lists the switches.
@@ -60,6 +63,8 @@ def main():
     ap.add_argument("--gpu", default="0,1")
     ap.add_argument("--ram", choices=["96", "64"], default="96", help="64: the 64 GB mode (README, \"64 GB of RAM\")")
     ap.add_argument("--coder", action="store_true", help="only the Coder release's experts (README, \"Coder\")")
+    ap.add_argument("--fast", action="store_true",
+                    help="the fast UD-Q4_K_XL: Coder mask, FNX_ROUTE_PRIOR=1.0, FNX_ONEHOP=2 (lossy; docs/GUIDE.md, \"Fast UD-Q4_K_XL\")")
     ap.add_argument("--template", help="another template than the model's")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
@@ -70,6 +75,10 @@ def main():
         sys.exit("--ram 64: only with --model iq3_s (UD-Q4_K_XL's experts alone are 72 GiB)")
     if a.coder and a.model == "edge0":
         sys.exit("--coder: not with --model edge0 (the Coder's list names Flash-Next's experts, not Edge0's latent ones)")
+    if a.fast and a.model != "q4_k_xl":
+        sys.exit("--fast: only with --model q4_k_xl (the settings were measured on UD-Q4_K_XL only)")
+    if a.fast and a.route_prior != "0":
+        sys.exit("--fast sets FNX_ROUTE_PRIOR=1.0 itself: leave --route-prior out")
     cards = a.gpu.split(",")
     if len(cards) != 2 or not all(c.strip().isdigit() for c in cards) or cards[0].strip() == cards[1].strip():
         sys.exit("--gpu: two different card numbers, e.g. 0,1")
@@ -106,8 +115,13 @@ def main():
         cfg["args"][cfg["args"].index("--conversation-cache-mib") + 1] = "2000"
         for k in ("FNX_ROPE_SCALE", "FNX_YARN_ORIG_CTX"):
             cfg["env"].pop(k)
-    if a.coder:
+    if a.coder or a.fast:
         cfg["env"]["FNX_EXPERT_MASK"] = str(RELEASE / "engine" / "data" / "coder_mask.txt")
+    if a.fast:
+        # our fast profile of 19 Nov 2026 (docs/GUIDE.md, "Fast UD-Q4_K_XL"): λ 1.0 prefers the experts already on the cards
+        # (higher was no faster), FNX_ONEHOP=2 sums the two cards' halves in one pass
+        cfg["env"]["FNX_ROUTE_PRIOR"] = "1.0"
+        cfg["env"]["FNX_ONEHOP"] = "2"
 
     native = Path(cfg["args"][cfg["args"].index("--native") + 1])
     need = [str(native.with_name(f)) for f in files] + [
@@ -126,8 +140,9 @@ def main():
     if missing:
         sys.exit("missing, nothing written:\n  " + "\n  ".join(missing))
     Path(a.out).write_text(json.dumps(cfg, indent=1) + "\n", encoding="utf-8")
-    print(f"wrote {a.out} ({a.model}, FNX_ROUTE_PRIOR={a.route_prior}, pictures {'on' if 'vision' in cfg else 'off'}, "
-          f"{a.ram} GB of RAM{', the Coder experts' if a.coder else ''})")
+    print(f"wrote {a.out} ({a.model}, FNX_ROUTE_PRIOR={cfg['env']['FNX_ROUTE_PRIOR']}, pictures {'on' if 'vision' in cfg else 'off'}, "
+          f"{a.ram} GB of RAM{', the Coder experts' if a.coder and not a.fast else ''}"
+          f"{', FAST (lossy: Coder mask, λ 1.0, FNX_ONEHOP=2)' if a.fast else ''})")
 
 
 if __name__ == "__main__":

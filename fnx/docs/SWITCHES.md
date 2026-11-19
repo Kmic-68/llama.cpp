@@ -90,6 +90,17 @@ has what it gave.
 |---|---|---|---|---|---|
 | `FNX_EXPERT_MASK` | `engine/data/coder_mask.txt` | unset | ours | a file with one line a layer: the layer, then the experts the router may pick (`#` lines are comments; every layer needs at least 10). A dropped expert's router logit becomes −inf wherever a layer's logits are read (the decode windows' router, the prompt path's, the next layer's guesses), so no top 10 or guess takes it, and the ten picks' weights are a softmax over them, as in a pruned model. In placement a dropped expert ranks below every kept one, so `FNX_EXPERT_RAM_GIB` sends the dropped ones to RAM first, the prompt path never stages them and the expert cache never refills a slot with one. The MTP draft layer is not masked. RAM use stays the same: every expert is still loaded | lossy: a different model by design. Unset, the code takes no branch and launches nothing: the same bits (KL 0, 27 of 27 against `bf9c7f1f`) |
 
+## The fast UD-Q4_K_XL profile
+
+`fill_profile.py --model q4_k_xl --fast` (or `setup.sh --model q4_k_xl --fast`) writes the UD-Q4_K_XL 512k profile with
+these three on top. Lossy on purpose; GUIDE.md, "Fast UD-Q4_K_XL", has what they gave and the warning that goes with them.
+
+| Switch | Fast profile | Unset | Origin | What it does | Output effect |
+|---|---|---|---|---|---|
+| `FNX_EXPERT_MASK` | `engine/data/coder_mask.txt` | unset | ours | as in "The Coder experts" above | lossy: a different model by design |
+| `FNX_ROUTE_PRIOR` | 1.0 | 0 | ours | past each token's top 2 experts the router adds λ times the logits' range to the experts already in VRAM; the value is re-read at most every 20 ms from `FNX_ROUTE_PRIOR_FILE` if that is set | lossy; the answer depends on what the cards hold, so the same prompt at temperature 0 can differ between loads. At 1.0 with the mask it was as fast as at 2.0 |
+| `FNX_ONEHOP` | 2 | 1 (rings) | Strata (upstream's screen) | on two cards too, the window sums and the attention merge in one hop: each card adds the two fp16-rounded halves in fp32 | rounding: the last bits differ (about 1 % faster) |
+
 ## The Edge0-145B profile
 
 `profile/flash-next-edge0-512k.template.json` is the IQ3_S profile with Edge0's files and these switches (`fill_profile.py

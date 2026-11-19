@@ -19,6 +19,7 @@
 #   bash setup.sh /data/flash-next-q4 --model q4_k_xl         # Unsloth's UD-Q4_K_XL (README, "Unsloth's UD-Q4_K_XL")
 #   bash setup.sh /data/edge0 --model edge0                   # Edge0's Edge0-145B-NVFP4 (README, "Edge0-145B")
 #   bash setup.sh /data/flash-next-coder --models /data/flash-next/models --coder   # the Coder's experts only (README, "Coder")
+#   bash setup.sh /data/flash-next-q4-fast --models /data/flash-next-q4/models --model q4_k_xl --fast   # the fast UD-Q4_K_XL, lossy
 #
 # Options:
 #   --model M        iq3_s (default): ISTA-DASLab's GSQ-RCO IQ3_S; q4_k_xl: Unsloth's UD-Q4_K_XL (512k, needs 96 GB of RAM);
@@ -30,6 +31,9 @@
 #   --ram 64         the 64 GB mode in the profile (262,144 positions, the lookup table from the disk; IQ3_S only); default 96
 #   --coder          route only to the 256 experts a layer that ISTA-DASLab's Coder release keeps (FNX_EXPERT_MASK): faster,
 #                    lossy, for code; with either file
+#   --fast           the fast UD-Q4_K_XL (--model q4_k_xl only; docs/GUIDE.md, "Fast UD-Q4_K_XL"): the Coder mask, FNX_ROUTE_PRIOR=1.0
+#                    and FNX_ONEHOP=2, about 1.4x fresh writing and 2x code edits. LOSSY: answers are worded differently from
+#                    the exact profile, instructions in other languages than English may be ignored; for code and English
 #   --check          only check and report
 # Environment: HF_TOKEN (sent to Hugging Face if set), CUDA, HOSTCXX (as for build.sh), JOBS (encoder build, default 6).
 set -euo pipefail
@@ -66,10 +70,10 @@ declare -A SHA=([${IQ3_S[0]}]=4c1eb2ceb4915e1192f4f386021897bde56a97f40a0bb78bb8
                 [${EDGE0_FILES[3]}]=ce9b4a20b92c5c866e65d84a3884c104986522471cf11cc5f797a153affbcc06
                 [$MMPROJ]=b1a82259702816a5330d7bd7607cd9676b11780e79ff7348c21103ff3ce49bd0)
 
-[ $# -ge 1 ] && [ "${1#-}" = "$1" ] || die "usage: bash setup.sh DATA [--model iq3_s|q4_k_xl|edge0] [--models DIR] [--strata DIR] [--no-pictures] [--route-prior X] [--ram 96|64] [--coder] [--check]"
+[ $# -ge 1 ] && [ "${1#-}" = "$1" ] || die "usage: bash setup.sh DATA [--model iq3_s|q4_k_xl|edge0] [--models DIR] [--strata DIR] [--no-pictures] [--route-prior X] [--ram 96|64] [--coder] [--fast] [--check]"
 DATA=$1
 shift
-MODEL=iq3_s MODELS='' STRATA='' PICTURES=1 PRIOR=0 RAM=96 CODER=0 CHECK=0
+MODEL=iq3_s MODELS='' STRATA='' PICTURES=1 PRIOR=0 RAM=96 CODER=0 FAST=0 CHECK=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --model) MODEL=${2:?--model iq3_s, q4_k_xl or edge0}; case "$MODEL" in iq3_s|q4_k_xl|edge0) ;; *) die "--model: iq3_s, q4_k_xl or edge0" ;; esac; shift 2 ;;
@@ -79,12 +83,15 @@ while [ $# -gt 0 ]; do
     --route-prior) PRIOR=${2:?--route-prior X}; shift 2 ;;
     --ram) RAM=${2:?--ram 96 or 64}; [ "$RAM" = 96 ] || [ "$RAM" = 64 ] || die "--ram: 96 or 64"; shift 2 ;;
     --coder) CODER=1; shift ;;
+    --fast) FAST=1; shift ;;
     --check) CHECK=1; shift ;;
     *) die "unknown option $1" ;;
   esac
 done
 [ "$RAM" = 96 ] || [ "$MODEL" = iq3_s ] || die "--ram 64: only with the IQ3_S file (UD-Q4_K_XL's and Edge0's profiles need 96 GB)"
 [ "$CODER" = 0 ] || [ "$MODEL" != edge0 ] || die "--coder: not with --model edge0 (the Coder's list names Flash-Next's experts, not Edge0's)"
+[ "$FAST" = 0 ] || [ "$MODEL" = q4_k_xl ] || die "--fast: only with --model q4_k_xl (the settings were measured on UD-Q4_K_XL only)"
+[ "$FAST" = 0 ] || [ "$PRIOR" = 0 ] || die "--fast sets FNX_ROUTE_PRIOR=1.0 itself: leave --route-prior out"
 abspath() { case "$1" in /*) echo "$1" ;; *) echo "$PWD/$1" ;; esac; }
 DATA=$(abspath "$DATA")
 MODELS=$(abspath "${MODELS:-$DATA/models}")
@@ -300,6 +307,7 @@ else
   [ "$PICTURES" = 1 ] && vis=(--vision-exe "$VISION")
   coder=()
   [ "$CODER" = 1 ] && coder=(--coder)
+  [ "$FAST" = 1 ] && coder+=(--fast)
   python3 "$HERE/profile/fill_profile.py" --models "$MODELS" --mtp "$PREP/mtp-rt" --tokenizer "$PREP/tokenizer" \
     ${vis[@]+"${vis[@]}"} ${coder[@]+"${coder[@]}"} --logs "$DATA/logs" --model "$MODEL" --route-prior "$PRIOR" --ram "$RAM" \
     --gpu "$GPU_LIST" --exe "$EXE" --out "$CFG"

@@ -37,7 +37,7 @@ and reads at about **1,000**.
   text edits run at over 100 tok/s.
 - 🎯 **Exact by default:** each step was checked against the build before it, with the same first-token logits (KL 0)
   and the same answers at temperature 0. A few kernel switches change only rounding. The lossy options
-  (`FNX_ROUTE_PRIOR` and the Coder mask) are off unless you set them.
+  (`FNX_ROUTE_PRIOR`, the Coder mask and the fast UD-Q4_K_XL profile) are off unless you set them.
 - 🔌 **No NVLink, no P2P:** plain PCIe. The cards exchange their sums through pinned host memory.
 - 🖼️ **Pictures, a 524,288-token context and an OpenAI-compatible API** through Strata v0.2.9's server.
 - 🧰 **Tools for your machine:** `tune/check.py` finds what limits it, and `tune/tune.py` measures the exact switches on it.
@@ -80,11 +80,14 @@ built from this repository's 17 Nov sources (`e56c3f60`, before the 18 Nov switc
 | Flash-Next IQ3_S, 64 GB mode ¹ | 256k | 64 GB | 63.8 | 93.6 / 99.2 | 807 |
 | Flash-Next UD-Q4_K_XL (Unsloth) ² | 512k | 96 GB | 50.9 | 62.5 / 63.7 | 795 |
 | Edge0-145B NVFP4 | 512k | 96 GB | 55.0 | 96.6 / 98.9 | 691 |
+| ⚠️ Fast UD-Q4_K_XL, **lossy** ⁴ | 512k | 96 GB | 73.9 | 125.1 / 126.4 | 1,007 |
 
 ¹ We have no 64 GB machine: this ran in a 58 GiB memory cgroup on our 96 GB server.<br>
 ² Measured on 16 Nov. Since 18 Nov the UD-Q4_K_XL profiles write fresh text 3.3 % faster in our own rounds
 (51.75 → 53.45 tok/s, same answers), and writing at a depth of 58.5k is 1.7-4.3 % slower. `bench.py` has not been run
-with them yet.
+with them yet.<br>
+⁴ Our own test chain on 18-19 Nov, not `bench.py`; the exact UD-Q4_K_XL in the same window: 52.3, 60.2 / 63.6, 963.
+Answers are worded differently from the exact profile, see [Fast UD-Q4_K_XL](docs/GUIDE.md#fast-ud-q4_k_xl).
 
 <details>
 <summary><b>Our machine</b></summary>
@@ -108,6 +111,7 @@ Every number, including deep contexts, conversation reads and pictures, is in th
 | [Unsloth **UD-Q4_K_XL**](https://huggingface.co/unsloth/Qwen3.8-Flash-Next-GGUF) | `setup.sh /data/flash-next-q4 --model q4_k_xl` | 112 GB | The larger quantization. Fewer experts fit on the cards, so edits wait for PCIe, and 96 GB of RAM is tight. |
 | [Edge0 **Edge0-145B NVFP4**](https://huggingface.co/Edge0/Edge0-145B-NVFP4) | `setup.sh /data/edge0 --model edge0` | 87 GB ³ | Flash-Next with its experts in a latent space (Edge0 Community Model License). Weaker Slovenian in our tests. |
 | **Coder** expert mask | `setup.sh /data/flash-next-coder --models /data/flash-next/models --coder` | none | Flash-Next only: the experts ISTA-DASLab's Coder keeps. At λ 0.15, code edits ran 11 % (IQ3_S) to 43 % (UD-Q4_K_XL) faster, but it is worse outside code and ignored instructions in Slovenian (lossy). |
+| ⚠️ **Fast UD-Q4_K_XL** (lossy) | `setup.sh /data/flash-next-q4-fast --models /data/flash-next-q4/models --model q4_k_xl --fast` | none | The UD-Q4_K_XL file with the Coder mask, `FNX_ROUTE_PRIOR=1.0` and `FNX_ONEHOP=2`: 1.4x fresh writing, 2x code edits. **Answers are worded differently** from the exact profile; in our 87 code, edit and English tasks it did about as well (four loads: 0, 0, 2 and 0 failed tasks, the exact profile 1), but it may ignore instructions in other languages and is not repeatable at temperature 0. For code and English. [Details and warning](docs/GUIDE.md#fast-ud-q4_k_xl). |
 
 ³ 28.8 GB of it is the IQ3_S's second shard: point `--models` at the IQ3_S folder to share it.
 
@@ -170,6 +174,11 @@ Our scripts and docs refer to sections as *(README, "Section")*. Those sections 
 
 ## 📰 News
 
+- **19 Nov 2026:** ⚠️ a **fast, lossy UD-Q4_K_XL profile** (`setup.sh --model q4_k_xl --fast`): the Coder mask, λ 1.0 and
+  `FNX_ONEHOP=2` on the same file and engine. Fresh writing 52.3 → 73.9 tok/s, code edits 60.2 → 125.1, writing code
+  50.8 → 85.6. Its answers are worded differently from the exact profile; on our own 45 functions with hidden tests,
+  26 edits and 16 English questions it did about as well, in four loads. For code and English only ([why](docs/GUIDE.md#fast-ud-q4_k_xl)).
+  The task set is in `bench/coding/`. The exact profiles do not change.
 - **18 Nov 2026:** UD-Q4_K_XL draft-layer norm per stream (`FNX_MTP_NORM_STREAMS`) and 150 more expert slots per card.
   Fresh writing is 3.3 % faster with the same answers, and writing at a depth of 58.5k is 1.7-4.3 % slower. To get it,
   rebuild and update `profile.json` ([how](docs/GUIDE.md#unsloths-ud-q4_k_xl)).

@@ -348,6 +348,81 @@ With `FNX_EXPERT_RAM_GIB=26` instead of 29 (more of the kept experts on the card
 Use it for code. For general use, and for instructions in languages other than English, keep the full model. We have
 not checked it on English prose.
 
+## Fast UD-Q4_K_XL
+
+> ⚠️ **Lossy on purpose.** This profile trades exactness for speed. Its answers are **worded differently** from the exact
+> UD-Q4_K_XL profile: the first token differs in about a quarter of our prompts, and the same prompt at temperature 0
+> can give a different text from one load to the next. In our tests the *content* held up: code that passes the same
+> hidden tests, the same edits, the same English answers (numbers below). That is a test of 87 tasks, not a guarantee.
+> It also **may ignore instructions in languages other than English** (in Slovenian it skipped a word replacement and a
+> bug fix it did in English) and answers pictures in English. Use it for code and English. For anything else, or when
+> you need the same answer every time, use the exact profile.
+
+The same model file (Unsloth's UD-Q4_K_XL) and the same engine as the exact profile, with every speed lever we have,
+including the lossy ones, chosen so that coding does not suffer. Three switches on top of the exact UD-Q4_K_XL 512k
+profile:
+
+| Switch | Value | What it does |
+|---|---|---|
+| `FNX_EXPERT_MASK` | `engine/data/coder_mask.txt` | only the 256 experts a layer that ISTA-DASLab's Coder keeps (see "Coder"): more of them fit on the cards, fewer wait for PCIe. The biggest lever |
+| `FNX_ROUTE_PRIOR` | 1.0 | past each token's top 2 experts the router prefers experts already on the cards. Higher was no faster: at 2.0 it wrote at the same speed |
+| `FNX_ONEHOP` | 2 | the two cards' halves summed in one pass (rounding only, about 1 %) |
+
+- **Turn it on:** `bash setup.sh /data/flash-next-q4-fast --models /data/flash-next-q4/models --model q4_k_xl --fast`
+  (its own folder, sharing the model files), or `fill_profile.py --model q4_k_xl --fast`. Only with UD-Q4_K_XL: we have
+  not measured these settings on IQ3_S or Edge0-145B.
+- **The engine is the same build** as for every other profile. Nothing to rebuild.
+
+**Speed.** Our own test chain, not `bench/bench.py`: the exact profile and the fast one in the same test window on 18-19
+Nov 2026, each on a freshly loaded engine, 512k, tok/s:
+
+| Test | UD-Q4_K_XL, exact | **Fast UD-Q4_K_XL** | |
+|---|---:|---:|---:|
+| Fresh writing: 12 new prompts, 300 tokens each | 52.3 | **73.9** | +41 % |
+| Edit: a 4.6 KB Python file with a variable renamed (1,388 tokens) | 60.2 | **125.1** | ×2.1 |
+| Edit: a 5,000-character Markdown text with a word replaced | 63.6 | 126.4 | ×2.0, but see below |
+| Cold read of 36,424 tokens | 963 | **1,007** | +5 % |
+| Writing right after that read | 47.8 | 65.4 | +37 % |
+| Writing code with reasoning (45 tasks, below) | 50.8 | **85.6** | +69 % |
+| Edits through an `edit` tool, as a coding agent works (26 tasks) | 44.4 | **88.0** | +98 % |
+| Rewriting a whole 127-161 line file with one change | 46.7 | **107.1** | ×2.3 |
+
+Because the routing depends on what the cards hold, the fast profile's speed varies between loads by a few percent:
+three more loads of the same profile gave fresh writing 71.5, 71.5 and (256k) 74.5, Python edits 125.0-125.5, writing
+code 86.1-89.4, and a deep conversation (58,555 tokens read, then code written) 68.0 / 75.2 tok/s against the exact
+profile's 49.7 / 52.2. The 256k profile (`--template profile/flash-next-q4_k_xl-256k.template.json` with `--fast`) ran
+as fast as the 512k one.
+
+**Quality.** Our own tasks, written for this test so no model saw them in training (`bench/coding/`, run it yourself
+against any OpenAI-style endpoint), reasoning effort low, temperature 0:
+
+- **45 functions** with hidden tests (41 in English): parsers, dynamic programming, graphs, caches, text formatting with
+  exact specs.
+- **26 edits:** 11 in a coding agent's way (the file comes as a `read` tool result, the model must call `edit` with an
+  `oldString` copied exactly, a wrong one is refused as OpenCode does), 4 whole-file rewrites of 127-161 lines with
+  tests for every function in the file, and 11 English twins of the tasks asked in Slovenian.
+- **16 English questions** with one checkable answer (arithmetic, logic, facts) and 4 open English prompts read by hand.
+
+| | Exact | Fast, λ 1.0: four loads (the last one 256k) | All 11 runs with the mask (λ 0.15-2.0, some with CPU experts) |
+|---|---:|---:|---|
+| Functions, English (41) | 40 | 41, 41, 39, 41 | 39-41, on average 40.4; a different task missed each time |
+| Edits, English (15) | 15 | 15, 15, 15, 15 | 15 every run; no `oldString` ever refused |
+| English questions (16) | 16 | 16, 16, 16, 16 | 16 every run |
+| Functions and edits asked in Slovenian (15) | 15 | 15, 15, 15, 15 | 14-15 |
+| Markdown edit asked in Slovenian (5 replacements) | 5 | 0, 2, 2, 5 | 0-5 |
+| A picture (red and blue), asked in Slovenian | answered in Slovenian | "red, blue" (English) | |
+
+The exact profile misses one function too (an expression evaluator). In one load the fast profile missed two (a
+variable it forgot to declare `nonlocal` in a sliding median, and an IBAN with hyphens it should have rejected but
+crashed on), both of which the exact profile got right; in the other three it missed none. Over this many tasks we see no
+loss, but we cannot rule out a small one. The first-token KL against the exact profile is about 2 (the same first token
+in 46-47 of 64 prompts): the mask makes it a different model, and λ adds little on top (λ 0.15 alone, without the mask:
+KL 0.024, 59 of 64, and only +10 % fresh, +29 % edits).
+
+**What did not help.** Computing the missing experts on the CPU (`FNX_CPU_EXPERTS`, a patch we did not publish) made
+every test 1-2 % slower and writing after a long read 21 % slower on our Xeon Bronze 3106; with the mask and λ almost
+every expert a token needs is on the cards already. λ above 1.0 was no faster.
+
 ## Edge0-145B
 
 [Edge0/Edge0-145B-NVFP4](https://huggingface.co/Edge0/Edge0-145B-NVFP4) (revision `cf9b3679`, the Edge0 Community Model
@@ -678,6 +753,9 @@ means that: the same bits as our previous build.
   made only 2 of 6 replacements, so we stopped at 0.15. The template defaults to 0.
 - **`FNX_EXPERT_MASK`** (`--coder`) makes it a different model on purpose, with half of the experts (see "Coder").
   Unset, it changes nothing.
+- **The fast UD-Q4_K_XL profile** (`--fast`) puts the mask, λ 1.0 and `FNX_ONEHOP=2` together for speed. Its answers are
+  worded differently from the exact profile's and are not repeatable at temperature 0; on our code, edit and English
+  tasks it did as well (see "Fast UD-Q4_K_XL" for the numbers and the warning).
 - **Against other engines** the answers are close, not identical: the P100 kernels compute in FP16 where Strata's use
   other arithmetic (`FNX_PF_F16ACC`, the HFMA2 expert kernels). Against our earlier engine on the same cards (Strata
   0.2.9's layer-split engine with our P100 kernels) the first token matched in 21 of 21 requests. The YaRN setting

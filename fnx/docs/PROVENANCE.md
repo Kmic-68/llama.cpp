@@ -18,7 +18,9 @@ Since 18 Nov 2026 `src/engine.cu`, `src/kernels.cu`, `src/kernels.hpp` and `src/
 sources as they are here were built with that option on 17 Nov (`a77172354b195150…`): that engine is in none of our
 profiles and has not run in a round or in the benchmark, and `build.sh` has not been run on them. Our UD-Q4_K_XL
 production engine since 18 Nov is `f28228d145e981b5…`: `6ccc87af7e9baf50…`'s sources with the same patch, built with that
-option (GUIDE.md, "Unsloth's UD-Q4_K_XL" and "Known limitations").
+option (GUIDE.md, "Unsloth's UD-Q4_K_XL" and "Known limitations"). The fast UD-Q4_K_XL profile of 19 Nov (GUIDE.md, "Fast
+UD-Q4_K_XL") ran on `fa2b8f86ab7e6cd2…`: the sources as they are here plus our CPU-experts patch (`FNX_CPU_EXPERTS`, not
+published; its switch off in that profile), built with that option. No file of this folder changed for it.
 
 | File | Origin | SHA-256 |
 |---|---|---|
