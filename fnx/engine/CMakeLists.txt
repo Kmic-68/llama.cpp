@@ -89,6 +89,13 @@ foreach(_p RANGE 0 8)
   list(APPEND _sp_kparts ${_f})
 endforeach()
 
+# FNX_FAST_MATH=OFF: the CUDA kernels without --use_fast_math (IEEE division, sqrt and expf), for the math checks
+option(FNX_FAST_MATH "build the CUDA kernels with --use_fast_math" ON)
+if(FNX_FAST_MATH)
+  set(FNX_FASTMATH_FLAG --use_fast_math)
+else()
+  set(FNX_FASTMATH_FLAG "")
+endif()
 foreach(_n ${STRATA_SPLIT_CARDS})
   if(NOT _n MATCHES "^[234]$")
     message(FATAL_ERROR "STRATA_SPLIT_CARDS: 2, 3 or 4, not ${_n}")
@@ -112,7 +119,7 @@ foreach(_n ${STRATA_SPLIT_CARDS})
                              ${STRATA_GGML_DIR}/ggml/include)
   target_compile_definitions(${_t} PRIVATE FNX_NCARD=${_n} FNX_ARCH=${STRATA_SPLIT_ARCH} FNX_27B=0 FNX_HOSTRING=1 FNX_PF_JOB=${STRATA_SPLIT_PF_JOB}
                              FNX_DIR="${_sp}")
-  target_compile_options(${_t} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math --expt-relaxed-constexpr -Wno-deprecated-gpu-targets>)
+  target_compile_options(${_t} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${FNX_FASTMATH_FLAG} --expt-relaxed-constexpr -Wno-deprecated-gpu-targets>)
   set_target_properties(${_t} PROPERTIES CUDA_ARCHITECTURES "${STRATA_SPLIT_ARCH}-real" CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON
                         CXX_STANDARD 17)
   find_package(Threads REQUIRED)
@@ -147,7 +154,7 @@ if(STRATA_BUILD_TESTS)
   target_include_directories(split_moe_tile_test PRIVATE ${_sp}/src ${_sp}/tools ${STRATA_GGML_DIR}/ggml/src/ggml-cuda ${STRATA_GGML_DIR}/ggml/src
                              ${STRATA_GGML_DIR}/ggml/include)
   target_compile_definitions(split_moe_tile_test PRIVATE FNX_NCARD=${_n0} FNX_ARCH=${STRATA_SPLIT_ARCH} FNX_27B=0)
-  target_compile_options(split_moe_tile_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math --expt-relaxed-constexpr -Wno-deprecated-gpu-targets>)
+  target_compile_options(split_moe_tile_test PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${FNX_FASTMATH_FLAG} --expt-relaxed-constexpr -Wno-deprecated-gpu-targets>)
   set_target_properties(split_moe_tile_test PROPERTIES CUDA_ARCHITECTURES "${STRATA_SPLIT_ARCH}-real" CUDA_STANDARD 17 CXX_STANDARD 17)
   target_link_libraries(split_moe_tile_test PRIVATE Threads::Threads)
   # fnx_run: sFNX's test driver (teacher-forced logits to an .lgr file, prompt/decode checks), the same engine objects with its own main
@@ -157,8 +164,9 @@ if(STRATA_BUILD_TESTS)
   set_source_files_properties(${_sp}/tools/fnx_run.cpp PROPERTIES LANGUAGE CUDA)
   target_include_directories(split_fnx_run PRIVATE ${_sp}/src ${_sp}/tools ${STRATA_GGML_DIR}/ggml/src/ggml-cuda ${STRATA_GGML_DIR}/ggml/src
                              ${STRATA_GGML_DIR}/ggml/include)
-  target_compile_definitions(split_fnx_run PRIVATE FNX_NCARD=${_n0} FNX_ARCH=${STRATA_SPLIT_ARCH} FNX_27B=0 FNX_HOSTRING=1 FNX_DIR="${_sp}")
-  target_compile_options(split_fnx_run PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--use_fast_math --expt-relaxed-constexpr -Wno-deprecated-gpu-targets>)
+  target_compile_definitions(split_fnx_run PRIVATE FNX_NCARD=${_n0} FNX_ARCH=${STRATA_SPLIT_ARCH} FNX_27B=0 FNX_HOSTRING=1 FNX_PF_JOB=${STRATA_SPLIT_PF_JOB}
+                             FNX_DIR="${_sp}")
+  target_compile_options(split_fnx_run PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:${FNX_FASTMATH_FLAG} --expt-relaxed-constexpr -Wno-deprecated-gpu-targets>)
   set_target_properties(split_fnx_run PROPERTIES CUDA_ARCHITECTURES "${STRATA_SPLIT_ARCH}-real" CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON CXX_STANDARD 17)
   find_package(CUDAToolkit REQUIRED)
   target_link_libraries(split_fnx_run PRIVATE CUDA::cublas CUDA::cuda_driver Threads::Threads)
