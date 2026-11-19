@@ -120,6 +120,23 @@ static __global__ void k_pfr_add(const __half2* __restrict__ in, const float2* _
         out[e] = __floats2half2_rn(v.x, v.y);
     }
 }
+// FNX_PF_RING_F32=1: the same sums with fp32 words (twice the bytes over PCIe): no rounding of a card's part or of the sum.
+// The range check stays, for NaN and inf (bit 2), so a bad sum still stops the read
+static __global__ void k_pfr_pack_f32(const float2* __restrict__ x, int n2, float2* __restrict__ out, unsigned* err) {
+    for (int e = blockIdx.x * blockDim.x + threadIdx.x; e < n2; e += gridDim.x * blockDim.x) {
+        const float2 v = x[e];
+        if (!(fabsf(v.x) <= 3.0e38f && fabsf(v.y) <= 3.0e38f)) atomicOr(err, 2u);
+        out[e] = v;
+    }
+}
+static __global__ void k_pfr_add_f32(const float2* __restrict__ in, const float2* __restrict__ x, int n2, float2* __restrict__ out, unsigned* err) {
+    for (int e = blockIdx.x * blockDim.x + threadIdx.x; e < n2; e += gridDim.x * blockDim.x) {
+        const float2 a = in[e], b = x[e];
+        const float2 v = make_float2(a.x + b.x, a.y + b.y);
+        if (!(fabsf(v.x) <= 3.0e38f && fabsf(v.y) <= 3.0e38f)) atomicOr(err, 2u);
+        out[e] = v;
+    }
+}
 // FNX_HOSTRING: a finished part from this card's gather buffer to the next card's, both in host memory, copied by a kernel. A host-to-host
 // cudaMemcpyAsync blocks the calling thread until the stream has caught up, and the prompt path enqueues the cards one after the other on
 // one thread: card 0's copy waits for a flag only card 1's (not yet enqueued) work sets, so the first read stalled. A kernel does not block.
@@ -149,6 +166,18 @@ static __global__ void k_pfr_add_gather(const __half2* __restrict__ in, const fl
     if (dst.sysfence) __threadfence_system();
 #endif
 }
+static __global__ void k_pfr_add_gather_f32(const float2* __restrict__ in, const float2* __restrict__ x, int n2, PfGatherDst dst, unsigned* err) {
+    for (int e = blockIdx.x * blockDim.x + threadIdx.x; e < n2; e += gridDim.x * blockDim.x) {
+        const float2 a = in[e], b = x[e];
+        const float2 v = make_float2(a.x + b.x, a.y + b.y);
+        if (!(fabsf(v.x) <= 3.0e38f && fabsf(v.y) <= 3.0e38f)) atomicOr(err, 2u);
+#pragma unroll
+        for (int d = 0; d < NCARD; ++d) reinterpret_cast<float2*>(dst.p[d])[e] = v;
+    }
+#if FNX_HIP
+    if (dst.sysfence) __threadfence_system();
+#endif
+}
 // FNX_PF_DMA_CHECK=1: the device copy a DMA made against the host buffer it read, compared by a kernel right after the copy; a block that finds a
 // difference prints once (the DMA saw older data than a later load: the peer's stores were not visible to the copy engine yet)
 static __global__ void k_pfr_cmp(const uint4* __restrict__ dev, const uint4* __restrict__ host, size_t n16, int card, int what, int rows0, unsigned* err) {
@@ -169,6 +198,9 @@ static __global__ void k_pfr_cmp(const uint4* __restrict__ dev, const uint4* __r
 }
 static __global__ void k_pfr_out(const __half2* __restrict__ ag, float2* __restrict__ x, int n2) {
     for (int e = blockIdx.x * blockDim.x + threadIdx.x; e < n2; e += gridDim.x * blockDim.x) x[e] = __half22float2(ag[e]);
+}
+static __global__ void k_pfr_out_f32(const float2* __restrict__ ag, float2* __restrict__ x, int n2) {
+    for (int e = blockIdx.x * blockDim.x + threadIdx.x; e < n2; e += gridDim.x * blockDim.x) x[e] = ag[e];
 }
 // RCCL's fp16 sum back to x as f32, with the range check the host exchange's adds make (a sum past fp16's range, or NaN: error bit 2)
 static __global__ void k_pfr_out_chk(const __half2* __restrict__ ag, float2* __restrict__ x, int n2, unsigned* err) {
@@ -194,6 +226,8 @@ inline void pf_ring_run(const Ring& r, int dev, int g, float* x, int C, unsigned
         for (const PfRingOp& o : r.plan)
             if (o.k == PfRingOp::GADD) throw std::runtime_error("prefill: the reduce-scatter alone takes the ring plan, not the direct gather");
     const int set = (int) (seq & 1u), fin_part = (g + 1) % NCARD;   // the part this card finishes (pf_ring_plan)
+    const size_t W = (size_t) r.w;                                     // halves an element: 1 fp16, 2 fp32 (FNX_PF_RING_F32)
+    const bool f32 = W == 2;
     __half* const own_ag = r.dma ? r.dag[set] : r.ag[set];             // where this card's gathered rows are (device with DMA, host without)
     auto r0 = [&](int k) { return k * C / NCARD; };
     auto rows = [&](int k) { return r0(k + 1) - r0(k); };
@@ -207,10 +241,10 @@ inline void pf_ring_run(const Ring& r, int dev, int g, float* x, int C, unsigned
     auto copy = [&](__half* dst, const __half* src, int nrows) {
         if (r.send_kernel) {   // FNX_PF_SEND=kernel: the sender's device -> host copy by a kernel (its stores are done when the kernel is)
             if (nrows > 0)
-                k_pfr_copy<<<grid_for((size_t) nrows * N / 8), 256, 0, s>>>((const uint4*) src, (uint4*) dst, (size_t) nrows * N / 8);
+                k_pfr_copy<<<grid_for((size_t) nrows * N * W / 8), 256, 0, s>>>((const uint4*) src, (uint4*) dst, (size_t) nrows * N * W / 8);
             return;
         }
-        ckc(cudaMemcpyAsync(dst, src, (size_t) nrows * N * sizeof(__half), cudaMemcpyDefault, s), "ring copy");   // device -> host buffer
+        ckc(cudaMemcpyAsync(dst, src, (size_t) nrows * N * W * sizeof(__half), cudaMemcpyDefault, s), "ring copy");   // device -> host buffer
     };
     // FNX_PF_DMA_BARRIER=1 (HIP): after a host -> device copy, an event recorded and waited on in the same stream, so no later kernel of the stream starts
     // before the copy engine is done (a copy engine's completion is not otherwise ordered against the compute queue's next kernel on every runtime)
@@ -224,13 +258,20 @@ inline void pf_ring_run(const Ring& r, int dev, int g, float* x, int C, unsigned
     // copies move nothing, its flags still step
     auto add = [&](const __half* in, int part, __half* out) {
         if (rows(part) == 0) return;
-        k_pfr_add<<<grid_for((size_t) rows(part) * N / 2), 256, 0, s>>>((const __half2*) in, (const float2*) (x + (size_t) r0(part) * N),
-                                                                       rows(part) * N / 2, (__half2*) out, err);
+        if (f32)
+            k_pfr_add_f32<<<grid_for((size_t) rows(part) * N / 2), 256, 0, s>>>((const float2*) in, (const float2*) (x + (size_t) r0(part) * N),
+                                                                               rows(part) * N / 2, (float2*) out, err);
+        else
+            k_pfr_add<<<grid_for((size_t) rows(part) * N / 2), 256, 0, s>>>((const __half2*) in, (const float2*) (x + (size_t) r0(part) * N),
+                                                                           rows(part) * N / 2, (__half2*) out, err);
     };
     for (const PfRingOp& o : r.plan) {
         switch (o.k) {
             case PfRingOp::PACK:
-                if (rows(o.part) > 0)
+                if (rows(o.part) > 0 && f32)
+                    k_pfr_pack_f32<<<grid_for((size_t) rows(o.part) * N / 2), 256, 0, s>>>((const float2*) (x + (size_t) r0(o.part) * N),
+                                                                                           rows(o.part) * N / 2, (float2*) r.send, err);
+                else if (rows(o.part) > 0)
                     k_pfr_pack<<<grid_for((size_t) rows(o.part) * N / 2), 256, 0, s>>>((const float2*) (x + (size_t) r0(o.part) * N),
                                                                                        rows(o.part) * N / 2, (__half2*) r.send, err);
                 break;
@@ -238,26 +279,26 @@ inline void pf_ring_run(const Ring& r, int dev, int g, float* x, int C, unsigned
                 // the slot that arrived in host memory goes to device memory on the copy engine (asynchronous, beside the next chunk's
                 // compute), and the add reads it there: a kernel reading host memory stalls its SMs at PCIe speed (FNX_PF_DMA=0: it reads the host slot)
                 if (rows(o.part) > 0 && r.dma) {
-                    ckc(cudaMemcpyAsync(r.din[o.hop][set], r.in[o.hop][set], (size_t) rows(o.part) * N * sizeof(__half), cudaMemcpyDefault, s),
+                    ckc(cudaMemcpyAsync(r.din[o.hop][set], r.in[o.hop][set], (size_t) rows(o.part) * N * W * sizeof(__half), cudaMemcpyDefault, s),
                         "ring in");
                     dma_fence();
                     if (r.dma_check)
-                        k_pfr_cmp<<<grid_for((size_t) rows(o.part) * N / 8), 256, 0, s>>>((const uint4*) r.din[o.hop][set], (const uint4*) r.in[o.hop][set],
-                                                                                          (size_t) rows(o.part) * N / 8, g, 0, rows(o.part), err);
+                        k_pfr_cmp<<<grid_for((size_t) rows(o.part) * N * W / 8), 256, 0, s>>>((const uint4*) r.din[o.hop][set], (const uint4*) r.in[o.hop][set],
+                                                                                          (size_t) rows(o.part) * N * W / 8, g, 0, rows(o.part), err);
                 }
-                add(r.dma ? r.din[o.hop][set] : r.in[o.hop][set], o.part, o.fin ? own_ag + (size_t) r0(o.part) * N : r.send);
+                add(r.dma ? r.din[o.hop][set] : r.in[o.hop][set], o.part, o.fin ? own_ag + (size_t) r0(o.part) * N * W : r.send);
                 break;
             case PfRingOp::SEND: copy(r.nin[o.hop][set], r.send, rows(o.part)); break;
             case PfRingOp::PASS:
                 if (rs_only) break;
                 if (rows(o.part) > 0) {
-                    const size_t off = (size_t) r0(o.part) * N;
+                    const size_t off = (size_t) r0(o.part) * N * W;
                     if (o.part == fin_part && r.dma)   // the part finished here: device -> the next card's host gather buffer, by DMA
-                        ckc(cudaMemcpyAsync(r.nag[set] + off, r.dag[set] + off, (size_t) rows(o.part) * N * sizeof(__half), cudaMemcpyDefault, s),
+                        ckc(cudaMemcpyAsync(r.nag[set] + off, r.dag[set] + off, (size_t) rows(o.part) * N * W * sizeof(__half), cudaMemcpyDefault, s),
                             "ring gather");
                     else   // a part that arrived (three or more cards), or no DMA: host -> host by a kernel (a host-to-host memcpy would block the thread)
-                        k_pfr_copy<<<grid_for((size_t) rows(o.part) * N / 8), 256, 0, s>>>((const uint4*) (r.ag[set] + off), (uint4*) (r.nag[set] + off),
-                                                                                       (size_t) rows(o.part) * N / 8);
+                        k_pfr_copy<<<grid_for((size_t) rows(o.part) * N * W / 8), 256, 0, s>>>((const uint4*) (r.ag[set] + off), (uint4*) (r.nag[set] + off),
+                                                                                       (size_t) rows(o.part) * N * W / 8);
                 }
                 break;
             case PfRingOp::GADD:
@@ -265,17 +306,22 @@ inline void pf_ring_run(const Ring& r, int dev, int g, float* x, int C, unsigned
                     // the received slot to device memory by DMA (as ADD), the sum stored into this card's device rows and every other card's
                     // host rows (stores to host memory are posted, they do not stall the SMs as loads do)
                     if (r.dma) {
-                        ckc(cudaMemcpyAsync(r.din[o.hop][set], r.in[o.hop][set], (size_t) rows(o.part) * N * sizeof(__half), cudaMemcpyDefault, s),
+                        ckc(cudaMemcpyAsync(r.din[o.hop][set], r.in[o.hop][set], (size_t) rows(o.part) * N * W * sizeof(__half), cudaMemcpyDefault, s),
                             "ring in");
                         dma_fence();
                         if (r.dma_check)
-                            k_pfr_cmp<<<grid_for((size_t) rows(o.part) * N / 8), 256, 0, s>>>((const uint4*) r.din[o.hop][set], (const uint4*) r.in[o.hop][set],
-                                                                                              (size_t) rows(o.part) * N / 8, g, 0, rows(o.part), err);
+                            k_pfr_cmp<<<grid_for((size_t) rows(o.part) * N * W / 8), 256, 0, s>>>((const uint4*) r.din[o.hop][set], (const uint4*) r.in[o.hop][set],
+                                                                                              (size_t) rows(o.part) * N * W / 8, g, 0, rows(o.part), err);
                     }
                     PfGatherDst dst;
                     dst.sysfence = r.dma ? 1 : 0;
                     for (int d = 0; d < NCARD; ++d)
-                        dst.p[d] = (__half2*) ((d == g ? own_ag : r.pag[d][set]) + (size_t) r0(o.part) * N);
+                        dst.p[d] = (__half2*) ((d == g ? own_ag : r.pag[d][set]) + (size_t) r0(o.part) * N * W);
+                    if (f32)
+                        k_pfr_add_gather_f32<<<grid_for((size_t) rows(o.part) * N / 2), 256, 0, s>>>((const float2*) (r.dma ? r.din[o.hop][set] : r.in[o.hop][set]),
+                                                                                                   (const float2*) (x + (size_t) r0(o.part) * N),
+                                                                                                   rows(o.part) * N / 2, dst, err);
+                    else
                     k_pfr_add_gather<<<grid_for((size_t) rows(o.part) * N / 2), 256, 0, s>>>((const __half2*) (r.dma ? r.din[o.hop][set] : r.in[o.hop][set]),
                                                                                            (const float2*) (x + (size_t) r0(o.part) * N),
                                                                                            rows(o.part) * N / 2, dst, err);
@@ -295,7 +341,10 @@ inline void pf_ring_run(const Ring& r, int dev, int g, float* x, int C, unsigned
             case PfRingOp::WAIT: wait(o.step); break;
             case PfRingOp::OUT:
                 if (rs_only) {
-                    if (rows(fin_part) > 0)
+                    if (rows(fin_part) > 0 && f32)
+                        k_pfr_out_f32<<<grid_for((size_t) rows(fin_part) * N / 2), 256, 0, s>>>((const float2*) (own_ag + (size_t) r0(fin_part) * N * W),
+                                                                                            (float2*) (x + (size_t) r0(fin_part) * N), rows(fin_part) * N / 2);
+                    else if (rows(fin_part) > 0)
                         k_pfr_out<<<grid_for((size_t) rows(fin_part) * N / 2), 256, 0, s>>>((const __half2*) (own_ag + (size_t) r0(fin_part) * N),
                                                                                         (float2*) (x + (size_t) r0(fin_part) * N), rows(fin_part) * N / 2);
                     break;
@@ -305,15 +354,18 @@ inline void pf_ring_run(const Ring& r, int dev, int g, float* x, int C, unsigned
                     for (int p = 0; p < NCARD; ++p)
                         if (p != fin_part && rows(p) > 0)
                         {
-                            ckc(cudaMemcpyAsync(r.dag[set] + (size_t) r0(p) * N, r.ag[set] + (size_t) r0(p) * N, (size_t) rows(p) * N * sizeof(__half),
+                            ckc(cudaMemcpyAsync(r.dag[set] + (size_t) r0(p) * N * W, r.ag[set] + (size_t) r0(p) * N * W, (size_t) rows(p) * N * W * sizeof(__half),
                                                 cudaMemcpyDefault, s), "ring out");
                             dma_fence();
                             if (r.dma_check)
-                                k_pfr_cmp<<<grid_for((size_t) rows(p) * N / 8), 256, 0, s>>>((const uint4*) (r.dag[set] + (size_t) r0(p) * N),
-                                                                                             (const uint4*) (r.ag[set] + (size_t) r0(p) * N),
-                                                                                             (size_t) rows(p) * N / 8, g, 1, rows(p), err);
+                                k_pfr_cmp<<<grid_for((size_t) rows(p) * N * W / 8), 256, 0, s>>>((const uint4*) (r.dag[set] + (size_t) r0(p) * N * W),
+                                                                                             (const uint4*) (r.ag[set] + (size_t) r0(p) * N * W),
+                                                                                             (size_t) rows(p) * N * W / 8, g, 1, rows(p), err);
                         }
-                k_pfr_out<<<grid_for((size_t) C * N / 2), 256, 0, s>>>((const __half2*) own_ag, (float2*) x, C * N / 2);
+                if (f32)
+                    k_pfr_out_f32<<<grid_for((size_t) C * N / 2), 256, 0, s>>>((const float2*) own_ag, (float2*) x, C * N / 2);
+                else
+                    k_pfr_out<<<grid_for((size_t) C * N / 2), 256, 0, s>>>((const __half2*) own_ag, (float2*) x, C * N / 2);
                 break;
             default: throw std::runtime_error("prefill: a ring step of unknown kind " + std::to_string((int) o.k));
         }

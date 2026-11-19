@@ -9685,3 +9685,22 @@ per-context buffer and the kernel reads that (keeps aff8f78d2's skipped 1 MiB co
   [1]2.9589 [2]4.4416, identical to p100-optimizations (build-rv6), so the in-place read is exact.
 - Open: GGML_CUDA_GDN_GATHER=0 on p100-moe is not run-to-run deterministic at -ub 1 under -sm tensor (4.4268, 4.4739);
   the default path is. p100-optimizations is (4.4416 twice).
+
+## 331 — fnx (Megla123's engine, 397738d) on p100-moe: math checks and where the time goes (11-18)
+
+Baseline on our box (UD-IQ4_XS, 62 GB RAM, his bench.py, temp 0): fresh 54.0, edit 72.1 / 77.8, long read 718 t/s,
+write after 57.1. His README (IQ3_S, 96 GB): 66.5 / 110.7 / 115.8 / 1,012 / 61.5.
+
+Math (fnx/check: llama.cpp CPU fp32 reference, 2 prompts x 2000 tokens + 128 teacher-forced steps, windows of 5):
+his engine is at llama.cpp's own floor (llama.cpp batched vs CPU: code KL median 9.5e-5, his 8.6e-5; prose 6.2e-3 vs
+1.1e-2, the prose tail is a repetition loop where llama.cpp disagrees with itself as much). Each fp16 shortcut switched
+to fp32 (FNX_PF_F16ACC=0, FNX_RING_F32=1, the new FNX_PF_RING_F32=1, no --use_fast_math) moves logits ~10x less
+than the engine-vs-reference gap (vs all of them on: code KL median 3-6e-5). None kept on: no measured gain.
+softplus (log1pf), q8_1 correction sum (no weight type here reads it) and the L2 norm need no port.
+
+FNX_PF_RING_F32=1 (new, default off): the prompt path's card sums in fp32 words. Off: bit-identical to before.
+
+Profile (FNX_PROF): prompt chunk of 16,384 rows: expert gate/up 24%, down 13%, hc 13%, qkvz 11%, attention 9%, gdn 8%;
+the cuBLAS phases ~39%. Decode windows: experts 56-66%. The cold long read's gap to 1,000 t/s is the 28.8 GB PLE
+n-gram table (16 random 154-byte rows a token) read through ntfs-3g at ~10k rows/s: the same read with those pages
+cached ran at 989 t/s. Not an engine issue; the drive stays on ntfs-3g (user's call).

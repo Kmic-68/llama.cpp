@@ -402,6 +402,7 @@ struct Engine::PfRing {
     bool send_kernel = false;  // FNX_PF_SEND=kernel
     bool dma_check = false;  // FNX_PF_DMA_CHECK=1: compare each DMA copy with its host source by a kernel
     bool dma = true;         // receive and gather by DMA into device memory (FNX_PF_DMA=0: kernels read host memory)
+    int w = 1;               // halves an element: 1 = fp16 sums (the default), 2 = fp32 (FNX_PF_RING_F32=1: no rounding, twice the bytes)
     std::vector<PfRingOp> plan;
 };
 
@@ -1089,13 +1090,14 @@ void Engine::prefill_alloc() {
         }
         {
             PfRing& r = p->ring_ce;
-            const size_t share = (size_t) (pf_c_ + NCARD - 1) / NCARD * N;   // a card's share of the rows
+            r.w = env_int("FNX_PF_RING_F32", 0) != 0 ? 2 : 1;
+            const size_t share = (size_t) (pf_c_ + NCARD - 1) / NCARD * N * r.w;   // a card's share of the rows (in halves)
             r.send = palloc<__half>(share);
             for (int k = 0; k < 2; ++k) {
                 for (int h = 0; h < NCARD - 1; ++h) r.in[h][k] = hpalloc<__half>(share);   // a slot per reduce hop
-                r.ag[k] = hpalloc<__half>((size_t) pf_c_ * N);
+                r.ag[k] = hpalloc<__half>((size_t) pf_c_ * N * r.w);
                 for (int h = 0; h < NCARD - 1; ++h) r.din[h][k] = palloc<__half>(share);
-                r.dag[k] = palloc<__half>((size_t) pf_c_ * N);
+                r.dag[k] = palloc<__half>((size_t) pf_c_ * N * r.w);
             }
             r.flags = hpalloc<unsigned>(2 * PF_RING_STEPS);
         }
