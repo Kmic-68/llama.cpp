@@ -1,3 +1,4 @@
+#include <mutex>
 #include "mmvq-f16.cuh"
 #include "unary.cuh"
 #include "mmvq.cuh"
@@ -2859,8 +2860,10 @@ struct mmvq_f16_cache {
     int                 device = -1; // the buffer's device: a freed context's address can be reused by one on another GPU
 };
 static std::unordered_map<const ggml_backend_cuda_context *, mmvq_f16_cache> mmvq_f16_caches;
+static std::mutex mmvq_f16_caches_mtx;   // the meta backend's device threads look up their contexts at once
 
 void ggml_cuda_mmvq_f16_invalidate(ggml_backend_cuda_context & ctx) {
+    std::lock_guard<std::mutex> lock(mmvq_f16_caches_mtx);
     auto it = mmvq_f16_caches.find(&ctx);
     if (it != mmvq_f16_caches.end()) {
         it->second.src1 = nullptr;
@@ -3014,7 +3017,12 @@ static void mmvq_f16_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor 
     const int nw = (int) ((K + MMVQ_F16_WIN - 1)/MMVQ_F16_WIN);
     cudaStream_t stream = ctx.stream();
 
-    mmvq_f16_cache & cache = mmvq_f16_caches[&ctx];
+    mmvq_f16_cache * cache_p;
+    {
+        std::lock_guard<std::mutex> lock(mmvq_f16_caches_mtx);
+        cache_p = &mmvq_f16_caches[&ctx];   // node-based map: the reference survives later insertions
+    }
+    mmvq_f16_cache & cache = *cache_p;
     if (cache.device != ctx.device) {
         // a stale entry from a destroyed context on another device: its buffer is not usable here
         if (cache.buf) {
@@ -3030,11 +3038,14 @@ static void mmvq_f16_prepare(ggml_backend_cuda_context & ctx, const ggml_tensor 
     const bool hit = cache.src1 == src1 && cache.data == src1->data && cache.ncols == ncols && cache.K == K;
     if (!hit) {
         if (cache.cap < need) {
-            if (cache.buf) {
-                CUDA_CHECK(cudaFree(cache.buf)); // synchronizes; only when the buffer grows
-            }
-            CUDA_CHECK(cudaMalloc(&cache.buf, need));
-            cache.cap = need;
+            // no cudaFree here: it synchronizes the device, and a graph whose kernels wait on the expert cache's copy-engine fills
+            // (moe-lru, GGML_CUDA_LRU_CE) deadlocks against the fill worker's driver calls (perplexity -ub 4 hung). The outgrown
+            // buffer may still be read by queued kernels: it is kept (doubling growth, a few MiB, a handful of times at most)
+            const size_t cap = std::max(need, 2*cache.cap);
+            void * nb = nullptr;
+            CUDA_CHECK(cudaMalloc(&nb, cap));
+            cache.buf = nb;
+            cache.cap = cap;
         }
         cache.src1 = src1; cache.data = src1->data; cache.ncols = ncols; cache.K = K;
     }
