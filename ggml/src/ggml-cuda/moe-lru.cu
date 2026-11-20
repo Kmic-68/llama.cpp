@@ -1419,7 +1419,9 @@ struct lru_ce_dev {
     std::vector<lru_ce_job> queue;
     std::thread worker;
 };
-static lru_ce_dev g_lru_ce[GGML_CUDA_MAX_DEVICES];
+// never destroyed: the detached workers wait on these condition variables for good, and destroying a condition variable that a
+// thread still waits on blocks in glibc (the process hung at exit after "cleaning up before exit")
+static lru_ce_dev * const g_lru_ce = new lru_ce_dev[GGML_CUDA_MAX_DEVICES];
 
 static __global__ void k_lru_ce_publish(const int32_t * __restrict__ fill_list, int n_slot, lru_ce_slot * slot, uint32_t seq) {
     const int n = min(fill_list[3 * n_slot], LRU_CE_MAXF);
