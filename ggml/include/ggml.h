@@ -586,6 +586,7 @@ extern "C" {
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
         GGML_OP_TOP_K_MASK,
+        GGML_OP_HC_MIX,
 
         GGML_OP_UNARY,
 
@@ -2880,6 +2881,21 @@ extern "C" {
             struct ggml_tensor  * x,
             struct ggml_tensor  * gate,
             float                 scale);
+
+    // hc_mix (Qwen3.8-Flash-Next hyper-connection read, build_hc_mix in one op): x [n_embd, hc, n_tokens],
+    //   w_norm [n_embd*hc] (f32), w_down [n_embd*hc, lr], w_up [lr, n_embd*hc], w_inject [n_embd*hc, hc] (f32) or NULL
+    //   xn  = rms_norm per stream (eps) * w_norm;  lo = silu((w_down . xn) / hc);  gate = w_up . lo
+    //   -> 1D [(n_embd + hc)*n_tokens]: first mixed [n_embd, n_tokens] = mean_h xn_h * sigmoid(gate_h), then inject
+    //      [hc, n_tokens] = w_inject . xn (0 without w_inject)
+    //
+    GGML_API struct ggml_tensor * ggml_hc_mix(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * w_norm,
+            struct ggml_tensor  * w_down,
+            struct ggml_tensor  * w_up,
+            struct ggml_tensor  * w_inject,
+            float                 eps);
 
     // hc_post: x [n_embd, n_tokens], residual [n_embd, hc, n_tokens],
     //          post [hc, n_tokens], comb [dst_hc, src_hc, n_tokens]

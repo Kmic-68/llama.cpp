@@ -4880,6 +4880,61 @@ struct test_dsv4_hc_pre : public test_dsv4_hc {
     }
 };
 
+// GGML_OP_HC_MIX (Qwen3.8-Flash-Next hyper-connection read)
+struct test_hc_mix : public test_case {
+    const int64_t n_embd;
+    const int64_t lr;
+    const int64_t n_tokens;
+    const bool    inject;
+
+    std::string vars() override {
+        return VARS_TO_STR4(n_embd, lr, n_tokens, inject);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4;   // q8_1 activations against the reference's f32
+    }
+
+    test_hc_mix(int64_t n_embd = 256, int64_t lr = 64, int64_t n_tokens = 1, bool inject = true)
+        : n_embd(n_embd), lr(lr), n_tokens(n_tokens), inject(inject) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t hc = 4;
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_name(x, "x");
+        ggml_tensor * wn = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd*hc);
+        ggml_set_name(wn, "w_norm");
+        ggml_tensor * wd = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, n_embd*hc, lr);
+        ggml_set_name(wd, "w_down");
+        ggml_tensor * wu = ggml_new_tensor_2d(ctx, GGML_TYPE_Q8_0, lr, n_embd*hc);
+        ggml_set_name(wu, "w_up");
+        ggml_tensor * wi = inject ? ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd*hc, hc) : nullptr;
+        if (wi) {
+            ggml_set_name(wi, "w_inject");
+        }
+        ggml_tensor * out = ggml_hc_mix(ctx, x, wn, wd, wu, wi, 1e-6f);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            const std::string name = ggml_get_name(t);
+            if (name == "w_norm") {
+                init_tensor_uniform(t, 0.8f, 1.2f);
+            } else if (name == "w_down") {
+                init_tensor_uniform(t, -2.0f/sqrtf((float) t->ne[0]), 2.0f/sqrtf((float) t->ne[0]));
+            } else if (name == "w_up") {
+                init_tensor_uniform(t, -2.0f/sqrtf((float) t->ne[0]), 2.0f/sqrtf((float) t->ne[0]));
+            } else if (name == "w_inject") {
+                init_tensor_uniform(t, -0.02f, 0.02f);
+            } else {
+                init_tensor_uniform(t, -2.0f, 2.0f);
+            }
+        }
+    }
+};
+
 struct test_dsv4_hc_post : public test_dsv4_hc {
     const int64_t n_embd;
     const int64_t n_tokens;
@@ -10312,6 +10367,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_dsv4_hc_comb(n_tokens, 20));
     }
 
+    // 512-expert routing (Flash-Next): decode-sized and larger windows
+    for (int64_t nt : {1, 3, 8, 9}) {
+        for (bool with_norm : {false, true}) {
+            test_cases.emplace_back(new test_topk_moe({512, nt, 1, 1}, 10, with_norm));
+            test_cases.emplace_back(new test_topk_moe({512, nt, 1, 1}, 10, with_norm, false, GATING_FUNC_SIGMOID, 2.0f));
+        }
+    }
+    for (int64_t nt : {1, 2, 3, 5, 8}) {
+        test_cases.emplace_back(new test_hc_mix(256, 64, nt));
+        test_cases.emplace_back(new test_hc_mix(2560, 320, nt));
+    }
+    test_cases.emplace_back(new test_hc_mix(512, 320, 2, false));
+    test_cases.emplace_back(new test_hc_mix(2560, 320, 9));   // past the CUDA kernel's window: not supported, CPU only
     test_cases.emplace_back(new test_dsv4_hc_pre(1, 4, 1));
     test_cases.emplace_back(new test_dsv4_hc_pre(31, 4, 17));
     test_cases.emplace_back(new test_dsv4_hc_pre(128, 4, 257));
@@ -12921,6 +12989,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    for (int64_t nt : {1, 2, 4}) {
+        test_cases.emplace_back(new test_hc_mix(2560, 320, nt));
+    }
 
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here

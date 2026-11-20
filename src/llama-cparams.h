@@ -48,6 +48,7 @@ struct llama_cparams {
     bool fused_dsv4_hc_pre;
     bool fused_dsv4_hc_comb;
     bool fused_dsv4_hc_post;
+    bool fused_hc_mix;       // p100-series: the hyper-connection read in one op (GGML_OP_HC_MIX)
     bool auto_fhc;
     bool fused_top_k_mask;   // use fused top-k sparse attention mask
     bool auto_ftkm;

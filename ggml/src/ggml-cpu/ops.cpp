@@ -12,6 +12,8 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <cstring>
+#include <vector>
 
 // ggml_compute_forward_dup
 
@@ -11579,6 +11581,85 @@ void ggml_compute_forward_dsv4_hc_comb(
             {
                 GGML_ABORT("fatal error");
             }
+    }
+}
+
+// ggml_compute_forward_hc_mix (reference: f32 math on the dequantized weights; one thread)
+
+void ggml_compute_forward_hc_mix(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    if (params->ith != 0) {
+        return;
+    }
+    const ggml_tensor * x  = dst->src[0];
+    const ggml_tensor * wn = dst->src[1];
+    const ggml_tensor * wd = dst->src[2];
+    const ggml_tensor * wu = dst->src[3];
+    const ggml_tensor * wi = dst->src[4];
+    const float eps = ggml_get_op_params_f32(dst, 0);
+    const int64_t n = x->ne[0], hc = x->ne[1], nt = x->ne[2], d = n*hc, lr = wd->ne[1];
+    std::vector<float> xn(d), lo(lr), row(std::max<int64_t>(d, lr)), gate(d);
+    const auto * tf_d = ggml_get_type_traits(wd->type);
+    const auto * tf_u = ggml_get_type_traits(wu->type);
+    for (int64_t t = 0; t < nt; t++) {
+        for (int64_t c = 0; c < hc; c++) {
+            const float * xr = (const float *) ((const char *) x->data + t*x->nb[2] + c*x->nb[1]);
+            double ss = 0.0;
+            for (int64_t i = 0; i < n; i++) {
+                ss += (double) xr[i]*xr[i];
+            }
+            const float rs = 1.0f/sqrtf((float) (ss/n) + eps);
+            for (int64_t i = 0; i < n; i++) {
+                xn[c*n + i] = xr[i]*rs*((const float *) wn->data)[c*n + i];
+            }
+        }
+        for (int64_t r = 0; r < lr; r++) {
+            const char * wr = (const char *) wd->data + r*wd->nb[1];
+            if (wd->type == GGML_TYPE_F32) {
+                memcpy(row.data(), wr, d*sizeof(float));
+            } else {
+                tf_d->to_float(wr, row.data(), d);
+            }
+            double s = 0.0;
+            for (int64_t i = 0; i < d; i++) {
+                s += (double) row[i]*xn[i];
+            }
+            const float v = (float) s/(float) hc;
+            lo[r] = v/(1.0f + expf(-v));
+        }
+        for (int64_t r = 0; r < d; r++) {
+            const char * wr = (const char *) wu->data + r*wu->nb[1];
+            if (wu->type == GGML_TYPE_F32) {
+                memcpy(row.data(), wr, lr*sizeof(float));
+            } else {
+                tf_u->to_float(wr, row.data(), lr);
+            }
+            double s = 0.0;
+            for (int64_t i = 0; i < lr; i++) {
+                s += (double) row[i]*lo[i];
+            }
+            gate[r] = (float) s;
+        }
+        float * out = (float *) dst->data + t*n;
+        float * inj = (float *) dst->data + nt*n + t*hc;
+        for (int64_t i = 0; i < n; i++) {
+            float s = 0.0f;
+            for (int64_t c = 0; c < hc; c++) {
+                s += xn[c*n + i]/(1.0f + expf(-gate[c*n + i]));
+            }
+            out[i] = s/(float) hc;
+        }
+        for (int64_t c = 0; c < hc; c++) {
+            double s = 0.0;
+            if (wi) {
+                const float * wr = (const float *) ((const char *) wi->data + c*wi->nb[1]);
+                for (int64_t i = 0; i < d; i++) {
+                    s += (double) wr[i]*xn[i];
+                }
+            }
+            inj[c] = (float) s;
+        }
     }
 }
 

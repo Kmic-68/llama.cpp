@@ -9704,3 +9704,35 @@ Profile (FNX_PROF): prompt chunk of 16,384 rows: expert gate/up 24%, down 13%, h
 the cuBLAS phases ~39%. Decode windows: experts 56-66%. The cold long read's gap to 1,000 t/s is the 28.8 GB PLE
 n-gram table (16 random 154-byte rows a token) read through ntfs-3g at ~10k rows/s: the same read with those pages
 cached ran at 989 t/s. Not an engine issue; the drive stays on ntfs-3g (user's call).
+
+## 332 — Flash-Next decode, ours vs Megla123's engine, per token (11-19)
+
+Short prompt, 300 tokens, model-card sampling, 140 slots, -c 16384 -ub 512, build-pm (p100-moe bbd2dc93a):
+| config | t/s |
+|---|---|
+| defaults (CE fills, no CUDA graphs) | 33.2-34.1 |
+| GGML_CUDA_LRU_CE=0 (SM fills) | 31.9-32.5 |
+| CE=0 + GGML_CUDA_GRAPHS_PRE_VOLTA=3 | 30.0-32.0 |
+CUDA graphs buy nothing (the threaded dispatch already hides launches), so making the CE fills capturable (his DmaBox
+mailbox) is not worth porting. His engine (FNX_PROF, our box): T=1 window 21.2 ms, T=2 28.7 ms (drafts 59% accepted).
+nsys of ours (GPU0, per token; nsys inflates idle): 2613 kernels, 25.7 ms busy. By part, ours vs his: hc ~6.6 vs 3.4 ms,
+dense q8_0 4.5 vs 4.0, experts + router + top-k + cache ~6.0 vs ~9.7 (his includes the shared expert), AllReduce 1.1 vs
+1.35, head 0.63 vs 0.62, small ops ~3.5 vs ~2.5. His split-layout q8_0 matvec (microbench) is ~10% faster than our mmvq
+on 5120x2560 / 2560x5120. Exit hang: llama-server with the LRU deadlocked on a futex after "cleaning up before exit"
+(killed; no backtrace, ptrace_scope 1).
+
+## 333 — GGML_OP_HC_MIX: the hyper-connection read in one op (Megla123's fused hc read, reimplemented for q8_0) (11-19)
+
+build_hc_mix (rms_norm per stream * w_norm, q8_0 down 10240 -> 320, silu(/hc), q8_0 up 320 -> 10240, mean_c xn * sigmoid(gate),
+f32 inject) as one op for windows of 1-8 tokens: three launches (down + inject partials per 256-column slice / reduce + lo as
+q8_1 / up + gate + mean) instead of rms_norm_mul_q8, mmvq down, smallk up, hc_pre and the inject matvec. The rms factor is applied
+after the dots, so x is quantized before it; fp32 sums in a fixed order (deterministic, a different order than the graph's).
+CPU reference in fp32 on the dequantized weights; test-backend-ops HC_MIX 11/11 (NMSE <= 5e-4). LLAMA_HC_MIX=0: unfused.
+- Per hc read (nsys, decode): 12.8 + 5.2 + 14.2 = 32 us vs ~47 us for the five kernels it replaces.
+- Decode (short prompt, 300 tokens, model-card sampling, seed 7): 34.1 -> 36.1-36.25 t/s (+6%).
+- Math: PENDING (fnx-math harness + decode-path KLD at the end of the session's work).
+
+Rejected the same day (slower in the real pipeline, though bit-exact):
+- topk_moe for 512 experts across 16 warps + a merge: 30.9 us (CPL 16) / 17.5 us standalone (CPL 5) vs 12-17 us. The ten argmax
+  rounds' shuffle chain is the floor either way; fusing router + top-k + plan (his router_route) is the way to save it.
+- k_lru_decide with its state (or only ids / slot ids) in shared memory: 18.3 us vs 11.2; decode 35.76 vs 36.06 t/s.

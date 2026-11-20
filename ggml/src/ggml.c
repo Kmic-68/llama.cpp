@@ -1094,6 +1094,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
     "TOP_K_MASK",
+    "HC_MIX",
 
     "UNARY",
 
@@ -1116,7 +1117,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "LRU_HOST_MERGE",
 };
 
-static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
+static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1215,6 +1216,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
     "top_k_mask(mask, top_k, score, blocks, extra)",
+    "hc_mix(x, w_norm, w_down, w_up, w_inject)",
 
     "unary(x)",
 
@@ -1236,7 +1238,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "experts[host]=host(x)",
 };
 
-static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
+static_assert(GGML_OP_COUNT == 107, "GGML_OP_COUNT != 107");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6825,6 +6827,39 @@ struct ggml_tensor * ggml_dsv4_hc_pre_gated(
         struct ggml_tensor  * gate,
         float                 scale) {
     return ggml_dsv4_hc_pre_impl(ctx, x, gate, scale, true);
+}
+
+// ggml_hc_mix
+
+struct ggml_tensor * ggml_hc_mix(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * w_norm,
+        struct ggml_tensor  * w_down,
+        struct ggml_tensor  * w_up,
+        struct ggml_tensor  * w_inject,
+        float                 eps) {
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && w_norm->type == GGML_TYPE_F32);
+    const int64_t n_embd = x->ne[0], hc = x->ne[1], n_tokens = x->ne[2];
+    GGML_ASSERT(x->ne[3] == 1);
+    GGML_ASSERT(ggml_nelements(w_norm) == n_embd*hc);
+    GGML_ASSERT(w_down->ne[0] == n_embd*hc && w_up->ne[1] == n_embd*hc && w_up->ne[0] == w_down->ne[1]);
+    GGML_ASSERT(w_inject == NULL || (w_inject->type == GGML_TYPE_F32 && w_inject->ne[0] == n_embd*hc && w_inject->ne[1] == hc));
+
+    // [mixed (n_embd x n_tokens) | inject (hc x n_tokens)], both contiguous
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (n_embd + hc)*n_tokens);
+
+    ggml_set_op_params_f32(result, 0, eps);
+    ggml_set_op_params_i32(result, 1, (int32_t) n_tokens);
+
+    result->op     = GGML_OP_HC_MIX;
+    result->src[0] = x;
+    result->src[1] = w_norm;
+    result->src[2] = w_down;
+    result->src[3] = w_up;
+    result->src[4] = w_inject;
+
+    return result;
 }
 
 // ggml_dsv4_hc_post
