@@ -901,6 +901,16 @@ void llama_context::sched_reserve() {
         n_input_tensors_tg = this->n_input_tensors;
     }
 
+    // slot loan: a mid-size batch (a short prompt) takes other MoE paths than the pp and tg graphs and can need more compute buffer
+    // than either; a graph that outgrows the arena at run time cannot be allocated, so reserve those shapes too (max is kept)
+    if (lend && !cparams.training) {
+        for (uint32_t nt = 16; nt < n_tokens; nt *= 2) {
+            if (!graph_reserve(nt, n_seqs, std::min(nt, cparams.n_outputs_max), mctx.get(), model.hparams.no_alloc)) {
+                throw std::runtime_error("failed to allocate compute buffers");
+            }
+        }
+    }
+
     // reserve again with pp graph to avoid ggml-alloc reallocations during inference
     {
         // TODO: the worst case graph is not always reached for `n_seqs > 1`
