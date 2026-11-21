@@ -13228,6 +13228,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // Flash-Next dense q8_0 projections per GPU of 2 (GDN qkv / gate / out, QSA q / out), 1, 2 and 4 columns (decode, MTP verify)
+    for (auto mk : std::vector<std::pair<int, int>>{{5120, 2560}, {3072, 2560}, {2560, 3072}, {6144, 2560}}) {
+        for (int bs : {1, 2, 4}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, mk.first, bs, mk.second, {1, 1}, {1, 1}));
+        }
+    }
+
     // Flash-Next decode / MTP verify at ~64k depth, per GPU of 2: the QSA indexer over 16384 pools, its top 512, the attention
     // (1 KV head, 12 query heads, q4_0 cache) for 1 and 2 query tokens
     for (int nb : {1, 2}) {
