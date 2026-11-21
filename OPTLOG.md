@@ -9839,3 +9839,16 @@ Why MTP loses at depth (32k, nsys + per-ubatch host timing): GPU work per round 
 context): the graph is reused, but the allocator re-plans it (input views whose size moves from round to round, ~1.4 a round,
 and the draft's 2 <-> 3 catch-up rows), and with several buffers that is a full scheduler reserve. Plain decode at depth is not
 affected (its reallocs are the prefill ubatches). Next: keep those input shapes stable (pad, or a constant draft row count).
+
+## 338 — QSA pool layout truncated on sequence edits: MTP wins at depth (11-21)
+
+The per-round host cost at depth was the pool layout (llama_memory_hybrid_idx::kpool_layout_update): every MTP rejection's seq_rm
+marked the sequence stale and the whole cell list + pool scan was rebuilt in both contexts (apply() 2-3.5 ms a ubatch at 32k,
+0.03 ms after). The cells below the lowest edited position are kept with the pools ending before it; checked against a full
+rebuild on every ubatch (LLAMA_KPOOL_TRUNCATE_CHECK=1) through a 32k run and the 24-request soak: identical.
+| 71567-token prompt, -c 131072, 200 tokens | t/s |
+|---|---|
+| plain (115 + LEND 60) | 33.28 |
+| MTP before (110 + LEND 60) | 28.9-32.9 |
+| MTP after | 40.69 |
+32k depth MTP 36.8-38.9 -> 40.7. Greedy md5 unchanged; soak 0 failures.

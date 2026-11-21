@@ -96,8 +96,8 @@ pass as the draft row and skip the FFN. `-ubd 16` keeps the draft under the op-o
 A soak of 24 requests on one server (short chats, 1.5k-4.5k-token prompts, a 1000-token answer, a 12-turn conversation with
 prompt-cache reuse) ran clean at 40-47 t/s, VRAM flat (peak 15.8 / 16.1 GB per card). A round is a 2-token verify (~33 ms) plus a
 ~1.7 ms draft pass. Two drafts (`-n-max 2`) are slower (30 t/s): a 2-token rollback
-needs a recurrent-state checkpoint restore and replay. At depth it loses for now: a 71567-token prompt at `-c 131072` (the arena then needs LEND >= 59) decodes 33.3 t/s plain
-and 28.9-32.9 with MTP; the 2-token verify grows to 46 ms and the draft to 7.9 ms there. Use it for short and mid contexts.
+needs a recurrent-state checkpoint restore and replay. At depth it holds up: a 71567-token prompt at `-c 131072` (the arena then needs LEND >= 59) decodes 33.3 t/s plain and 40.7 with
+MTP (110 + 60 slots).
 
 ## The config finder
 
