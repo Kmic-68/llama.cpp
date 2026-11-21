@@ -1521,6 +1521,45 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 GGML_ASSERT(src_backend_id != -1); // all inputs should be assigned by now
 
                 if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
+                    // a view of a user input (Flash-Next's QSA pool mask, one view per 128-query chunk per attention layer): copy the
+                    // input once per backend and make the view a view of that copy. Copied view by view, every view was its own
+                    // whole-graph input buffer and upload: 288 x 16 MiB = 4.5 GiB of compute buffer at 262k context, -ub 3072.
+                    // The copy is never freed (OUTPUT), so views the allocator does not count cannot release it early.
+                    // GGML_SCHED_VIEW_DEDUP=0: copy each view as before
+                    static const bool view_dedup = [] { const char * e = getenv("GGML_SCHED_VIEW_DEDUP"); return !e || atoi(e) != 0; }();
+                    struct ggml_tensor * vsrc = src->view_src;
+                    if (view_dedup && vsrc != NULL && (vsrc->flags & GGML_TENSOR_FLAG_INPUT) && vsrc->view_src == NULL &&
+                            sched->hv_tensor_backend_ids[hash_id(vsrc)] == src_backend_id &&
+                            !ggml_backend_sched_buffer_supported(sched, vsrc, cur_backend_id)) {
+                        const size_t vsrc_id = hash_id(vsrc);
+                        if (tensor_id_copy(vsrc_id, cur_backend_id, 0) == NULL) {
+                            ggml_backend_t backend = sched->backends[cur_backend_id];
+                            for (int c = 0; c < sched->n_copies; c++) {
+                                struct ggml_tensor * vcpy = ggml_dup_tensor_layout(sched->ctx, vsrc);
+                                ggml_format_name(vcpy, "%s#%s#%d", ggml_backend_name(backend), vsrc->name, c);
+                                ggml_set_input(vcpy);
+                                ggml_set_output(vcpy);
+                                tensor_id_copy(vsrc_id, cur_backend_id, c) = vcpy;
+                                SET_CAUSE(vcpy, "4.cpy");
+                            }
+                            int n_inputs = split->n_inputs++;
+                            if (n_inputs >= split->inputs_capacity) {
+                                ggml_backend_sched_split_inputs_grow(split);
+                            }
+                            split->inputs[n_inputs] = vsrc;
+                        }
+                        if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
+                            for (int c = 0; c < sched->n_copies; c++) {
+                                struct ggml_tensor * base = tensor_id_copy(vsrc_id, cur_backend_id, c);
+                                struct ggml_tensor * v = ggml_view_4d(sched->ctx, base, src->ne[0], src->ne[1], src->ne[2], src->ne[3],
+                                                                      src->nb[1], src->nb[2], src->nb[3], src->view_offs);
+                                ggml_format_name(v, "%s#%s#%d", ggml_backend_name(sched->backends[cur_backend_id]), src->name, c);
+                                tensor_id_copy(src_id, cur_backend_id, c) = v;
+                            }
+                        }
+                        node->src[j] = tensor_id_copy(src_id, cur_backend_id, sched->cur_copy);
+                        continue;
+                    }
                     // create a copy of the input in the split's backend
                     if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
                         ggml_backend_t backend = sched->backends[cur_backend_id];
