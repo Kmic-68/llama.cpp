@@ -1607,6 +1607,54 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<float>              zero_h;
     int64_t                         n_h_miss = 0;
 
+    // LLAMA_MTP_MERGE_CATCHUP (default 1): a verify-sized catch-up (the rows process() would decode into the draft cache) is kept
+    // here instead and decoded by draft() in the same batch as its first draft row, one draft-context pass a round instead of two.
+    // accept() drops the rejected rows; anything left is decoded before the next process() (rows a later batch starts at or
+    // before are dropped: the cache was cut there). The rows and their KV are the same as the separate pass's.
+    struct deferred_row {
+        llama_token  id;
+        llama_pos    pos;
+        llama_seq_id seq_id;
+        std::vector<float> h;
+    };
+    std::vector<deferred_row> deferred;
+    bool merge_catchup = [] { const char * e = getenv("LLAMA_MTP_MERGE_CATCHUP"); return !e || atoi(e) != 0; }();
+
+    // decode the deferred rows on their own (no draft follows them)
+    bool flush_deferred(const common_batch * next) {
+        if (deferred.empty()) {
+            return true;
+        }
+        batch.clear();
+        for (const auto & r : deferred) {
+            bool stale = false;
+            if (next) {
+                for (int k = 0; k < next->size(); ++k) {
+                    if (next->tokens[k].seq_id == r.seq_id && next->tokens[k].pos[0] <= r.pos) {
+                        stale = true;
+                        break;
+                    }
+                }
+            }
+            if (stale) {
+                continue;
+            }
+            const int32_t idx = batch.add(r.id, r.pos, r.seq_id, false);
+            batch.set_embd_state(idx, { r.h.data(), 1, (size_t) n_embd });
+        }
+        int32_t rc = 0;
+        if (batch.size() > 0) {
+            rc = llama_process(params.ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+        }
+        batch.clear();
+        deferred.clear();
+        if (rc != 0) {
+            SPC_ERR("llama_process(ctx_dft) deferred catch-up failed rc=%d\n", (int) rc);
+            return false;
+        }
+        return true;
+    }
+
     const float * h_at(llama_seq_id seq_id, llama_pos pos) {
         if (pos >= 0) {
             if (pending_pos[seq_id] == pos) {
@@ -1851,8 +1899,25 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
+        if (!flush_deferred(&batch_in)) {
+            return false;
+        }
+
+        bool defer = merge_catchup && !is_mem_shared && !chain_heads && n_tokens <= params.n_max + 1;
+        for (int k = 0; k < n_tokens && defer; ++k) {
+            defer = batch_in.tokens[k].id != LLAMA_TOKEN_NULL;
+        }
+        if (defer) {
+            const float * h_tgt0 = llama_get_embeddings_nextn(ctx_tgt);
+            for (int k = 0; k < n_tokens; ++k) {
+                const auto & t = batch_in.tokens[k];
+                const float * h_row = k == i_batch_beg[t.seq_id] ? h_at(t.seq_id, t.pos[0] - 1) : h_tgt0 + (size_t) (k - 1) * n_embd;
+                deferred.push_back({ t.id, t.pos[0], t.seq_id, std::vector<float>(h_row, h_row + n_embd) });
+            }
+        }
+
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
-        if (!is_mem_shared) {
+        if (!is_mem_shared && !defer) {
             batch.clear();
 
             // pair each token with the tgt embedding shifted right by one position, and
@@ -1948,6 +2013,18 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         batch.clear();
 
+        // the deferred catch-up rows go first (no output): those before the draft position of a drafting sequence, all of the
+        // others' (accept() already dropped the rejected ones)
+        std::vector<deferred_row> rows;
+        rows.swap(deferred);
+        for (const auto & r : rows) {
+            if (r.seq_id >= 0 && r.seq_id < (llama_seq_id) n_seq && dparams[r.seq_id].drafting && r.pos >= dparams[r.seq_id].pos0) {
+                continue;
+            }
+            const int32_t idx = batch.add(r.id, r.pos, r.seq_id, false);
+            batch.set_embd_state(idx, { r.h.data(), 1, (size_t) n_embd });
+        }
+
         // keep track of which sequences are still drafting
         int n_drafting = 0;
         std::vector<bool> drafting(n_seq);
@@ -1998,6 +2075,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (chain_heads) {
                 chain_h[seq_id].assign(h_last, h_last + n_embd);
             }
+        }
+
+        if (n_drafting == 0 && batch.size() > 0) {
+            // only deferred catch-up rows: decode them now
+            if (llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get()) != 0) {
+                SPC_ERR("%s", "llama_process(ctx_dft) deferred catch-up failed\n");
+            }
+            batch.clear();
         }
 
         int i = 0;
@@ -2250,6 +2335,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
+        if (!deferred.empty()) {
+            // verify rows past the accepted ones are rejected drafts: they never reach the draft cache
+            const llama_pos keep_end = verify_pos0[seq_id] + i_h;
+            deferred.erase(std::remove_if(deferred.begin(), deferred.end(),
+                [&](const deferred_row & r) { return r.seq_id == seq_id && r.pos > keep_end; }), deferred.end());
+        }
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
         pending_pos[seq_id] = verify_pos0[seq_id] + i_h;
 
