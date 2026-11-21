@@ -98,6 +98,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -2622,6 +2623,21 @@ static bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
+
+    {   // GGML_CUDA_LOG_MM=1 (debug): each distinct (name without digits, types, shapes) of a non-quantized MUL_MAT once
+        static const bool log_mm = getenv("GGML_CUDA_LOG_MM") != nullptr;
+        if (log_mm && !ggml_is_quantized(src0->type) && src1->ne[1] > 8) {
+            static std::mutex mtx;
+            static std::set<std::string> seen;
+            std::string key;
+            for (const char * p = dst->name; *p; ++p) if (*p < '0' || *p > '9') key += *p;
+            char buf[256];
+            snprintf(buf, sizeof(buf), "%s %s[%lld %lld %lld %lld] x [%lld %lld %lld %lld]", key.c_str(), ggml_type_name(src0->type),
+                (long long) ne00, (long long) ne01, (long long) ne02, (long long) ne03, (long long) ne10, (long long) ne11, (long long) ne12, (long long) ne13);
+            std::lock_guard<std::mutex> lk(mtx);
+            if (seen.insert(buf).second) fprintf(stderr, "log_mm: %s (src0 %s)\n", buf, src0->name);
+        }
+    }
 
     if (ggml_cuda_op_mul_mat_use_fwht(dst) && ggml_cuda_op_fwht(ctx, src1, dst)) {
         return;
