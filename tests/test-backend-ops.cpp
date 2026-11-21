@@ -12979,6 +12979,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_lightning_indexer(128, 64, kv, 32, 4, 1, type_K));
         }
     }
+    // QSA gathered prefill attention (CUDA q4p): GQA 12 / 18 over a q4_0 cache at head size 256, 1-3 queries a stream
+    for (int64_t nr2 : { 12, 18 }) {
+        for (int64_t nb : { 1, 3 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {nr2, 2}, 2304, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32,
+                                                            GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
+        }
+    }
+
     // 4-head f16 prefill tiles (CUDA gemm4: 32 tokens x 128 keys a block) with ragged edges
     for (int kv : { 129, 300 }) {
         for (int bs : { 33, 45 }) {

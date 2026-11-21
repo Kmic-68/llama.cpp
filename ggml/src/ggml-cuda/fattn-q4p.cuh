@@ -1218,7 +1218,9 @@ static bool ggml_cuda_fattn_q4p_supported(const ggml_tensor * dst) {
     if (Q->ne[0] != FATTN_Q4P_D || K->ne[0] != FATTN_Q4P_D || V->ne[0] != FATTN_Q4P_D) {
         return false;
     }
-    if (Q->ne[1] < 1 || Q->ne[1] > 5 || K->ne[2] == 0 || Q->ne[2] != 6*K->ne[2]) {
+    // a GQA ratio that is a multiple of 6: a block takes 6 heads, the kernel finds their KV head as head0/(ne02/ne12) (the QSA gathered
+    // prefill attention has 24 query heads over 2 KV heads a card; it ran in the tile kernel at 1485 vs 858 us a 128-query chunk)
+    if (Q->ne[1] < 1 || Q->ne[1] > 5 || K->ne[2] == 0 || Q->ne[2] % K->ne[2] != 0 || (Q->ne[2]/K->ne[2]) % 6 != 0) {
         return false;
     }
     float max_bias = 0.0f, logit_softcap = 0.0f;
