@@ -551,6 +551,128 @@ static __global__ void lightning_indexer_kernel_tile(
     }
 }
 
+// p100-series: the prefill shape of Flash-Next's QSA indexer (4 heads x 128, f16 keys, a chunk of >= 32 queries against every pool)
+// as a register-tiled fp32 GEMM. A block scores 32 tokens x 128 keys, a thread 2 tokens x 4 heads x 8 keys (64 accumulators), the
+// 128 dimensions staged 16 at a time as floats ([d][token*4 + head] and [d][key]), so each dimension step is 4 128-bit shared loads
+// for 64 FMAs (the tile kernel: 6 loads for 16). Every (token, head, key) sum runs over d = 0..127 in order with one fmaf chain, the
+// head sum and the mask as in the tile kernel: the same scores bit for bit. GGML_CUDA_LI_GEMM=0: the tile kernel.
+static constexpr int LI_GEMM_TT = 2, LI_GEMM_KPT = 8, LI_GEMM_DK = 16, LI_GEMM_BT = 16*LI_GEMM_TT, LI_GEMM_BK = 16*LI_GEMM_KPT;
+
+template <ggml_type TYPE_K>
+static __global__ void __launch_bounds__(256, 2) lightning_indexer_kernel_gemm4(
+        const float * Q, const char * K, const float * W, const half * M, float * dst,
+        int64_t n_stream, int64_t n_batch, int64_t n_kv,
+        size_t nb1, size_t nb2, size_t nb3,
+        size_t nbq1, size_t nbq2, size_t nbq3,
+        size_t nbk1, size_t nbk2, size_t nbk3,
+        size_t nbw1, size_t nbw2, size_t nbw3,
+        size_t nbm1, size_t nbm2, size_t nbm3,
+        int64_t nem3, const int32_t * __restrict__ kidx) {
+    GGML_UNUSED(n_stream); GGML_UNUSED(nb2); GGML_UNUSED(nbk1); GGML_UNUSED(nbw2); GGML_UNUSED(nbm2);
+    constexpr int NH = 4, D = 128, TT = LI_GEMM_TT, KPT = LI_GEMM_KPT, DK = LI_GEMM_DK, BT = LI_GEMM_BT, BK = LI_GEMM_BK;
+    __shared__ __align__(16) float q_sh[DK][BT*NH];
+    __shared__ __align__(16) float k_sh[DK][BK];
+
+    const int tid = threadIdx.y*WARP_SIZE + threadIdx.x;
+    const int lane = tid % WARP_SIZE, wid = tid / WARP_SIZE;
+    const int kg = lane % 16;                 // this thread's keys kg*KPT .. +KPT (16 threads cover a row of 128 keys)
+    const int tg = lane / 16 + 2*wid;         // this thread's tokens tg*TT .. +TT
+    const int t0 = blockIdx.y*BT, p0 = blockIdx.x*BK, s = blockIdx.z;
+
+    float acc[TT][NH][KPT];
+#pragma unroll
+    for (int a = 0; a < TT; ++a)
+#pragma unroll
+        for (int h = 0; h < NH; ++h)
+#pragma unroll
+            for (int j = 0; j < KPT; ++j) acc[a][h][j] = 0.0f;
+
+    for (int d0 = 0; d0 < D; d0 += DK) {
+        __syncthreads();   // the previous chunk is consumed
+        // queries: BT*NH rows (token*4 + head) x DK dims, float4 loads
+        for (int i = tid; i < BT*NH*(DK/4); i += 256) {
+            const int r = i / (DK/4), c4 = i % (DK/4), tt = r / NH, h = r % NH;
+            float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            if (t0 + tt < n_batch) {
+                v = *(const float4 *) ((const char *) Q + h*nbq1 + (t0 + tt)*nbq2 + s*nbq3 + (d0 + 4*c4)*sizeof(float));
+            }
+            q_sh[4*c4 + 0][r] = v.x; q_sh[4*c4 + 1][r] = v.y; q_sh[4*c4 + 2][r] = v.z; q_sh[4*c4 + 3][r] = v.w;
+        }
+        // keys: BK rows x DK dims, four halves per load, widened (exactly) to float
+        for (int i = tid; i < BK*(DK/4); i += 256) {
+            const int r = i / (DK/4), c4 = i % (DK/4), p = p0 + r;
+            float2 lo = make_float2(0.0f, 0.0f), hi = lo;
+            if (p < n_kv) {
+                const char * row = K + (int64_t) (kidx ? kidx[p] : p)*nbk2 + s*nbk3;
+                if constexpr (TYPE_K == GGML_TYPE_F16) {
+                    const uint2 raw = *(const uint2 *) (row + (d0 + 4*c4)*sizeof(half));
+                    lo = __half22float2(*(const half2 *) &raw.x);
+                    hi = __half22float2(*(const half2 *) &raw.y);
+                } else {
+                    // quantized keys (the indexer cache follows -ctk): dequantized, rounded to half and widened, as the tile kernel
+                    constexpr dequantize_V_t dequantize_k = get_dequantize_V<TYPE_K, float, 4>();
+                    float4 v;
+                    dequantize_k(row, &v, d0 + 4*c4);
+                    lo = __half22float2(make_half2(v.x, v.y));
+                    hi = __half22float2(make_half2(v.z, v.w));
+                }
+            }
+            k_sh[4*c4 + 0][r] = lo.x; k_sh[4*c4 + 1][r] = lo.y; k_sh[4*c4 + 2][r] = hi.x; k_sh[4*c4 + 3][r] = hi.y;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int d = 0; d < DK; ++d) {
+            float qv[TT*NH], kv[KPT];
+#pragma unroll
+            for (int v = 0; v < TT*NH/4; ++v) {
+                *(float4 *) &qv[4*v] = *(const float4 *) &q_sh[d][tg*TT*NH + 4*v];
+            }
+#pragma unroll
+            for (int v = 0; v < KPT/4; ++v) {
+                *(float4 *) &kv[4*v] = *(const float4 *) &k_sh[d][kg*KPT + 4*v];
+            }
+#pragma unroll
+            for (int a = 0; a < TT; ++a)
+#pragma unroll
+                for (int h = 0; h < NH; ++h)
+#pragma unroll
+                    for (int j = 0; j < KPT; ++j) {
+                        acc[a][h][j] = fmaf(kv[j], qv[a*NH + h], acc[a][h][j]);
+                    }
+        }
+    }
+
+    // ReLU, weight, mask, as the tile kernel's phase 5
+#pragma unroll
+    for (int a = 0; a < TT; ++a) {
+        const int i_batch = t0 + tg*TT + a;
+        if (i_batch >= n_batch) {
+            continue;
+        }
+        const float * w_row = (const float *) ((const char *) W + i_batch*nbw1 + s*nbw3);
+        float wv[NH];
+#pragma unroll
+        for (int h = 0; h < NH; ++h) wv[h] = w_row[h];
+        float score[KPT] = { 0.0f };
+#pragma unroll
+        for (int h = 0; h < NH; ++h) {
+#pragma unroll
+            for (int j = 0; j < KPT; ++j) {
+                score[j] += fmaxf(acc[a][h][j], 0.0f) * wv[h];
+            }
+        }
+        const half * m_base = (const half *) ((const char *) M + i_batch*nbm1 + (s%nem3)*nbm3);
+        float * dst_base = (float *) ((char *) dst + i_batch*nb1 + s*nb3);
+#pragma unroll
+        for (int j = 0; j < KPT; ++j) {
+            const int i_kv = p0 + kg*KPT + j;
+            if (i_kv < n_kv) {
+                dst_base[i_kv] = score[j] + __half2float(m_base[i_kv]);
+            }
+        }
+    }
+}
+
 #define LIGHTNING_INDEXER_CASE(lightning_indexer_kernel, n_embd, n_head, K, type_K)         \
     if (K->type == (type_K)) {                                                              \
         lightning_indexer_kernel<WARPS_PER_BLOCK, K_VECS_PER_BLOCK, n_embd, n_head, type_K> \
@@ -700,6 +822,23 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
             LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 32, k, GGML_TYPE_F32)
             GGML_ABORT("fatal error");
         }
+    } else if (n_embd == 128 && n_head == 4 && n_batch >= LI_GEMM_BT &&
+               (k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_Q4_0 || k->type == GGML_TYPE_Q8_0) &&
+               [] { const char * e = getenv("GGML_CUDA_LI_GEMM"); return !e || atoi(e) != 0; }() &&
+               (uintptr_t) q_d % 16 == 0 && nbq1 % 16 == 0 && nbq2 % 16 == 0 && nbq3 % 16 == 0 &&
+               (k->type != GGML_TYPE_F16 || ((uintptr_t) k_d % 8 == 0 && nbk2 % 8 == 0 && nbk3 % 8 == 0))) {
+        dim3 block(32, 8);
+        dim3 grid((n_kv + LI_GEMM_BK - 1)/LI_GEMM_BK, (n_batch + LI_GEMM_BT - 1)/LI_GEMM_BT, n_stream);
+#define LI_GEMM4_CASE(T) \
+        if (k->type == (T)) { \
+            lightning_indexer_kernel_gemm4<T><<<grid, block, 0, ctx.stream()>>>( \
+                q_d, k_d, w_d, m_d, dst_d, n_stream, n_batch, n_kv, nb1, nb2, nb3, nbq1, nbq2, nbq3, nbk1, nbk2, nbk3, \
+                nbw1, nbw2, nbw3, nbm1, nbm2, nbm3, nem3, k_idx); \
+        }
+        LI_GEMM4_CASE(GGML_TYPE_F16)
+        LI_GEMM4_CASE(GGML_TYPE_Q4_0)
+        LI_GEMM4_CASE(GGML_TYPE_Q8_0)
+#undef LI_GEMM4_CASE
     } else if (n_embd == 128 && n_head == 4 && n_batch >= LIGHTNING_INDEXER_TILE_TOKENS) {
         // too few heads for a wmma tile, the tile kernel shares the keys across the tokens
         constexpr int WARPS_PER_BLOCK = 8;

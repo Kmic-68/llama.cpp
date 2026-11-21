@@ -12979,6 +12979,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_lightning_indexer(128, 64, kv, 32, 4, 1, type_K));
         }
     }
+    // 4-head f16 prefill tiles (CUDA gemm4: 32 tokens x 128 keys a block) with ragged edges
+    for (int kv : { 129, 300 }) {
+        for (int bs : { 33, 45 }) {
+            test_cases.emplace_back(new test_lightning_indexer(128, 4, kv, bs, 1, 1, GGML_TYPE_F16));
+            test_cases.emplace_back(new test_lightning_indexer(128, 4, kv, bs, 2, 1, GGML_TYPE_F16));
+            test_cases.emplace_back(new test_lightning_indexer(128, 4, kv, bs, 1, 1, GGML_TYPE_Q4_0));
+            test_cases.emplace_back(new test_lightning_indexer(128, 4, kv, bs, 2, 1, GGML_TYPE_Q8_0));
+        }
+    }
 
     return test_cases;
 }
@@ -13245,6 +13254,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     // Flash-Next QSA prefill at 128k depth: a 128-query chunk scores 32768 pools (4 heads) and keeps the top 512
     test_cases.emplace_back(new test_lightning_indexer(128, 4, 32768, 128, 1, 1, GGML_TYPE_F16));
+    // Flash-Next prefill at 262k: 65600 pools, a 128-query chunk, keys as the -ctk q4_0 indexer cache stores them
+    test_cases.emplace_back(new test_lightning_indexer(128, 4, 65600, 128, 1, 1, GGML_TYPE_Q4_0));
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {32768, 128, 1, 1}, 512));
 
     // Flash-Next under a 2-GPU tensor split, per GPU: 150 pooled experts, 10 used; gate/up iq3_s 2560 -> 320, down iq4_nl 320 -> 2560
@@ -13630,6 +13641,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_l2_norm_batch(GGML_TYPE_F32, { n, 16, 16, 1 }, 4, 1e-12f, true));
     }
 
+    // Flash-Next UD-IQ4_XS prefill experts per GPU under -sm tensor (512 experts, 10 used): IQ3_S gate/up (K 2560 -> M 320),
+    // IQ4_NL down (K 320 -> M 2560), at the 2048 / 4096-token ubatches of a long prompt (tile_mm's grouped mode)
+    for (int n : { 2048, 4096 }) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_S,  GGML_TYPE_F32, 512, 10, false,  320, n, 2560));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 512, 10, false, 2560, n,  320));
+    }
 
     return test_cases;
 }
