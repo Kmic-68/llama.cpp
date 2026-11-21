@@ -790,6 +790,90 @@ bool ggml_cuda_mmvf_gdn_gate(ggml_backend_cuda_context & ctx, const ggml_tensor 
     return true;
 }
 
+// p100-series: a one-row f32 gate matvec, its sigmoid and the broadcast multiply of another vector by it (Flash-Next's shared
+// expert gate: ffn_shexp * sigmoid(x . w)), one token, one launch. The dot is chunked and summed as k_mmvf_fewrows does it for one
+// row; the epilogue is op_sigmoid then op_mul, so the result is bit-identical to MUL_MAT + SIGMOID + MUL.
+static __global__ void __launch_bounds__(MMVF_FR_THREADS) k_mmvf_gate_mul(
+        const float * __restrict__ w, const float * __restrict__ y, const float * __restrict__ v, float * __restrict__ dst, const int nv,
+        float * __restrict__ partial, unsigned int * __restrict__ done, const int ncols4, const int nchunks, const int chunk4) {
+    const int ch = blockIdx.x;
+    const int i0 = ch*chunk4;
+    const int i1 = min(ncols4, i0 + chunk4);
+    const float4 * xr = (const float4 *) w;
+    const float4 * y4 = (const float4 *) y;
+    float sum = 0.0f;
+    for (int i = i0 + (int) threadIdx.x; i < i1; i += MMVF_FR_THREADS) {
+        const float4 a = xr[i];
+        const float4 b = y4[i];
+        sum += a.x*b.x + a.y*b.y + a.z*b.z + a.w*b.w;
+    }
+    sum = warp_reduce_sum(sum);
+    __shared__ float ws[MMVF_FR_THREADS/WARP_SIZE];
+    __shared__ bool is_last;
+    __shared__ float gs;
+    if (threadIdx.x % WARP_SIZE == 0) {
+        ws[threadIdx.x / WARP_SIZE] = sum;
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        float t = 0.0f;
+#pragma unroll
+        for (int k = 0; k < MMVF_FR_THREADS/WARP_SIZE; ++k) {
+            t += ws[k];
+        }
+        partial[blockIdx.x] = t;
+        __threadfence();
+        is_last = atomicAdd(done, 1u) == gridDim.x - 1;
+    }
+    __syncthreads();
+    if (!is_last) {
+        return;
+    }
+    __threadfence();
+    if (threadIdx.x == 0) {
+        float t = 0.0f;
+        for (int c = 0; c < nchunks; ++c) {
+            t += __ldcg(partial + c);
+        }
+        gs = 1.0f / (1.0f + expf(-t));
+        *done = 0;
+    }
+    __syncthreads();
+    const float g = gs;
+    for (int i = threadIdx.x; i < nv; i += MMVF_FR_THREADS) {
+        dst[i] = v[i] * g;
+    }
+}
+
+bool ggml_cuda_mmvf_gate_mul(ggml_backend_cuda_context & ctx, const ggml_tensor * mm, const ggml_tensor * v, ggml_tensor * dst) {
+    static const bool enabled = [] { const char * e = getenv("GGML_CUDA_FUSE_GATE_MUL"); return !e || atoi(e) != 0; }();
+    const ggml_tensor * w = mm->src[0], * src1 = mm->src[1];
+    const int64_t K = w->ne[0];
+    if (!enabled || w->type != GGML_TYPE_F32 || w->ne[1] != 1 || ggml_nelements(w) != K || !ggml_is_contiguous(w) || K < 2048 || K % 4 != 0 ||
+            (uintptr_t) w->data % 16 != 0 || src1->type != GGML_TYPE_F32 || ggml_nelements(src1) != K || !ggml_is_contiguous(src1) ||
+            (uintptr_t) src1->data % 16 != 0 || v->type != GGML_TYPE_F32 || !ggml_is_contiguous(v) || ggml_nrows(v) != 1 ||
+            dst->type != GGML_TYPE_F32 || !ggml_is_contiguous(dst) || ggml_nelements(dst) != ggml_nelements(v)) {
+        return false;
+    }
+    static float        * part_dev[GGML_CUDA_MAX_DEVICES] = {};
+    static unsigned int * done_dev[GGML_CUDA_MAX_DEVICES] = {};
+    const int dev = ggml_cuda_get_device();
+    if (done_dev[dev] == nullptr) {
+        CUDA_CHECK(cudaMalloc(&part_dev[dev], MMVF_FR_MAX_CHUNK*sizeof(float)));
+        CUDA_CHECK(cudaMalloc(&done_dev[dev], sizeof(unsigned int)));
+        CUDA_CHECK(cudaMemset(done_dev[dev], 0, sizeof(unsigned int)));
+    }
+    // mmvf_fewrows' chunking for ne01 = 1
+    const int ncols4 = (int) (K/4);
+    int nchunks = (int) std::max<int64_t>(1, std::min<int64_t>(MMVF_FR_MAX_CHUNK, std::min<int64_t>(128, ncols4/256)));
+    const int chunk4 = (ncols4 + nchunks - 1)/nchunks;
+    nchunks = (ncols4 + chunk4 - 1)/chunk4;
+    k_mmvf_gate_mul<<<(unsigned) nchunks, MMVF_FR_THREADS, 0, ctx.stream()>>>((const float *) w->data, (const float *) src1->data,
+        (const float *) v->data, (float *) dst->data, (int) ggml_nelements(v), part_dev[dev], done_dev[dev], ncols4, nchunks, chunk4);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
 static bool mmvf_fewrows(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     static const int env = [] { const char * e = getenv("GGML_CUDA_MMVF_FEWROWS"); return !e ? 1 : strcmp(e, "ab") == 0 ? 2 : atoi(e) != 0; }();
     const int64_t ne00 = src0->ne[0], ne01 = src0->ne[1];

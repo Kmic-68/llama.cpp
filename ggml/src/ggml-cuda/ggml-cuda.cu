@@ -5956,6 +5956,48 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         }
     }
 
+    // shared expert gate: MUL_MAT(f32 [K, 1]) -> SIGMOID -> MUL(v, sigmoid), one token, in one launch (views between allowed)
+    if (node->op == GGML_OP_MUL_MAT && node->src[0]->type == GGML_TYPE_F32 && node->ne[0] == 1 && node->ne[1] == 1 &&
+            !(node->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        const int n = cgraph->n_nodes;
+        auto next = [&](int j) {
+            for (++j; j < n; ++j) {
+                if (!ggml_cuda_is_view_or_noop(cgraph->nodes[j]) && (cgraph->nodes[j]->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+                    return j;
+                }
+            }
+            return -1;
+        };
+        const int js = next(i), jm = js < 0 ? -1 : next(js);
+        if (jm > 0) {
+            ggml_tensor * sg = cgraph->nodes[js], * mul = cgraph->nodes[jm];
+            auto is_of = [](const ggml_tensor * v, const ggml_tensor * t) {
+                for (; v; v = v->view_src) { if (v == t) return true; }
+                return false;
+            };
+            if (sg->op == GGML_OP_UNARY && ggml_get_unary_op(sg) == GGML_UNARY_OP_SIGMOID && is_of(sg->src[0], node) &&
+                    ggml_nelements(sg) == 1 && mul->op == GGML_OP_MUL && is_of(mul->src[1], sg) && !is_of(mul->src[0], sg) &&
+                    !(sg->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+                // node and sg (and their views) read only by sg / mul
+                bool ok = true;
+                for (int j = 0; j < n && ok; ++j) {
+                    const ggml_tensor * t = cgraph->nodes[j];
+                    if (t == sg || t == mul || ggml_cuda_is_view_or_noop(t)) {
+                        continue;
+                    }
+                    for (int k = 0; k < GGML_MAX_SRC; ++k) {
+                        if (t->src[k] && (is_of(t->src[k], node) || is_of(t->src[k], sg))) {
+                            ok = false;
+                        }
+                    }
+                }
+                if (ok && ggml_cuda_mmvf_gate_mul(*cuda_ctx, node, mul->src[0], mul)) {
+                    return jm - i;
+                }
+            }
+        }
+    }
+
     // The delta net's alpha/beta matvecs and what follows them, in one launch:
     //   MUL_MAT(alpha) -> ADD(dt) -> SOFTPLUS -> MUL(a) = gate,  MUL_MAT(beta) -> SIGMOID = beta
     // (views between them allowed). Every intermediate must be consumed only inside the group.

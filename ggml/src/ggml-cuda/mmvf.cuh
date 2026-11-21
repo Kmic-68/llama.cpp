@@ -16,3 +16,6 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, int warp_size, const
 // p100-series: the delta net's f32 alpha/beta matvecs + softplus/sigmoid epilogues in one launch (one token; bit-identical)
 bool ggml_cuda_mmvf_gdn_gate(ggml_backend_cuda_context & ctx, const ggml_tensor * mm_a, const ggml_tensor * mm_b,
                              const ggml_tensor * b, const ggml_tensor * m, ggml_tensor * gate_out, ggml_tensor * beta_out);
+
+// p100-series: MUL_MAT(f32 [K,1]) -> SIGMOID -> MUL(v, it), one token, one launch (bit-identical)
+bool ggml_cuda_mmvf_gate_mul(ggml_backend_cuda_context & ctx, const ggml_tensor * mm, const ggml_tensor * v, ggml_tensor * dst);
