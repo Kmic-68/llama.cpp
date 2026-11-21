@@ -9817,6 +9817,7 @@ a 12-turn conversation with prompt-cache reuse) found:
 | before 23fedbfa7 | - | 8 (server died at turn 5) | |
 | 23fedbfa7 | 43.50 | 0 | 15.8 / 16.1 GB |
 | + e05fe4590 zero-copy short prompts | 45.62 | 0 | 15.8 / 16.1 GB |
-The decode gain is on the 12 fresh-prompt requests (+3 to +5 t/s each, the conversation turns are unchanged); why decode is
-faster after a zero-copy prefill than after the DMA assembly is not understood yet.
+The decode difference is NOT from zero-copy: ABBA on the 8 short chats, one build, LLAMA_MOE_LRU_ZEROCOPY=0 vs default:
+41.39 / 45.17 / 44.61 / 45.06 t/s. The first server load of a session decodes ~4 t/s slower (PLE rows and host experts not
+in the page cache yet); soak2 ran cold. Only the prefill gain is real.
 Rejected: GDN gate / shared-expert gate fusions for 2-4 tokens (verify 33.35 vs 32.93 ms, qprof/gates-multitoken-rejected.patch).
