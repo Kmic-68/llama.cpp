@@ -489,6 +489,21 @@ static __global__ void k_get_rows_raw(
     }
 }
 
+// the same copy for a 1-D index list over 16-byte-aligned rows (QSA prefill: ~300k rows of 144 bytes a call): a thread per 16-byte
+// unit, 32-bit index math. The warp-per-row kernel moved ~107 GB/s there (36 words a row: a warp's second pass used 4 lanes, and
+// the 64-bit div/mod per row). GGML_CUDA_GETROWS_RAW16=0: the warp-per-row kernel
+static __global__ void k_get_rows_raw16(const char * __restrict__ src0, const int32_t * __restrict__ src1, char * __restrict__ dst,
+        const int units, const int n_units, const int64_t nb01, const int64_t nb1) {
+    const int g = blockIdx.x*blockDim.x + threadIdx.x;
+    if (g >= n_units) {
+        return;
+    }
+    const int r = g / units, u = g - r*units;
+    const int32_t i01 = __ldg(src1 + r);
+    const uint4 v = __ldg((const uint4 *) (src0 + (int64_t) i01*nb01) + u);
+    *((uint4 *) (dst + (int64_t) r*nb1) + u) = v;
+}
+
 void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -505,6 +520,14 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         GGML_ASSERT(row_bytes % 2 == 0 && nb01 % 2 == 0 && nb1 % 2 == 0);
         const int64_t n_rows = ne10*ne11*ne12;
         const dim3 grid((unsigned) ((n_rows + 7)/8), 1, 1), block(32, 8, 1);
+        static const bool raw16_on = [] { const char * e = getenv("GGML_CUDA_GETROWS_RAW16"); return !e || atoi(e) != 0; }();
+        if (raw16_on && ne11 == 1 && ne12 == 1 && nb10 == sizeof(int32_t) && row_bytes % 16 == 0 && nb01 % 16 == 0 && nb1 % 16 == 0 &&
+                (uintptr_t) src0->data % 16 == 0 && (uintptr_t) dst->data % 16 == 0 && (int64_t) ne10*(int64_t) (row_bytes/16) < INT32_MAX) {
+            const int units = (int) (row_bytes/16), n_units = (int) (ne10*units);
+            k_get_rows_raw16<<<(n_units + 255)/256, 256, 0, stream>>>((const char *) src0->data, (const int32_t *) src1->data, (char *) dst->data,
+                units, n_units, (int64_t) nb01, (int64_t) nb1);
+            return;
+        }
         const bool w4 = row_bytes % 4 == 0 && nb01 % 4 == 0 && nb02 % 4 == 0 && nb03 % 4 == 0 && nb1 % 4 == 0 && nb2 % 4 == 0 &&
                         nb3 % 4 == 0 && (uintptr_t) src0->data % 4 == 0 && (uintptr_t) dst->data % 4 == 0;
         if (w4) {
