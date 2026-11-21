@@ -9736,3 +9736,66 @@ Rejected the same day (slower in the real pipeline, though bit-exact):
 - topk_moe for 512 experts across 16 warps + a merge: 30.9 us (CPL 16) / 17.5 us standalone (CPL 5) vs 12-17 us. The ten argmax
   rounds' shuffle chain is the floor either way; fusing router + top-k + plan (his router_route) is the way to save it.
 - k_lru_decide with its state (or only ids / slot ids) in shared memory: 18.3 us vs 11.2; decode 35.76 vs 36.06 t/s.
+
+## 334 — Flash-Next plain decode 11-20: slot-loan fix and exact fusions (36.1 -> 42.7 t/s short prompt)
+
+Short prompt (quick.sh: one load, greedy md5 of 128 tokens at temp 0 + two sampled 300-token chats), build-pm, 140 slots, -c 16384.
+Every kept change: greedy md5 unchanged (af870089eb15 with the loan; 7acd790038a7 is the no-loan text of the completion test).
+| change | t/s | kept |
+|---|---|---|
+| start (HC_MIX in, no loan) | 36.1 | |
+| 4e2c960bc slot loan's exclusive assembly sized pool + host slots (LEND 60) | 40.8 | yes (bug fix, see below) |
+| LEND 70 | 41.8 | config |
+| bcd665b87 GDN f32 alpha/beta + softplus/sigmoid in one launch | 41.86 | yes |
+| 362a5a84d mmvq q8_1 cache hits through reshapes (routed experts reuse the shared expert's quantized input) | 42.12 | yes |
+| 8c2f100f6 shared expert gate (1-row matvec + sigmoid + mul) in one launch | 42.70 | yes |
+| hc_post fused into HC_MIX | 39.1, md5 changed | no (qprof/hc-mix-post-rejected.patch) |
+| HC_MIX tile sizes HM_NG 8/16, HM_UPC 6/8/12 (op bench) | 31.3-31.8 vs 29.3 us | no |
+| CUDA graphs (GGML_CUDA_GRAPHS_PRE_VOLTA=3/1) | noise; mode 3 server hung at exit | no |
+
+The slot-loan bug (pre-existing, 11-19 build too): with LLAMA_MOE_LRU_LEND the exclusive [pool | host] assembly is n_expert + the
+borrowed slots long but was sized n_expert, so a prompt of 14+ tokens read experts out of range (llama-completion: illegal address
+in the MoE mmq; llama-server: a silently wrong prompt). The 43.5-44.3 t/s loan figures of 11-20 came from that broken prompt.
+
+Open: short-prompt prefill. Any ubatch of 14+ tokens assembles every host expert of every layer (~23 GB over PCIe at -ub 512):
+82 tokens 2.40 s (his engine ~0.85 s for 69). LLAMA_MOE_LRU_ZEROCOPY=1 gives 1.73 s but halves long prefill (11k: 218 -> 111 t/s);
+a batch-size threshold (zero-copy only for small ubatches) broke the slot-loan arena (a small zero-copy graph re-allocated its
+compute buffer off the arena, OOM even with those sizes reserved): reverted, qprof/zerocopy-threshold-rejected.patch.
+-ub 13 for short prompts (decide path): 7 t/s, no.
+
+HC_MIX math check (closes 333's PENDING), decode path: llama-perplexity, ppl-orig.txt, -c 512 --chunks 8, base = LLAMA_HC_MIX=0
+at -ub 1 (saved logits), 135 slots + LEND 56:
+| run | PPL(Q) | KLD | same top p |
+|---|---|---|---|
+| control: HC_MIX=0, -ub 1 again | 3.3052 | 0.000000 | 100.0 % |
+| floor: HC_MIX=0, -ub 4 (summation order only) | 3.3117 | 0.0372 +- 0.0023 | 94.56 % |
+| HC_MIX, -ub 1 | 3.2497 | 0.0403 +- 0.0038 | 94.31 % |
+| HC_MIX, -ub 2 (the MTP verify width) | 3.2400 | 0.0401 +- 0.0043 | 94.07 % |
+| HC_MIX, -ub 4 | 3.2806 | 0.0394 +- 0.0027 | 94.12 % |
+HC_MIX sits at the floor of a pure summation-order change (Flash-Next is that sensitive: see the KLD noise-floor note) and its
+PPL is no worse: no math regression.
+
+## 335 — Flash-Next MTP K=1 working beside the expert cache (11-21)
+
+Bench: qprof/mtpb.sh, one load, a warm-up + 6 sampled 300-token chats (3 prompts x seeds 1-6), model-card sampling, -c 16384,
+LLAMA_SPEC_SAMPLE_TEMP=1.0 LLAMA_SPEC_DRAFT_TOPK=20, --spec-draft-n-max 1. Run-to-run noise of this set: about +-2 t/s.
+Plain decode on the same set: 38.9 t/s (140 slots + LEND 70); 37.9-38.9 at 135 + LEND 56.
+| step | t/s | draft acceptance |
+|---|---|---|
+| draft experts on CPU (-cmoed), -ubd 16, LEND 56 (two draft passes a round) | 35.8 | 0.756 |
+| 63f870b0d meta backend: simple tensors reused on re-init (the draft context aborted with obj_new in its 2nd request) | - | - |
+| 33f1ca8d4 catch-up rows in the draft pass (one draft pass a round) | 39.1 | 0.757 |
+| e7d3a82c5 MTP graph: rows without an output skip FFN + head | 43.9 | 0.763 |
+| 42339bc36 draft vocab head (81920 rows q4_0) on GPU, full head + token_embd on CPU, MTP experts requantized IQ4_XS/IQ4_NL on GPU, 135 slots | 46.25 | 0.782 |
+| --spec-draft-n-max 2 --spec-draft-p-min 0.5 | 30.1 | 0.726 |
+
+VRAM per card: the loan arena must hold the -ub 512 compute buffer (3152 MiB), so LEND >= 54; the IQ4 draft experts (650 MiB a
+card) fit after the full head left the GPU and 5 base slots went (SLOTS 135). -ubd 16 keeps the draft below the op-offload
+threshold (at -ubd 64 its compute buffer copied the experts: 866 MiB).
+Round (host timeline, LLAMA_TL): verify 33.0 ms (2 tokens), draft 1.7 ms, the rest ~1.5 ms. GPU per round 30.8 ms busy; gaps:
+host between phases 2.8 ms, expert fill waits 1.4 ms, launch gaps 2.9 ms. His engine on our box (profile-nospec.json, K=1):
+54.0 / 60.1 / 60.4 t/s, verify round 27.2 ms GPU, draft 1.0 ms.
+K=2 loses: a 2-token rollback exceeds the recurrent snapshots, so the server restores a checkpoint and replays.
+Trap: -otd patterns are regex searches: 'output=CPU' also put blk.48.attn_output on the CPU (1 ms a draft pass); anchor them.
+Draft model file: /mnt/fast/p100-scratch/mtpq/mtp-exps-iq4xs.gguf (llama-quantize --allow-requantize --tensor-type
+"ffn_.*_exps=iq4_xs" from mtp-Qwen3.8-Flash-Next-Q8_0.gguf; down falls back to iq4_nl). Only the proposals change.
