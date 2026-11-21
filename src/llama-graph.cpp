@@ -2200,7 +2200,16 @@ static bool llama_lru_tail_layer(llama_moe_lru * lru, int il) {
     return llama_lru_tail_kind(lru, il, 0) && llama_lru_tail_kind(lru, il, 1) && llama_lru_tail_kind(lru, il, 2);
 }
 
-static ggml_tensor * llama_lru_assemble(ggml_context * ctx0, llama_moe_lru * lru, int il, int fk, int64_t n_expert) {
+// zero-copy tails (the tile GEMM reads the missing experts in place from pinned host memory) for small batches, the DMA
+// assembly for large ones: an 82-token prompt 2.40 -> 1.73 s, but an 11k prompt at -ub 512 218 -> 111 t/s with zero-copy.
+// LLAMA_MOE_LRU_ZEROCOPY=1 / =0 forces it on / off; unset: ubatches of at most LLAMA_MOE_LRU_ZEROCOPY_MAX tokens (default 176: the crossover, 150 tokens 1.97 vs 2.21 s, 200 tokens 2.33 vs 2.24 s)
+static bool llama_lru_zerocopy(int64_t n_tokens) {
+    static const int force = [] { const char * e = getenv("LLAMA_MOE_LRU_ZEROCOPY"); return e ? (atoi(e) != 0 ? 1 : 0) : -1; }();
+    static const int64_t zmax = [] { const char * e = getenv("LLAMA_MOE_LRU_ZEROCOPY_MAX"); return e ? (int64_t) atoll(e) : (int64_t) 176; }();
+    return force >= 0 ? force == 1 : n_tokens <= zmax;
+}
+
+static ggml_tensor * llama_lru_assemble(ggml_context * ctx0, llama_moe_lru * lru, int il, int fk, int64_t n_expert, int64_t n_tokens) {
     ggml_tensor * pool = lru->pool_get(il, fk);
     if (lru->is_exclusive()) {
         // the layout is [pool slots | host slots]; with a slot loan that is longer than n_expert by the borrowed slots (sized
@@ -2208,8 +2217,7 @@ static ggml_tensor * llama_lru_assemble(ggml_context * ctx0, llama_moe_lru * lru
         n_expert = std::max<int64_t>(n_expert, pool->ne[2] + lru->exps_get(il, fk)->ne[2]);
     }
     const bool tail = llama_lru_tail_kind(lru, il, fk);
-    static const bool zerocopy = [] { const char * e = getenv("LLAMA_MOE_LRU_ZEROCOPY"); return e && atoi(e) != 0; }();
-    if (tail && zerocopy) {
+    if (tail && llama_lru_zerocopy(n_tokens)) {
         return ggml_lru_assemble_zerocopy(ctx0, lru->state_get(il), lru->exps_get(il, fk), pool, n_expert, lru->ctrl(), lru->pool_index(il));
     }
     return tail ? ggml_lru_assemble_tail(ctx0, lru->state_get(il), lru->exps_get(il, fk), pool, n_expert, lru->ctrl(), lru->pool_index(il))
@@ -2231,7 +2239,7 @@ void llm_graph_context::build_lru_prefetch_first() const {
     }
     std::array<ggml_tensor *, 3> nxt;
     for (int fk = 0; fk < 3; fk++) {
-        nxt[fk] = llama_lru_assemble(ctx0, lru, nx, fk, hparams.n_expert);
+        nxt[fk] = llama_lru_assemble(ctx0, lru, nx, fk, hparams.n_expert, n_tokens);
         ggml_build_forward_expand(gf, nxt[fk]);
     }
     lru_asm_ahead[nx] = nxt;
@@ -2577,7 +2585,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             lru_asm_ahead.erase(ahead);
         } else {
             for (int fk = 0; fk < 3; fk++) {
-                asmb[fk] = llama_lru_assemble(ctx0, lru, il, fk, hparams.n_expert);
+                asmb[fk] = llama_lru_assemble(ctx0, lru, il, fk, hparams.n_expert, n_tokens);
             }
         }
         // the next pooled layer's experts do not depend on anything computed here: put their assembly into the graph now,
@@ -2596,7 +2604,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
             if (pf_ok && nx < (int) hparams.n_layer() && lru_asm_ahead.find(nx) == lru_asm_ahead.end()) {
                 std::array<ggml_tensor *, 3> nxt;
                 for (int fk = 0; fk < 3; fk++) {
-                    nxt[fk] = llama_lru_assemble(ctx0, lru, nx, fk, hparams.n_expert);
+                    nxt[fk] = llama_lru_assemble(ctx0, lru, nx, fk, hparams.n_expert, n_tokens);
                     ggml_build_forward_expand(gf, nxt[fk]);
                 }
                 lru_asm_ahead[nx] = nxt;
