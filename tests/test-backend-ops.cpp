@@ -13228,6 +13228,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // Flash-Next decode / MTP verify at ~64k depth, per GPU of 2: the QSA indexer over 16384 pools, its top 512, the attention
+    // (1 KV head, 12 query heads, q4_0 cache) for 1 and 2 query tokens
+    for (int nb : {1, 2}) {
+        test_cases.emplace_back(new test_lightning_indexer(128, 4, 16384, nb, 1, 1, GGML_TYPE_F16));
+        test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {16384, nb, 1, 1}, 512));
+        test_cases.emplace_back(new test_flash_attn_ext(256, 256, 1, {12, 1}, 65536, nb, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
+    }
+
     // Flash-Next QSA prefill at 128k depth: a 128-query chunk scores 32768 pools (4 heads) and keeps the top 512
     test_cases.emplace_back(new test_lightning_indexer(128, 4, 32768, 128, 1, 1, GGML_TYPE_F16));
     test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {32768, 128, 1, 1}, 512));
