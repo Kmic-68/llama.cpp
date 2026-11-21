@@ -9799,3 +9799,24 @@ K=2 loses: a 2-token rollback exceeds the recurrent snapshots, so the server res
 Trap: -otd patterns are regex searches: 'output=CPU' also put blk.48.attn_output on the CPU (1 ms a draft pass); anchor them.
 Draft model file: /mnt/fast/p100-scratch/mtpq/mtp-exps-iq4xs.gguf (llama-quantize --allow-requantize --tensor-type
 "ffn_.*_exps=iq4_xs" from mtp-Qwen3.8-Flash-Next-Q8_0.gguf; down falls back to iq4_nl). Only the proposals change.
+
+## 336 — Flash-Next MTP soak, two serving fixes, zero-copy short prompts (11-21)
+
+Tests on p100-moe e05fe4590 (build-pm): test-backend-ops full suite 19679/19679 on both cards. Decode-path KLD after the
+multi-token gate experiment was reverted: as in 334. Plain greedy md5 af870089eb15 at 140+70 and 135+56.
+Soak (qprof/soak.sh, one MTP server, 24 requests: 8 short chats, prompts of 1545 / 2091 / 4479 tokens, a 1000-token answer,
+a 12-turn conversation with prompt-cache reuse) found:
+- 23fedbfa7: turn 5 of the conversation aborted (OOM): a 138-token prompt ubatch with no outputs on the MTP target (unmasked
+  nextn rows) planned a layout 55 MiB larger than the reserve and re-allocated beside the arena. With the loan off the arena
+  now takes it. (Reserving zero-output shapes did not help: a re-planned layout is not bounded by the reserved ones.)
+- e05fe4590: with that, the 11-20 zero-copy threshold works: ubatches <= 176 tokens read missing experts in place (crossover
+  measured: 150 tokens 1.97 vs 2.21 s, 200 tokens 2.33 vs 2.24 s). 82-token prompt 2.40 -> 1.83 s; 1364 / 11355 tokens
+  unchanged (194 / 220 t/s). Greedy md5 unchanged.
+| soak, same 24 requests (identical texts: same draft counts) | mean decode t/s | failures | VRAM per card peak |
+|---|---|---|---|
+| before 23fedbfa7 | - | 8 (server died at turn 5) | |
+| 23fedbfa7 | 43.50 | 0 | 15.8 / 16.1 GB |
+| + e05fe4590 zero-copy short prompts | 45.62 | 0 | 15.8 / 16.1 GB |
+The decode gain is on the 12 fresh-prompt requests (+3 to +5 t/s each, the conversation turns are unchanged); why decode is
+faster after a zero-copy prefill than after the DMA assembly is not understood yet.
+Rejected: GDN gate / shared-expert gate fusions for 2-4 tokens (verify 33.35 vs 32.93 ms, qprof/gates-multitoken-rejected.patch).

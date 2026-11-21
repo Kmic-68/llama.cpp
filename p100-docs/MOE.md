@@ -70,8 +70,34 @@ cache needs the memory most. `LLAMA_MOE_LRU_LEND=N` adds N slots per layer whose
 are allocated in VMM chunks and ggml-cuda maps the borrowed chunks a second time, behind a small head
 (`LLAMA_MOE_LRU_LEND_HEAD`, MiB, default 768) that holds the decode graphs. Decode uses every slot; before a larger batch the
 borrowed slots are emptied (they hold copies, the experts keep their host slots), and refill as decode runs. Outputs are
-identical with and without it. It needs the exclusive cache with `GGML_CUDA_LRU_STASH=0`; give it about the compute buffer's
-size (N x per-slot bytes x layers) and take the base slot count down so prefill's own peak still fits.
+identical with and without it (since 11-20: before, a prompt of 14+ tokens read past the assembled experts with the loan on, a
+silent wrong prompt in llama-server). It needs the exclusive cache with `GGML_CUDA_LRU_STASH=0`; give it about the compute buffer's
+size (N x per-slot bytes x layers) and take the base slot count down so prefill's own peak still fits. The arena has to hold the
+compute buffer, so N has a floor (at `-ub 512`, 16k context: N >= 54).
+
+## MTP drafting (Flash-Next, short context, measured 11-21)
+
+Flash-Next's MTP block ships as a separate file. With its experts requantized to IQ4_XS / IQ4_NL (it only proposes tokens, so the
+output distribution is unchanged; llama-quantize `--allow-requantize --tensor-type "ffn_.*_exps=iq4_xs"`), the draft fits on the
+cards beside the cache, its full vocab head and token table in host RAM:
+
+    -md mtp-exps-iq4xs.gguf --spec-type draft-mtp --spec-draft-n-max 1 -ngld 99 -ubd 16 -ctkd q4_0 -ctvd q4_0 \
+      -otd '^token_embd\.weight=CPU,^output\.weight=CPU'      # anchor these: 'output=CPU' also matches attn_output
+    LLAMA_SPEC_SAMPLE_TEMP=1.0 LLAMA_SPEC_DRAFT_TOPK=20 LLAMA_MOE_LRU_LEND=56, 135 base slots, -c 16384
+
+The draft scores only the first 81920 tokens (`LLAMA_MTP_DRAFT_VOCAB`, a q4_0 copy on the GPU), its catch-up rows ride in the same
+pass as the draft row and skip the FFN. `-ubd 16` keeps the draft under the op-offload threshold.
+
+| 6 sampled 300-token chats (qprof/mtpb.sh) | t/s | draft acceptance |
+|---|---|---|
+| plain decode | 38.9 | - |
+| MTP K=1 | 46.25 | 0.78 |
+
+A soak of 24 requests on one server (short chats, 1.5k-4.5k-token prompts, a 1000-token answer, a 12-turn conversation with
+prompt-cache reuse) ran clean at 40-47 t/s, VRAM flat (peak 15.8 / 16.1 GB per card). A round is a 2-token verify (~33 ms) plus a
+~1.7 ms draft pass. Two drafts (`-n-max 2`) are slower (30 t/s): a 2-token rollback
+needs a recurrent-state checkpoint restore and replay. Not measured yet at 128k / 262k context, where the KV cache and the draft
+compete for the same VRAM.
 
 ## The config finder
 
@@ -115,5 +141,7 @@ Not ported (yet): his fp16 single-token matvec kernels (`mmvq-gp100`, `mmvq-h1`)
 | `GGML_META_THREADS` | on for MoE models, else off | threaded two-GPU dispatch |
 | `GGML_META_AR_MAX_BYTES` | 32 MiB | largest in-kernel AllReduce |
 | `LLAMA_MOE_LRU_LEND`, `LLAMA_MOE_LRU_LEND_HEAD` | 0, 768 | slot loan: borrowed slots per layer, head MiB |
+| `LLAMA_MOE_LRU_ZEROCOPY_MAX` | 176 | ubatches up to this many tokens read the missing experts in place (zero-copy) instead of assembling every host expert; `LLAMA_MOE_LRU_ZEROCOPY=1`/`0` forces it |
+| `LLAMA_MTP_MERGE_CATCHUP`, `LLAMA_MTP_CROP`, `LLAMA_MTP_DRAFT_VOCAB` | 1, 1, 81920 | MTP: catch-up rows in the draft pass, no FFN/head for rows without output, draft head rows |
 
 `autoconfig.py` prints the full set for the chosen config.
