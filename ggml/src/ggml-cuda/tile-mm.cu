@@ -329,8 +329,15 @@ static __global__ void tile_mm_prep(const float * __restrict__ X, const int64_t 
 
 // TN >= 5 (80 / 96 columns) needs > 32 KB of shared memory, so only one block fits per SM anyway: let it use the registers
 // (with the 2-block bound it spilled; 65-column verify batches -- ngram-mod's 64-token drafts + 1 -- land here)
+// two blocks an SM whenever the tile's shared memory allows it (64 KB an SM): the short-row types (IQ3_S, IQ4_NL, ...) fit two
+// 80- / 96-column blocks, which the 80+ tokens an expert gets in a 4096-token ubatch need (one column tile, one decode of its weights)
+template <ggml_type type, int TN, int TM>
+static constexpr int tile_mm_min_blocks() {
+    return (16*TM*tile_mm_traits<type>::RW*4 + (16*TM + 16*TN)*TMM_LD*4 + 16*TM*4) <= 31*1024 ? 2 : 1;
+}
+
 template <ggml_type type, int TN, bool ID, int TM = 4>
-static __global__ void __launch_bounds__(256, TN >= 5 ? 1 : 2) tile_mm(const tile_mm_params prm) {
+static __global__ void __launch_bounds__(256, (tile_mm_min_blocks<type, TN, TM>())) tile_mm(const tile_mm_params prm) {
     using tr = tile_mm_traits<type>;
     constexpr int BM = 16*TM, BN = 16*TN, RPW = BM/8, RW = tr::RW, UV = tr::UV, SPU = UV/64;
     constexpr int XI = (BN*8 + 255)/256;
@@ -846,7 +853,10 @@ bool ggml_cuda_tile_mm_id_try(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
     const int64_t total = n_tokens*n_used;
     const int64_t avg   = (total + n_experts - 1)/n_experts;
-    const int tn   = avg <= 16 ? 1 : avg <= 32 ? 2 : avg <= 48 ? 3 : 4;
+    // wider tiles for the 80+ tokens an expert gets in a 4096-token ubatch (each column tile decodes the expert's weights again);
+    // GGML_CUDA_TMM_ID_TN_MAX=4: at most 64 columns, as before
+    static const int tn_max = [] { const char * e = getenv("GGML_CUDA_TMM_ID_TN_MAX"); return e ? atoi(e) : 6; }();
+    const int tn   = std::min(tn_max, avg <= 16 ? 1 : avg <= 32 ? 2 : avg <= 48 ? 3 : avg <= 64 ? 4 : avg <= 80 ? 5 : 6);
     const int bn   = 16*tn;
     const int nwin = (int) ((K + TMM_WIN - 1)/TMM_WIN);
     const int max_tiles = (int) ((total + bn - 1)/bn + n_experts);
