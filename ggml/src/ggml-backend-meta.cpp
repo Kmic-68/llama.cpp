@@ -1301,6 +1301,12 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
 
     std::vector<ggml_tensor *> simple_tensors;
     simple_tensors.reserve(n_simple_bufs);
+    // a tensor allocated again into the same container (a graph re-allocated every eval without a meta rebuild, e.g. the MTP
+    // draft context: its graph is not reused) reuses its simple tensors instead of leaking new ones into the fixed-size context
+    // (GGML_ASSERT(obj_new) after ~1M of them)
+    const auto prev_it = stc.simple_tensors.find(tensor);
+    const std::vector<ggml_tensor *> * prev = prev_it != stc.simple_tensors.end() && prev_it->second.size() == n_simple_bufs ?
+        &prev_it->second : nullptr;
     for (size_t j = 0; j < n_simple_bufs; j++) {
         ggml_context          * simple_ctx = stc.ctxs[j].get();
         ggml_backend_buffer_t   simple_buf = buf_ctx->bufs[j].get();
@@ -1319,7 +1325,16 @@ static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_m
             }
         }
 
-        ggml_tensor * t_ij = ggml_new_tensor(simple_ctx, tensor->type, GGML_MAX_DIMS, ne);
+        ggml_tensor * t_ij;
+        if (prev != nullptr && (*prev)[j] != nullptr && (*prev)[j]->type == tensor->type) {
+            t_ij = (*prev)[j];
+            for (int i = 0; i < GGML_MAX_DIMS; i++) {
+                t_ij->ne[i] = ne[i];
+            }
+            t_ij->extra = nullptr;
+        } else {
+            t_ij = ggml_new_tensor(simple_ctx, tensor->type, GGML_MAX_DIMS, ne);
+        }
         t_ij->op = tensor->op;
         for (int i = 0; i < GGML_MAX_DIMS; i++) {
             t_ij->nb[i] = nb[i];
