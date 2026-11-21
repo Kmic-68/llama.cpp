@@ -301,6 +301,18 @@ static struct buffer_address ggml_dyn_tallocr_alloc(struct ggml_dyn_tallocr * al
     }
 #endif
 
+    {   // GGML_ALLOC_HWM=<MiB>: log every allocation that raises a chunk's high-water mark by at least that much (debug)
+        static long hwm_mib = -2;
+        if (hwm_mib == -2) { const char * e = getenv("GGML_ALLOC_HWM"); hwm_mib = e ? atol(e) : -1L; }
+        if (hwm_mib >= 0 && addr.offset + size > chunk->max_size + (size_t) hwm_mib * 1048576) {
+            size_t free_bytes = 0;
+            for (int b = 0; b < chunk->n_free_blocks; b++) if (chunk->free_blocks[b].offset < chunk->max_size) free_bytes += MIN(chunk->free_blocks[b].size, chunk->max_size - chunk->free_blocks[b].offset);
+            GGML_LOG_WARN("alloc_hwm: chunk %d %.1f -> %.1f MiB by %s (%s, %.1f MiB at %.1f), free blocks %d holding %.1f MiB\n",
+                addr.chunk, chunk->max_size / 1048576.0, (addr.offset + size) / 1048576.0, tensor ? tensor->name : "?",
+                tensor ? ggml_op_desc(tensor) : "?", size / 1048576.0, addr.offset / 1048576.0, chunk->n_free_blocks, free_bytes / 1048576.0);
+        }
+    }
+
     chunk->max_size = MAX(chunk->max_size, addr.offset + size);
 
     return addr;

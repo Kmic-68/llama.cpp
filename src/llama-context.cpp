@@ -2947,6 +2947,24 @@ ggml_cgraph * llama_context::graph_reserve(
             const ggml_tensor * t = ggml_graph_node(gf, i);
             if (t->view_src == nullptr) v.push_back({ ggml_nbytes(t), t });
         }
+        {   // inputs (graph leafs the buffer holds: masks, indices), reached through the nodes' sources
+            std::vector<const ggml_tensor *> seen;
+            for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
+                const ggml_tensor * t = ggml_graph_node(gf, i);
+                for (int j = 0; j < GGML_MAX_SRC; j++) {
+                    const ggml_tensor * s = t->src[j];
+                    if (s && s->op == GGML_OP_NONE && s->view_src == nullptr && s->data == nullptr && s->buffer == nullptr &&
+                            std::find(seen.begin(), seen.end(), s) == seen.end()) {
+                        seen.push_back(s);
+                        v.push_back({ ggml_nbytes(s), s });
+                        if (getenv("LLAMA_RESERVE_LEAFS") && ggml_nbytes(s) >= (1u << 20)) {
+                            LLAMA_LOG_WARN("reserve_leaf: %8.1f MiB %-36s %s [%lld %lld %lld %lld]\n", ggml_nbytes(s) / 1048576.0, s->name,
+                                ggml_type_name(s->type), (long long) s->ne[0], (long long) s->ne[1], (long long) s->ne[2], (long long) s->ne[3]);
+                        }
+                    }
+                }
+            }
+        }
         std::sort(v.begin(), v.end(), [](const auto & a, const auto & b) { return a.first > b.first; });
         LLAMA_LOG_WARN("reserve_top: %d tokens, %d nodes\n", (int) n_tokens, ggml_graph_n_nodes(gf));
         for (int i = 0; i < reserve_top && i < (int) v.size(); i++) {
