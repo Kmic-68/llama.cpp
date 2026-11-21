@@ -1831,7 +1831,9 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, input);
     struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
-    if (input->flags & GGML_TENSOR_FLAG_INPUT) {
+    // a view of a user input (the QSA tail ids, reshaped per layer) is host data the user sets too: without this it took the path
+    // below, which drains the split backend before a blocking copy (Flash-Next decode: ~10 GPU drains a token, ~0.9 ms)
+    if ((input->flags & GGML_TENSOR_FLAG_INPUT) || (input->view_src != NULL && (input->view_src->flags & GGML_TENSOR_FLAG_INPUT))) {
         // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
             ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
@@ -1846,8 +1848,11 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
             return !e || atoi(e) != 0;
         }();
         if (async_inputs && sched->events[split_backend_id][sched->cur_copy] == NULL &&
-                split_backend->iface.set_tensor_async != NULL && input->buffer != NULL &&
-                ggml_backend_buffer_is_host(input->buffer) && ggml_is_contiguous(input) && ggml_is_contiguous(input_cpy)) {
+                split_backend->iface.set_tensor_async != NULL && input->data != NULL &&
+                // a view of a host input (a reshape of the QSA tail ids) may have no buffer of its own: take its source's
+                (input->buffer ? input->buffer : input->view_src ? input->view_src->buffer : NULL) != NULL &&
+                ggml_backend_buffer_is_host(input->buffer ? input->buffer : input->view_src->buffer) &&
+                ggml_is_contiguous(input) && ggml_is_contiguous(input_cpy)) {
             ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
             inputs_in_flight = true;
         } else {
