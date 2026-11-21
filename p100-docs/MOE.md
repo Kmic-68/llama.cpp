@@ -90,14 +90,14 @@ pass as the draft row and skip the FFN. `-ubd 16` keeps the draft under the op-o
 
 | 6 sampled 300-token chats (qprof/mtpb.sh) | t/s | draft acceptance |
 |---|---|---|
-| plain decode | 38.9 | - |
-| MTP K=1 | 46.25 | 0.78 |
+| plain decode | 39.3-39.8 | - |
+| MTP K=1 | 49.1-49.4 | 0.78 |
 
 A soak of 24 requests on one server (short chats, 1.5k-4.5k-token prompts, a 1000-token answer, a 12-turn conversation with
 prompt-cache reuse) ran clean at 40-47 t/s, VRAM flat (peak 15.8 / 16.1 GB per card). A round is a 2-token verify (~33 ms) plus a
 ~1.7 ms draft pass. Two drafts (`-n-max 2`) are slower (30 t/s): a 2-token rollback
-needs a recurrent-state checkpoint restore and replay. Not measured yet at 128k / 262k context, where the KV cache and the draft
-compete for the same VRAM.
+needs a recurrent-state checkpoint restore and replay. At depth it loses for now: a 71567-token prompt at `-c 131072` (the arena then needs LEND >= 59) decodes 33.3 t/s plain
+and 28.9-32.9 with MTP; the 2-token verify grows to 46 ms and the draft to 7.9 ms there. Use it for short and mid contexts.
 
 ## The config finder
 

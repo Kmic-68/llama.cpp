@@ -9821,3 +9821,16 @@ The decode difference is NOT from zero-copy: ABBA on the 8 short chats, one buil
 41.39 / 45.17 / 44.61 / 45.06 t/s. The first server load of a session decodes ~4 t/s slower (PLE rows and host experts not
 in the page cache yet); soak2 ran cold. Only the prefill gain is real.
 Rejected: GDN gate / shared-expert gate fusions for 2-4 tokens (verify 33.35 vs 32.93 ms, qprof/gates-multitoken-rejected.patch).
+
+## 337 — Flash-Next MTP vs plain: warm numbers, p-min, dedup, long context (11-21)
+
+Warm machine, qprof/mtpb.sh (6 chats): plain 39.30 (140 + LEND 70) / 39.80 (135 + LEND 56); MTP K=1 49.37 / 49.12 (+24%).
+His engine on the same box and prompt family: 54.0-60.4 (K=1). The 11-21 46.25 was a colder run.
+| tried | result | kept |
+|---|---|---|
+| --spec-draft-p-min 0.3 / 0.5 / 0.7 | 42.6 / 34.6 / 30.1 t/s (every 1 <-> 2 token switch rebuilds the meta graph, and even low-confidence drafts pay at a 1.41x verify) | no |
+| mul_mat_vec_q_moe: one block per distinct expert across the verify's tokens (GGML_CUDA_MOE_DEDUP, bit-exact, 934/934 MUL_MAT_ID) | verify 35.36 vs 32.91 ms (half the warps idle; little overlap) | no, qprof/moe-dedup-rejected.patch |
+Long context (-c 131072, a 71567-token prompt, 200 sampled tokens; the arena needs LEND >= 59 there: the compute buffer is
+3450 MiB): plain (115 + LEND 60) prefill 217 t/s, decode 33.28 t/s, 14.7 GB per card; MTP (110 + LEND 60) 28.9-32.9 t/s,
+15.3 / 15.6 GB. Per round at that depth: verify 46.3 ms (33.0 at 16k), draft 7.9 ms (1.7). The 2-token attention does not
+share its KV reads and the draft's one attention layer grows with depth: MTP pays only at short / mid context for now.
