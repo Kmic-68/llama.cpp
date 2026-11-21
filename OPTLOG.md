@@ -9878,3 +9878,14 @@ indexer 8.1 (f16 keys x f32 queries at the fp32 rate), gemm_fold 5.0, AllReduce 
 whole cache's indexer keys gathered per layer), flash_attn_tile 2.2, top-k 1.3; H2D 253 GiB (overlapped). Per token: ours
 3.4 ms wall / 2.45 ms kernels, his 1.24 ms wall. His indexer also selects per query (256-row groups only bound the score
 buffer); his dense prompt GEMMs accumulate in fp16 (FNX_PF_F16ACC, 595 -> 750 t/s by his notes), which we do not copy.
+
+## 340 — Flash-Next 261k: PLE scan cache off (prefill 294.8 -> 354.1 t/s, first decode 16.05 -> 29.36) (11-21)
+
+Per-ubatch host profile (LLAMA_UBATCH_PROFILE=2 EVERY=1) at 250k: GPU compute a steady ~5.1 s per 2048 tokens, but set_inputs 0.05 s to
+6.3 s (once 45.5 s), all in llm_graph_input_qwen4exp_ple (LLAMA_INPUT_PROF). LLAMA_PLE_SCAN_MIN=8192 (on in our test scripts, off by
+default in the code) streams the whole 28.8 GB PLE table through ntfs-3g per batch while the ubatches fault their rows from the same
+file; the scan was still running when decode began, so decode's PLE faults queued behind it (the first-decode slump; a restored slot
+never scans). Scan off, 8k-token passes at 250k: 321 / 328 / 317 / 310 t/s vs on 246 / 252 / 74 / 239. Fresh 260,914-token prompt,
+-ub 2048, 75 + LEND 80, plain: prefill 354.1 t/s (was 294.8), decode right after 29.36 t/s (was 16.05), next request 30.83; VRAM per
+card 14885 MiB. His engine: 808.8 / 29.3. Idle gaps in the scan-on nsys: 6.0 s before ubatch starts (the PLE stalls), 2.2 s before
+k_lru_remap (expert copies), so with the scan off the kernels (~2.2 ms a token at 250k) are the limit.
