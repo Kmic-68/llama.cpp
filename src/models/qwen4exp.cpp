@@ -651,16 +651,15 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     // rows without an output (an MTP catch-up: only their K/V is kept) skip the FFN and the head, as the main graph's last layer
     // does (LLAMA_MTP_CROP=0: run them through)
     static const bool mtp_crop = [] { const char * e = getenv("LLAMA_MTP_CROP"); return !e || atoi(e) != 0; }();
+    // (after the combine: the attention output is still a per-device partial sum before it, and a get_rows on that runs on the
+    // CPU under -sm tensor, ~1.6 ms a draft pass)
     const bool cropped = mtp_crop && crop_before_nextn(inp_out_ids);
+    res_hc = build_hc_combine(res_hc, cur, inject, il);
     if (cropped) {
-        cur    = ggml_get_rows(ctx0, cur,    inp_out_ids);
-        inject = ggml_get_rows(ctx0, inject, inp_out_ids);
-
         res_hc = ggml_reshape_2d(ctx0, res_hc, n_embd*hc, res_hc->ne[2]);
         res_hc = ggml_get_rows(ctx0, res_hc, inp_out_ids);
         res_hc = ggml_reshape_3d(ctx0, res_hc, n_embd, hc, res_hc->ne[1]);
     }
-    res_hc = build_hc_combine(res_hc, cur, inject, il);
 
     cur    = build_hc_mix(res_hc, layer.hc_ffn_norm, layer.hc_ffn_down, layer.hc_ffn_up, layer.hc_ffn_inject, &inject, il);
     cur    = build_layer_ffn(cur, il);
@@ -679,7 +678,8 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    cur = build_lora_mm(model.output, cur, model.output_s);
+    // LLAMA_MTP_DRAFT_VOCAB: the draft scores only the first rows of the vocabulary (the others get -inf); proposals only
+    cur = model.output_draft ? build_lora_mm(model.output_draft, cur) : build_lora_mm(model.output, cur, model.output_s);
 
     // a reduced-vocabulary head (d2t) outputs only its rows; llama_context scatters them to target ids while extracting logits
     // (a graph-side set_rows over the vocab-split logits trips the tensor-split meta backend: set_rows on SPLIT_AXIS_1)

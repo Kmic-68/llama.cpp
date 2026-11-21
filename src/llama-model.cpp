@@ -2125,7 +2125,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     // Default 81920 rows in q4_0: ~112 MiB per GPU of 2 (OPTLOG 226). 0 turns it off.
     static const int64_t draft_vocab = [] { const char * e = getenv("LLAMA_MTP_DRAFT_VOCAB"); return e ? (int64_t) atoll(e) : (int64_t) 81920; }();
     if (draft_vocab > 0 && output && hparams.n_layer_nextn > 0 && output->buffer && output->ne[1] > draft_vocab &&
-            (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE)) {
+            (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE ||
+             // Flash-Next's MTP file (its own output head, 248320 rows in q8_0)
+             (arch == LLM_ARCH_QWEN4EXP && (int64_t) layers.size() > (int64_t) hparams.n_layer() &&
+              layers[hparams.n_layer()].nextn.eh_proj != nullptr))) {
         const int64_t nd = draft_vocab;
         const auto * w = ml.get_weight(ggml_get_name(output));
         if (w != nullptr) {
@@ -2138,7 +2141,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             ggml_context * ctx = ggml_init(ip);
             ggml_tensor * t = ggml_new_tensor_2d(ctx, dtype, n_embd_o, nd);
             ggml_set_name(t, "output_draft.weight");
-            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, ggml_backend_buffer_get_type(output->buffer));
+            // the full head may sit in host memory (Flash-Next MTP: -otd output=CPU, only this copy is read): then the copy goes
+            // where the MTP block's weights are
+            ggml_backend_buffer_type_t dbuft = ggml_backend_buffer_get_type(output->buffer);
+            if (ggml_backend_buffer_is_host(output->buffer) && arch == LLM_ARCH_QWEN4EXP &&
+                    layers[hparams.n_layer()].nextn.eh_proj->buffer != nullptr) {
+                dbuft = ggml_backend_buffer_get_type(layers[hparams.n_layer()].nextn.eh_proj->buffer);
+            }
+            ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, dbuft);
             GGML_ASSERT(buf != nullptr);
             ggml_backend_buffer_set_usage(buf, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
             std::vector<uint8_t> src(ggml_row_size(output->type, n_embd_o)*nd);
