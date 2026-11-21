@@ -475,7 +475,11 @@ static __global__ void __launch_bounds__(16*RL, 2) tile_mm_rows(const tile_mm_pa
             __syncthreads();   // the previous step's products are done with sw, sx (and g3 is staged)
             {
                 uint4 o[8];
+#ifdef TMR_STUB
+                _Pragma("unroll") for (int q = 0; q < 8; ++q) o[q] = make_uint4(raw[q] | 0x3c003c00u, raw[q+8], raw[q+1], raw[q+2]);
+#else
                 tmr_decode_step<type>(raw, st, g3, o);
+#endif
                 const int slot = (tid % RL)*16 + tid / RL;
 #pragma unroll
                 for (int q = 0; q < 8; ++q) sw[slot*LD + q] = my_row < M ? o[q] : make_uint4(0, 0, 0, 0);
@@ -483,9 +487,11 @@ static __global__ void __launch_bounds__(16*RL, 2) tile_mm_rows(const tile_mm_pa
             if constexpr (type != GGML_TYPE_IQ4_NL) {   // IQ3_S's 160-thread blocks have no registers to spare for a prefetch
                 TMR_XLOAD(k0)
             }
+            // stored rotated by one k-pair (slot j holds pair j + 1 mod 4): a weight pair e and its activation pair then sit in
+            // different register banks (the same component of two 4-aligned quads shares a bank: a conflict on every HFMA2)
 #pragma unroll
             for (int q = 0; q < XQ; ++q) {
-                if (xsi[q] >= 0) sx[xsi[q]] = xv[q];
+                if (xsi[q] >= 0) sx[xsi[q]] = make_uint4(xv[q].y, xv[q].z, xv[q].w, xv[q].x);
             }
             if constexpr (type == GGML_TYPE_IQ4_NL) {
                 if (k0 + 64 < K) {
@@ -510,9 +516,9 @@ static __global__ void __launch_bounds__(16*RL, 2) tile_mm_rows(const tile_mm_pa
                 for (int r = 0; r < RL; ++r) wr[r] = sw[(r*16 + ni)*LD + c];
 #pragma unroll
                 for (int i = 0; i < TL; ++i) xq[i] = sx[(ti*TL + i)*LD + c];
-#define TMR_MAC(F) _Pragma("unroll") for (int i = 0; i < TL; ++i) _Pragma("unroll") for (int r = 0; r < RL; ++r) \
-                    h[i][r] = __hfma2(*(const half2 *) &wr[r].F, *(const half2 *) &xq[i].F, h[i][r]);
-                TMR_MAC(x) TMR_MAC(y) TMR_MAC(z) TMR_MAC(w)
+#define TMR_MAC(F, G) _Pragma("unroll") for (int i = 0; i < TL; ++i) _Pragma("unroll") for (int r = 0; r < RL; ++r) \
+                    h[i][r] = __hfma2(*(const half2 *) &wr[r].F, *(const half2 *) &xq[i].G, h[i][r]);
+                TMR_MAC(x, w) TMR_MAC(y, x) TMR_MAC(z, y) TMR_MAC(w, z)
 #undef TMR_MAC
             }
 #pragma unroll
