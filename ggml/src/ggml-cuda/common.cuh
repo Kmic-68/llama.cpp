@@ -1726,6 +1726,8 @@ struct ggml_backend_cuda_context {
     size_t              mmvq_q8_1_need[GGML_CUDA_MAX_DEVICES] = { 0 };
     void *              mmvq_q8_1_ptr [GGML_CUDA_MAX_DEVICES] = { nullptr };
     size_t              mmvq_q8_1_cap [GGML_CUDA_MAX_DEVICES] = { 0 };
+    void *              mmvq_q8_1_glu_ptr [GGML_CUDA_MAX_DEVICES] = { nullptr };   // the fused swiglu quantization's own buffer
+    size_t              mmvq_q8_1_glu_cap [GGML_CUDA_MAX_DEVICES] = { 0 };
 
     void mmvq_q8_1_invalidate() {
         for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {

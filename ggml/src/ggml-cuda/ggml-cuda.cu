@@ -794,6 +794,11 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
             CUDA_CHECK(cudaFree(mmvq_q8_1_ptr[i]));
             mmvq_q8_1_ptr[i] = nullptr;
         }
+        if (mmvq_q8_1_glu_ptr[i] != nullptr) {
+            ggml_cuda_set_device(i);
+            CUDA_CHECK(cudaFree(mmvq_q8_1_glu_ptr[i]));
+            mmvq_q8_1_glu_ptr[i] = nullptr;
+        }
     }
 
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);

@@ -2472,12 +2472,22 @@ void ggml_cuda_mul_mat_vec_q(
                           ctx.mmvq_q8_1_need[dev] == q8_1_bytes &&
                           ctx.mmvq_q8_1_ptr [dev] != nullptr;
 
+    // the fused swiglu quantization (a down projection's input, read once) goes to its own buffer: in the main slot it evicted the
+    // cached activation that the next matmuls share (Flash-Next: the shared expert's down sat between the shared expert's and the
+    // routed experts' gate/up, so the routed experts quantized the same input again)
+    char * q8_1_glu = nullptr;
+    if (glu_q) {
+        if (ctx.mmvq_q8_1_glu_cap[dev] < q8_1_bytes) {
+            // no cudaFree mid-graph (a device sync: deadlocks against moe-lru copy-engine fills); the old buffer is kept
+            CUDA_CHECK(cudaMalloc(&ctx.mmvq_q8_1_glu_ptr[dev], q8_1_bytes + 16));
+            ctx.mmvq_q8_1_glu_cap[dev] = q8_1_bytes;
+            ctx.mmvq_q8_1_epoch++;
+        }
+        q8_1_glu = (char *) ctx.mmvq_q8_1_glu_ptr[dev];
+    }
     if (!q8_1_hit || glu_q) {
-        if (ctx.mmvq_q8_1_cap[dev] < q8_1_bytes) {
-            if (ctx.mmvq_q8_1_ptr[dev] != nullptr) {
-                CUDA_CHECK(cudaFree(ctx.mmvq_q8_1_ptr[dev]));
-                ctx.mmvq_q8_1_ptr[dev] = nullptr;
-            }
+        if (!glu_q && ctx.mmvq_q8_1_cap[dev] < q8_1_bytes) {
+            // no cudaFree mid-graph (see above): the outgrown buffer is kept
             // + 16: the Pascal staging reads whole 16-byte units and can run up to 15 bytes past
             // the last block. q8_1_bytes has no slack of its own when ne10 is already a multiple
             // of MATRIX_ROW_PADDING, so without this the read leaves the allocation.
@@ -2504,18 +2514,17 @@ void ggml_cuda_mul_mat_vec_q(
             const int64_t o0 = g0->nb[1]/sizeof(float);
             const int64_t o1 = g1 ? g1->nb[1]/sizeof(float) : o0;
             const dim3 nb((unsigned) ((ne10_padded + CUDA_QUANTIZE_BLOCK_SIZE - 1)/CUDA_QUANTIZE_BLOCK_SIZE), (unsigned) ne11a, 1);
-            quantize_q8_1_swiglu<<<nb, CUDA_QUANTIZE_BLOCK_SIZE, 0, stream>>>(xg, gg, (block_q8_1 *) ctx.mmvq_q8_1_ptr[dev], o0, o1, ne10, ne10_padded);
+            quantize_q8_1_swiglu<<<nb, CUDA_QUANTIZE_BLOCK_SIZE, 0, stream>>>(xg, gg, (block_q8_1 *) q8_1_glu, o0, o1, ne10, ne10_padded);
         } else {
             quantize_row_q8_1_cuda(src1_d, nullptr, (char *) ctx.mmvq_q8_1_ptr[dev], src0->type, ne10, s11, s12, s13, ne10_padded, ne11a, ne12, ne13, stream);
+            ctx.mmvq_q8_1_src1[dev] = src1;
+            ctx.mmvq_q8_1_data[dev] = src1_d;
+            ctx.mmvq_q8_1_type[dev] = src0->type;
+            ctx.mmvq_q8_1_need[dev] = q8_1_bytes;
         }
-
-        ctx.mmvq_q8_1_src1[dev] = src1;
-        ctx.mmvq_q8_1_data[dev] = src1_d;
-        ctx.mmvq_q8_1_type[dev] = src0->type;
-        ctx.mmvq_q8_1_need[dev] = q8_1_bytes;
     }
 
-    struct { char * get() const { return p; } char * p; } src1_q8_1 { (char *) ctx.mmvq_q8_1_ptr[dev] };
+    struct { char * get() const { return p; } char * p; } src1_q8_1 { glu_q ? q8_1_glu : (char *) ctx.mmvq_q8_1_ptr[dev] };
 
     const int64_t s01 = src0->nb[1] / ts_src0;
     const int64_t s11 = ne10_padded / QK8_1;
@@ -2735,10 +2744,7 @@ block_q8_1 * ggml_cuda_mmvq_q8_1_reserve(ggml_backend_cuda_context & ctx, const 
     const int dev = ggml_cuda_get_device();
     const size_t q8_1_bytes = mmvq_q8_1_bytes_for(src1);
     if (ctx.mmvq_q8_1_cap[dev] < q8_1_bytes) {
-        if (ctx.mmvq_q8_1_ptr[dev] != nullptr) {
-            CUDA_CHECK(cudaFree(ctx.mmvq_q8_1_ptr[dev]));
-            ctx.mmvq_q8_1_ptr[dev] = nullptr;
-        }
+        // no cudaFree mid-graph (a device sync: deadlocks against moe-lru copy-engine fills): the outgrown buffer is kept
         CUDA_CHECK(cudaMalloc(&ctx.mmvq_q8_1_ptr[dev], q8_1_bytes + 16));
         ctx.mmvq_q8_1_cap[dev] = q8_1_bytes;
         ctx.mmvq_q8_1_epoch++;
