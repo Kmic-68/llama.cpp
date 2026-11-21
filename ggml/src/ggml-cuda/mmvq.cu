@@ -2466,7 +2466,17 @@ void ggml_cuda_mul_mat_vec_q(
     // the cache is invalidated at the start of each graph evaluation.
     const int dev = ggml_cuda_get_device();
 
-    const bool q8_1_hit = ctx.mmvq_q8_1_src1[dev] == src1 &&
+    // a reshape / whole view of the cached node has the same contents (Flash-Next: the routed experts read the shared expert's
+    // input as [K, 1, T]); contents are fixed within a graph evaluation, so the root node + data pointer identify them
+    auto q8_root = [](const ggml_tensor * t) {
+        while (t && (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_VIEW) && t->src[0] && t->data == t->src[0]->data &&
+               ggml_nbytes(t) == ggml_nbytes(t->src[0]) && ggml_is_contiguous(t) && ggml_is_contiguous(t->src[0])) {
+            t = t->src[0];
+        }
+        return t;
+    };
+    const bool q8_1_hit = (ctx.mmvq_q8_1_src1[dev] == src1 ||
+                           (ctx.mmvq_q8_1_src1[dev] != nullptr && q8_root(ctx.mmvq_q8_1_src1[dev]) == q8_root(src1))) &&
                           ctx.mmvq_q8_1_data[dev] == src1_d &&
                           (ctx.mmvq_q8_1_type[dev] == src0->type || q8_1_any_type()) &&
                           ctx.mmvq_q8_1_need[dev] == q8_1_bytes &&
