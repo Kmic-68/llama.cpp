@@ -415,7 +415,25 @@ const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_lay
 
         sq.strm = unified ? 0 : mem_idx->get_stream(s);
 
-        if (mem_idx_stale[s] == POS_CLEAN && !sq.cells.empty() && !sp.empty() &&
+        // an edit from position st on (st is the lowest edited position of every edit since the last ubatch, see
+        // mem_idx_stale_set) leaves the cells before st as they were: keep them and the pools that end before st, and
+        // rescan from the end of the last kept pool. A speculative rollback (seq_rm of the rejected drafts) did a full
+        // rebuild here, O(context): ~2-3.5 ms a ubatch at 32k on Flash-Next MTP. LLAMA_KPOOL_TRUNCATE=0: always rebuild
+        static const bool truncate_on = [] { const char * e = getenv("LLAMA_KPOOL_TRUNCATE"); return !e || atoi(e) != 0; }();
+        bool truncated = false;
+        const llama_pos st = mem_idx_stale[s];
+        if (truncate_on && st != POS_CLEAN && st > 0 && !sq.cells.empty() && !sp.empty() && sq.pos_min == sp.begin()->first &&
+                st > sq.pos_min) {
+            const auto cut = std::lower_bound(sq.cells.begin(), sq.cells.end(), std::make_pair(st, (uint32_t) 0));
+            sq.cells.erase(cut, sq.cells.end());
+            while (!sq.pools.empty() && (size_t) sq.pools.back() + kpool > sq.cells.size()) {
+                sq.pools.pop_back();
+            }
+            sq.j_next = sq.pools.empty() ? 0 : sq.pools.back() + kpool;
+            truncated = true;
+        }
+
+        if ((mem_idx_stale[s] == POS_CLEAN || truncated) && !sq.cells.empty() && !sp.empty() &&
                 sq.pos_min == sp.begin()->first) {
             for (auto it = sp.upper_bound(sq.cells.back()); it != sp.end(); ++it) {
                 sq.cells.push_back(*it);
@@ -424,7 +442,7 @@ const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_lay
 
         // the appended tail accounts for every cell only if nothing before it was dropped, but an edit can
         // regroup a sequence without changing its cell count, so a stale sequence must rebuild regardless
-        if (sq.cells.size() != sp.size() || mem_idx_stale[s] != POS_CLEAN) {
+        if (sq.cells.size() != sp.size() || (mem_idx_stale[s] != POS_CLEAN && !truncated)) {
             sq.cells.assign(sp.begin(), sp.end());
             sq.pools.clear();
             sq.j_next  = 0;
@@ -461,6 +479,28 @@ const llama_memory_hybrid_idx::kpool_layout & llama_memory_hybrid_idx::kpool_lay
             }
         }
         sq.j_next = j;
+
+        if (truncated && getenv("LLAMA_KPOOL_TRUNCATE_CHECK")) {   // debug: O(context), as the old rebuild
+            // the same scan over a full rebuild must give the same layout
+            std::vector<std::pair<llama_pos, uint32_t>> fc(sp.begin(), sp.end());
+            std::vector<uint32_t> fp;
+            size_t fj = 0;
+            if (hparams_idx.indexer_kpool_by_order) {
+                for (; fj + kpool <= fc.size(); fj += kpool) {
+                    fp.push_back((uint32_t) fj);
+                }
+            } else {
+                const llama_pos pm = fc.empty() ? 0 : fc.front().first;
+                while (fj + kpool <= fc.size()) {
+                    const llama_pos p0 = fc[fj].first;
+                    if ((p0 - pm) % (llama_pos) kpool != 0) { ++fj; continue; }
+                    bool ok = true;
+                    for (uint32_t k = 1; k < kpool; ++k) { if (fc[fj + k].first != p0 + (llama_pos) k) { ok = false; break; } }
+                    if (ok) { fp.push_back((uint32_t) fj); fj += kpool; } else { ++fj; }
+                }
+            }
+            GGML_ASSERT(fc == sq.cells && fp == sq.pools && fj == sq.j_next && "kpool truncation differs from a rebuild");
+        }
 
         lay.n_pool_real += (uint32_t) sq.pools.size();
     }
