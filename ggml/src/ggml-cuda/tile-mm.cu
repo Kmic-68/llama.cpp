@@ -383,9 +383,11 @@ static __device__ __forceinline__ void tmr_decode_step(const uint32_t (&w)[28], 
 #undef TMR_B
 }
 
-template <ggml_type type>
-static __global__ void __launch_bounds__(TMR_NT, 2) tile_mm_rows(const tile_mm_params prm) {
-    constexpr int NT = TMR_NT, RB = TMR_RB, TB = TMR_TB, TL = TMR_TL, RL = TMR_RL, KU = TMR_KU, LD = TMR_LD;
+// RL rows x TL tokens a thread, 16 row groups: RB = 16 RL rows = NT threads (one decode row each), TB = RL TL tokens a tile
+// (8 x 6: 128 rows x 48 tokens; 10 x 5: 160 x 50, which tiles Flash-Next's M = 320 gate/up exactly)
+template <ggml_type type, int RL = TMR_RL, int TL = TMR_TL>
+static __global__ void __launch_bounds__(16*RL, 2) tile_mm_rows(const tile_mm_params prm) {
+    constexpr int NT = 16*RL, RB = 16*RL, TB = RL*TL, KU = TMR_KU, LD = TMR_LD;
     constexpr int UV = type == GGML_TYPE_IQ3_S ? QK_K : 64;   // values a staged unit (IQ3_S: a superblock, IQ4_NL: two blocks)
     constexpr int UB = type == GGML_TYPE_IQ3_S ? (int) sizeof(block_iq3_s) : 2*(int) sizeof(block_iq4_nl);
     constexpr int NW = type == GGML_TYPE_IQ3_S ? 28 : 9;      // words a unit (IQ3_S from the aligned-down address, realigned)
@@ -1035,13 +1037,17 @@ bool ggml_cuda_tile_mm_id_try(ggml_backend_cuda_context & ctx, const ggml_tensor
     // GGML_CUDA_TMM_ID_TN_MAX=4: at most 64 columns, as before
     static const int tn_max = [] { const char * e = getenv("GGML_CUDA_TMM_ID_TN_MAX"); return e ? atoi(e) : 6; }();
     // the row-per-thread kernel (IQ3_S / IQ4_NL, whole units, 4-aligned rows): 48-column tiles
-    // (IQ4_NL by default: IQ3_S gate/up measured no faster, M = 320 leaves a half-empty 128-row block; GGML_CUDA_TMM_ROWS=2: both, 0: neither)
+    // (IQ4_NL in 128-row blocks, IQ3_S in 160-row blocks when M % 160 == 0 -- Flash-Next's M = 320 gate/up left a 128-row grid's last
+    // block half empty; GGML_CUDA_TMM_ROWS=2: IQ3_S also in 128-row blocks, 0: neither)
     static const int rows_on = [] { const char * e = getenv("GGML_CUDA_TMM_ROWS"); return e ? atoi(e) : 1; }();
-    const bool rows_k = ((rows_on >= 1 && type == GGML_TYPE_IQ4_NL) || (rows_on >= 2 && type == GGML_TYPE_IQ3_S)) &&
+    const bool rows_k = ((rows_on >= 1 && type == GGML_TYPE_IQ4_NL) ||
+                         (rows_on >= 1 && type == GGML_TYPE_IQ3_S && (M % 160 == 0 || rows_on >= 2))) &&
                         K % (type == GGML_TYPE_IQ3_S ? QK_K : 64) == 0 && src0->nb[1] % 4 == 0 && src0->nb[2] % 4 == 0 &&
                         (tpool == nullptr || (tpool->nb[1] == src0->nb[1] && tpool->nb[2] % 4 == 0));
     const int tn   = rows_k ? TMR_TB/16 : std::min(tn_max, avg <= 16 ? 1 : avg <= 32 ? 2 : avg <= 48 ? 3 : avg <= 64 ? 4 : avg <= 80 ? 5 : 6);
-    const int bn   = 16*tn;
+    static const int r160_env = [] { const char * e = getenv("GGML_CUDA_TMM_ROWS160"); return e ? atoi(e) : 1; }();
+    const bool r160 = rows_k && r160_env && type == GGML_TYPE_IQ3_S && M % 160 == 0;   // 160-row blocks (10 x 5 a thread, 50-token tiles)
+    const int bn   = r160 ? 50 : rows_k ? TMR_TB : 16*tn;
     const int nwin = (int) ((K + TMM_WIN - 1)/TMM_WIN);
     const int max_tiles = (int) ((total + bn - 1)/bn + n_experts);
 
@@ -1080,7 +1086,14 @@ bool ggml_cuda_tile_mm_id_try(ggml_backend_cuda_context & ctx, const ggml_tensor
     prm.M = (int) M; prm.K = (int) K; prm.N = 0; prm.nwin = nwin;
     static const int tm_env = [] { const char * e = getenv("GGML_CUDA_TMM_TM"); return e ? atoi(e) : 5; }();
     prm.tm = tm_env == 5 && M % 80 == 0 ? 5 : 4;
-    if (rows_k) {
+    if (rows_k && r160) {
+        const dim3 grid(prm.M/160, max_tiles);
+        if (type == GGML_TYPE_IQ3_S) {
+            tile_mm_rows<GGML_TYPE_IQ3_S, 10, 5><<<grid, 160, 0, stream>>>(prm);
+        } else {
+            tile_mm_rows<GGML_TYPE_IQ4_NL, 10, 5><<<grid, 160, 0, stream>>>(prm);
+        }
+    } else if (rows_k) {
         const dim3 grid((prm.M + TMR_RB - 1)/TMR_RB, max_tiles);
         if (type == GGML_TYPE_IQ3_S) {
             tile_mm_rows<GGML_TYPE_IQ3_S><<<grid, TMR_NT, 0, stream>>>(prm);
