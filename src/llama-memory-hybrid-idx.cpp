@@ -794,7 +794,8 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
 
     GGML_ASSERT(n_pool == kpool_pad(st.n_pool_real));
     GGML_ASSERT(st.is_new.size() == st.n_pool_real);
-    GGML_ASSERT(pool_mask->ne[0] == (int64_t) n_pool && pool_mask->ne[1] == (int64_t) n_tokens);
+    const bool range_mask = pool_mask->type == GGML_TYPE_I32;   // [2, n_tokens]: the visible pools [lo, hi) of each token
+    GGML_ASSERT(pool_mask->ne[0] == (range_mask ? 2 : (int64_t) n_pool) && pool_mask->ne[1] == (int64_t) n_tokens);
     GGML_ASSERT(tail_idxs->ne[0] == (int64_t) kpool - 1 && tail_idxs->ne[1] == (int64_t) n_tokens);
     GGML_ASSERT(pool_idxs->ne[0] == (int64_t) kpool && pool_idxs->ne[1] == (int64_t) n_pool);
     GGML_ASSERT(ggml_backend_buffer_is_host(new_pool_idxs->buffer));
@@ -950,21 +951,25 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
     // a pool is visible when it belongs to the token's sequence and ends at or before it
     auto fill_mask = [&](auto * data) {
         using T = std::remove_pointer_t<decltype(data)>;
-        const T keep = llama_cast<T>(0.0f);
-        const T drop = llama_cast<T>(-INFINITY);
 
         for (uint32_t i = 0; i < n_tokens; ++i) {
             const llama_seq_id s = ubatch->seq_id[i][0];
             const llama_pos    p = ubatch->pos[i];
 
-            T * row = data + (size_t) i*n_pool;
-            std::fill(row, row + n_pool, drop);
-
             const uint32_t p0 = seq_pool_start[s];
             const uint32_t p1 = p0 + (uint32_t) lay.seqs[s].pools.size();
             const uint32_t nv = by_order ? std::min(p1 - p0, (uint32_t) ((rank[i] + 1)/kpool)) :
                 (uint32_t) (std::upper_bound(pool_end.begin() + p0, pool_end.begin() + p1, p) - (pool_end.begin() + p0));
-            std::fill(row + p0, row + p0 + nv, keep);
+            if constexpr (std::is_same_v<T, int32_t>) {
+                data[2*(size_t) i + 0] = (int32_t) p0;
+                data[2*(size_t) i + 1] = (int32_t) (p0 + nv);
+            } else {
+                const T keep = llama_cast<T>(0.0f);
+                const T drop = llama_cast<T>(-INFINITY);
+                T * row = data + (size_t) i*n_pool;
+                std::fill(row, row + n_pool, drop);
+                std::fill(row + p0, row + p0 + nv, keep);
+            }
 
             // Finite visible pools occupy the first min(nv, n_top) ranked slots.
             if (gm != nullptr) {
@@ -975,7 +980,9 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
             }
         }
     };
-    if (pool_mask->type == GGML_TYPE_F16) {
+    if (range_mask) {
+        fill_mask((int32_t *) pool_mask->data);
+    } else if (pool_mask->type == GGML_TYPE_F16) {
         fill_mask((ggml_fp16_t *) pool_mask->data);
     } else {
         fill_mask((float *) pool_mask->data);
@@ -1028,7 +1035,9 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
             const auto & sq = lay.seqs[s];
             std::vector<int> cnt(n_kv + 1, 0);
             for (uint32_t ip = 0; ip < n_pool; ++ip) {
-                const float mv = pool_mask->type == GGML_TYPE_F16 ? ggml_fp16_to_fp32(((const ggml_fp16_t *) pool_mask->data)[(size_t) i*n_pool + ip]) :
+                const float mv = range_mask ? (ip >= (uint32_t) ((const int32_t *) pool_mask->data)[2*i] &&
+                                               ip <  (uint32_t) ((const int32_t *) pool_mask->data)[2*i + 1] ? 0.0f : -INFINITY) :
+                                 pool_mask->type == GGML_TYPE_F16 ? ggml_fp16_to_fp32(((const ggml_fp16_t *) pool_mask->data)[(size_t) i*n_pool + ip]) :
                                                                     ((const float *) pool_mask->data)[(size_t) i*n_pool + ip];
                 if (mv == 0.0f) {
                     for (uint32_t k = 0; k < kpool; ++k) {

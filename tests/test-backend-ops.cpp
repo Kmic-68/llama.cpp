@@ -9458,6 +9458,40 @@ struct test_lightning_indexer : public test_case {
     }
 };
 
+// GGML_OP_LIGHTNING_INDEXER with an I32 [2, nb] range mask (a token sees keys [lo, hi))
+struct test_lightning_indexer_range : public test_lightning_indexer {
+    using test_lightning_indexer::test_lightning_indexer;
+    std::string vars() override { return test_lightning_indexer::vars() + ",range=1"; }
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk, nh, nb, ns);
+        ggml_set_name(q, "q");
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_K, hsk, 1, kv, ns);
+        ggml_set_name(k, "k");
+        ggml_tensor * w = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, nh, nb, 1, ns);
+        ggml_set_name(w, "w");
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_I32, 2, nb, 1, nm);
+        ggml_set_name(m, "m");
+        ggml_tensor * out = ggml_lightning_indexer(ctx, q, k, w, m);
+        ggml_set_name(out, "out");
+        return out;
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(1234);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "m") == 0) {
+                std::vector<int32_t> r(ggml_nelements(t));
+                for (size_t i = 0; i < r.size(); i += 2) {
+                    const int32_t lo = (int32_t) (rng() % (uint32_t) (kv/2)), hi = lo + 1 + (int32_t) (rng() % (uint32_t) (kv - lo));
+                    r[i] = lo; r[i + 1] = std::min<int32_t>(hi, (int32_t) kv);
+                }
+                ggml_backend_tensor_set(t, r.data(), 0, r.size()*sizeof(int32_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_TOP_K_MASK
 struct test_top_k_mask : public test_case {
     const ggml_type type;
@@ -12985,6 +13019,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {nr2, 2}, 2304, nb, true, false, 0.0f, 0.0f, GGML_PREC_F32,
                                                             GGML_TYPE_Q4_0, GGML_TYPE_Q4_0));
         }
+    }
+
+    // range masks (the QSA pool mask of >= 32-token ubatches)
+    for (ggml_type tk : { GGML_TYPE_F16, GGML_TYPE_Q4_0 }) {
+        test_cases.emplace_back(new test_lightning_indexer_range(128, 4, 300, 45, 1, 1, tk));
+        test_cases.emplace_back(new test_lightning_indexer_range(128, 4, 1029, 128, 2, 1, tk));
     }
 
     // 4-head f16 prefill tiles (CUDA gemm4: 32 tokens x 128 keys a block) with ragged edges

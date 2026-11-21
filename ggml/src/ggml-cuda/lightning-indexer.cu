@@ -558,7 +558,7 @@ static __global__ void lightning_indexer_kernel_tile(
 // head sum and the mask as in the tile kernel: the same scores bit for bit. GGML_CUDA_LI_GEMM=0: the tile kernel.
 static constexpr int LI_GEMM_TT = 2, LI_GEMM_KPT = 8, LI_GEMM_DK = 16, LI_GEMM_BT = 16*LI_GEMM_TT, LI_GEMM_BK = 16*LI_GEMM_KPT;
 
-template <ggml_type TYPE_K>
+template <ggml_type TYPE_K, bool RANGE>
 static __global__ void __launch_bounds__(256, 2) lightning_indexer_kernel_gemm4(
         const float * Q, const char * K, const float * W, const half * M, float * dst,
         int64_t n_stream, int64_t n_batch, int64_t n_kv,
@@ -663,11 +663,17 @@ static __global__ void __launch_bounds__(256, 2) lightning_indexer_kernel_gemm4(
         }
         const half * m_base = (const half *) ((const char *) M + i_batch*nbm1 + (s%nem3)*nbm3);
         float * dst_base = (float *) ((char *) dst + i_batch*nb1 + s*nb3);
+        int lo = 0, hi = 0;
+        if constexpr (RANGE) {   // I32 [lo, hi): the same 0 / -inf the F16 mask holds
+            lo = ((const int32_t *) m_base)[0];
+            hi = ((const int32_t *) m_base)[1];
+        }
 #pragma unroll
         for (int j = 0; j < KPT; ++j) {
             const int i_kv = p0 + kg*KPT + j;
             if (i_kv < n_kv) {
-                dst_base[i_kv] = score[j] + __half2float(m_base[i_kv]);
+                const float mv = RANGE ? (i_kv >= lo && i_kv < hi ? 0.0f : -INFINITY) : __half2float(m_base[i_kv]);
+                dst_base[i_kv] = score[j] + mv;
             }
         }
     }
@@ -697,7 +703,7 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
     GGML_ASSERT(  q->type == GGML_TYPE_F32);
     GGML_ASSERT(  w->type == GGML_TYPE_F32);
-    GGML_ASSERT(  m->type == GGML_TYPE_F16);
+    GGML_ASSERT(  m->type == GGML_TYPE_F16 || m->type == GGML_TYPE_I32);   // I32 [2, n_batch] ranges: the gemm4 kernel only
 
     GGML_TENSOR_LOCALS(int64_t, neq,  q, ne)
     GGML_TENSOR_LOCALS(size_t,  nbq,  q, nb)
@@ -831,7 +837,10 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
         dim3 grid((n_kv + LI_GEMM_BK - 1)/LI_GEMM_BK, (n_batch + LI_GEMM_BT - 1)/LI_GEMM_BT, n_stream);
 #define LI_GEMM4_CASE(T) \
         if (k->type == (T)) { \
-            lightning_indexer_kernel_gemm4<T><<<grid, block, 0, ctx.stream()>>>( \
+            if (m->type == GGML_TYPE_I32) lightning_indexer_kernel_gemm4<T, true><<<grid, block, 0, ctx.stream()>>>( \
+                q_d, k_d, w_d, m_d, dst_d, n_stream, n_batch, n_kv, nb1, nb2, nb3, nbq1, nbq2, nbq3, nbk1, nbk2, nbk3, \
+                nbw1, nbw2, nbw3, nbm1, nbm2, nbm3, nem3, k_idx); \
+            else lightning_indexer_kernel_gemm4<T, false><<<grid, block, 0, ctx.stream()>>>( \
                 q_d, k_d, w_d, m_d, dst_d, n_stream, n_batch, n_kv, nb1, nb2, nb3, nbq1, nbq2, nbq3, nbk1, nbk2, nbk3, \
                 nbw1, nbw2, nbw3, nbm1, nbm2, nbm3, nem3, k_idx); \
         }
@@ -839,6 +848,8 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
         LI_GEMM4_CASE(GGML_TYPE_Q4_0)
         LI_GEMM4_CASE(GGML_TYPE_Q8_0)
 #undef LI_GEMM4_CASE
+    } else if (m->type == GGML_TYPE_I32) {
+        GGML_ABORT("lightning indexer: a range mask needs the gemm4 kernel (4 heads x 128, >= 32 queries, f16/q4_0/q8_0 keys)");
     } else if (n_embd == 128 && n_head == 4 && n_batch >= LIGHTNING_INDEXER_TILE_TOKENS) {
         // too few heads for a wmma tile, the tile kernel shares the keys across the tokens
         constexpr int WARPS_PER_BLOCK = 8;
@@ -903,6 +914,14 @@ bool ggml_cuda_lightning_indexer_supported(int device, const ggml_tensor * dst) 
 
     if (neq0 != 128) {
         return false;
+    }
+    if (m->type == GGML_TYPE_I32) {   // range mask: the gemm4 kernel's shapes only
+        const char * e = getenv("GGML_CUDA_LI_GEMM");
+        if ((e && atoi(e) == 0) || neq1 != 4 || neq2 < LI_GEMM_BT ||
+                (k->type != GGML_TYPE_F16 && k->type != GGML_TYPE_Q4_0 && k->type != GGML_TYPE_Q8_0) ||
+                (uintptr_t) nbq1 % 16 != 0 || nbq2 % 16 != 0 || nbq3 % 16 != 0) {
+            return false;
+        }
     }
 
     if (neq1 != 64 && neq1 != 32 && neq1 != 4) {

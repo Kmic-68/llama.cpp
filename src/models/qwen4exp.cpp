@@ -777,7 +777,12 @@ llama_model_qwen4exp::llm_graph_input_kpool * llama_model_qwen4exp::graph::build
     inp->k_idxs     = mctx_idx->build_input_k_idxs(ctx0, ubatch);
     inp->pool_cells = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_pool);
     inp->pool_idxs  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool, n_pool);
-    inp->pool_mask  = ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_pool, n_tokens);
+    // a token sees one range of pools: for the CUDA gemm4 indexer (>= 32 tokens) the mask is that range, I32 [2, n_tokens], instead
+    // of an F16 [n_pool, n_tokens] row of 0 / -inf (537 MB built on the host and uploaded per 4096-token ubatch at 262k).
+    // LLAMA_QSA_RANGE_MASK=0: the F16 rows
+    static const bool range_mask = [] { const char * e = getenv("LLAMA_QSA_RANGE_MASK"); return !e || atoi(e) != 0; }();
+    inp->pool_mask  = range_mask && n_tokens >= 32 ? ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, 2, n_tokens)
+                                                   : ggml_new_tensor_2d(ctx0, GGML_TYPE_F16, n_pool, n_tokens);
     inp->tail_idxs  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool - 1, n_tokens);
     ggml_set_input(inp->pool_cells);
     ggml_set_input(inp->pool_idxs);
@@ -905,7 +910,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
             const int64_t nt = std::min(qchunk, n_tokens - t0);
             ggml_tensor * qc = ggml_view_3d(ctx0, q, idx_dim, n_idx_h, nt, q->nb[1], q->nb[2], t0*q->nb[2]);
             ggml_tensor * wc = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_idx_h, nt), 1.0f/sqrtf((float) idx_dim));
-            ggml_tensor * pm = ggml_view_2d(ctx0, inp_kpool->pool_mask, n_pool, nt, inp_kpool->pool_mask->nb[1],
+            ggml_tensor * pm = ggml_view_2d(ctx0, inp_kpool->pool_mask, inp_kpool->pool_mask->ne[0], nt, inp_kpool->pool_mask->nb[1],
                                             t0*inp_kpool->pool_mask->nb[1]);
             ggml_tensor * sc = indexer(qc, wc, pm); // [n_pool, nt]
             res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, sc, il});
@@ -953,7 +958,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
             if (nt != n_tokens) {
                 ggml_tensor * qc = ggml_view_3d(ctx0, q, idx_dim, n_idx_h, nt, q->nb[1], q->nb[2], t0*q->nb[2]);
                 ggml_tensor * wc = ggml_fill(ctx0, ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_idx_h, nt), 1.0f/sqrtf((float) idx_dim));
-                ggml_tensor * pm = ggml_view_2d(ctx0, inp_kpool->pool_mask, n_pool, nt, inp_kpool->pool_mask->nb[1],
+                ggml_tensor * pm = ggml_view_2d(ctx0, inp_kpool->pool_mask, inp_kpool->pool_mask->ne[0], nt, inp_kpool->pool_mask->nb[1],
                                                 t0*inp_kpool->pool_mask->nb[1]);
                 sc = indexer(qc, wc, pm); // [n_pool, nt]
                 res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, sc, il});

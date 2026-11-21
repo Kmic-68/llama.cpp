@@ -12684,7 +12684,7 @@ void ggml_compute_forward_lightning_indexer(
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(   q->type == GGML_TYPE_F32);
     GGML_ASSERT(   w->type == GGML_TYPE_F32);
-    GGML_ASSERT(   m->type == GGML_TYPE_F16);
+    GGML_ASSERT(   m->type == GGML_TYPE_F16 || m->type == GGML_TYPE_I32);
 
     GGML_TENSOR_LOCALS(int64_t, neq,  q, ne)
     GGML_TENSOR_LOCALS(size_t,  nbq,  q, nb)
@@ -12730,6 +12730,7 @@ void ggml_compute_forward_lightning_indexer(
         for (int t = 0; t < n_tokens; ++t) {
             const float       *   w_row =       (float *) ((char *)   w->data + t*nbw1 +        s*nbw3);
             const ggml_fp16_t *   m_row = (ggml_fp16_t *) ((char *)   m->data + t*nbm1 + (s%nem3)*nbm3);
+            const int32_t * m_rng = m->type == GGML_TYPE_I32 ? (const int32_t *) m_row : nullptr;   // [lo, hi) visible
             float             * dst_row =       (float *) ((char *) dst->data + t*nb1  +        s*nb3 );
             for (int ik = ir0; ik < ir1; ++ik) {
                 char * k_row = (char *) k->data + ik*nbk2 + s*nbk3;
@@ -12748,7 +12749,7 @@ void ggml_compute_forward_lightning_indexer(
                     score += MAX(qk, 0.0f) * w_row[h];
                 }
                 // apply mask
-                dst_row[ik] = score + GGML_CPU_FP16_TO_FP32(m_row[ik]);
+                dst_row[ik] = score + (m_rng ? (ik >= m_rng[0] && ik < m_rng[1] ? 0.0f : -INFINITY) : GGML_CPU_FP16_TO_FP32(m_row[ik]));
             }
         }
     }
