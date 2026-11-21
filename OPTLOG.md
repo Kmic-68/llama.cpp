@@ -9834,3 +9834,8 @@ Long context (-c 131072, a 71567-token prompt, 200 sampled tokens; the arena nee
 3450 MiB): plain (115 + LEND 60) prefill 217 t/s, decode 33.28 t/s, 14.7 GB per card; MTP (110 + LEND 60) 28.9-32.9 t/s,
 15.3 / 15.6 GB. Per round at that depth: verify 46.3 ms (33.0 at 16k), draft 7.9 ms (1.7). The 2-token attention does not
 share its KV reads and the draft's one attention layer grows with depth: MTP pays only at short / mid context for now.
+Why MTP loses at depth (32k, nsys + per-ubatch host timing): GPU work per round grows only 30.8 -> 33.5 ms, but host gaps
+4.3 -> 15.4 ms. Both contexts' multi-token ubatches spend ~2.2-2.5 ms in build+alloc on every round at depth (0.1-0.2 ms at short
+context): the graph is reused, but the allocator re-plans it (input views whose size moves from round to round, ~1.4 a round,
+and the draft's 2 <-> 3 catch-up rows), and with several buffers that is a full scheduler reserve. Plain decode at depth is not
+affected (its reallocs are the prefill ubatches). Next: keep those input shapes stable (pad, or a constant draft row count).
