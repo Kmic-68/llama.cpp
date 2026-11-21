@@ -427,23 +427,47 @@ static __global__ void __launch_bounds__(16*RL, 2) tile_mm_rows(const tile_mm_pa
 #pragma unroll
         for (int r = 0; r < RL; ++r) s[i][r] = 0.0f;
 
-    uint32_t raw[28];
+    // this thread's activation staging slots (fixed for the block): XS offset (halves, without k0) and sx index
+    constexpr int XQ = (TB*KU + NT - 1)/NT;
+    int64_t xoff[XQ];
+    int xsi[XQ];
+#pragma unroll
+    for (int q = 0; q < XQ; ++q) {
+        const int i = tid + q*NT, c = i % KU, j = i / KU, n = n0 + j;
+        xsi[q] = i < TB*KU ? j*LD + c : -1;
+        xoff[q] = i < TB*KU && n < N ? (int64_t) (prm.xrow ? __ldg(prm.xrow + base + n) : base + n)*K + 8*c : -1;
+    }
+    // the next step's activations, loaded during this step's products (and IQ4_NL's next unit: a unit is one step)
+    uint4 xv[XQ];
+#define TMR_XLOAD(kk) _Pragma("unroll") for (int q = 0; q < XQ; ++q) \
+        xv[q] = xoff[q] >= 0 ? __ldg((const uint4 *) (prm.XS + xoff[q] + (kk))) : make_uint4(0, 0, 0, 0);
+    if constexpr (type == GGML_TYPE_IQ4_NL) {
+        TMR_XLOAD(0)
+    }
+
+    uint32_t raw[28], rawn[type == GGML_TYPE_IQ4_NL ? 9 : 1];
 #pragma unroll
     for (int q = 0; q < 28; ++q) raw[q] = 0u;
     const int nu = K/UV;
+#define TMR_RLOAD(dst, uu) do { \
+        const uintptr_t ad = (uintptr_t) (wrow + (int64_t) (uu)*UB); \
+        const uint32_t * wa = (const uint32_t *) (ad & ~(uintptr_t) 3); \
+        _Pragma("unroll") for (int q = 0; q < NW; ++q) (dst)[q] = __ldg(wa + q); \
+        if constexpr (type == GGML_TYPE_IQ3_S) { \
+            if (ad & 3) {   /* 2-aligned superblock: shift the words down by 2 bytes */ \
+                _Pragma("unroll") for (int q = 0; q < 27; ++q) (dst)[q] = __funnelshift_r((dst)[q], (dst)[q + 1], 16); \
+                (dst)[27] >>= 16;   /* bytes 108, 109 (the last two scales) */ \
+            } \
+        } } while (0)
+    if constexpr (type == GGML_TYPE_IQ4_NL) {
+        TMR_RLOAD(rawn, 0);
+    }
     for (int u = 0; u < nu; ++u) {
-        {   // this row's unit
-            const uintptr_t ad = (uintptr_t) (wrow + (int64_t) u*UB);
-            const uint32_t * wa = (const uint32_t *) (ad & ~(uintptr_t) 3);
+        if constexpr (type == GGML_TYPE_IQ4_NL) {
 #pragma unroll
-            for (int q = 0; q < NW; ++q) raw[q] = __ldg(wa + q);
-            if constexpr (type == GGML_TYPE_IQ3_S) {
-                if (ad & 3) {   // 2-aligned superblock: shift the words down by 2 bytes
-#pragma unroll
-                    for (int q = 0; q < 27; ++q) raw[q] = __funnelshift_r(raw[q], raw[q + 1], 16);
-                    raw[27] >>= 16;   // bytes 108, 109 (the last two scales)
-                }
-            }
+            for (int q = 0; q < 9; ++q) raw[q] = rawn[q];
+        } else {
+            TMR_RLOAD(raw, u);
         }
 #pragma unroll
         for (int st = 0; st < UV/64; ++st) {
@@ -456,14 +480,20 @@ static __global__ void __launch_bounds__(16*RL, 2) tile_mm_rows(const tile_mm_pa
 #pragma unroll
                 for (int q = 0; q < 8; ++q) sw[slot*LD + q] = my_row < M ? o[q] : make_uint4(0, 0, 0, 0);
             }
-            for (int i = tid; i < TB*KU; i += NT) {
-                const int c = i % KU, j = i / KU, n = n0 + j;
-                uint4 v = make_uint4(0, 0, 0, 0);
-                if (n < N) {
-                    const int xr = prm.xrow ? __ldg(prm.xrow + base + n) : base + n;
-                    v = __ldg((const uint4 *) (prm.XS + (int64_t) xr*K + k0) + c);
+            if constexpr (type != GGML_TYPE_IQ4_NL) {   // IQ3_S's 160-thread blocks have no registers to spare for a prefetch
+                TMR_XLOAD(k0)
+            }
+#pragma unroll
+            for (int q = 0; q < XQ; ++q) {
+                if (xsi[q] >= 0) sx[xsi[q]] = xv[q];
+            }
+            if constexpr (type == GGML_TYPE_IQ4_NL) {
+                if (k0 + 64 < K) {
+                    TMR_XLOAD(k0 + 64)
                 }
-                sx[j*LD + c] = v;
+            }
+            if constexpr (type == GGML_TYPE_IQ4_NL) {
+                if (u + 1 < nu) TMR_RLOAD(rawn, u + 1);
             }
             float swin[TL];
 #pragma unroll
@@ -494,6 +524,8 @@ static __global__ void __launch_bounds__(16*RL, 2) tile_mm_rows(const tile_mm_pa
                 }
         }
     }
+#undef TMR_XLOAD
+#undef TMR_RLOAD
 #pragma unroll
     for (int i = 0; i < TL; ++i) {
         const int n = n0 + ti*TL + i;
