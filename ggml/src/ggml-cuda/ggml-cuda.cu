@@ -5959,7 +5959,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     // The delta net's alpha/beta matvecs and what follows them, in one launch:
     //   MUL_MAT(alpha) -> ADD(dt) -> SOFTPLUS -> MUL(a) = gate,  MUL_MAT(beta) -> SIGMOID = beta
     // (views between them allowed). Every intermediate must be consumed only inside the group.
-    if (node->op == GGML_OP_MUL_MAT && node->src[0]->type == GGML_TYPE_Q6_K && node->ne[0] < 256) {
+    if (node->op == GGML_OP_MUL_MAT && (node->src[0]->type == GGML_TYPE_Q6_K || node->src[0]->type == GGML_TYPE_F32) && node->ne[0] < 256) {
         const int n = cgraph->n_nodes;
         auto next = [&](int j) {
             for (++j; j < n; ++j) {
@@ -6015,8 +6015,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                         ok = false;
                     }
                 }
-                if (ok && ggml_cuda_mmvq_f16_gdn_gate(*cuda_ctx, node, mmb, bvec, mvec, mul, sg,
-                                                      ggml_cuda_active_cols(node->src[1]->ne[1]))) {
+                if (ok && (node->src[0]->type == GGML_TYPE_F32 ?
+                           ggml_cuda_mmvf_gdn_gate(*cuda_ctx, node, mmb, bvec, mvec, mul, sg) :
+                           ggml_cuda_mmvq_f16_gdn_gate(*cuda_ctx, node, mmb, bvec, mvec, mul, sg,
+                                                       ggml_cuda_active_cols(node->src[1]->ne[1])))) {
                     return js - i;
                 }
             }
