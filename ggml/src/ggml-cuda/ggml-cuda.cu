@@ -1097,10 +1097,45 @@ static void ggml_cuda_copy_sync_or_defer(int device) {
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
+// inside a copy batch, host->device sources are first copied into a pinned ring: a small cudaMemcpyAsync from pageable memory
+// costs ~20 us of driver staging, from pinned memory it is only enqueued (a decode step sets ~60 inputs over two GPUs: ~1.2 ms of
+// GPU idle per token on Flash-Next). The batch's closing synchronize is what makes the ring reusable. GGML_CUDA_COPY_PIN_MIB
+// (default 4, 0 = off) sizes it; a source that does not fit the rest of the ring takes the pageable path.
+static thread_local char *   ggml_cuda_copy_pin     = nullptr;
+static thread_local size_t   ggml_cuda_copy_pin_cap = 0;
+static thread_local size_t   ggml_cuda_copy_pin_off = 0;
+
+static const void * ggml_cuda_copy_stage(const void * data, size_t size) {
+    if (!ggml_cuda_copy_batch_open) {
+        return data;
+    }
+    if (ggml_cuda_copy_pin == nullptr) {
+        static const size_t cap = [] { const char * e = getenv("GGML_CUDA_COPY_PIN_MIB"); return (size_t) (e ? atoi(e) : 4) << 20; }();
+        if (cap == 0 || ggml_cuda_copy_pin_cap == (size_t) -1) {
+            return data;
+        }
+        if (cudaMallocHost((void **) &ggml_cuda_copy_pin, cap) != cudaSuccess) {
+            (void) cudaGetLastError();
+            ggml_cuda_copy_pin     = nullptr;
+            ggml_cuda_copy_pin_cap = (size_t) -1;
+            return data;
+        }
+        ggml_cuda_copy_pin_cap = cap;
+    }
+    const size_t off = (ggml_cuda_copy_pin_off + 255) & ~(size_t) 255;
+    if (off + size > ggml_cuda_copy_pin_cap) {
+        return data;
+    }
+    memcpy(ggml_cuda_copy_pin + off, data, size);
+    ggml_cuda_copy_pin_off = off + size;
+    return ggml_cuda_copy_pin + off;
+}
+
 void ggml_backend_cuda_copy_batch(bool begin) {
     if (begin) {
         ggml_cuda_copy_batch_open    = true;
         ggml_cuda_copy_batch_devices = 0;
+        ggml_cuda_copy_pin_off       = 0;
         return;
     }
     ggml_cuda_copy_batch_open = false;
@@ -1111,6 +1146,7 @@ void ggml_backend_cuda_copy_batch(bool begin) {
             ggml_cuda_copy_batch_devices &= ~((uint64_t) 1 << dev);
         }
     }
+    ggml_cuda_copy_pin_off = 0;
 }
 
 static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
@@ -1125,7 +1161,7 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
-    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
+    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, ggml_cuda_copy_stage(data, size), size, cudaMemcpyHostToDevice, cudaStreamPerThread));
     ggml_cuda_copy_sync_or_defer(ctx->device);
 }
 
