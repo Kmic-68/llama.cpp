@@ -2226,14 +2226,25 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         const int64_t tpu0 = dprof2 ? ggml_time_us() : 0;
         // slot loan: the decide path (every expert of the batch fits the pools) uses the borrowed slots; a larger batch's buffers
         // overwrite them, so they are emptied before it
+        bool lend_route = false;
         if (lru && lru->lend_enabled()) {
             const bool want = (int64_t) ubatch.n_tokens * model.hparams.n_expert_used() <= lru->n_slots_min();
             if (want != lru->lend_is_on()) {
                 synchronize();
                 lru->lend_set(want);
             }
+            // loan off (the borrowed slots are empty): a compute buffer this graph re-allocates goes back onto the arena. A
+            // prompt ubatch without outputs on the MTP target (unmasked nextn rows) plans a different layout than the reserved
+            // ones and outgrew the reserve by 55 MiB; the arena has room, a cudaMalloc beside it does not
+            if (!want) {
+                llama_moe_lru::lend_fn_compute()(true);
+                lend_route = true;
+            }
         }
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+        if (lend_route) {
+            llama_moe_lru::lend_fn_compute()(false);
+        }
         if (dprof2 && ubatch.n_tokens > 1) {
             LLAMA_LOG_WARN("decode_prof: process_ubatch %.1f ms\n", (ggml_time_us() - tpu0) / 1000.0);
         }
