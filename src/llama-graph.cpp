@@ -2202,6 +2202,11 @@ static bool llama_lru_tail_layer(llama_moe_lru * lru, int il) {
 
 static ggml_tensor * llama_lru_assemble(ggml_context * ctx0, llama_moe_lru * lru, int il, int fk, int64_t n_expert) {
     ggml_tensor * pool = lru->pool_get(il, fk);
+    if (lru->is_exclusive()) {
+        // the layout is [pool slots | host slots]; with a slot loan that is longer than n_expert by the borrowed slots (sized
+        // n_expert, the ids were remapped past it: illegal address in the MoE matmul of a 14+ token prompt, host copies overran)
+        n_expert = std::max<int64_t>(n_expert, pool->ne[2] + lru->exps_get(il, fk)->ne[2]);
+    }
     const bool tail = llama_lru_tail_kind(lru, il, fk);
     static const bool zerocopy = [] { const char * e = getenv("LLAMA_MOE_LRU_ZEROCOPY"); return e && atoi(e) != 0; }();
     if (tail && zerocopy) {
