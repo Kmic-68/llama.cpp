@@ -9852,3 +9852,29 @@ rebuild on every ubatch (LLAMA_KPOOL_TRUNCATE_CHECK=1) through a 32k run and the
 | MTP before (110 + LEND 60) | 28.9-32.9 |
 | MTP after | 40.69 |
 32k depth MTP 36.8-38.9 -> 40.7. Greedy md5 unchanged; soak 0 failures.
+
+## 339 — Flash-Next at 261k depth vs his engine; QSA view copies fixed (11-21)
+
+One 260,914-token prompt (Strata v0.2.9 docs + sources, his sweep's corpus), model-card sampling, -c 262144, both engines.
+| | ours (75 slots + LEND 80, -ub 2048, plain) | his (profile-cbd.json, spec 4 + lookup) |
+|---|---|---|
+| prefill | 294.8 t/s | 808.8 t/s |
+| first decode after the prefill | 16.05 t/s | 29.3 t/s |
+| decode, a later request (cached prompt) | 30.34 t/s | - (cache off) |
+| VRAM per card | 15397 / 15397 MiB | 15969 / 15969 MiB |
+Restored slot (no prefill in the process): decode 28.3 then 29.8 t/s, so the first-decode slump comes from the prefill
+(open; 250k: 9.7 t/s over the first 200 tokens). -ub 512 (the MTP config) prefilled at 190 t/s and ran out of memory at
+121k depth (compute buffer 3357 MiB > arena 3332).
+- 9871389f2: the cause of that growth was not ggml-alloc fragmentation (uniform slots: 7069 MiB; prefetch off: 6328) but the
+  scheduler copying each view of the host QSA pool mask as its own whole-graph input: 288 x 16 MiB at 262k / -ub 3072
+  (GGML_ALLOC_HWM=0 found them). Copied once and viewed: 262k loads at -ub 3072 / 4096 (14495 MiB per card), bit-exact
+  (md5 5efacf75e27f both ways), -ub 2048 prefill ABBA 305.6 vs 305.0.
+- Fast loop: kv/deep250k.bin (raw 250k prompt) + RESTORE_EACH + an 8k-token suffix (qprof/deep.py, deep.sh): one prefill
+  pass at depth in ~40 s instead of a 15-minute prefill. Noise ~±5% from ntfs-3g page faults (70-93k major faults a pass,
+  no block reads: the mmapped PLE table through FUSE).
+- -ub 4096 at 250k: 319.5 / 314.6 t/s vs -ub 2048 335.6 / 344.5 / 318.8: no gain. The cost is per token, not per pass.
+nsys at 250k, -ub 2048, per GPU, 18,635 prompt tokens: kernels 45.6 s of ~64 s (idle ~30%). tile_mm 12.3 s, lightning
+indexer 8.1 (f16 keys x f32 queries at the fp32 rate), gemm_fold 5.0, AllReduce 3.0, cuBLAS sgemm 2.8, get_rows 2.7 (the
+whole cache's indexer keys gathered per layer), flash_attn_tile 2.2, top-k 1.3; H2D 253 GiB (overlapped). Per token: ours
+3.4 ms wall / 2.45 ms kernels, his 1.24 ms wall. His indexer also selects per query (256-row groups only bound the score
+buffer); his dense prompt GEMMs accumulate in fp16 (FNX_PF_F16ACC, 595 -> 750 t/s by his notes), which we do not copy.
