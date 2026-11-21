@@ -4772,9 +4772,15 @@ private:
         if (spec) {
             bool ok = true;
             tl_mark("P0");
-            queue_tasks.yield_to_queue([&]() {
+            // a verify-sized batch only stages the MTP catch-up rows (decoded with the next draft): no yield, its worker
+            // handshake (~0.15 ms) was all the call cost
+            if (batch.view.size() <= 8) {
                 ok = common_speculative_process(spec.get(), batch.view);
-            });
+            } else {
+                queue_tasks.yield_to_queue([&]() {
+                    ok = common_speculative_process(spec.get(), batch.view);
+                });
+            }
             tl_mark("P1");
 
             if (!ok) {
