@@ -1455,14 +1455,15 @@ void llm_graph_result::reset() {
 }
 
 void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
-    // LLAMA_INPUT_PROF=1: host time of each input's set_input, over 2 ms (over 50 us for a single token)
+    // LLAMA_INPUT_PROF=1: host time of each input's set_input, over 2 ms (over 50 us for a single token; LLAMA_INPUT_PROF_US=N: over N us)
     static const bool prof = [] { const char * e = getenv("LLAMA_INPUT_PROF"); return e && atoi(e) != 0; }();
     for (auto & input : inputs) {
         const int64_t t0 = prof ? ggml_time_us() : 0;
         input->set_input(ubatch);
         if (prof) {
             const int64_t dt = ggml_time_us() - t0;
-            if (dt > (ubatch->n_tokens > 1 ? 2000 : 50)) {
+            static const int64_t thr = [] { const char * e = getenv("LLAMA_INPUT_PROF_US"); return e ? (int64_t) atoll(e) : (int64_t) -1; }();
+            if (dt > (thr >= 0 ? thr : (ubatch->n_tokens > 1 ? 2000 : 50))) {
                 LLAMA_LOG_WARN("input_prof: %s %.1f ms (n_tokens %u)\n", typeid(*input).name(), dt / 1000.0, ubatch->n_tokens);
             }
         }
