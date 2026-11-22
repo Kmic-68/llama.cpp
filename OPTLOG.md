@@ -10009,3 +10009,23 @@ Wait-point log (named): after the MoE AllReduce a prompt subgraph opens with the
 gate mat-vec, sigmoid, mul) and then ADD ffn_out (the reader) at node 7; the 6-node lookahead waited at node 2, so only the gate/up
 matmuls overlapped (fast loop 604.1 -> 600.1). Next: a 4-node window (the longest fusion opening before a reader: SCALE, SIGMOID,
 SCALE, HC_POST). Prefill ubatches never run k_lru_fill (the 96 fills in the profile window were the pass's decode tokens).
+
+## 348 — small-op batch: prescale v10/v12, SwiGLU into the down prep, split tiles, small fold pairs, concat tree (11-22)
+
+Fast loop (250k depth, -ub 4096, same server, ab.py 2 pairs): new knobs off 608.7 t/s, on 626.6 t/s (B/A 1.029), md5 identical
+(29d612523a9c, k=1 suffix). Op checks (qprof/quick.sh, all IDENTICAL bytes):
+
+| change | op | before | after |
+|---|---|---|---|
+| prescale v10/v12 (K up to 12288) | hc down q8_0 320x4096x10240 | 3859 us | 3506 us |
+| SwiGLU folded into the MoE-down prep (GGML_CUDA_TMM_GLU, on) | down iq4_nl 4096 tok | 11758 | 11644 |
+| split tile lists (GGML_CUDA_TMM_SPLIT_TILES, on for IQ4_NL/Q8_0) | down iq4_nl 4096 tok | 11673 | 11465 |
+| same, IQ3_S r160 (off there) | gate/up iq3_s | 11395 | 11819 |
+| small fold pairs (GGML_CUDA_FOLD_PAIR_SMALL, on) | 2x q8_0 640x2560 | 2399 | 2399 (neutral, kept on: no VRAM cost) |
+| concat tree (GGML_CUDA_CONCAT_TREE, default OFF) | 16 chunks x 128 | 1537 | 600 |
+| hc_post+rms fusion skips view/noop nodes | hcpostrms reshape | — | identical; fires in more layers |
+
+Concat tree hung a 2-GPU llama-perplexity chunk (bisected: only knob that matters). Likely cause: two concat trees back to back,
+the fusion skipped the first tree's nodes without writing them. Fix in tree (walk must cover the whole run), untested, default off.
+Expert host-pool copy threaded (LLAMA_MOE_LRU_LOAD_THREADS, default 8): server load 258 s under swap pressure, no gain seen yet.
+Absolute level ~610-625 vs ~675 this morning: box was swapping (2.7 GB swapped, 9 GB available); recheck after a clean restart.
