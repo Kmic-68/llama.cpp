@@ -10005,3 +10005,7 @@ GGML_CUDA_AR_SPLIT=1) alone: 642.4 vs 642.1 t/s, md5 identical. The shared exper
 (675-681 before vs 522-669 after, noisy). ab.py now warms each suffix twice (first passes after a start were ~35% slow).
 Combined test (GGML_META_AR_NO_SKIP=1 + LLAMA_SHEXP_AFTER=1 + async + split handshake): 676.4 -> 668.6 t/s, waits still at
 nodes 0 / 2: no overlap. All reverted; the AllReduce stays synchronous (copy engine, chunked).
+Wait-point log (named): after the MoE AllReduce a prompt subgraph opens with the mirrored shared expert (gate, up, swiglu, down,
+gate mat-vec, sigmoid, mul) and then ADD ffn_out (the reader) at node 7; the 6-node lookahead waited at node 2, so only the gate/up
+matmuls overlapped (fast loop 604.1 -> 600.1). Next: a 4-node window (the longest fusion opening before a reader: SCALE, SIGMOID,
+SCALE, HC_POST). Prefill ubatches never run k_lru_fill (the 96 fills in the profile window were the pass's decode tokens).
