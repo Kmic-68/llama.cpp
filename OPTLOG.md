@@ -9920,8 +9920,8 @@ Fresh 260,060-token prompt (no cache), 75 slots + LEND 80, LEND_HEAD 1024, -ub 4
 | change | op result | fast loop |
 |---|---|---|
 | 8f216b39b IQ4_XS experts (layer 2 gate/up) through tile_mm_rows + LRU tails | 20624 -> 14060 us | ~+1% (math: fp16 acts as the other layers) |
-| f9e0f8a AllReduce > 1 MiB: f32 partial by cudaMemcpyPeerAsync (copy engine) | 40 MiB both ways 6.1 -> 4.3 ms isolated | 611.4 -> 616.4 |
-| tile_mm_prep grid-strides rows (8192-token ubatches crashed: grid.y > 65535) | - | - |
+| e88e6893d AllReduce > 1 MiB: f32 partial by cudaMemcpyPeerAsync (copy engine) | 40 MiB both ways 6.1 -> 4.3 ms isolated | 611.4 -> 616.4 |
+| 1ec0142ea tile_mm_prep grid-strides rows (8192-token ubatches crashed: grid.y > 65535) | - | - |
 | db4e49b77 MoE weighting + slot sum fused for in-place prefill graphs, unfused rounding | 5812 -> 1090 us a layer | +5% (3 ABBA runs) |
 | 9f9a7c443 rms_norm 1024..8192 cols by 256 threads playing the 1024-thread tree | 1460 -> 1208 us | - |
 | 7bb2a0f17 Q8_0 experts (5 down layers) through tile_mm_rows; warp skip past an expert's end | 15830 -> 11217 us | - |
