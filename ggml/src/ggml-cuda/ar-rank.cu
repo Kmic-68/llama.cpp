@@ -97,8 +97,8 @@ static __device__ __forceinline__ float ar_ll_get(const uint2 * p, const int tok
 // KLD gemma4 16-chunk +6 % on average over -ub 512 / 1024 / 1536 (inside the batching noise), ornith even, qwen36 better, Swift / glimmer
 // bit-identical (their q6_K prefill matmuls already produce fp16 values, which the scaled wire carries exactly).
 static int ar_wire() {
-    static const int w = [] { const char * e = getenv("GGML_CUDA_AR_WIRE"); return e ? std::max(0, std::min(2, atoi(e))) : 0; }();   // p100-optimizations: exact fp32 wire by default (16-bit wire changes prefill sums)
-    return w;
+    // p100-optimizations: exact fp32 wire by default (16-bit wire changes prefill sums); a live knob (A/B in one server)
+    return std::max(0, std::min(2, ggml_knob_i32("GGML_CUDA_AR_WIRE", 0)));
 }
 static __device__ __forceinline__ uint32_t ar_bf16_enc(const float x) {
     uint32_t u = __float_as_uint(x);
@@ -646,7 +646,7 @@ bool ggml_cuda_ar_rank_eligible(const ggml_cuda_ar_rank_ctx * c, const ggml_tens
 bool ggml_cuda_ar_rank_reduce_chunked(ggml_cuda_ar_rank_ctx * c, int rank, cudaStream_t stream, cudaStream_t copy_stream, ggml_tensor * t,
                                       const int n_chunks, const int64_t * elem_off, cudaEvent_t * ev) {
     const int n = (int) ggml_nelements(t);
-    if (n_chunks < 2 || !ar_ce((size_t) n * sizeof(float)) || ggml_knob_i32("GGML_CUDA_AR_CHUNKED", 1) == 0 ||
+    if (n_chunks < 2 || !ar_ce((size_t) n * sizeof(float)) || ggml_knob_i32("GGML_CUDA_AR_CHUNKED", 1) == 0 || ar_wire() != 0 ||
             (ar_ll_enabled() && n <= ar_ll_max())) {
         return false;
     }

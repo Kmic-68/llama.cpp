@@ -10036,3 +10036,8 @@ Kept (e9645e489): IQ3_S/Q8_0 bytes to float as 2^23 + b by PRMT, minus 2^23 (exa
 Q8_0 6930 -> 6878, byte-identical. Reverted: IQ3_S grid bytes (odd 1..15) as 8 per-sub-block halves picked by PRMT, sign by XOR:
 byte-identical but 6478 -> 7574 us (registers: the r160 kernel is at its limit). Concat tree on: model md5 identical, fast loop
 648.7 (off) vs 644.1 (on), noise. Clean-box server load 203 s (threaded copy is not the limit).
+
+## 350 — fp16 AllReduce wire (GGML_CUDA_AR_WIRE=2) rejected on Flash-Next (11-22)
+
+pplkld 2 chunks vs exact fp32 wire: PPL(Q)/PPL(base) 1.007618 +/- 0.003803 (2 sigma worse), KLD 0.020228, same top 95.19 %.
+Stays off (default 0). The wire is now a live knob, and the chunked CE path steps aside when it is on (A/B in one server).
