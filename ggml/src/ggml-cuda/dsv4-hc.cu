@@ -223,16 +223,17 @@ static __global__ void dsv4_hc_post_f32_all(
         if constexpr (gated) {
             p = gate_scale_out * (1.0f / (1.0f + expf(-(gate_scale_in * p))));
         }
-        // explicit: a rounded product, then one fma a stream (the per-stream kernel's loop compiles to that; unrolled, the
-        // compiler could fuse x*p into the first term instead)
-        float sum = __fmul_rn(xv, p);
+        // explicit, as the per-stream kernel compiles: with comb a rounded product, then one fma a stream (unrolled, the compiler
+        // could fuse x*p into the first term instead); without comb one fma, x*p + r
+        float sum;
         if constexpr (has_comb) {
+            sum = __fmul_rn(xv, p);
 #pragma unroll
             for (int isrc = 0; isrc < HC; ++isrc) {
                 sum = __fmaf_rn(r[isrc], comb[idst*sc0 + isrc*sc1 + it*sc2], sum);
             }
         } else {
-            sum = __fadd_rn(sum, r[idst]);
+            sum = __fmaf_rn(xv, p, r[idst]);
         }
         dst[i0*sd0 + idst*sd1 + it*sd2] = sum;
     }

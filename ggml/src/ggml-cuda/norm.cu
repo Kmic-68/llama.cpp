@@ -491,6 +491,12 @@ static void group_norm_f32_cuda(
     }
 }
 
+// rows of 8193..12288 held in 12 registers a thread (GGML_CUDA_RMS_WIDE=0: the two-pass path)
+static bool rms_wide(const int ncols) {
+    static const bool on = [] { const char * e = getenv("GGML_CUDA_RMS_WIDE"); return !e || atoi(e) != 0; }();
+    return on && ncols > 8192 && ncols <= 12288;
+}
+
 static void rms_norm_f32_cuda(
         const float * x, float * dst, const int ncols, const int nrows, const int nchannels, const int nsamples,
         const int64_t stride_row, const int64_t stride_channel, const int64_t stride_sample, const float eps, cudaStream_t stream) {
@@ -507,7 +513,7 @@ static void rms_norm_f32_cuda(
         // underlying cudaLaunchKernelEx does not support default params
         nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0),
         nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), 1.0f, 0.0f, nullptr, nullptr, nullptr);
-    } else if (ncols > 1024*8 && ncols <= 1024*12) {
+    } else if (rms_wide(ncols)) {
         // rows held in 12 registers a thread instead of read twice (937 -> 709 us for 10240 x 4096); smaller rows keep 8 (occupancy)
         const dim3 block_dims(1024, 1, 1);
         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, 32 * sizeof(float), stream};
@@ -578,7 +584,7 @@ static void rms_norm_mul_f32_cuda(const float *  x,
             const dim3 block_dims(1024, 1, 1);
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
             // rows of 8193..12288: held in 12 registers a thread (read once, the same sums)
-            ggml_cuda_kernel_launch(ncols > 8192 && ncols <= 12288 ? rms_norm_f32<1024, true, false, false, false, false, 12> : rms_norm_f32<1024, true>, launch_params,
+            ggml_cuda_kernel_launch(rms_wide(ncols) ? rms_norm_f32<1024, true, false, false, false, false, 12> : rms_norm_f32<1024, true>, launch_params,
                 x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
                 mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
                 // underlying cudaLaunchKernelEx does not support default params
@@ -611,7 +617,7 @@ static void rms_norm_mul_f32_cuda(const float *  x,
         } else {
             const dim3 block_dims(1024, 1, 1);
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
-            ggml_cuda_kernel_launch(ncols > 8192 && ncols <= 12288 ? rms_norm_f32<1024, true, true, false, false, false, 12> : rms_norm_f32<1024, true, true>, launch_params,
+            ggml_cuda_kernel_launch(rms_wide(ncols) ? rms_norm_f32<1024, true, true, false, false, false, 12> : rms_norm_f32<1024, true, true>, launch_params,
                 x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
                 mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, add,
                 add_stride_row, add_stride_channel, add_stride_sample, add_ncols_packed, add_nrows_packed,
