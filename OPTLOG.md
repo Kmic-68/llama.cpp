@@ -9889,3 +9889,25 @@ never scans). Scan off, 8k-token passes at 250k: 321 / 328 / 317 / 310 t/s vs on
 -ub 2048, 75 + LEND 80, plain: prefill 354.1 t/s (was 294.8), decode right after 29.36 t/s (was 16.05), next request 30.83; VRAM per
 card 14885 MiB. His engine: 808.8 / 29.3. Idle gaps in the scan-on nsys: 6.0 s before ubatch starts (the PLE stalls), 2.2 s before
 k_lru_remap (expert copies), so with the scan off the kernels (~2.2 ms a token at 250k) are the limit.
+
+## 341 — Flash-Next 260k prefill 354 -> 483-504 t/s (exact kernels, -ub 4096) (11-21)
+
+Fresh ~260k-token prompts (no cache), 75 slots + LEND 80, LEND_HEAD 1024, -ub 4096, -b 16384, plain: 482.7 and 503.5 t/s
+(OPTLOG 340: 354.1 at -ub 2048). VRAM per card 15935 MiB peak. His engine: 808.8. Work loop: op perf (test-backend-ops) +
+byte-identical op check (qprof/opdiff/diff.sh, ~5 s a run) per change, model md5 checks batched.
+| change | op result | math |
+|---|---|---|
+| dd303fb06 QSA indexer prefill shape as an fp32 GEMM (q4_0/q8_0/f16 keys) | 65600 pools x 128 queries 3841 -> 1544 us | byte-identical |
+| 3735aa85a tile_mm two blocks an SM / 96-column ID tiles | IQ3_S gate 4096 tok 18333 -> 17504 us | identical |
+| 5a82b14db, d949a9e99, bbf43bc0c, +prefetch, +rotation: tile_mm_rows (a thread per weight row; IQ4_NL 8x6, IQ3_S 160-row 10x3) | 4096 tok per GPU: IQ3_S gate 17420 -> 13288, IQ4_NL down 16323 -> 12909 us | byte-identical |
+| 4453bf868 get_rows_raw a thread per 16 bytes | 295k rows of 144 B 816 -> 199 us | byte-identical |
+| aed8b5b07 q4p attention for GQA multiples of 6 (gathered prefill: 24 q heads / 2 KV heads a card) | 2782 -> 1570 us a chunk | fp32 Q / sums (FLASH_ATTN_EXT 4184/4184) |
+| 1dae7cf52, 3fce34e31 QSA pool mask as a per-token range (I32 [2, n]) + meta backend subgraph fix | no 537 MB host mask per ubatch | model md5 identical on 3 passes |
+| -ub 4096 (fits after 9871389f2) | fast loop 345/318 -> 362/362 t/s | ubatch-dependent (as any -ub) |
+Rejected: tile_mm warp 8x4 remap, IQ3_S grid in smem, hc down via gemm_fold (6%), small-M f32 kernels (cuBLAS fine), IQ3_S
+per-step raw reload (spilled worse), launch bounds 1 for 160-row (spills anyway), IQ4_NL 8x4/8x5/8x7.
+Found: an op CUDA declines runs silently on the CPU (another summation order): the range mask's < 32-query chunks did.
+nsys at 250k, -ub 4096 (per token, card 0): kernels 1574 us (tile_mm_rows 388, gemm_fold 249, indexer 146, cuBLAS sgemm 162,
+q4p 66, AllReduce 33); inside a prompt the GPU is ~85% busy between multi-second host gaps at the server's context checkpoints
+(4 + n_ubatch and 4 tokens before the end: ~5 s each on a restored 250k slot) -- open. Sporadic stalls (decode 3 t/s) follow
+real disk reads (swap / page cache on a full 62 GB box).
