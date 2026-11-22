@@ -24,6 +24,48 @@ static __global__ void moe_weighted_reduction_f32(const float * __restrict__ exp
     dst[token * n_embd + col] = sum;
 }
 
+// p100-series: the unfused graph's rounding (the MUL's rounded products, then the ADD chain in slot order): for the prefill graphs where
+// the fused path above is refused (its output aliases the in-place MUL's buffer), so the fusion leaves the model's outputs unchanged
+static __global__ void moe_weighted_reduction_seq_f32(const float * __restrict__ experts, const float * __restrict__ expert_scale,
+                                                      const float * __restrict__ weights, float * __restrict__ dst,
+                                                      const int64_t n_embd, const int n_expert_used) {
+    const int64_t token = blockIdx.x;
+    const int64_t col   = (int64_t) blockIdx.y * blockDim.x + threadIdx.x;
+    if (col >= n_embd) {
+        return;
+    }
+    const uint64_t first_row = (uint64_t) token * n_expert_used;
+    float sum = 0.0f;
+    for (int expert = 0; expert < n_expert_used; ++expert) {
+        const uint64_t row = first_row + expert;
+        float p = experts[row * n_embd + col];
+        if (expert_scale != nullptr) {
+            p = __fmul_rn(p, expert_scale[row]);
+        }
+        p = __fmul_rn(p, weights[row]);
+        sum = expert == 0 ? p : __fadd_rn(sum, p);
+    }
+    dst[token * n_embd + col] = sum;
+}
+
+void ggml_cuda_op_moe_weighted_reduction_seq(ggml_backend_cuda_context & ctx, const ggml_tensor * experts, const ggml_tensor * expert_scale,
+                                             const ggml_tensor * weights, ggml_tensor * dst, const bool alias) {
+    const int64_t n_embd = experts->ne[0], n_expert_used = experts->ne[1], n_tokens = experts->ne[2] * experts->ne[3];
+    cudaStream_t stream = ctx.stream();
+    ggml_cuda_pool_alloc<float> tmp(ctx.pool());
+    float * out = (float *) dst->data;
+    if (alias) {   // the output overlaps the experts' buffer: another block may still read the rows it would write
+        out = tmp.alloc(n_embd * n_tokens);
+    }
+    const dim3 blocks(n_tokens, (n_embd + 255) / 256, 1);
+    moe_weighted_reduction_seq_f32<<<blocks, 256, 0, stream>>>((const float *) experts->data,
+        expert_scale ? (const float *) expert_scale->data : nullptr, (const float *) weights->data, out, n_embd, (int) n_expert_used);
+    CUDA_CHECK(cudaGetLastError());
+    if (alias) {
+        CUDA_CHECK(cudaMemcpyAsync(dst->data, out, n_embd * n_tokens * sizeof(float), cudaMemcpyDeviceToDevice, stream));
+    }
+}
+
 static void launch_moe_weighted_reduction(const float * experts,
                                           const float * expert_scale,
                                           const float * weights,

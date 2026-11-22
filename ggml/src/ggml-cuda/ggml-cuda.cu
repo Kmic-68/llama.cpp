@@ -4510,11 +4510,14 @@ static bool ggml_cuda_match_moe_weighted_reduction(
 
         if (candidate->op == GGML_OP_VIEW) {
             const int expert = (int) views.size();
-            if (expert >= n_expert_used || candidate->src[0] != weighted || candidate->view_src != weighted ||
+            // an in-place MUL (prefill) is itself a view: ggml then points its views at the MUL's source with the offsets added
+            const ggml_tensor * vsrc = weighted->view_src ? weighted->view_src : weighted;
+            const size_t        voff = weighted->view_src ? weighted->view_offs : 0;
+            if (expert >= n_expert_used || candidate->src[0] != weighted || candidate->view_src != vsrc ||
                     candidate->type != GGML_TYPE_F32 || candidate->ne[0] != weighted->ne[0] ||
                     candidate->ne[1] != n_tokens || candidate->ne[2] != 1 || candidate->ne[3] != 1 ||
                     candidate->nb[0] != weighted->nb[0] || candidate->nb[1] != weighted->nb[2] ||
-                    candidate->view_offs != (size_t) expert * weighted->nb[1]) {
+                    candidate->view_offs != voff + (size_t) expert * weighted->nb[1]) {
                 return false;
             }
             views.push_back(candidate);
@@ -4542,7 +4545,25 @@ static bool ggml_cuda_match_moe_weighted_reduction(
     }
 
     const int output_idx = node_idx + node_count - 1;
-    if (!ggml_can_fuse_subgraph(cgraph, node_idx, node_count, ops.data(), &output_idx, 1)) {
+    // in place: the views' source is the expert products themselves (outside the subgraph), which the fused kernel reads anyway; the
+    // generic check refuses any outside view source, so check the rest of it here (no outside uses, no graph outputs inside)
+    bool fusable = false;
+    if (first->view_src == experts && mul_count == 1) {
+        fusable = true;
+        for (int k = 0; k < node_count && fusable; ++k) {
+            const ggml_tensor * nd = cgraph->nodes[node_idx + k];
+            if (nd->op != ops[k] || (nd->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) { fusable = false; break; }
+            if (k == node_count - 1) break;
+            if (nd->flags & GGML_TENSOR_FLAG_OUTPUT) { fusable = false; break; }
+            int uses = 0;
+            for (int j = k + 1; j < node_count; ++j)
+                for (int q = 0; q < GGML_MAX_SRC; ++q) uses += cgraph->nodes[node_idx + j]->src[q] == nd;
+            if (uses != ggml_node_get_use_count(cgraph, node_idx + k)) fusable = false;
+        }
+    } else {
+        fusable = ggml_can_fuse_subgraph(cgraph, node_idx, node_count, ops.data(), &output_idx, 1);
+    }
+    if (!fusable) {
         return false;
     }
 
@@ -5119,9 +5140,23 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         ggml_cuda_moe_weighted_reduction_match match;
         if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
             const int output_idx = i + match.node_count - 1;
-            if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, match.node_count, &output_idx, 1)) {
+            const bool inplace = node->view_src != nullptr;   // the unfused graph rounds each product: keep that (the seq kernel)
+            if (!inplace && ggml_cuda_check_fusion_memory_ranges(cgraph, i, match.node_count, &output_idx, 1)) {
                 ggml_cuda_op_moe_weighted_reduction(
                     *cuda_ctx, match.experts, match.expert_scale, match.weights, match.dst);
+                return match.node_count - 1;
+            }
+            // p100-series: refused for aliasing (prefill: the MUL is in place on the expert outputs): one pass with the unfused
+            // graph's rounding instead of a MUL and n_used - 1 ADDs over the [n_embd, n_used, n_tokens] products (Flash-Next 4096-token
+            // ubatch: ~4.3 -> ~1 ms a layer). GGML_CUDA_FUSE_MOE_SUM (knob) = 0: unfused
+            if (ggml_knob_i32("GGML_CUDA_FUSE_MOE_SUM", 1) != 0) {
+                // the unfused graph frees the router weights after the MUL, so an ADD output may sit on them as well as on the products
+                auto overlaps = [&](const ggml_tensor * t) {
+                    const char * d0 = (const char *) match.dst->data, * t0 = (const char *) t->data;
+                    return d0 < t0 + ggml_nbytes(t) && t0 < d0 + ggml_nbytes(match.dst);
+                };
+                const bool alias = overlaps(match.experts) || overlaps(match.weights);
+                ggml_cuda_op_moe_weighted_reduction_seq(*cuda_ctx, match.experts, match.expert_scale, match.weights, match.dst, alias);
                 return match.node_count - 1;
             }
         }
