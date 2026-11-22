@@ -9987,3 +9987,19 @@ PLE prompt scan threshold 32768 -> 131072 (a 40k prompt: 688 -> 705 t/s prefill 
 Rejected: indexer gemm4 with 4 tokens a thread (2 blocks: spills, 17 ms; 1 block: 2005 vs 1534 us), 32-dim staging (1772 us).
 Fresh 260k + 128 tokens: prefill 617.4, decode 28.1 t/s (box noise +-5%; earlier runs 630-661). Decode warm at 250k: 27.7-34.4,
 median ~29-30 (his 29.3). Cold first requests after a restart 5-11 t/s (expert cache warm-up).
+
+## 347 — expert kernel occupancy probes; why the async AllReduce never overlapped (11-22)
+
+Expert kernel (IQ4_NL down, 4096 tokens a GPU, test-backend-ops perf):
+| variant | us | note |
+|---|---|---|
+| 8 x 6, 2 blocks an SM (254 regs, 25 KB smem) | 11421 | current |
+| same, forced to 1 block an SM (16 KB dynamic pad) | 18356 | occupancy matters: a 48 KB "128-value step" kernel is out |
+| 8 x 4 (174 regs) / 8 x 3 (138 regs) | 12074 / 13361 | fewer registers but less reuse: slower |
+So the kernel needs both its 8 x 6 tile and 2 blocks an SM; with 254 registers there is no room for a third block on sm_60.
+Async AllReduce: the wait log showed every graph waiting at node 0 (the 24-node lookahead always found the consumer); with a
+6-node window the waits are at nodes 0 / 2: the meta backend's skip_unrelated moves every independent mirrored node (the
+inject, the shared expert) before the AllReduce, leaving nothing after it. New switches for the test: GGML_META_AR_NO_SKIP=1,
+LLAMA_SHEXP_AFTER=1 (shared expert after the routed experts in prompt ubatches). The split handshake (1-block signal + plain sum,
+GGML_CUDA_AR_SPLIT=1) alone: 642.4 vs 642.1 t/s, md5 identical. The shared expert moved after the routed experts alone: no gain
+(675-681 before vs 522-669 after, noisy). ab.py now warms each suffix twice (first passes after a start were ~35% slow).
