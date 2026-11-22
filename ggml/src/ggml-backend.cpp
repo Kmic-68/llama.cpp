@@ -22,6 +22,8 @@
 #include <algorithm>
 #include <unordered_map>
 #include <vector>
+#include <set>
+#include <string>
 
 #ifdef __APPLE__
 #include <sys/types.h>
@@ -1589,6 +1591,24 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
     if (sched->debug) {
         ggml_backend_sched_print_assignments(sched, graph);
+    }
+
+    {   // GGML_SCHED_LOG_CPU=1 (debug): each distinct (op, name without digits) the scheduler puts on the last (CPU) backend, once
+        static const bool log_cpu = getenv("GGML_SCHED_LOG_CPU") != nullptr;
+        if (log_cpu && sched->n_backends > 1) {
+            static std::set<std::string> seen;
+            for (int i = 0; i < graph->n_nodes; i++) {
+                struct ggml_tensor * node = graph->nodes[i];
+                if (ggml_is_view_op(node->op) || node->op == GGML_OP_NONE) continue;
+                if (tensor_backend_id(node) != sched->n_backends - 1) continue;
+                std::string key = std::string(ggml_op_desc(node)) + " ";
+                for (const char * c = node->name; *c; ++c) if (*c < '0' || *c > '9') key += *c;
+                if (seen.insert(key).second) {
+                    fprintf(stderr, "sched_cpu: %s [%lld %lld %lld %lld] %s\n", key.c_str(), (long long) node->ne[0], (long long) node->ne[1],
+                            (long long) node->ne[2], (long long) node->ne[3], ggml_type_name(node->type));
+                }
+            }
+        }
     }
 
     // pass 6: collect all input tensors into graph_inputs

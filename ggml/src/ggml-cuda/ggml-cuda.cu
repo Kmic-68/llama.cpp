@@ -8166,7 +8166,9 @@ static void * ggml_backend_cuda_ar_rank_create(ggml_backend_t b0, ggml_backend_t
     const char * env = getenv("GGML_META_AR_MAX_BYTES");
     // up to 32 MiB in-kernel (prefill activations too): without it every larger reduction takes the peer copy + ADD
     // path, whose two receive buffers per device cost more VRAM than the inbox (Flash-Next -ub 3072: guard kill)
-    const size_t max_bytes = env ? (size_t) strtoull(env, nullptr, 10) : (size_t) 32 << 20;
+    // 48 MiB: a -ub 4096 activation (2560 x 4096 f32 = 40 MiB) is reduced in-kernel too; at 32 it took the peer copy + ADD path,
+    // whose receive buffers cost ~780 MB a card more (Flash-Next 262k -ub 4096: 15935 -> 15159 MiB), same sums, same speed
+    const size_t max_bytes = env ? (size_t) strtoull(env, nullptr, 10) : (size_t) 48 << 20;
     return max_bytes > 0 ? ggml_cuda_ar_rank_init(d0, d1, max_bytes) : nullptr;
 }
 
