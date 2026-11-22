@@ -1803,9 +1803,9 @@ void llama_model_qwen4exp::ple_cache_release() const {
 // p100-series: a long prompt's PLE rows in ONE sequential scan of the table (not one per -b batch, which streamed the 28.8 GB table
 // through ntfs-3g for every batch), started when the server begins the prompt; the batches then read their rows from the cache
 // (or the mapping, for rows the scan has not reached yet). Only where the rows come from changes. LLAMA_PLE_PROMPT_SCAN: the
-// smallest prompt scanned (default 32768 tokens, 0 = off)
+// smallest prompt scanned (default 131072 tokens: a 40k prompt touches ~1 GB of rows, the scan reads 28 GB; 0 = off)
 void llama_model_qwen4exp::prefetch_prompt(const llama_token * tokens, int64_t n_tokens) const {
-    static const int64_t min_tok = [] { const char * e = getenv("LLAMA_PLE_PROMPT_SCAN"); return e ? (int64_t) atoll(e) : (int64_t) 32768; }();
+    static const int64_t min_tok = [] { const char * e = getenv("LLAMA_PLE_PROMPT_SCAN"); return e ? (int64_t) atoll(e) : (int64_t) 131072; }();
     if (n_tokens == 0) {
         if (ple_prompt_mode) {
             ple_cache_release();
