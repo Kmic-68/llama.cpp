@@ -5156,9 +5156,9 @@ static int ggml_cuda_try_fuse_gate_up(ggml_backend_cuda_context * ctx, ggml_cgra
 // leaf is copied straight into the root's buffer instead of each tree level copying everything again (~5 full copies). Only when
 // the run of CONCAT nodes starting at i forms a tree whose inner nodes are used by their parent alone, all contiguous f32/f16 of one
 // type, joined along their outermost non-1 dimension (so a leaf is one contiguous byte range of the root). Byte-identical (copies).
-// GGML_CUDA_CONCAT_TREE (knob, default 0: it hung a 2-GPU llama-perplexity chunk, cause not found yet) = 1: on
+// GGML_CUDA_CONCAT_TREE (knob, default 1) = 0: off. (back-to-back trees once hung a 2-GPU run: the walk must cover the whole run)
 static int ggml_cuda_try_fuse_concat_tree(ggml_backend_cuda_context * ctx, ggml_cgraph * cgraph, int i) {
-    if (cgraph->nodes[i]->op != GGML_OP_CONCAT || ggml_knob_i32("GGML_CUDA_CONCAT_TREE", 0) == 0) {
+    if (cgraph->nodes[i]->op != GGML_OP_CONCAT || ggml_knob_i32("GGML_CUDA_CONCAT_TREE", 1) == 0) {
         return 0;
     }
     int j = i;
