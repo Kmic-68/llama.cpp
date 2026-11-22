@@ -2193,7 +2193,11 @@ static bool llama_lru_tail_kind(llama_moe_lru * lru, int il, int fk) {
     // Q8_0 kinds as tails too (the tile MUL_MAT_ID takes a per-device half of a Q8_0 down row, 340 bytes, in two-block units):
     // those layers then prefetch like the rest (128k prefill ubatch 437.8 -> 462.7 t/s). LLAMA_MOE_LRU_TAIL_Q8=0: full assemblies
     static const bool q8 = [] { const char * e = getenv("LLAMA_MOE_LRU_TAIL_Q8"); return !e || atoi(e) != 0; }();
-    return llama_lru_tail_on() && lru->is_exclusive() && (t == GGML_TYPE_IQ3_S || t == GGML_TYPE_IQ4_NL || (q8 && t == GGML_TYPE_Q8_0));
+    // IQ4_XS too (the CUDA row-per-thread kernel takes its tail; Flash-Next UD-IQ4_XS layer 2's gate/up): no full assembly there, so
+    // layers 2 and 3 prefetch. LLAMA_MOE_LRU_TAIL_IQ4XS=0: full assemblies
+    static const bool iq4xs = [] { const char * e = getenv("LLAMA_MOE_LRU_TAIL_IQ4XS"); return !e || atoi(e) != 0; }();
+    return llama_lru_tail_on() && lru->is_exclusive() && (t == GGML_TYPE_IQ3_S || t == GGML_TYPE_IQ4_NL || (q8 && t == GGML_TYPE_Q8_0) ||
+                                                          (iq4xs && t == GGML_TYPE_IQ4_XS));
 }
 
 // every kind of the layer assembles its tail only

@@ -11791,6 +11791,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0,   GGML_TYPE_F32, 1024, 10, false, 256, n, 128));
     }
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
+    // IQ4_XS experts with M % 160 == 0 (CUDA: the row-per-thread kernel), Flash-Next layer 2's gate/up per GPU
+    for (int n : { 37, 300 }) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, 512, 10, false, 320, n, 2560));
+    }
     // >= 4096 slots (CUDA: the counting-sort ids helper), with and without skipped slots
     for (bool skip : { false, true }) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 512, 10, false, 64, 600, 256, 0, false, skip));
@@ -13698,9 +13702,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_dsv4_hc_post(2560, 4096, false, false));
     test_cases.emplace_back(new test_dsv4_hc_post(2560, 4096, false, true));
 
+    // Flash-Next prefill few-row quantized projections per GPU at 4096 tokens (fp32 cuBLAS below GGML_CUDA_GEMM_FOLD_MINROWS):
+    // shared expert gate/up (2560 -> 320), hyper-connection down (10240 -> 320)
+    for (auto [m, k] : { std::pair<int, int>{320, 2560}, std::pair<int, int>{320, 10240} }) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, m, 4096, k, {1, 1}, {1, 1}));
+    }
+
     // Flash-Next UD-IQ4_XS prefill experts per GPU under -sm tensor (512 experts, 10 used): IQ3_S gate/up (K 2560 -> M 320),
     // IQ4_NL down (K 320 -> M 2560), at the 2048 / 4096-token ubatches of a long prompt (tile_mm's grouped mode)
     for (int n : { 2048, 4096 }) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, 512, 10, false,  320, n, 2560));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_S,  GGML_TYPE_F32, 512, 10, false,  320, n, 2560));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 512, 10, false, 2560, n,  320));
     }
