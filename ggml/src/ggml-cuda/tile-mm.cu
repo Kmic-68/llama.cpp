@@ -298,11 +298,13 @@ struct tile_mm_params {
 // X f32 [N][K] (row stride sx floats) -> XS half [N][K] prescaled by 2^-e per (column, window) so |x| < 1; S[n][w] = 2^e.
 // With ids (MUL_MAT_ID) column c of XS is row ids[c] of X (the compact, expert-sorted order).
 static __global__ void tile_mm_prep(const float * __restrict__ X, const int64_t sx, const int * __restrict__ ids, __half * __restrict__ XS,
-                                    float * __restrict__ S, const int K, const int nwin) {
-    const int w = blockIdx.x*blockDim.y + threadIdx.y, c = blockIdx.y;
+                                    float * __restrict__ S, const int K, const int nwin, const int nrows) {
+    const int w = blockIdx.x*blockDim.y + threadIdx.y;
     if (w >= nwin) {
         return;
     }
+    // rows beyond grid.y's 65535 (MUL_MAT_ID per slot: 8192 tokens x 10 slots) by a grid stride
+    for (int c = blockIdx.y; c < nrows; c += gridDim.y) {
     const float * x = X + (int64_t) (ids ? ids[c] : c)*sx + (int64_t) w*TMM_WIN;
     const int len = min(TMM_WIN, K - w*TMM_WIN);
     float m = 0.0f;
@@ -324,6 +326,7 @@ static __global__ void tile_mm_prep(const float * __restrict__ X, const int64_t 
     }
     if (threadIdx.x == 0) {
         S[(int64_t) c*nwin + w] = ldexpf(1.0f, e);
+    }
     }
 }
 
@@ -1083,9 +1086,9 @@ bool ggml_cuda_tile_mm_try(ggml_backend_cuda_context & ctx, const ggml_tensor * 
     ggml_cuda_pool_alloc<float>  sc(ctx.pool(), N*nwin);
     ggml_cuda_pool_alloc<float>  part(ctx.pool(), (int64_t) splits*N*M);
     {
-        const dim3 pb(WARP_SIZE, 4), pg((nwin + 3)/4, (unsigned) N);
+        const dim3 pb(WARP_SIZE, 4), pg((nwin + 3)/4, (unsigned) std::min<int64_t>(N, 65535));
         tile_mm_prep<<<pg, pb, 0, stream>>>((const float *) src1->data, (int64_t) (src1->nb[1]/sizeof(float)), nullptr, xs.get(), sc.get(),
-                                            (int) K, nwin);
+                                            (int) K, nwin, (int) N);
     }
     tile_mm_params prm = {};
     prm.W = src0->data; prm.row_bytes = (int64_t) src0->nb[1]; prm.XS = xs.get(); prm.S = sc.get(); prm.P = part.get();
@@ -1184,9 +1187,9 @@ bool ggml_cuda_tile_mm_id_try(ggml_backend_cuda_context & ctx, const ggml_tensor
         tile_mm_id_tiles<<<1, 1, 0, stream>>>(bounds.get(), (int) n_experts, bn, tiles.get() + 1, tiles.get());
     }
     {
-        const dim3 pb(WARP_SIZE, 4), pg((nwin + 3)/4, (unsigned) nx);
+        const dim3 pb(WARP_SIZE, 4), pg((nwin + 3)/4, (unsigned) std::min<int64_t>(nx, 65535));
         tile_mm_prep<<<pg, pb, 0, stream>>>((const float *) src1->data, (int64_t) (src1->nb[1]/sizeof(float)), xtok ? nullptr : ids_src1.get(), xs.get(),
-                                            sc.get(), (int) K, nwin);
+                                            sc.get(), (int) K, nwin, (int) nx);
     }
     tile_mm_params prm = {};
     prm.W = zc_base ? zc_base : src0->data; prm.row_bytes = (int64_t) src0->nb[1]; prm.expert_bytes = (int64_t) src0->nb[2];

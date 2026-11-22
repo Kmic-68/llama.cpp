@@ -13710,8 +13710,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     // Flash-Next UD-IQ4_XS prefill experts per GPU under -sm tensor (512 experts, 10 used): IQ3_S gate/up (K 2560 -> M 320),
     // IQ4_NL down (K 320 -> M 2560), at the 2048 / 4096-token ubatches of a long prompt (tile_mm's grouped mode)
-    for (int n : { 2048, 4096 }) {
+    for (int n : { 2048, 4096, 8192 }) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, 512, 10, false,  320, n, 2560));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 512, 10, false,  384, n, 2560));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_S,  GGML_TYPE_F32, 512, 10, false,  640, n, 2560));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_S,  GGML_TYPE_F32, 16, 4, false,  640, n, 2560));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 16, 4, false,  2560, n, 320));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_S,  GGML_TYPE_F32, 512, 10, false,  320, n, 2560));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 512, 10, false, 2560, n,  320));
     }
