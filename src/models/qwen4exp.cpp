@@ -1762,6 +1762,11 @@ llama_model_qwen4exp::~llama_model_qwen4exp() {
 }
 
 const uint8_t * llama_model_qwen4exp::ple_row(int32_t r) const {
+    // no scan cache (LLAMA_PLE_SCAN_MIN unset, the default): straight from the mapping, no lock (the PLE gather runs on 8 threads)
+    static const bool scan_on = [] { const char * e = getenv("LLAMA_PLE_SCAN_MIN"); return e && atoll(e) > 0; }();
+    if (!scan_on) {
+        return (const uint8_t *) per_layer_tok_embd->data + (size_t) r * per_layer_tok_embd->nb[1];
+    }
     {
         std::unique_lock<std::mutex> lk(ple_mtx);
         auto it = ple_pos.find(r);
