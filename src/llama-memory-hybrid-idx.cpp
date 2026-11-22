@@ -924,12 +924,21 @@ void llama_memory_hybrid_idx_context::set_input_kpool(ggml_tensor * pool_cells, 
     // Padded entries re-pool cells whose pooled slot is never read: only the reps of complete pools are read.
     // Each entry takes its own cell, entries sharing one would write it from several threads in the scatter.
     if (n_new_g > n_new) {
-        std::vector<int64_t> reps(pcell, pcell + pool_end.size());
-        std::sort(reps.begin(), reps.end());
+        // the smallest cells that are no pool's rep, ascending (as before), from a byte map instead of sorting every rep: decode pads
+        // nearly every token, and the sort of ~62k reps at 250k was most of this input's ~1.8 ms a token
+        const int64_t n_cells = (int64_t) kv_size*n_stream_kv;
+        std::vector<uint8_t> is_rep;
+        is_rep.assign((size_t) std::min<int64_t>(n_cells, (int64_t) pool_end.size() + (n_new_g - n_new) + 1), 0);
+        for (size_t q = 0; q < pool_end.size(); ++q) {
+            if (pcell[q] >= 0 && (size_t) pcell[q] < is_rep.size()) {
+                is_rep[(size_t) pcell[q]] = 1;
+            }
+        }
+        auto rep_at = [&](int64_t c) { return (size_t) c < is_rep.size() && is_rep[(size_t) c]; };
 
         int64_t pad_cell = 0;
         for (uint32_t i = n_new; i < n_new_g; ++i, ++pad_cell) {
-            while (std::binary_search(reps.begin(), reps.end(), pad_cell)) {
+            while (rep_at(pad_cell)) {
                 ++pad_cell;
             }
             GGML_ASSERT(pad_cell < (int64_t) kv_size*n_stream_kv);
