@@ -11,6 +11,8 @@ int ggml_cuda_ar_rank_wire();
 void                    ggml_cuda_ar_rank_free(ggml_cuda_ar_rank_ctx * c);
 bool                    ggml_cuda_ar_rank_eligible(const ggml_cuda_ar_rank_ctx * c, const ggml_tensor * t);
 void                    ggml_cuda_ar_rank_reduce(ggml_cuda_ar_rank_ctx * c, int rank, cudaStream_t stream, ggml_tensor * t);
+bool                    ggml_cuda_ar_rank_reduce_chunked(ggml_cuda_ar_rank_ctx * c, int rank, cudaStream_t stream, cudaStream_t copy_stream,
+                                                         ggml_tensor * t, int n_chunks, const int64_t * elem_off, cudaEvent_t * ev);
 
 // AllReduce + the RMS norm (and residual ADDs) that open the next subgraph; bit-identical to the separate kernels
 struct ggml_cuda_ar_rank_norm_args {

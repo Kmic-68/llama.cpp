@@ -133,6 +133,7 @@ struct ggml_cuda_ar_rank_ctx {
     unsigned long long * prof[2] = {nullptr, nullptr};  // GGML_CUDA_AR_PROF: device ring per rank
     uint2 * ll[2] = {nullptr, nullptr};                 // device i: AR_RANK_SLOTS * AR_LL_MAX_ELEMS LL words, written by the peer
     std::vector<ar_prof_meta> prof_meta[2];
+    cudaEvent_t chunk_done[2] = {nullptr, nullptr};   // ggml_cuda_ar_rank_reduce_chunked: the chunk copies done
 };
 
 static __global__ void ggml_cuda_ar_rank_kernel(float * data, const int n, float * __restrict__ wire_out, const float * __restrict__ wire_in,
@@ -634,6 +635,46 @@ bool ggml_cuda_ar_rank_eligible(const ggml_cuda_ar_rank_ctx * c, const ggml_tens
     const int64_t n = ggml_nelements(t);
     return n % 4 == 0 && ((uintptr_t) t->data & 15) == 0 &&
            ar_wire_scales_off(n) + (size_t) (n / 1024 + 1) * sizeof(float) <= c->slot_bytes;
+}
+
+// p100-series: the partial's source GEMM ran in token chunks with an event after each (gemm-fold.cu, xchg): send each chunk with the
+// copy engine as soon as it is done, on copy_stream, while the compute stream runs the later chunks; then the usual handshake + sum.
+// The same f32 bytes into the same inbox: the same sums. Returns false when the copy-engine path does not apply (the caller then
+// reduces as usual). GGML_CUDA_AR_CHUNKED (knob) = 0: off
+bool ggml_cuda_ar_rank_reduce_chunked(ggml_cuda_ar_rank_ctx * c, int rank, cudaStream_t stream, cudaStream_t copy_stream, ggml_tensor * t,
+                                      const int n_chunks, const int64_t * elem_off, cudaEvent_t * ev) {
+    const int n = (int) ggml_nelements(t);
+    if (n_chunks < 2 || !ar_ce((size_t) n * sizeof(float)) || ggml_knob_i32("GGML_CUDA_AR_CHUNKED", 1) == 0 ||
+            (ar_ll_enabled() && n <= ar_ll_max())) {
+        return false;
+    }
+    const int      peer  = rank ^ 1;
+    const uint32_t token = ++c->calls[rank];
+    const int      slot  = token % AR_RANK_SLOTS;
+    const int      n4    = n / 4;
+    const int      nb    = std::max(1, std::min(ar_blocks_large(), (n4 + AR_RANK_THREADS - 1) / AR_RANK_THREADS));
+    float * wire_out   = (float *) (c->inbox[peer] + (size_t) slot * c->slot_bytes);
+    float * wire_in    = (float *) (c->inbox[rank] + (size_t) slot * c->slot_bytes);
+    int   * signal_out = (int *) (c->arrival[peer] + (size_t) slot * AR_RANK_ALLOC_BLOCKS * AR_RANK_STRIDE);
+    int   * signal_in  = (int *) (c->arrival[rank] + (size_t) slot * AR_RANK_ALLOC_BLOCKS * AR_RANK_STRIDE);
+    if (c->prof[rank] != nullptr) {
+        c->prof_meta[rank].push_back({token, (uint8_t) 0, n, 1});
+    }
+    if (c->chunk_done[rank] == nullptr) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&c->chunk_done[rank], cudaEventDisableTiming));
+    }
+    const float * data = (const float *) t->data;
+    for (int k = 0; k < n_chunks; ++k) {
+        CUDA_CHECK(cudaStreamWaitEvent(copy_stream, ev[k], 0));
+        CUDA_CHECK(cudaMemcpyPeerAsync(wire_out + elem_off[k], c->devices[peer], data + elem_off[k], c->devices[rank],
+                                       (size_t) (elem_off[k + 1] - elem_off[k]) * sizeof(float), copy_stream));
+    }
+    CUDA_CHECK(cudaEventRecord(c->chunk_done[rank], copy_stream));
+    CUDA_CHECK(cudaStreamWaitEvent(stream, c->chunk_done[rank], 0));
+    ggml_cuda_ar_rank_kernel<<<nb, AR_RANK_THREADS, 0, stream>>>((float *) t->data, n, wire_out, wire_in, signal_out, signal_in, (int) token,
+                                                                  c->prof[rank], true);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
 }
 
 void ggml_cuda_ar_rank_reduce(ggml_cuda_ar_rank_ctx * c, int rank, cudaStream_t stream, ggml_tensor * t) {

@@ -8218,6 +8218,17 @@ static bool ggml_backend_cuda_ar_rank_can(void * c, const ggml_tensor * t) {
 static void ggml_backend_cuda_ar_rank_run(void * c, int rank, ggml_backend_t backend, ggml_tensor * t) {
     ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_cuda_set_device(ctx->device);
+    auto & xc = ctx->xchg;
+    if (xc.data == t->data && !xc.direct && xc.n >= 2 && xc.rows*xc.col[xc.n] == ggml_nelements(t)) {
+        int64_t off[9];
+        for (int k = 0; k <= xc.n; ++k) off[k] = xc.col[k]*xc.rows;
+        const bool done = ggml_cuda_ar_rank_reduce_chunked((ggml_cuda_ar_rank_ctx *) c, rank, ctx->stream(), ctx->peer_copy_stream(), t,
+                                                           xc.n, off, xc.ev);
+        xc.data = nullptr;
+        if (done) {
+            return;
+        }
+    }
     ggml_cuda_ar_rank_reduce((ggml_cuda_ar_rank_ctx *) c, rank, ctx->stream(), t);
 }
 
