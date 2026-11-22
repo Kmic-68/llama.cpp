@@ -9976,3 +9976,14 @@ prefill 599.7 / decode 16.8 t/s (scan on), 534.8 / 5.2 (scan off). --cache-ram 0
 prefill 629.8, decode 27.6 t/s, no swap. His: 808.8 / 29.3. On this box (64 GB, ~50 GB pinned by the expert pool) a long-context
 Flash-Next server needs --cache-ram 0 (or a small value): a serving-flag change, outputs unchanged.
 PLE prompt scan threshold 32768 -> 131072 (a 40k prompt: 688 -> 705 t/s prefill without the 28 GB read).
+
+## 346 — hc down on the fold GEMM, top-k write pass, AllReduce copy deadlock fixed (11-22)
+
+| change | op | math |
+|---|---|---|
+| 8503dea44 AllReduce copy-engine sends by cudaMemcpyAsync (UVA), not cudaMemcpyPeerAsync | llama-perplexity hung on chunk 1 (copy serialized behind the peer's spinning kernel) | identical (PPL 2.5879 = CE off) |
+| 56f3a5493 fold GEMM from 320 rows (hc down) | 4345 -> 3859 us | KLD 0.0183, PPL 1.9971 -> 1.9952 |
+| 683b615b6 top_k_rowblock picks per warp segment | 540 -> 400 us (65600 x 128, k 512) | byte-identical, model md5 identical |
+Rejected: indexer gemm4 with 4 tokens a thread (2 blocks: spills, 17 ms; 1 block: 2005 vs 1534 us), 32-dim staging (1772 us).
+Fresh 260k + 128 tokens: prefill 617.4, decode 28.1 t/s (box noise +-5%; earlier runs 630-661). Decode warm at 250k: 27.7-34.4,
+median ~29-30 (his 29.3). Cold first requests after a restart 5-11 t/s (expert cache warm-up).
