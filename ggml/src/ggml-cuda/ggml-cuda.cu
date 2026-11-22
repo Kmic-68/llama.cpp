@@ -1,3 +1,4 @@
+#include <functional>
 #include <unordered_set>
 #include "ggml-cuda.h"
 #include "ggml-impl.h"
@@ -5151,7 +5152,127 @@ static int ggml_cuda_try_fuse_gate_up(ggml_backend_cuda_context * ctx, ggml_cgra
     return 0;
 }
 
+// p100-series: a balanced tree of CONCATs (qwen4exp's gathered-attention chunk outputs, 32 a 4096-token ubatch) as one pass: every
+// leaf is copied straight into the root's buffer instead of each tree level copying everything again (~5 full copies). Only when
+// the run of CONCAT nodes starting at i forms a tree whose inner nodes are used by their parent alone, all contiguous f32/f16 of one
+// type, joined along their outermost non-1 dimension (so a leaf is one contiguous byte range of the root). Byte-identical (copies).
+// GGML_CUDA_CONCAT_TREE (knob, default 0: it hung a 2-GPU llama-perplexity chunk, cause not found yet) = 1: on
+static int ggml_cuda_try_fuse_concat_tree(ggml_backend_cuda_context * ctx, ggml_cgraph * cgraph, int i) {
+    if (cgraph->nodes[i]->op != GGML_OP_CONCAT || ggml_knob_i32("GGML_CUDA_CONCAT_TREE", 0) == 0) {
+        return 0;
+    }
+    int j = i;
+    while (j + 1 < cgraph->n_nodes && cgraph->nodes[j + 1]->op == GGML_OP_CONCAT) {
+        j++;
+    }
+    if (j == i) {
+        return 0;
+    }
+    ggml_tensor * root = cgraph->nodes[j];
+    std::unordered_set<const ggml_tensor *> inner;
+    for (int k = i; k <= j; ++k) {
+        inner.insert(cgraph->nodes[k]);
+    }
+    const int dim = ggml_get_op_params_i32(root, 0);
+    // the root's dims above `dim` must be 1 (a leaf is then one contiguous range), every node contiguous and of one type
+    for (int d = dim + 1; d < GGML_MAX_DIMS; ++d) {
+        if (root->ne[d] != 1) {
+            return 0;
+        }
+    }
+    std::vector<const ggml_tensor *> leaves;
+    bool ok = true;
+    size_t n_walked = 0;   // inner nodes reached from the root: all of the run, or the run holds more than one tree
+    std::function<void(const ggml_tensor *)> walk = [&](const ggml_tensor * t) {
+        if (!ok) return;
+        if (inner.count(t)) {
+            n_walked++;
+            if (ggml_get_op_params_i32(t, 0) != dim || !ggml_is_contiguous(t) || t->type != root->type) { ok = false; return; }
+            walk(t->src[0]);
+            walk(t->src[1]);
+        } else {
+            if (!ggml_is_contiguous(t) || t->type != root->type) { ok = false; return; }
+            leaves.push_back(t);
+        }
+    };
+    walk(root);
+    // (two trees back to back -- the chunk outputs' and the QSA selection's small index concats -- would leave the first one's
+    // nodes skipped but never written: their readers then gathered garbage rows, which hung a 2-GPU run)
+    if (!ok || (int) leaves.size() < 3 || n_walked != inner.size()) {
+        return 0;
+    }
+    // inner nodes other than the root: used once (by their parent), not graph outputs
+    for (int k = i; k < j; ++k) {
+        const ggml_tensor * n = cgraph->nodes[k];
+        if ((n->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(cgraph, k) != 1) {
+            return 0;
+        }
+    }
+    size_t off = 0;
+    for (const ggml_tensor * l : leaves) {
+        const size_t nb = ggml_nbytes(l);
+        // a leaf must not overlap the root (the allocator could have reused a dead leaf's memory for it otherwise)
+        const char * r0 = (const char *) root->data, * l0 = (const char *) l->data;
+        if (l0 < r0 + ggml_nbytes(root) && r0 < l0 + nb) {
+            return 0;
+        }
+        off += nb;
+    }
+    if (off != ggml_nbytes(root)) {
+        return 0;
+    }
+    off = 0;
+    for (const ggml_tensor * l : leaves) {
+        CUDA_CHECK(cudaMemcpyAsync((char *) root->data + off, l->data, ggml_nbytes(l), cudaMemcpyDeviceToDevice, ctx->stream()));
+        off += ggml_nbytes(l);
+    }
+    return j - i;
+}
+
+// p100-series: the routed experts' SWIGLU folded into the down projection's activation prep (tile MUL_MAT_ID, prompt ubatches):
+// silu(gate) * up computed where the prep reads its input, so the swiglu kernel and its [n_ff, n_used, n_tokens] tensor go.
+// The same products as unary_gated_op_kernel; GGML_CUDA_TMM_GLU (knob) = 0: off
+static int ggml_cuda_try_fuse_glu_mmid(ggml_backend_cuda_context * ctx, ggml_cgraph * cgraph, int i) {
+    ggml_tensor * glu = cgraph->nodes[i];
+    if (glu->op != GGML_OP_GLU || ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || glu->type != GGML_TYPE_F32 || glu->src[1] == nullptr ||
+            ggml_get_op_params_i32(glu, 1) != 0 || i + 1 >= cgraph->n_nodes || ggml_knob_i32("GGML_CUDA_TMM_GLU", 1) == 0) {
+        return 0;
+    }
+    ggml_tensor * mm = cgraph->nodes[i + 1];
+    const ggml_tensor * g = glu->src[0], * u = glu->src[1];
+    if (mm->op != GGML_OP_MUL_MAT_ID || mm->src[1] != glu || !(mm->flags & GGML_TENSOR_FLAG_COMPUTE) || mm->src[1]->ne[2] <= 32 ||
+            !ggml_node_has_n_uses(cgraph, i, 1) || (glu->flags & GGML_TENSOR_FLAG_OUTPUT) ||
+            g->type != GGML_TYPE_F32 || u->type != GGML_TYPE_F32 || !ggml_are_same_shape(g, glu) || !ggml_are_same_shape(u, glu) ||
+            g->nb[1] != u->nb[1] || g->nb[2] != u->nb[2] || g->nb[0] != sizeof(float) || u->nb[0] != sizeof(float) ||
+            glu->ne[1] == 1) {
+        return 0;
+    }
+    if (ctx->n_lru_pending > 0) {
+        ggml_cuda_lru_wait_srcs(*ctx, cgraph, i + 1);
+    }
+    if (ctx->lru_ovl_active) {
+        ggml_cuda_lru_ovl_guard(*ctx, cgraph, i + 1);
+    }
+    ggml_cuda_lru_ce_pending_wait(*ctx, mm->src[0]->data);
+    if (!ggml_cuda_tile_mm_id_try(*ctx, mm->src[0], g, mm->src[2], mm, nullptr, nullptr, u)) {
+        return 0;
+    }
+    return 1;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    {
+        const int skip = ggml_cuda_try_fuse_glu_mmid(cuda_ctx, cgraph, i);
+        if (skip > 0) {
+            return skip;
+        }
+    }
+    {
+        const int skip = ggml_cuda_try_fuse_concat_tree(cuda_ctx, cgraph, i);
+        if (skip > 0) {
+            return skip;
+        }
+    }
     {
         const int skip = ggml_cuda_try_fuse_gate_up(cuda_ctx, cgraph, i);
         if (skip > 0) {
@@ -6377,15 +6498,20 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         // p100-series: + the next hyper-connection norm (RMS_NORM of the hc_post output rows, MUL by the [n_embd, hc] weight) in the
         // same kernel, same bits (dsv4-hc.cu). GGML_CUDA_HC_POST_RMS (knob) = 0: off
         ggml_tensor * hp = cgraph->nodes[i + 3];
-        if (i + 5 < cgraph->n_nodes && ggml_knob_i32("GGML_CUDA_HC_POST_RMS", 1) != 0) {
-            ggml_tensor * rn = cgraph->nodes[i + 4];
-            ggml_tensor * mn = cgraph->nodes[i + 5];
+        // the norm may follow a reshape / view of the hc_post output (prefill graphs): skip those no-op nodes
+        int ir = i + 4;
+        while (ir < cgraph->n_nodes && ir <= i + 6 && ggml_cuda_is_view_or_noop(cgraph->nodes[ir])) {
+            ir++;
+        }
+        if (ir + 1 < cgraph->n_nodes && ggml_knob_i32("GGML_CUDA_HC_POST_RMS", 1) != 0) {
+            ggml_tensor * rn = cgraph->nodes[ir];
+            ggml_tensor * mn = cgraph->nodes[ir + 1];
             const ggml_tensor * rsrc = rn->src[0];
             if (rn->op == GGML_OP_RMS_NORM && mn->op == GGML_OP_MUL && (rn->flags & GGML_TENSOR_FLAG_COMPUTE) && (mn->flags & GGML_TENSOR_FLAG_COMPUTE) &&
                     rsrc != nullptr && rsrc->data == hp->data && ggml_are_same_shape(rsrc, hp) && ggml_is_contiguous(rsrc) && ggml_is_contiguous(hp) &&
-                    (mn->src[0] == rn || mn->src[1] == rn) && ggml_node_has_n_uses(cgraph, i + 4, 1) && !(rn->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+                    (mn->src[0] == rn || mn->src[1] == rn) && ggml_node_has_n_uses(cgraph, ir, 1) && !(rn->flags & GGML_TENSOR_FLAG_OUTPUT) &&
                     ggml_cuda_op_dsv4_hc_post_rms(*cuda_ctx, hp, node, cgraph->nodes[i + 2], rn, mn)) {
-                return 5;
+                return ir + 1 - i;   // through the MUL (the view nodes between are no-ops)
             }
         }
         ggml_cuda_op_dsv4_hc_post(*cuda_ctx, hp, node, cgraph->nodes[i + 2]);
