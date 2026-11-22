@@ -887,6 +887,10 @@ bool ggml_cuda_gemm_fold_try(ggml_backend_cuda_context & ctx, const ggml_tensor 
             gemm_fold_prescale_v<6><<<N, 256, 0, stream>>>(xs, s1, x_alloc.get(), s_alloc.get(), K, ggml_cuda_gemm_fold_xexp());
         } else if (vec && K <= 1024*9) {
             gemm_fold_prescale_v<9><<<N, 256, 0, stream>>>(xs, s1, x_alloc.get(), s_alloc.get(), K, ggml_cuda_gemm_fold_xexp());
+        } else if (vec && K <= 1024*10) {   // Flash-Next's hc down (K = 10240): one read instead of two (866 us a call before)
+            gemm_fold_prescale_v<10><<<N, 256, 0, stream>>>(xs, s1, x_alloc.get(), s_alloc.get(), K, ggml_cuda_gemm_fold_xexp());
+        } else if (vec && K <= 1024*12) {
+            gemm_fold_prescale_v<12><<<N, 256, 0, stream>>>(xs, s1, x_alloc.get(), s_alloc.get(), K, ggml_cuda_gemm_fold_xexp());
         } else {
             gemm_fold_prescale<<<N, 256, 0, stream>>>(xs, s1, x_alloc.get(), s_alloc.get(), K, ggml_cuda_gemm_fold_xexp());
         }
@@ -938,7 +942,10 @@ bool ggml_cuda_gemm_fold_try(ggml_backend_cuda_context & ctx, const ggml_tensor 
         CUDA_CHECK(cudaMemGetInfo(&free_b, &total_b));
         pair_room[ctx.device] = free_b > ((size_t) 3 << 29) ? 1 : -1;
     }
-    if (pt != nullptr && (pair_room[ctx.device] < 0 || gemm_fold_pf[ctx.device].broken)) {
+    // a small partner (<= 64 MiB as f16: Flash-Next's shared-expert up, 3.3 MB) pairs regardless of the room check
+    const bool pt_small = pt != nullptr && (size_t) ggml_nelements(pt->src[0])*sizeof(half) <= ((size_t) 64 << 20) &&
+                          ggml_knob_i32("GGML_CUDA_FOLD_PAIR_SMALL", 1) != 0;
+    if (pt != nullptr && ((pair_room[ctx.device] < 0 && !pt_small) || gemm_fold_pf[ctx.device].broken)) {
         pt = nullptr;
     }
     if (pt != nullptr && u2 && !ctx.xchg_want && M % BM == 0 && pt->op == GGML_OP_MUL_MAT && pt->src[1] == src1 &&
