@@ -450,6 +450,97 @@ static void top_k_argsort_cuda(
     }
 }
 
+// p100-series: one block per row for long rows (QSA's pool scores: 65600 a row, 128 rows, k = 512): a 3-pass radix select (11, 11 and
+// 10 bits of the order-preserving key) finds the k-th largest value and how many of its ties to take, then the row's columns above it
+// are written in any order and its ties lowest column first -- top_k_radix's rule, so the same set. One launch, the row read 4 times
+// from L2 instead of ~6 launches over the whole tensor. GGML_CUDA_TOPK_ROWBLOCK=0: the radix path
+static constexpr int TOPK_RB_NT = 512;
+
+static __device__ __forceinline__ unsigned int topk_rb_key(const float f) {
+    const unsigned int u = __float_as_uint(f);
+    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+}
+
+static __global__ void __launch_bounds__(TOPK_RB_NT) top_k_rowblock(const float * __restrict__ src, int * __restrict__ dst, const int ncols, const int k) {
+    constexpr int NT = TOPK_RB_NT;
+    __shared__ unsigned int hist[2048];
+    __shared__ unsigned int s_prefix, s_mask, s_krem, s_out;
+    __shared__ unsigned int s_wsum[NT/32];
+    const int tid = threadIdx.x, lane = tid % 32, wid = tid / 32;
+    const float * x = src + (int64_t) blockIdx.x*ncols;
+    int * out = dst + (int64_t) blockIdx.x*k;
+    if (tid == 0) { s_prefix = 0; s_mask = 0; s_krem = (unsigned int) k; s_out = 0; }
+    const int shifts[3] = { 21, 10, 0 }, nbits[3] = { 11, 11, 10 };
+    for (int p = 0; p < 3; ++p) {
+        const int nb = 1 << nbits[p], sh = shifts[p];
+        const unsigned int bm = (unsigned int) nb - 1;
+        for (int i = tid; i < 2048; i += NT) hist[i] = 0;
+        __syncthreads();
+        const unsigned int prefix = s_prefix, pmask = s_mask;
+        for (int i = tid; i < ncols; i += NT) {
+            const unsigned int key = topk_rb_key(__ldg(x + i));
+            if ((key & pmask) == prefix) atomicAdd(&hist[(key >> sh) & bm], 1u);
+        }
+        __syncthreads();
+        if (wid == 0) {   // the bin of the k_rem-th largest, from the top: lane l sums bins [nb-1 - l*per - per + 1, nb-1 - l*per]
+            const int per = nb/32, hi = nb - 1 - lane*per;
+            unsigned int sum = 0;
+            for (int j = 0; j < per; ++j) sum += hist[hi - j];
+            unsigned int incl = sum;
+#pragma unroll
+            for (int o = 1; o < 32; o <<= 1) {
+                const unsigned int v = __shfl_up_sync(0xffffffff, incl, o);
+                if (lane >= o) incl += v;
+            }
+            const unsigned int excl = incl - sum, krem = s_krem;
+            if (excl < krem && krem <= incl) {
+                unsigned int c = excl;
+                int b = hi;
+                for (int j = 0; j < per; ++j) {
+                    const unsigned int h = hist[hi - j];
+                    if (c + h >= krem) { b = hi - j; break; }
+                    c += h;
+                }
+                s_prefix = prefix | ((unsigned int) b << sh);
+                s_mask   = pmask  | (bm << sh);
+                s_krem   = krem - c;
+            }
+        }
+        __syncthreads();
+    }
+    const unsigned int T = s_prefix, ntie = s_krem;   // the k-th largest key; ties of it to take (>= 1)
+    // above T: any order; ties: lowest column first, ranked tile by tile (NT columns a tile, coalesced): a warp ballot gives the rank
+    // inside the warp, the warps' counts the rank inside the tile, a running count the tiles before
+    __shared__ unsigned int s_run;
+    if (tid == 0) s_run = 0;
+    __syncthreads();
+    for (int base = 0; base < ncols; base += NT) {
+        const int i = base + tid;
+        const unsigned int key = i < ncols ? topk_rb_key(__ldg(x + i)) : 0u;
+        const bool tie = i < ncols && key == T;
+        if (i < ncols && key > T) {
+            out[atomicAdd(&s_out, 1u)] = i;
+        }
+        const unsigned int bal = __ballot_sync(0xffffffff, tie);
+        if (lane == 0) s_wsum[wid] = __popc(bal);
+        __syncthreads();
+        const unsigned int run = s_run;   // (no early exit: columns above T can come after the last tie taken)
+        unsigned int woff = 0, tot = 0;
+        for (int w = 0; w < NT/32; ++w) {
+            const unsigned int c = s_wsum[w];
+            woff += w < wid ? c : 0;
+            tot  += c;
+        }
+        if (tie) {
+            const unsigned int rank = run + woff + __popc(bal & ((1u << lane) - 1u));
+            if (rank < ntie) out[(int) ((unsigned int) k - ntie + rank)] = i;
+        }
+        __syncthreads();
+        if (tid == 0) s_run = run + tot;
+        __syncthreads();
+    }
+}
+
 void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0   = dst->src[0];
     const float *       src0_d = (const float *) src0->data;
@@ -487,6 +578,11 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         }
     }
 
+    static const bool rowblock_on = [] { const char * e = getenv("GGML_CUDA_TOPK_ROWBLOCK"); return !e || atoi(e) != 0; }();
+    if (rowblock_on && ncols >= 8192 && ncols < (1 << 30) && nrows >= 16 && k >= 1 && k <= ncols && ggml_is_contiguous(src0)) {
+        top_k_rowblock<<<(unsigned int) nrows, TOPK_RB_NT, 0, stream>>>(src0_d, dst_d, (int) ncols, (int) k);
+        return;
+    }
     if (nrows > GGML_CUDA_TOP_K_NROWS_THRESHOLD) {
         top_k_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
         return;
