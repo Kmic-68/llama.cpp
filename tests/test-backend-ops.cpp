@@ -11794,6 +11794,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // IQ4_XS experts with M % 160 == 0 (CUDA: the row-per-thread kernel), Flash-Next layer 2's gate/up per GPU
     for (int n : { 37, 300 }) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, 512, 10, false, 320, n, 2560));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512, 10, false, 2560, n, 320));
     }
     // >= 4096 slots (CUDA: the counting-sort ids helper), with and without skipped slots
     for (bool skip : { false, true }) {
@@ -13712,6 +13713,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // IQ4_NL down (K 320 -> M 2560), at the 2048 / 4096-token ubatches of a long prompt (tile_mm's grouped mode)
     for (int n : { 2048, 4096, 8192 }) {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_XS, GGML_TYPE_F32, 512, 10, false,  320, n, 2560));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0,   GGML_TYPE_F32, 512, 10, false, 2560, n,  320));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 512, 10, false,  384, n, 2560));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_S,  GGML_TYPE_F32, 512, 10, false,  640, n, 2560));
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ3_S,  GGML_TYPE_F32, 16, 4, false,  640, n, 2560));

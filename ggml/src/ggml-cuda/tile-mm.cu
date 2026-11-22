@@ -345,7 +345,23 @@ static constexpr int TMR_NT = 128, TMR_RB = 128, TMR_TB = 48, TMR_TL = 6, TMR_RL
 template <ggml_type type, int NWA>
 static __device__ __forceinline__ void tmr_decode_step(const uint32_t (&w)[NWA], const int st, const uint32_t * g3, uint4 (&o)[8]) {
 #define TMR_B(i) ((w[(i) >> 2] >> (8*((i) & 3))) & 0xFFu)
-    if constexpr (type == GGML_TYPE_IQ4_XS) {
+    if constexpr (type == GGML_TYPE_Q8_0) {
+        // two blocks (68 bytes, 4-aligned): d0 qs0[32] d1 qs1[32]; values 32 b + i = d_b*qs_b[i], as tile_mm's Q8_0 (d x1024 in fp32, one rounding)
+#pragma unroll
+        for (int bk = 0; bk < 2; ++bk) {
+            const float d = __half2float(__ushort_as_half((unsigned short) ((w[17*bk/2] >> (16*(bk & 1))) & 0xFFFF)))*1024.0f;
+#pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                half2 hv[4];
+#pragma unroll
+                for (int p = 0; p < 4; ++p) {
+                    const int i = 8*c + 2*p, ob = 34*bk + 2 + i;
+                    hv[p] = __floats2half2_rn(d*(int) (signed char) TMR_B(ob), d*(int) (signed char) TMR_B(ob + 1));
+                }
+                o[4*bk + c] = make_uint4(*(const uint32_t *) &hv[0], *(const uint32_t *) &hv[1], *(const uint32_t *) &hv[2], *(const uint32_t *) &hv[3]);
+            }
+        }
+    } else if constexpr (type == GGML_TYPE_IQ4_XS) {
         // a 136-byte superblock: d, scales_h, scales_l[4], qs[128]; sub-block ib (32 values) scale d*(ls - 32), its 16 qs bytes as IQ4_NL's
         const float d = __half2float(__ushort_as_half((unsigned short) (w[0] & 0xFFFF)));
         const uint32_t sh_all = w[0] >> 16;
@@ -410,15 +426,25 @@ static __device__ __forceinline__ void tmr_decode_step(const uint32_t (&w)[NWA],
 #undef TMR_B
 }
 
+// GGML_CUDA_TMM_WSKIP=0: warps past an expert's last token run the products too (on zero activations)
+static __device__ __forceinline__ bool tmr_wskip() {
+#ifdef GGML_CUDA_TMM_NO_WSKIP
+    return false;
+#else
+    return true;
+#endif
+}
+
 // RL rows x TL tokens a thread, 16 row groups: RB = 16 RL rows = NT threads (one decode row each), TB = RL TL tokens a tile
 // (8 x 6: 128 rows x 48 tokens; 10 x 5: 160 x 50, which tiles Flash-Next's M = 320 gate/up exactly)
 template <ggml_type type, int RL = TMR_RL, int TL = TMR_TL>
 static __global__ void __launch_bounds__(16*RL, 2) tile_mm_rows(const tile_mm_params prm) {
     constexpr int NT = 16*RL, RB = 16*RL, TB = RL*TL, KU = TMR_KU, LD = TMR_LD;
-    constexpr int UV = type == GGML_TYPE_IQ4_NL ? 64 : QK_K;   // values a staged unit (IQ3_S / IQ4_XS: a superblock, IQ4_NL: two blocks)
+    constexpr bool U64 = type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_Q8_0;   // a unit is one 64-value step (two blocks), prefetched
+    constexpr int UV = U64 ? 64 : QK_K;   // values a staged unit (IQ3_S / IQ4_XS: a superblock, IQ4_NL: two blocks)
     constexpr int UB = type == GGML_TYPE_IQ3_S ? (int) sizeof(block_iq3_s) : type == GGML_TYPE_IQ4_XS ? (int) sizeof(block_iq4_xs) :
-                       2*(int) sizeof(block_iq4_nl);
-    constexpr int NW = type == GGML_TYPE_IQ3_S ? 28 : type == GGML_TYPE_IQ4_XS ? 34 : 9;   // words a unit (IQ3_S: aligned-down, realigned)
+                       type == GGML_TYPE_Q8_0 ? 2*(int) sizeof(block_q8_0) : 2*(int) sizeof(block_iq4_nl);
+    constexpr int NW = type == GGML_TYPE_IQ3_S ? 28 : type == GGML_TYPE_IQ4_XS ? 34 : type == GGML_TYPE_Q8_0 ? 17 : 9;   // words a unit (IQ3_S: aligned-down, realigned)
     constexpr int NWA = type == GGML_TYPE_IQ4_XS ? 34 : 28;
     __shared__ __align__(16) uint4 sw[RB*LD];                 // decoded rows, row ni*RL + r at slot r*16 + ni
     __shared__ __align__(16) uint4 sx[TB*LD];                 // the step's activations, [token][k-pair quad]
@@ -455,6 +481,7 @@ static __global__ void __launch_bounds__(16*RL, 2) tile_mm_rows(const tile_mm_pa
     for (int i = 0; i < TL; ++i)
 #pragma unroll
         for (int r = 0; r < RL; ++r) s[i][r] = 0.0f;
+    const bool wact = n0 + (ti & ~1)*TL < N || !tmr_wskip();
 
     // this thread's activation staging slots (fixed for the block): XS offset (halves, without k0) and sx index
     constexpr int XQ = (TB*KU + NT - 1)/NT;
@@ -470,11 +497,11 @@ static __global__ void __launch_bounds__(16*RL, 2) tile_mm_rows(const tile_mm_pa
     uint4 xv[XQ];
 #define TMR_XLOAD(kk) _Pragma("unroll") for (int q = 0; q < XQ; ++q) \
         xv[q] = xoff[q] >= 0 ? __ldg((const uint4 *) (prm.XS + xoff[q] + (kk))) : make_uint4(0, 0, 0, 0);
-    if constexpr (type == GGML_TYPE_IQ4_NL) {
+    if constexpr (U64) {
         TMR_XLOAD(0)
     }
 
-    uint32_t raw[NWA], rawn[type == GGML_TYPE_IQ4_NL ? 9 : 1];
+    uint32_t raw[NWA], rawn[U64 ? NW : 1];
 #pragma unroll
     for (int q = 0; q < NWA; ++q) raw[q] = 0u;
     const int nu = K/UV;
@@ -488,13 +515,13 @@ static __global__ void __launch_bounds__(16*RL, 2) tile_mm_rows(const tile_mm_pa
                 (dst)[27] >>= 16;   /* bytes 108, 109 (the last two scales) */ \
             } \
         } } while (0)
-    if constexpr (type == GGML_TYPE_IQ4_NL) {
+    if constexpr (U64) {
         TMR_RLOAD(rawn, 0);
     }
     for (int u = 0; u < nu; ++u) {
-        if constexpr (type == GGML_TYPE_IQ4_NL) {
+        if constexpr (U64) {
 #pragma unroll
-            for (int q = 0; q < 9; ++q) raw[q] = rawn[q];
+            for (int q = 0; q < NW; ++q) raw[q] = rawn[q];
         } else {
             TMR_RLOAD(raw, u);
         }
@@ -513,7 +540,7 @@ static __global__ void __launch_bounds__(16*RL, 2) tile_mm_rows(const tile_mm_pa
 #pragma unroll
                 for (int q = 0; q < 8; ++q) sw[slot*LD + q] = my_row < M ? o[q] : make_uint4(0, 0, 0, 0);
             }
-            if constexpr (type != GGML_TYPE_IQ4_NL) {   // IQ3_S's 160-thread blocks have no registers to spare for a prefetch
+            if constexpr (!U64) {   // IQ3_S's 160-thread blocks have no registers to spare for a prefetch
                 TMR_XLOAD(k0)
             }
             // stored rotated by one k-pair (slot j holds pair j + 1 mod 4): a weight pair e and its activation pair then sit in
@@ -522,18 +549,20 @@ static __global__ void __launch_bounds__(16*RL, 2) tile_mm_rows(const tile_mm_pa
             for (int q = 0; q < XQ; ++q) {
                 if (xsi[q] >= 0) sx[xsi[q]] = make_uint4(xv[q].y, xv[q].z, xv[q].w, xv[q].x);
             }
-            if constexpr (type == GGML_TYPE_IQ4_NL) {
+            if constexpr (U64) {
                 if (k0 + 64 < K) {
                     TMR_XLOAD(k0 + 64)
                 }
             }
-            if constexpr (type == GGML_TYPE_IQ4_NL) {
+            if constexpr (U64) {
                 if (u + 1 < nu) TMR_RLOAD(rawn, u + 1);
             }
             float swin[TL];
 #pragma unroll
             for (int i = 0; i < TL; ++i) swin[i] = so[i] >= 0 ? prm.S[so[i] + k0/TMM_WIN]*(1.0f/1024.0f) : 0.0f;
             __syncthreads();
+            // a warp holds token groups 2w, 2w + 1: past the expert's last token (the end of its last, part-full tile) it only decodes
+            if (!wact) continue;
 #pragma unroll
             for (int i = 0; i < TL; ++i)
 #pragma unroll
@@ -1148,9 +1177,11 @@ bool ggml_cuda_tile_mm_id_try(ggml_backend_cuda_context & ctx, const ggml_tensor
     // (IQ4_NL in 128-row blocks, IQ3_S in 160-row blocks when M % 160 == 0 -- Flash-Next's M = 320 gate/up left a 128-row grid's last
     // block half empty; GGML_CUDA_TMM_ROWS=2: IQ3_S also in 128-row blocks, 0: neither)
     static const int rows_on = [] { const char * e = getenv("GGML_CUDA_TMM_ROWS"); return e ? atoi(e) : 1; }();
-    const bool rows_k = iq4xs || ((rows_on >= 1 && type == GGML_TYPE_IQ4_NL) ||
+    // Q8_0 too (Flash-Next's five Q8_0 down layers, K = 320): two-block units as IQ4_NL (GGML_CUDA_TMM_ROWS_Q8=0: tile_mm)
+    static const bool rows_q8 = tmm_env_on("GGML_CUDA_TMM_ROWS_Q8");
+    const bool rows_k = iq4xs || ((rows_on >= 1 && (type == GGML_TYPE_IQ4_NL || (rows_q8 && type == GGML_TYPE_Q8_0))) ||
                          (rows_on >= 1 && type == GGML_TYPE_IQ3_S && (M % 160 == 0 || rows_on >= 2))) &&
-                        K % (type == GGML_TYPE_IQ4_NL ? 64 : QK_K) == 0 && src0->nb[1] % 4 == 0 && src0->nb[2] % 4 == 0 &&
+                        K % (type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_Q8_0 ? 64 : QK_K) == 0 && src0->nb[1] % 4 == 0 && src0->nb[2] % 4 == 0 &&
                         (tpool == nullptr || (tpool->nb[1] == src0->nb[1] && tpool->nb[2] % 4 == 0));
     const int tn   = rows_k ? TMR_TB/16 : std::min(tn_max, avg <= 16 ? 1 : avg <= 32 ? 2 : avg <= 48 ? 3 : avg <= 64 ? 4 : avg <= 80 ? 5 : 6);
     static const int r160_env = [] { const char * e = getenv("GGML_CUDA_TMM_ROWS160"); return e ? atoi(e) : 1; }();
@@ -1212,6 +1243,8 @@ bool ggml_cuda_tile_mm_id_try(ggml_backend_cuda_context & ctx, const ggml_tensor
         const dim3 grid((prm.M + TMR_RB - 1)/TMR_RB, max_tiles);
         if (type == GGML_TYPE_IQ3_S) {
             tile_mm_rows<GGML_TYPE_IQ3_S><<<grid, TMR_NT, 0, stream>>>(prm);
+        } else if (type == GGML_TYPE_Q8_0) {
+            tile_mm_rows<GGML_TYPE_Q8_0><<<grid, TMR_NT, 0, stream>>>(prm);
         } else {
             tile_mm_rows<GGML_TYPE_IQ4_NL><<<grid, TMR_NT, 0, stream>>>(prm);
         }
