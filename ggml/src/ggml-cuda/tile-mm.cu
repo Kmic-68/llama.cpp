@@ -334,6 +334,9 @@ static __global__ void tile_mm_prep(const float * __restrict__ X, const int64_t 
 // decode is a run per thread instead of one k-pair call per lane. The arithmetic is tile_mm's: weights x1024 as float, rounded to half
 // once; half2 sums over the step's k-pairs 0..31 in order, folded into fp32 with the column's window scale: the same outputs bit for
 // bit. GGML_CUDA_TMM_ROWS=0: tile_mm.
+#ifndef TMR_TL160
+#define TMR_TL160 3
+#endif
 static constexpr int TMR_NT = 128, TMR_RB = 128, TMR_TB = 48, TMR_TL = 6, TMR_RL = 8, TMR_KU = 8, TMR_LD = TMR_KU + 1;
 
 template <ggml_type type>
@@ -1085,7 +1088,8 @@ bool ggml_cuda_tile_mm_id_try(ggml_backend_cuda_context & ctx, const ggml_tensor
     const int tn   = rows_k ? TMR_TB/16 : std::min(tn_max, avg <= 16 ? 1 : avg <= 32 ? 2 : avg <= 48 ? 3 : avg <= 64 ? 4 : avg <= 80 ? 5 : 6);
     static const int r160_env = [] { const char * e = getenv("GGML_CUDA_TMM_ROWS160"); return e ? atoi(e) : 1; }();
     const bool r160 = rows_k && r160_env && type == GGML_TYPE_IQ3_S && M % 160 == 0;   // 160-row blocks (10 x 5 a thread, 50-token tiles)
-    const int bn   = r160 ? 50 : rows_k ? TMR_TB : 16*tn;
+    // IQ3_S 160-row blocks: 10 rows x TMR_TL160 tokens a thread (3: 30-token tiles; per GPU at 4096 tokens 5 x 50 15764, 4 x 40 13750, 3 x 30 13288, 2 x 20 15504 us: fewer live registers, less spill)
+    const int bn   = r160 ? 10*TMR_TL160 : rows_k ? TMR_TB : 16*tn;
     const int nwin = (int) ((K + TMM_WIN - 1)/TMM_WIN);
     const int max_tiles = (int) ((total + bn - 1)/bn + n_experts);
 
@@ -1127,9 +1131,9 @@ bool ggml_cuda_tile_mm_id_try(ggml_backend_cuda_context & ctx, const ggml_tensor
     if (rows_k && r160) {
         const dim3 grid(prm.M/160, max_tiles);
         if (type == GGML_TYPE_IQ3_S) {
-            tile_mm_rows<GGML_TYPE_IQ3_S, 10, 5><<<grid, 160, 0, stream>>>(prm);
+            tile_mm_rows<GGML_TYPE_IQ3_S, 10, TMR_TL160><<<grid, 160, 0, stream>>>(prm);
         } else {
-            tile_mm_rows<GGML_TYPE_IQ4_NL, 10, 5><<<grid, 160, 0, stream>>>(prm);
+            tile_mm_rows<GGML_TYPE_IQ4_NL, 10, TMR_TL160><<<grid, 160, 0, stream>>>(prm);
         }
     } else if (rows_k) {
         const dim3 grid((prm.M + TMR_RB - 1)/TMR_RB, max_tiles);
