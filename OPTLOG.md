@@ -9934,3 +9934,24 @@ Per layer at 4096 tokens (shallow, card 0): experts ~32 ms, fold GEMMs ~19, two 
 replicated hc/router work ~22 (hc_post, rms, hc down/up, hc_pre, router: both GPUs do every token -- sequence parallelism would
 halve it), cuBLAS fp32 GEMMs run 5-6.7 TFLOPS (fine). His expert kernel: gu 3.45, down 3.07 T MAC/s; ours 2.68 / 2.73 at real
 routing, 3.35 / 3.07 at dense routing (weight loads cost only ~3%).
+
+## 343 — Flash-Next fresh 260k: PLE rows in one scan per prompt, gate/up pair, hc_post + norm fused (11-22, night)
+
+Correction to 342: its fresh "632.8 t/s / decode 35.2" ran a library still built with a timing probe (weight loads stubbed: the
+output was "4444..."); the probe's source was restored but the library not rebuilt. Valid fresh 260k numbers, same config:
+| build | fresh 260k prefill t/s | note |
+|---|---|---|
+| after 71060cbb9 (OPTLOG 342 commits) | 589.4, 540.1 (2nd run) | the 2nd run read 6.9 GB at random through ntfs-3g (PLE page faults) |
+| + 738b88013 gate/up pair, 768062b9a hc_post+norm, 22602d174 PLE prompt scan | 597.2 | batches a smooth 746 -> 535 t/s over depth; the scan reads 28 GB once |
+| change | op / model result | math |
+|---|---|---|
+| 738b88013 MoE gate/up MUL_MAT_IDs in one launch | 2 x 10.3 -> 22.1 ms incl. concat (opdiff); fast loop 647.0 -> 650.8 | byte-identical; a first version without the allocator-order checks produced garbage |
+| 768062b9a hc_post + next RMS norm (+ weight) in one kernel | 2560 x 2000: 6800 -> 4365 us | byte-identical (1024-thread tree replicated) |
+| 190138686 slot restore drops the file's pages | the 2.4 GB restore evicted PLE rows | - |
+| 22602d174 llama_prefetch_prompt: a prompt's PLE rows in ONE sequential scan | fresh 260k 589 / 540 -> 597 | only where rows are read from |
+Rejected: async AllReduce on a side stream with lazy waits (fast loop 643.1 -> 619.4: the spinning reduction blocks take SMs);
+sequence parallelism for the hc chain (the prefill subgraphs interleave PLE convolutions that mix tokens: not a token-local region).
+Probes (timing only): expert kernel without decode 8-14% faster, without the fp32 fold 5-10%, without weight loads 3%: the
+products and their two barriers a step run at ~40% of HFMA2 peak (gemm_fold's dense GEMM reaches ~75-80%).
+Measurement: the box has ~9 GB of file cache next to the 50 GB pinned pool; ab.py now warms each pair's suffix first, but swap-ins
+of the server's own pages (1.7 GB swapped) still add +-10% noise per pass.
