@@ -461,7 +461,8 @@ static __device__ __forceinline__ unsigned int topk_rb_key(const float f) {
     return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
 }
 
-static __global__ void __launch_bounds__(TOPK_RB_NT) top_k_rowblock(const float * __restrict__ src, int * __restrict__ dst, const int ncols, const int k) {
+static __global__ void __launch_bounds__(TOPK_RB_NT) top_k_rowblock(const float * __restrict__ src, int * __restrict__ dst, const int ncols, const int k,
+                                                                     const bool chunked) {
     constexpr int NT = TOPK_RB_NT;
     __shared__ unsigned int hist[2048];
     __shared__ unsigned int s_prefix, s_mask, s_krem, s_out;
@@ -511,6 +512,37 @@ static __global__ void __launch_bounds__(TOPK_RB_NT) top_k_rowblock(const float 
     const unsigned int T = s_prefix, ntie = s_krem;   // the k-th largest key; ties of it to take (>= 1)
     // above T: any order; ties: lowest column first, ranked tile by tile (NT columns a tile, coalesced): a warp ballot gives the rank
     // inside the warp, the warps' counts the rank inside the tile, a running count the tiles before
+    if (chunked) {
+        // each warp a contiguous segment of the row, read 32 columns at a time (coalesced): a ballot ranks a step's ties inside the
+        // warp, a running count the earlier steps, one block scan the earlier warps -- the ties' ranks of the tile loop below (column
+        // order), with 2 barriers instead of 3 a tile
+        constexpr int NW = NT/32;
+        const int seg = ((ncols + NW - 1)/NW + 31)/32*32, c0 = wid*seg, c1 = min(ncols, c0 + seg);
+        unsigned int nt_w = 0;
+        for (int i0 = c0; i0 < c1; i0 += 32) {
+            const int i = i0 + lane;
+            nt_w += __popc(__ballot_sync(0xffffffff, i < c1 && topk_rb_key(__ldg(x + i)) == T));
+        }
+        if (lane == 0) s_wsum[wid] = nt_w;
+        __syncthreads();
+        unsigned int run = 0;
+        for (int w = 0; w < wid; ++w) run += s_wsum[w];
+        for (int i0 = c0; i0 < c1; i0 += 32) {
+            const int i = i0 + lane;
+            const unsigned int key = i < c1 ? topk_rb_key(__ldg(x + i)) : 0u;
+            const bool tie = i < c1 && key == T;
+            if (i < c1 && key > T) {
+                out[atomicAdd(&s_out, 1u)] = i;
+            }
+            const unsigned int bal = __ballot_sync(0xffffffff, tie);
+            if (tie) {
+                const unsigned int rank = run + __popc(bal & ((1u << lane) - 1u));
+                if (rank < ntie) out[(int) ((unsigned int) k - ntie + rank)] = i;
+            }
+            run += __popc(bal);
+        }
+        return;
+    }
     __shared__ unsigned int s_run;
     if (tid == 0) s_run = 0;
     __syncthreads();
@@ -580,7 +612,8 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     static const bool rowblock_on = [] { const char * e = getenv("GGML_CUDA_TOPK_ROWBLOCK"); return !e || atoi(e) != 0; }();
     if (rowblock_on && ncols >= 8192 && ncols < (1 << 30) && nrows >= 16 && k >= 1 && k <= ncols && ggml_is_contiguous(src0)) {
-        top_k_rowblock<<<(unsigned int) nrows, TOPK_RB_NT, 0, stream>>>(src0_d, dst_d, (int) ncols, (int) k);
+        top_k_rowblock<<<(unsigned int) nrows, TOPK_RB_NT, 0, stream>>>(src0_d, dst_d, (int) ncols, (int) k,
+                                                                        ggml_knob_i32("GGML_CUDA_TOPK_CHUNKED", 1) != 0);
         return;
     }
     if (nrows > GGML_CUDA_TOP_K_NROWS_THRESHOLD) {
