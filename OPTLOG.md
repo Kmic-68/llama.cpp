@@ -10029,3 +10029,10 @@ Concat tree hung a 2-GPU llama-perplexity chunk (bisected: only knob that matter
 the fusion skipped the first tree's nodes without writing them. Fix in tree (walk must cover the whole run), untested, default off.
 Expert host-pool copy threaded (LLAMA_MOE_LRU_LOAD_THREADS, default 8): server load 258 s under swap pressure, no gain seen yet.
 Absolute level ~610-625 vs ~675 this morning: box was swapping (2.7 GB swapped, 9 GB available); recheck after a clean restart.
+
+## 349 — expert decode: I2F -> PRMT + FADD kept; IQ3_S half table reverted (11-22)
+
+Kept (e9645e489): IQ3_S/Q8_0 bytes to float as 2^23 + b by PRMT, minus 2^23 (exact). IQ3_S gate/up 2048 tok 6952 -> 6478 us,
+Q8_0 6930 -> 6878, byte-identical. Reverted: IQ3_S grid bytes (odd 1..15) as 8 per-sub-block halves picked by PRMT, sign by XOR:
+byte-identical but 6478 -> 7574 us (registers: the r160 kernel is at its limit). Concat tree on: model md5 identical, fast loop
+648.7 (off) vs 644.1 (on), noise. Clean-box server load 203 s (threaded copy is not the limit).
