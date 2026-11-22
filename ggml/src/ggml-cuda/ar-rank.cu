@@ -31,6 +31,12 @@ static int ar_blocks_large() {
     return v;
 }
 static constexpr int    AR_RANK_THREADS      = 256;
+// p100-series: an f32 reduction above 1 MiB sends its partial with the copy engine (cudaMemcpyPeerAsync into the peer's inbox) instead
+// of SM stores: 40 MiB both ways 4.3 ms vs 6.1 ms on 2x P100 (PHB), and the kernel then only handshakes and sums. Same bytes, same sum.
+// Either rank may use either path (both write the peer's inbox before signalling). GGML_CUDA_AR_CE (knob) = 0: SM stores
+static bool ar_ce(const size_t bytes) {
+    return bytes > ((size_t) 1 << 20) && ggml_knob_i32("GGML_CUDA_AR_CE", 1) != 0;
+}
 static constexpr size_t AR_RANK_STRIDE       = 64; // bytes between arrival ints (one cache line each)
 
 // p100-series AllReduce profiler (GGML_CUDA_AR_PROF=<path prefix>, exp/ar-prof): block 0 / thread 0 of every AllReduce kernel records
@@ -131,7 +137,7 @@ struct ggml_cuda_ar_rank_ctx {
 
 static __global__ void ggml_cuda_ar_rank_kernel(float * data, const int n, float * __restrict__ wire_out, const float * __restrict__ wire_in,
                                                 int * signal_out, const int * signal_in, const int token,
-                                                unsigned long long * prof) {
+                                                unsigned long long * prof, const bool ce) {
     const int tid  = threadIdx.x;
     const int bid  = blockIdx.x;
     const bool pr  = prof != nullptr && bid == 0 && tid == 0;
@@ -143,8 +149,9 @@ static __global__ void ggml_cuda_ar_rank_kernel(float * data, const int n, float
     const int n4   = n / 4;
     const bool vec = ((uintptr_t) data & 15) == 0;
 
-    // phase 1: my partial -> peer inbox (groups of 4 elements striped over the grid; tail by block 0)
-    for (int i = gtid; i < n4; i += gnt) {
+    // phase 1: my partial -> peer inbox (groups of 4 elements striped over the grid; tail by block 0). ce: the copy engine already
+    // wrote it (cudaMemcpyPeerAsync before this kernel on the same stream)
+    for (int i = ce ? n4 : gtid; i < n4; i += gnt) {
         float4 v;
         if (vec) {
             v = ((const float4 *) data)[i];
@@ -153,7 +160,7 @@ static __global__ void ggml_cuda_ar_rank_kernel(float * data, const int n, float
         }
         ((float4 *) wire_out)[i] = v;
     }
-    if (bid == 0 && tid < n - 4*n4) {
+    if (!ce && bid == 0 && tid < n - 4*n4) {
         wire_out[4*n4 + tid] = data[4*n4 + tid];
     }
     if (prof != nullptr) {
@@ -264,7 +271,7 @@ static __global__ void __launch_bounds__(BS) ggml_cuda_ar_rank_norm_kernel(
         uint2 * __restrict__ ll_out, const uint2 * __restrict__ ll_in, const bool ll_v4,
         int * signal_out, const int * signal_in, const int token,
         const float * res, float * x_out, const float * w, const float * add2, float * y, const float eps,
-        unsigned long long * prof) {
+        unsigned long long * prof, const bool ce) {
     // no __restrict__ on the fused outputs: the allocator may place an output in an input's buffer (in-place ADD / norm). Every
     // element is read and written by the same thread, y only after the row's reduction, so aliasing is safe.
     constexpr int max_regs = 8;
@@ -276,7 +283,7 @@ static __global__ void __launch_bounds__(BS) ggml_cuda_ar_rank_norm_kernel(
         ar_prof_mark(prof, token, 0);
     }
 
-    for (int r = bid; r < nrows; r += gridDim.x) {
+    for (int r = ce ? nrows : bid; r < nrows; r += gridDim.x) {   // ce: the copy engine wrote the peer's inbox (f32 wire only)
         if constexpr (LL) {
             if (ll_v4) {  // the reader below keeps its per-element map (same words), only the stores pair up
                 for (int c2 = tid; c2 < ncols/2; c2 += BS) {
@@ -671,8 +678,12 @@ void ggml_cuda_ar_rank_reduce(ggml_cuda_ar_rank_ctx * c, int rank, cudaStream_t 
         CUDA_CHECK(cudaGetLastError());
         return;
     }
+    const bool ce = ar_ce((size_t) n * sizeof(float));
+    if (ce) {
+        CUDA_CHECK(cudaMemcpyPeerAsync(wire_out, c->devices[peer], t->data, c->devices[rank], (size_t) n * sizeof(float), stream));
+    }
     ggml_cuda_ar_rank_kernel<<<nb, AR_RANK_THREADS, 0, stream>>>((float *) t->data, n, wire_out, wire_in, signal_out, signal_in, (int) token,
-                                                                  c->prof[rank]);
+                                                                  c->prof[rank], ce);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -703,14 +714,18 @@ void ggml_cuda_ar_rank_reduce_norm(ggml_cuda_ar_rank_ctx * c, int rank, cudaStre
     uint2 * ll_out = c->ll[peer] + (size_t) slot * AR_LL_MAX_ELEMS;
     uint2 * ll_in  = c->ll[rank] + (size_t) slot * AR_LL_MAX_ELEMS;
 #define AR_NORM_LAUNCH1(BS, AF, AA, LLV) ggml_cuda_ar_rank_norm_kernel<BS, AF, AA, LLV><<<nb, BS, 0, stream>>>((float *) t->data, ncols, nrows, \
-        wire_out, wire_in, ll_out, ll_in, v4, signal_out, signal_in, (int) token, a.res, a.x_out, a.w, a.add2, a.y, a.eps, c->prof[rank])
+        wire_out, wire_in, ll_out, ll_in, v4, signal_out, signal_in, (int) token, a.res, a.x_out, a.w, a.add2, a.y, a.eps, c->prof[rank], ce)
 #define AR_NORM_LAUNCHW(BS, AF, AA, W) ggml_cuda_ar_rank_norm_kernel<BS, AF, AA, false, W><<<nb, BS, 0, stream>>>((float *) t->data, ncols, nrows, \
-        wire_out, wire_in, ll_out, ll_in, v4, signal_out, signal_in, (int) token, a.res, a.x_out, a.w, a.add2, a.y, a.eps, c->prof[rank])
+        wire_out, wire_in, ll_out, ll_in, v4, signal_out, signal_in, (int) token, a.res, a.x_out, a.w, a.add2, a.y, a.eps, c->prof[rank], ce)
     // compressed wire only for large reductions (see ar_wire); the f16 scales (one per row) must fit after the 16-bit values
     const int wire = !ll && ar_wire() != 0 && (size_t) ggml_nbytes(t) > ((size_t) 1 << 20) &&
                      ar_wire_scales_off((int64_t) ncols*nrows) + (size_t) nrows*sizeof(float) <= c->slot_bytes ? ar_wire() : 0;
 #define AR_NORM_LAUNCH(BS, AF, AA) do { if (ll) AR_NORM_LAUNCH1(BS, AF, AA, true); else if (wire == 1) AR_NORM_LAUNCHW(BS, AF, AA, 1); \
         else if (wire == 2) AR_NORM_LAUNCHW(BS, AF, AA, 2); else AR_NORM_LAUNCH1(BS, AF, AA, false); } while (0)
+    const bool ce = !ll && wire == 0 && ar_ce(ggml_nbytes(t));
+    if (ce) {
+        CUDA_CHECK(cudaMemcpyPeerAsync(wire_out, c->devices[peer], t->data, c->devices[rank], ggml_nbytes(t), stream));
+    }
     const bool af = a.res != nullptr;
     const bool aa = a.add2 != nullptr;
     if (c->prof[rank] != nullptr) {
