@@ -10003,3 +10003,5 @@ inject, the shared expert) before the AllReduce, leaving nothing after it. New s
 LLAMA_SHEXP_AFTER=1 (shared expert after the routed experts in prompt ubatches). The split handshake (1-block signal + plain sum,
 GGML_CUDA_AR_SPLIT=1) alone: 642.4 vs 642.1 t/s, md5 identical. The shared expert moved after the routed experts alone: no gain
 (675-681 before vs 522-669 after, noisy). ab.py now warms each suffix twice (first passes after a start were ~35% slow).
+Combined test (GGML_META_AR_NO_SKIP=1 + LLAMA_SHEXP_AFTER=1 + async + split handshake): 676.4 -> 668.6 t/s, waits still at
+nodes 0 / 2: no overlap. All reverted; the AllReduce stays synchronous (copy engine, chunked).
