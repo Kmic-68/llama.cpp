@@ -366,7 +366,14 @@ static __device__ __forceinline__ void tmr_decode_step(const uint32_t (&w)[NWA],
 #pragma unroll
                 for (int p = 0; p < 4; ++p) {
                     const int i = 8*c + 2*p, ob = 34*bk + 2 + i;
+#ifndef TMR_NO_MAGIC
+                    const uint32_t wb = w[ob >> 2] ^ 0x80808080u;   // ob and ob + 1 share a word (ob is even and ob % 4 != 3)
+                    const float q0 = __uint_as_float(__byte_perm(wb, 0x4B000000u, 0x7540 + (ob & 3))) - 8388736.0f;
+                    const float q1 = __uint_as_float(__byte_perm(wb, 0x4B000000u, 0x7540 + (ob & 3) + 1)) - 8388736.0f;
+                    hv[p] = __floats2half2_rn(d*q0, d*q1);
+#else
                     hv[p] = __floats2half2_rn(d*(int) (signed char) TMR_B(ob), d*(int) (signed char) TMR_B(ob + 1));
+#endif
                 }
                 o[4*bk + c] = make_uint4(*(const uint32_t *) &hv[0], *(const uint32_t *) &hv[1], *(const uint32_t *) &hv[2], *(const uint32_t *) &hv[3]);
             }
@@ -409,7 +416,13 @@ static __device__ __forceinline__ void tmr_decode_step(const uint32_t (&w)[NWA],
                 for (int p = 0; p < 4; ++p) {
                     const uint32_t g = p < 2 ? g0 : g1;
                     const int jb = 2*(p & 1), oo = 2*p;
+#ifndef TMR_NO_MAGIC
+                    // a byte b as float exactly: the bits 0x4B0000bb are 2^23 + b (PRMT + FADD instead of a quarter-rate I2F)
+                    const float w0 = __uint_as_float(__byte_perm(g, 0x4B000000u, 0x7540 + jb)) - 8388608.0f;
+                    const float w1 = __uint_as_float(__byte_perm(g, 0x4B000000u, 0x7540 + jb + 1)) - 8388608.0f;
+#else
                     const float w0 = (float) ((g >> 8*jb) & 0xFF), w1 = (float) ((g >> (8*jb + 8)) & 0xFF);
+#endif
                     hv[p] = __floats2half2_rn(dl*((sg >> oo) & 1 ? -w0 : w0), dl*((sg >> (oo + 1)) & 1 ? -w1 : w1));
                 }
                 // k-pairs 16*sb + 4*il .. +3 of the step: uint4 slot 4*sb + il
