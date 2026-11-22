@@ -198,6 +198,46 @@ static __global__ void dsv4_hc_post_f32(
     dst[i0*sd0 + idst*sd1 + it*sd2] = sum;
 }
 
+// p100-series: every output stream of an (element, token) in one thread, so x and the residual streams are read once instead of
+// once per output stream (the (embd, stream, token) grid read them hc times). Each output's arithmetic is dsv4_hc_post_f32's in the
+// same order: the same bits. GGML_CUDA_HC_POST_ALL=0: the per-stream kernel
+template <bool has_comb, bool gated, int HC>
+static __global__ void dsv4_hc_post_f32_all(
+        const float * x, const float * residual, const float * post, const float * comb, float * dst,
+        int64_t n_embd, int64_t sx0, int64_t sx1, int64_t sr0, int64_t sr1, int64_t sr2, int64_t sp0, int64_t sp1,
+        int64_t sc0, int64_t sc1, int64_t sc2, int64_t sd0, int64_t sd1, int64_t sd2, float gate_scale_in, float gate_scale_out) {
+    const int64_t i0 = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t it = blockIdx.z;
+    if (i0 >= n_embd) {
+        return;
+    }
+    const float xv = x[i0*sx0 + it*sx1];
+    float r[HC];
+#pragma unroll
+    for (int isrc = 0; isrc < HC; ++isrc) {
+        r[isrc] = residual[i0*sr0 + isrc*sr1 + it*sr2];
+    }
+#pragma unroll
+    for (int idst = 0; idst < HC; ++idst) {
+        float p = post[idst*sp0 + it*sp1];
+        if constexpr (gated) {
+            p = gate_scale_out * (1.0f / (1.0f + expf(-(gate_scale_in * p))));
+        }
+        // explicit: a rounded product, then one fma a stream (the per-stream kernel's loop compiles to that; unrolled, the
+        // compiler could fuse x*p into the first term instead)
+        float sum = __fmul_rn(xv, p);
+        if constexpr (has_comb) {
+#pragma unroll
+            for (int isrc = 0; isrc < HC; ++isrc) {
+                sum = __fmaf_rn(r[isrc], comb[idst*sc0 + isrc*sc1 + it*sc2], sum);
+            }
+        } else {
+            sum = __fadd_rn(sum, r[idst]);
+        }
+        dst[i0*sd0 + idst*sd1 + it*sd2] = sum;
+    }
+}
+
 void ggml_cuda_op_dsv4_hc_comb(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * mixes = dst->src[0];
     const ggml_tensor * scale = dst->src[1];
@@ -314,6 +354,22 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     const dim3 grid_dims((n_embd + block_size - 1) / block_size, hc, n_tokens);
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
 
+    static const bool all_on = [] { const char * e = getenv("GGML_CUDA_HC_POST_ALL"); return !e || atoi(e) != 0; }();
+    if (all_on && hc == 4) {
+        const dim3 grid_all((n_embd + block_size - 1) / block_size, 1, n_tokens);
+        auto ka = comb ? (gated ? dsv4_hc_post_f32_all<true,  true, 4> : dsv4_hc_post_f32_all<true,  false, 4>)
+                       : (gated ? dsv4_hc_post_f32_all<false, true, 4> : dsv4_hc_post_f32_all<false, false, 4>);
+        ka<<<grid_all, block_dims, 0, ctx.stream()>>>(
+            (const float *) x->data, (const float *) residual->data,
+            (const float *) post->data, comb ? (const float *) comb->data : nullptr, (float *) dst->data,
+            n_embd, nbx0 / sizeof(float), nbx1 / sizeof(float),
+            nbr0 / sizeof(float), nbr1 / sizeof(float), nbr2 / sizeof(float),
+            nbp0 / sizeof(float), nbp1 / sizeof(float),
+            nbc0 / sizeof(float), nbc1 / sizeof(float), nbc2 / sizeof(float),
+            nbd0 / sizeof(float), nbd1 / sizeof(float), nbd2 / sizeof(float),
+            gate_in, gate_out);
+        return;
+    }
     auto kernel = comb ? (gated ? dsv4_hc_post_f32<true,  true> : dsv4_hc_post_f32<true,  false>)
                        : (gated ? dsv4_hc_post_f32<false, true> : dsv4_hc_post_f32<false, false>);
     ggml_cuda_kernel_launch(kernel, launch_params,

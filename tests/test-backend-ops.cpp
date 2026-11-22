@@ -13689,6 +13689,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_l2_norm_batch(GGML_TYPE_F32, { n, 16, 16, 1 }, 4, 1e-12f, true));
     }
 
+    // Flash-Next prefill hyper-connection post (4 streams of 2560, 4096-token ubatch), gated and not
+    test_cases.emplace_back(new test_dsv4_hc_post(2560, 4096, false, false));
+    test_cases.emplace_back(new test_dsv4_hc_post(2560, 4096, false, true));
+
     // Flash-Next UD-IQ4_XS prefill experts per GPU under -sm tensor (512 experts, 10 used): IQ3_S gate/up (K 2560 -> M 320),
     // IQ4_NL down (K 320 -> M 2560), at the 2048 / 4096-token ubatches of a long prompt (tile_mm's grouped mode)
     for (int n : { 2048, 4096 }) {
