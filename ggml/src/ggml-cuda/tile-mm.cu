@@ -359,7 +359,31 @@ static __device__ __forceinline__ void tmr_decode_step(const uint32_t (&w)[NWA],
         // two blocks (68 bytes, 4-aligned): d0 qs0[32] d1 qs1[32]; values 32 b + i = d_b*qs_b[i], as tile_mm's Q8_0 (d x1024 in fp32, one rounding)
 #pragma unroll
         for (int bk = 0; bk < 2; ++bk) {
-            const float d = __half2float(__ushort_as_half((unsigned short) ((w[17*bk/2] >> (16*(bk & 1))) & 0xFFFF)))*1024.0f;
+            const unsigned short dbits = (unsigned short) ((w[17*bk/2] >> (16*(bk & 1))) & 0xFFFF);
+#ifndef TMR_NO_HMUL
+            // as IQ4_NL: d*q exact in fp32, so half(d*1024) x half(q) in fp16 rounds the same; q as half by PRMT: 0x64bb = 1024 + bb
+            // with bb = q ^ 0x80, minus 1152 (exact)
+            const half dh = __ushort_as_half(dbits);
+            if (__hlt(__habs(dh), __float2half(64.0f))) {
+                const half  d1k = __hmul(dh, __float2half(1024.0f));
+                const half2 dd  = __halves2half2(d1k, d1k);
+                const half2 off = __float2half2_rn(1152.0f);
+#pragma unroll
+                for (int c = 0; c < 4; ++c) {
+                    half2 hv[4];
+#pragma unroll
+                    for (int p = 0; p < 4; ++p) {
+                        const int i = 8*c + 2*p, ob = 34*bk + 2 + i;
+                        const uint32_t wb = w[ob >> 2] ^ 0x80808080u;
+                        const uint32_t hb = __byte_perm(wb, 0x64646464u, (ob & 3) | (4 << 4) | (((ob & 3) + 1) << 8) | (4 << 12));
+                        hv[p] = __hmul2(dd, __hsub2(*(const half2 *) &hb, off));
+                    }
+                    o[4*bk + c] = make_uint4(*(const uint32_t *) &hv[0], *(const uint32_t *) &hv[1], *(const uint32_t *) &hv[2], *(const uint32_t *) &hv[3]);
+                }
+                continue;
+            }
+#endif
+            const float d = __half2float(__ushort_as_half(dbits))*1024.0f;
 #pragma unroll
             for (int c = 0; c < 4; ++c) {
                 half2 hv[4];

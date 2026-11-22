@@ -10041,3 +10041,9 @@ byte-identical but 6478 -> 7574 us (registers: the r160 kernel is at its limit).
 
 pplkld 2 chunks vs exact fp32 wire: PPL(Q)/PPL(base) 1.007618 +/- 0.003803 (2 sigma worse), KLD 0.020228, same top 95.19 %.
 Stays off (default 0). The wire is now a live knob, and the chunked CE path steps aside when it is on (A/B in one server).
+
+## 351 — expert decode: Q8_0 scale x q by HMUL2 kept, IQ4_NL pair-table HMUL2 reverted (11-22)
+
+d*q is exact in fp32, so half(d*1024) x half(q) in fp16 gives the same single rounding (|d| < 64, else the old fp32 path).
+Q8_0 bytes to half by PRMT (0x64bb = 1024 + (q^0x80), minus 1152): byte-identical, mmid q8_0 2560x2048x320 ABBA
+6252 -> ~6035 us (-3.4 %). IQ4_NL via a 256-entry half2 nibble-pair table: byte-identical but 6237 -> 6278 us (+0.7 %), reverted.
