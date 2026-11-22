@@ -638,12 +638,13 @@ static int ggml_cuda_gemm_fold_min_rows() {
 }
 
 // p100-series: the rows below which a matmul runs in fp32 cuBLAS. A quantized weight with >= GGML_CUDA_GEMM_FOLD_MINROWS_Q rows
-// (knob, default 512; 1024 = off) at >= 1024 tokens fills the SMs too (Flash-Next's shared-expert gate/up, 640 rows a GPU: fp16
+// (knob, default 320; 1024 = off) at >= 1024 tokens fills the SMs too (Flash-Next's shared-expert gate/up, 640 rows a GPU, and hc down,
+// 320 rows: 4345 -> 3859 us, KLD 0.0183 with the shared expert already folded; fp16
 // products folded into fp32 as the other dense matmuls, KLD 0.0177 vs the fp32 path, below the ~0.026 of any summation-order change); f32 weights
 // (the router) keep the fp32 path
 static int64_t gemm_fold_min_rows_for(const ggml_tensor * src0, const ggml_tensor * src1) {
     if (ggml_is_quantized(src0->type) && src1->ne[1] >= 1024) {
-        return std::min<int64_t>(ggml_cuda_gemm_fold_min_rows(), ggml_knob_i32("GGML_CUDA_GEMM_FOLD_MINROWS_Q", 512));
+        return std::min<int64_t>(ggml_cuda_gemm_fold_min_rows(), ggml_knob_i32("GGML_CUDA_GEMM_FOLD_MINROWS_Q", 320));
     }
     return ggml_cuda_gemm_fold_min_rows();
 }

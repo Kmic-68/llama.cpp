@@ -2222,9 +2222,11 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
 
         ggml_status status;
 
-        static const bool dprof2 = [] { const char * e = getenv("LLAMA_DECODE_PROF"); return e && atoi(e) != 0; }();
+        static const int dprof2v = [] { const char * e = getenv("LLAMA_DECODE_PROF"); return e ? atoi(e) : 0; }();
+        static const bool dprof2 = dprof2v != 0;
+        const uint32_t dprof_min = dprof2v >= 2 ? 1 : 2;   // LLAMA_DECODE_PROF=2: single-token ubatches too
         static int64_t t_after_prev = 0;
-        if (dprof2 && ubatch.n_tokens > 1 && t_after_prev > 0) {
+        if (dprof2 && ubatch.n_tokens >= dprof_min && t_after_prev > 0) {
             LLAMA_LOG_WARN("decode_prof: between ubatches %.1f ms\n", (ggml_time_us() - t_after_prev) / 1000.0);
         }
         const int64_t tpu0 = dprof2 ? ggml_time_us() : 0;
@@ -2249,8 +2251,8 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         if (lend_route) {
             llama_moe_lru::lend_fn_compute()(false);
         }
-        if (dprof2 && ubatch.n_tokens > 1) {
-            LLAMA_LOG_WARN("decode_prof: process_ubatch %.1f ms\n", (ggml_time_us() - tpu0) / 1000.0);
+        if (dprof2 && ubatch.n_tokens >= dprof_min) {
+            LLAMA_LOG_WARN("decode_prof: process_ubatch %.1f ms (%u tokens)\n", (ggml_time_us() - tpu0) / 1000.0, ubatch.n_tokens);
         }
         t_after_prev = dprof2 ? ggml_time_us() : 0;
 
