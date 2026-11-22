@@ -10,4 +10,5 @@ bool ggml_cuda_tile_mm_try(ggml_backend_cuda_context & ctx, const ggml_tensor * 
 // sorted on the device. Returns false if it does not handle the shape.
 // src0b / dstb: a second matrix on the same activations and ids (gate/up), run in the same launch (row-per-thread kernel only)
 bool ggml_cuda_tile_mm_id_try(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
-                              ggml_tensor * dst, const ggml_tensor * src0b = nullptr, ggml_tensor * dstb = nullptr);
+                              ggml_tensor * dst, const ggml_tensor * src0b = nullptr, ggml_tensor * dstb = nullptr,
+                              const ggml_tensor * glu_up = nullptr);

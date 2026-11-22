@@ -1,5 +1,6 @@
 #include "tile-mm.cuh"
 #include "mmid.cuh"
+#include "unary.cuh"
 
 // rows of skipped slots (expert id < 0) get zeros: the grouped GEMM never writes them (from wispoffates' mmid.cu, local here)
 static __global__ void tile_mm_zero_skipped(const int32_t * __restrict__ ids, float * __restrict__ dst,
@@ -303,7 +304,8 @@ struct tile_mm_params {
 // X f32 [N][K] (row stride sx floats) -> XS half [N][K] prescaled by 2^-e per (column, window) so |x| < 1; S[n][w] = 2^e.
 // With ids (MUL_MAT_ID) column c of XS is row ids[c] of X (the compact, expert-sorted order).
 static __global__ void tile_mm_prep(const float * __restrict__ X, const int64_t sx, const int * __restrict__ ids, __half * __restrict__ XS,
-                                    float * __restrict__ S, const int K, const int nwin, const int nrows) {
+                                    float * __restrict__ S, const int K, const int nwin, const int nrows,
+                                    const float * __restrict__ U = nullptr) {
     const int w = blockIdx.x*blockDim.y + threadIdx.y;
     if (w >= nwin) {
         return;
@@ -311,10 +313,13 @@ static __global__ void tile_mm_prep(const float * __restrict__ X, const int64_t 
     // rows beyond grid.y's 65535 (MUL_MAT_ID per slot: 8192 tokens x 10 slots) by a grid stride
     for (int c = blockIdx.y; c < nrows; c += gridDim.y) {
     const float * x = X + (int64_t) (ids ? ids[c] : c)*sx + (int64_t) w*TMM_WIN;
+    const float * u = U ? U + (int64_t) (ids ? ids[c] : c)*sx + (int64_t) w*TMM_WIN : nullptr;
     const int len = min(TMM_WIN, K - w*TMM_WIN);
+    // the folded swiglu: silu(gate) * up, the unary_gated_op_kernel arithmetic (a division, then a product: nothing to contract)
+    auto xv = [&](const int i) { return u ? ggml_cuda_op_silu_single(x[i]) * u[i] : x[i]; };
     float m = 0.0f;
     for (int i = threadIdx.x; i < len; i += WARP_SIZE) {
-        m = fmaxf(m, fabsf(x[i]));
+        m = fmaxf(m, fabsf(xv(i)));
     }
 #pragma unroll
     for (int o = WARP_SIZE/2; o; o >>= 1) {
@@ -327,7 +332,7 @@ static __global__ void tile_mm_prep(const float * __restrict__ X, const int64_t 
     const float inv = ldexpf(1.0f, -e);
     __half * xs = XS + (int64_t) c*K + (int64_t) w*TMM_WIN;
     for (int i = threadIdx.x; i < len; i += WARP_SIZE) {
-        xs[i] = __float2half(x[i]*inv);
+        xs[i] = __float2half(xv(i)*inv);
     }
     if (threadIdx.x == 0) {
         S[(int64_t) c*nwin + w] = ldexpf(1.0f, e);
@@ -877,6 +882,50 @@ static __global__ void tile_mm_id_tiles_par(const int * __restrict__ bounds, con
     }
 }
 
+// p100-series split tile lists (GGML_CUDA_TMM_SPLIT_TILES): an expert's full bn-token tiles, and a remainder of at most bns tokens
+// in a narrow tile of its own (list B, run by the narrow kernel) instead of a mostly empty wide one. A tile is (expert, first token).
+// Per output the same arithmetic in either kernel. One block of >= n_experts threads (n_experts <= 1024)
+static __global__ void tile_mm_id_tiles_split(const int * __restrict__ bounds, const int n_experts, const int bn, const int bns,
+                                              int * __restrict__ tiles_a, int * __restrict__ ntiles_a,
+                                              int * __restrict__ tiles_b, int * __restrict__ ntiles_b) {
+    __shared__ int wsa[32], wsb[32];
+    const int e = threadIdx.x, lane = e % 32, wid = e / 32;
+    const int n = e < n_experts ? bounds[e + 1] - bounds[e] : 0;
+    const int full = n / bn, rem = n % bn;
+    const int ta = full + (rem > bns ? 1 : 0), tb = (rem > 0 && rem <= bns) ? 1 : 0;
+    int ia = ta, ib = tb;
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {
+        const int va = __shfl_up_sync(0xffffffff, ia, o), vb = __shfl_up_sync(0xffffffff, ib, o);
+        if (lane >= o) { ia += va; ib += vb; }
+    }
+    if (lane == 31) { wsa[wid] = ia; wsb[wid] = ib; }
+    __syncthreads();
+    if (wid == 0) {
+        int wa = wsa[lane], wb = wsb[lane];
+#pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {
+            const int va = __shfl_up_sync(0xffffffff, wa, o), vb = __shfl_up_sync(0xffffffff, wb, o);
+            if (lane >= o) { wa += va; wb += vb; }
+        }
+        wsa[lane] = wa; wsb[lane] = wb;
+    }
+    __syncthreads();
+    const int ka = (wid > 0 ? wsa[wid - 1] : 0) + ia - ta, kb = (wid > 0 ? wsb[wid - 1] : 0) + ib - tb;
+    for (int j = 0; j < ta; ++j) {
+        tiles_a[2*(ka + j)]     = e;
+        tiles_a[2*(ka + j) + 1] = j*bn;
+    }
+    if (tb) {
+        tiles_b[2*kb]     = e;
+        tiles_b[2*kb + 1] = full*bn;
+    }
+    if (e == blockDim.x - 1) {
+        *ntiles_a = wsa[31];
+        *ntiles_b = wsb[31];
+    }
+}
+
 static __global__ void tile_mm_id_tiles(const int * __restrict__ bounds, const int n_experts, const int bn, int * __restrict__ tiles,
                                         int * __restrict__ ntiles) {
     int k = 0;
@@ -1140,7 +1189,7 @@ bool ggml_cuda_tile_mm_try(ggml_backend_cuda_context & ctx, const ggml_tensor * 
 }
 
 bool ggml_cuda_tile_mm_id_try(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
-                              ggml_tensor * dst, const ggml_tensor * src0b, ggml_tensor * dstb) {
+                              ggml_tensor * dst, const ggml_tensor * src0b, ggml_tensor * dstb, const ggml_tensor * glu_up) {
     // GGML_CUDA_TILE_MMID=0: leave MUL_MAT_ID to MMQ (A/B)
     static const bool on = tmm_env_on("GGML_CUDA_TILE_MMID");
     const ggml_type type = src0->type;
@@ -1252,15 +1301,47 @@ bool ggml_cuda_tile_mm_id_try(ggml_backend_cuda_context & ctx, const ggml_tensor
     }
     ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), bounds.get(), (int) n_experts, (int) n_tokens,
                                    (int) n_used, (int) nch, si1, sis1, /*write_inverse =*/ false, stream);
-    if (n_experts <= 1024) {
+    // split tile lists (GGML_CUDA_TMM_SPLIT_TILES knob): remainders of <= bns tokens go to a narrow kernel (row-per-thread paths of
+    // IQ3_S 160-row (10 tokens) and IQ4_NL / Q8_0 (24 tokens))
+    // (IQ4_NL down 11673 -> 11465 us at 4096 tokens; IQ3_S's 10-token narrow kernel was slower, 11395 -> 11819: off there)
+    const bool split_ok = rows_k && n_experts <= 1024 && !r160 && (type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_Q8_0) &&
+                          ggml_knob_i32("GGML_CUDA_TMM_SPLIT_TILES", 1) != 0;
+    const int bns = r160 ? 10 : 24;
+    ggml_cuda_pool_alloc<int32_t> tiles_b(ctx.pool(), split_ok ? 2*n_experts + 1 : 1);
+    if (split_ok) {
+        tile_mm_id_tiles_split<<<1, 1024, 0, stream>>>(bounds.get(), (int) n_experts, bn, bns, tiles.get() + 1, tiles.get(),
+                                                       tiles_b.get() + 1, tiles_b.get());
+    } else if (n_experts <= 1024) {
         tile_mm_id_tiles_par<<<1, 1024, 0, stream>>>(bounds.get(), (int) n_experts, bn, tiles.get() + 1, tiles.get());
     } else {
         tile_mm_id_tiles<<<1, 1, 0, stream>>>(bounds.get(), (int) n_experts, bn, tiles.get() + 1, tiles.get());
     }
     {
         const dim3 pb(WARP_SIZE, 4), pg((nwin + 3)/4, (unsigned) std::min<int64_t>(nx, 65535));
+        if (glu_up != nullptr && (xtok || glu_up->nb[1] != src1->nb[1] || glu_up->nb[2] != src1->nb[2] || !ggml_are_same_shape(glu_up, src1))) {
+            GGML_ABORT("tile_mm_id: folded swiglu with mismatched gate / up layouts");   // checked by the caller
+        }
         tile_mm_prep<<<pg, pb, 0, stream>>>((const float *) src1->data, (int64_t) (src1->nb[1]/sizeof(float)), xtok ? nullptr : ids_src1.get(), xs.get(),
-                                            sc.get(), (int) K, nwin, (int) nx);
+                                            sc.get(), (int) K, nwin, (int) nx, glu_up ? (const float *) glu_up->data : nullptr);
+    }
+    // GGML_CUDA_TMM_FILL_LOG=1 (debug, syncs): every 50th call, the tokens an expert gets and the tiles' fill (real tokens / tile slots)
+    if (getenv("GGML_CUDA_TMM_FILL_LOG")) {
+        static int ncall = 0;
+        if (ncall++ % 50 == 0) {
+            std::vector<int32_t> hb(n_experts + 1);
+            CUDA_CHECK(cudaMemcpyAsync(hb.data(), bounds.get(), (n_experts + 1)*sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            int64_t slots = 0, used = 0, hist[6] = {0};
+            for (int64_t e = 0; e < n_experts; ++e) {
+                const int64_t c = hb[e + 1] - hb[e];
+                used += c;
+                slots += (c + bn - 1)/bn*bn;
+                hist[c == 0 ? 0 : c <= bn/4 ? 1 : c <= bn/2 ? 2 : c <= bn ? 3 : c <= 2*bn ? 4 : 5]++;
+            }
+            fprintf(stderr, "tmm_fill: %s M %lld tok %lld bn %d: fill %.1f%% | experts with 0 / <=%d / <=%d / <=%d / <=%d / more: %lld %lld %lld %lld %lld %lld\n",
+                    ggml_type_name(type), (long long) M, (long long) n_tokens, bn, slots ? 100.0*used/slots : 0.0, bn/4, bn/2, bn, 2*bn,
+                    (long long) hist[0], (long long) hist[1], (long long) hist[2], (long long) hist[3], (long long) hist[4], (long long) hist[5]);
+        }
     }
     tile_mm_params prm = {};
     prm.W = zc_base ? zc_base : src0->data; prm.row_bytes = (int64_t) src0->nb[1]; prm.expert_bytes = (int64_t) src0->nb[2];
@@ -1276,6 +1357,11 @@ bool ggml_cuda_tile_mm_id_try(ggml_backend_cuda_context & ctx, const ggml_tensor
         const dim3 grid((src0b ? 2 : 1)*(prm.M/160), max_tiles);
         if (type == GGML_TYPE_IQ3_S) {
             tile_mm_rows<GGML_TYPE_IQ3_S, 10, TMR_TL160><<<grid, 160, 0, stream>>>(prm);
+            if (split_ok) {
+                tile_mm_params pb = prm;
+                pb.tiles = tiles_b.get() + 1; pb.ntiles = tiles_b.get();
+                tile_mm_rows<GGML_TYPE_IQ3_S, 10, 1><<<dim3(grid.x, (unsigned) n_experts), 160, 0, stream>>>(pb);
+            }
         } else if (type == GGML_TYPE_IQ4_XS) {
             tile_mm_rows<GGML_TYPE_IQ4_XS, 10, TMR_TL160><<<grid, 160, 0, stream>>>(prm);
         } else {
@@ -1288,8 +1374,18 @@ bool ggml_cuda_tile_mm_id_try(ggml_backend_cuda_context & ctx, const ggml_tensor
             tile_mm_rows<GGML_TYPE_IQ3_S><<<grid, TMR_NT, 0, stream>>>(prm);
         } else if (type == GGML_TYPE_Q8_0) {
             tile_mm_rows<GGML_TYPE_Q8_0><<<grid, TMR_NT, 0, stream>>>(prm);
+            if (split_ok) {
+                tile_mm_params pb = prm;
+                pb.tiles = tiles_b.get() + 1; pb.ntiles = tiles_b.get();
+                tile_mm_rows<GGML_TYPE_Q8_0, 8, 3><<<dim3(grid.x, (unsigned) n_experts), TMR_NT, 0, stream>>>(pb);
+            }
         } else {
             tile_mm_rows<GGML_TYPE_IQ4_NL><<<grid, TMR_NT, 0, stream>>>(prm);
+            if (split_ok) {
+                tile_mm_params pb = prm;
+                pb.tiles = tiles_b.get() + 1; pb.ntiles = tiles_b.get();
+                tile_mm_rows<GGML_TYPE_IQ4_NL, 8, 3><<<dim3(grid.x, (unsigned) n_experts), TMR_NT, 0, stream>>>(pb);
+            }
         }
     } else {
         tile_mm_dispatch<true>(type, tn, prm, max_tiles, stream);
