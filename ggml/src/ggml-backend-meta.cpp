@@ -1951,6 +1951,13 @@ struct ggml_backend_meta_context {
         // the AR -> ADD -> norm chain (qwen35moe) measured 0.6 % slower fused (one block per row pumps the P2P writes);
         // GGML_META_AR_NORM=2 fuses it too
         bool ar_norm_add_first = false;
+        // after each thread enqueues its half of the in-kernel AllReduce, both meet at a host barrier before issuing anything
+        // else. Without it a thread that ran ahead could make a context-synchronizing driver call (a module load on first use,
+        // a VMM map, cudaMalloc) while its GPU spun in the AllReduce for the peer, under the driver's lock that the peer's thread
+        // needed to enqueue its half: a deadlock (11-22: GPU0 at 100 % for good, GPU1 idle; Flash-Next after a 16-token prompt,
+        // a 4-layer Qwen3.6-35B on its first batch). With both halves enqueued first, the peer GPU always gets there.
+        // GGML_META_AR_FENCE=0 disables (measurement only).
+        bool ar_fence = true;
         // GGML_META_AR_STATS=1: per-rank counts printed at teardown (fused AllReduce, + norm chain, peer copy + ADD)
         bool                 stats = false;
         std::atomic<int64_t> n_ar{0}, n_ar_norm{0}, n_copy{0};
@@ -2100,6 +2107,7 @@ struct ggml_backend_meta_context {
                 disp.spin_us = atoll(env_spin);
             }
             disp.stats = getenv("GGML_META_AR_STATS") != nullptr && atoi(getenv("GGML_META_AR_STATS")) != 0;
+            disp.ar_fence = getenv("GGML_META_AR_FENCE") == nullptr || atoi(getenv("GGML_META_AR_FENCE")) != 0;
             const char * env_ar = getenv("GGML_META_AR");
             if (env_ar == nullptr || atoi(env_ar) != 0) {
                 ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(ggml_backend_get_device(simple_backends[0]));
@@ -2910,6 +2918,9 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                     }
                     if (backend_ctx->disp.stats) {
                         backend_ctx->disp.n_ar++;
+                    }
+                    if (backend_ctx->disp.ar_fence) {
+                        backend_ctx->disp.barrier();   // both halves enqueued before either thread issues more (see ar_fence)
                     }
                     continue;
                 }

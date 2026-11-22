@@ -8635,11 +8635,20 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
     return &reg;
 }
 
+void ggml_cuda_fa_fold_sass_preload(int dev);     // fattn-gemm.cu
+void ggml_cuda_gemm_fold_sass_preload(int dev);   // gemm-fold.cu
+
 ggml_backend_t ggml_backend_cuda_init(int device) {
     if (device < 0 || device >= ggml_backend_cuda_get_device_count()) {
         GGML_LOG_ERROR("%s: invalid device %d\n", __func__, device);
         return nullptr;
     }
+
+    // p100-series: the bank-fixed SASS modules load now, before any graph runs: a cuModuleLoadData on first use mid-graph
+    // synchronizes the context under the driver's lock and deadlocked 2-GPU runs against the in-kernel AllReduce (11-22).
+    ggml_cuda_set_device(device);
+    ggml_cuda_fa_fold_sass_preload(device);
+    ggml_cuda_gemm_fold_sass_preload(device);
 
     ggml_backend_cuda_context * ctx = new ggml_backend_cuda_context(device);
     if (ctx == nullptr) {

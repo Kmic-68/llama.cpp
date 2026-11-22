@@ -1318,38 +1318,57 @@ static int ggml_cuda_fa_fold_env(const char * name, int def) {
 // fa_fold_qk2 / fa_fold_pv2 through their register-bank-fixed SASS (fattn-fold-sass.h, built from the
 // fa_fold namespace by p100-handoff/tools/sass-gemm/facubin.py; bit-identical, only register names
 // differ). Loaded once per device; false (run the compiled kernel) if unavailable or GGML_CUDA_FA_SASS=0.
+static bool       fa_fold_sass_on() { static const bool on = ggml_cuda_fa_fold_env("GGML_CUDA_FA_SASS", 1) != 0; return on; }
+static int        fa_fold_sass_state[GGML_CUDA_MAX_DEVICES][2] = {};   // 0 not tried, 1 loaded, -1 unavailable
+static CUfunction fa_fold_sass_fn[GGML_CUDA_MAX_DEVICES][2]    = {};
+
+// Loads the module on the current device. Called for every device when its backend is created (ggml_cuda_sass_preload): a
+// cuModuleLoadData synchronizes the context and takes the driver's context lock, so on first use in the middle of a 2-GPU graph
+// it deadlocked against the in-kernel AllReduce (this GPU spinning for the peer, the peer's host thread blocked on that lock
+// before it could launch its half; 11-22, a 4-layer Qwen3.6-35B-A3B on its first prefill batch).
+static void fa_fold_sass_load(const int dev, const int which) {
+    int & st = fa_fold_sass_state[dev][which];
+    if (st != 0) {
+        return;
+    }
+    CUmodule mod;
+    const void * img  = which == 0 ? (const void *) fattn_fold_sass_qk2 : (const void *) fattn_fold_sass_pv2;
+    const char * name = which == 0 ? fattn_fold_sass_name_qk2 : fattn_fold_sass_name_pv2;
+    // GGML_CUDA_FA_SASS_DIR (development): load qk2.cubin / pv2.cubin from a directory instead
+    const char * dir = getenv("GGML_CUDA_FA_SASS_DIR");
+    CUresult r;
+    if (dir) {
+        const std::string path = std::string(dir) + (which == 0 ? "/qk2.cubin" : "/pv2.cubin");
+        r = cuModuleLoad(&mod, path.c_str());
+    } else {
+        r = cuModuleLoadData(&mod, img);
+    }
+    st = r == CUDA_SUCCESS && cuModuleGetFunction(&fa_fold_sass_fn[dev][which], mod, name) == CUDA_SUCCESS ? 1 : -1;
+    if (st < 0) {
+        GGML_LOG_WARN("%s: bank-fixed fold attention SASS unavailable, using the compiled kernel\n", __func__);
+    }
+}
+
+void ggml_cuda_fa_fold_sass_preload(const int dev) {
+    if (fa_fold_sass_on()) {
+        fa_fold_sass_load(dev, 0);
+        fa_fold_sass_load(dev, 1);
+    }
+}
+
 static bool fa_fold_sass_launch(const int which, const dim3 grid, cudaStream_t stream, void ** args) {
-    static const bool on = ggml_cuda_fa_fold_env("GGML_CUDA_FA_SASS", 1) != 0;
-    static int        state[GGML_CUDA_MAX_DEVICES][2] = {};
-    static CUfunction fn[GGML_CUDA_MAX_DEVICES][2]    = {};
-    if (!on) {
+    if (!fa_fold_sass_on()) {
         return false;
     }
     int dev = 0;
     CUDA_CHECK(cudaGetDevice(&dev));
-    int & st = state[dev][which];
-    if (st == 0) {
-        CUmodule mod;
-        const void * img  = which == 0 ? (const void *) fattn_fold_sass_qk2 : (const void *) fattn_fold_sass_pv2;
-        const char * name = which == 0 ? fattn_fold_sass_name_qk2 : fattn_fold_sass_name_pv2;
-        // GGML_CUDA_FA_SASS_DIR (development): load qk2.cubin / pv2.cubin from a directory instead
-        const char * dir = getenv("GGML_CUDA_FA_SASS_DIR");
-        CUresult r;
-        if (dir) {
-            const std::string path = std::string(dir) + (which == 0 ? "/qk2.cubin" : "/pv2.cubin");
-            r = cuModuleLoad(&mod, path.c_str());
-        } else {
-            r = cuModuleLoadData(&mod, img);
-        }
-        st = r == CUDA_SUCCESS && cuModuleGetFunction(&fn[dev][which], mod, name) == CUDA_SUCCESS ? 1 : -1;
-        if (st < 0) {
-            GGML_LOG_WARN("%s: bank-fixed fold attention SASS unavailable, using the compiled kernel\n", __func__);
-        }
-    }
+    fa_fold_sass_load(dev, which);   // a no-op after the preload
+    int & st = fa_fold_sass_state[dev][which];
+    CUfunction * fn = fa_fold_sass_fn[dev];
     if (st < 0) {
         return false;
     }
-    if (cuLaunchKernel(fn[dev][which], grid.x, grid.y, grid.z, 256, 1, 1, 0, stream, args, nullptr) != CUDA_SUCCESS) {
+    if (cuLaunchKernel(fn[which], grid.x, grid.y, grid.z, 256, 1, 1, 0, stream, args, nullptr) != CUDA_SUCCESS) {
         GGML_ABORT("cuLaunchKernel failed for the fold attention SASS");
     }
     return true;

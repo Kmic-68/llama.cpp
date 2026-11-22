@@ -10047,3 +10047,15 @@ Stays off (default 0). The wire is now a live knob, and the chunked CE path step
 d*q is exact in fp32, so half(d*1024) x half(q) in fp16 gives the same single rounding (|d| < 64, else the old fp32 path).
 Q8_0 bytes to half by PRMT (0x64bb = 1024 + (q^0x80), minus 1152): byte-identical, mmid q8_0 2560x2048x320 ABBA
 6252 -> ~6035 us (-3.4 %). IQ4_NL via a 256-entry half2 nibble-pair table: byte-identical but 6237 -> 6278 us (+0.7 %), reverted.
+
+## 352 — 2-GPU deadlock fixed: host fence after the in-kernel AllReduce enqueue + SASS modules preloaded (11-22)
+
+Symptom: GPU0 at 100 % / 41 W for good, GPU1 idle (Flash-Next server after a 16-token request + 32k, twice; a 4-layer
+Qwen3.6-35B-A3B on its first prefill batch, every time). gdb stacks (ptrace via an LD_PRELOAD prctl): one dispatch thread in a
+context-synchronizing driver call (CUDA's lazy module load at a kernel's first launch; our own cuModuleLoadData of the fold
+attention SASS on first use) while its GPU spun in the AllReduce for the peer; the peer's thread blocked on the driver lock in
+the cudaMemcpyAsync that enqueues its half. Fix: (1) the threaded dispatcher meets at its spin barrier after both halves are
+enqueued (GGML_META_AR_FENCE, default 1); (2) fattn-gemm / gemm-fold SASS modules load at backend creation. 35B mini: lazy
+loading hung 100 % before, 5/5 pass after, PPL identical in every run (58390.1833); tg128 515.3 -> 518.5 t/s (ABBA, no cost).
+Eager module loading alone also avoids case (1) but costs ~200 MiB per card and not (2) or other driver syncs.
+Found with the new testing suite (mini models, /mnt/fast/p100-scratch/testing-suite); the full-model gates never hit it.

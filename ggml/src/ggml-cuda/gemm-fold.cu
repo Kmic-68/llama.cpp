@@ -579,28 +579,45 @@ static int ggml_cuda_gemm_fold_env(const char * name, int def) {
 // operands in one register bank; renaming registers removes most of those stalls without changing any
 // instruction. Loaded once per device; if it fails to load (or GGML_CUDA_GEMM_FOLD_SASS=0), the
 // compiled kernel runs instead.
+static bool       gemm_fold_sass_on() { static const bool on = ggml_cuda_gemm_fold_env("GGML_CUDA_GEMM_FOLD_SASS", 1) != 0; return on; }
+static int        gemm_fold_sass_state[GGML_CUDA_MAX_DEVICES][2] = {};   // 0 not tried, 1 loaded, -1 unavailable
+static CUfunction gemm_fold_sass_fn[GGML_CUDA_MAX_DEVICES][2]    = {};
+
+// Loads the module on the current device; preloaded for every device at backend creation (ggml_cuda_sass_preload): loading it
+// on first use mid-graph can deadlock against the in-kernel AllReduce (see fa_fold_sass_load in fattn-gemm.cu).
+static void gemm_fold_sass_load(const int dev, const bool pair) {
+    int & st = gemm_fold_sass_state[dev][pair];
+    if (st != 0) {
+        return;
+    }
+    CUmodule mod;
+    const void * img  = pair ? (const void *) gemm_fold_u2_sass_1 : (const void *) gemm_fold_u2_sass_0;
+    const char * name = pair ? gemm_fold_u2_sass_name_1 : gemm_fold_u2_sass_name_0;
+    st = cuModuleLoadData(&mod, img) == CUDA_SUCCESS && cuModuleGetFunction(&gemm_fold_sass_fn[dev][pair], mod, name) == CUDA_SUCCESS ? 1 : -1;
+    if (st < 0) {
+        GGML_LOG_WARN("%s: bank-fixed u2 SASS unavailable, using the compiled kernel\n", __func__);
+    }
+}
+
+void ggml_cuda_gemm_fold_sass_preload(const int dev) {
+    if (gemm_fold_sass_on()) {
+        gemm_fold_sass_load(dev, false);
+        gemm_fold_sass_load(dev, true);
+    }
+}
+
 static void gemm_fold_launch_u2(const bool pair, const dim3 grid, cudaStream_t stream,
         const half * W, const half * X, const float * cs, float * Y, int M, int N, int K, int64_t sy,
         const half * W2, float * Y2, int Ms, int64_t sy2) {
-    static const bool sass_env = ggml_cuda_gemm_fold_env("GGML_CUDA_GEMM_FOLD_SASS", 1) != 0;
-    static int        state[GGML_CUDA_MAX_DEVICES][2] = {};   // 0 not tried, 1 loaded, -1 unavailable
-    static CUfunction fn[GGML_CUDA_MAX_DEVICES][2]    = {};
-    if (sass_env) {
+    if (gemm_fold_sass_on()) {
         int dev = 0;
         CUDA_CHECK(cudaGetDevice(&dev));
-        int & st = state[dev][pair];
-        if (st == 0) {
-            CUmodule mod;
-            const void * img  = pair ? (const void *) gemm_fold_u2_sass_1 : (const void *) gemm_fold_u2_sass_0;
-            const char * name = pair ? gemm_fold_u2_sass_name_1 : gemm_fold_u2_sass_name_0;
-            st = cuModuleLoadData(&mod, img) == CUDA_SUCCESS && cuModuleGetFunction(&fn[dev][pair], mod, name) == CUDA_SUCCESS ? 1 : -1;
-            if (st < 0) {
-                GGML_LOG_WARN("%s: bank-fixed u2 SASS unavailable, using the compiled kernel\n", __func__);
-            }
-        }
+        gemm_fold_sass_load(dev, pair);   // a no-op after the preload
+        const int st = gemm_fold_sass_state[dev][pair];
+        CUfunction * fn = gemm_fold_sass_fn[dev];
         if (st > 0) {
             void * args[] = {&W, &X, &cs, &Y, &M, &N, &K, &sy, &W2, &Y2, &Ms, &sy2};
-            if (cuLaunchKernel(fn[dev][pair], grid.x, grid.y, grid.z, 256, 1, 1, 0, stream, args, nullptr) != CUDA_SUCCESS) {
+            if (cuLaunchKernel(fn[pair], grid.x, grid.y, grid.z, 256, 1, 1, 0, stream, args, nullptr) != CUDA_SUCCESS) {
                 GGML_ABORT("cuLaunchKernel failed for the u2 SASS");
             }
             return;
