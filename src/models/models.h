@@ -2653,6 +2653,7 @@ struct llama_model_qwen4exp : public llama_model_base {
     class llm_graph_input_kpool;
 
     void prefetch_batch(const llama_token * tokens, int64_t n_tokens) const override;
+    void prefetch_prompt(const llama_token * tokens, int64_t n_tokens) const override;
     ~llama_model_qwen4exp() override;
 
     // the PLE read-ahead threads of the last batch (prefetch_batch); joined before the next batch's and on destruction
@@ -2668,8 +2669,14 @@ struct llama_model_qwen4exp : public llama_model_base {
     size_t ple_offs = 0;                   // the tensor's data offset in that file
     mutable std::mutex ple_mtx;
     mutable std::condition_variable ple_cv;
-    mutable std::unordered_map<int32_t, uint32_t> ple_pos;   // row -> slot in ple_data
+    mutable std::vector<int32_t> ple_uniq;   // the cached rows, sorted (row ple_uniq[p] is at slot p of ple_data)
     mutable std::vector<uint8_t> ple_data;
+    mutable std::atomic<bool> ple_cache_on{false};   // ple_uniq / ple_data valid (ple_row looks rows up there)
+    mutable std::atomic<bool> ple_scan_stop{false};
+    mutable bool ple_prompt_mode = false;    // the cache holds a whole prompt's rows (prefetch_prompt): batches start no scan
+    void ple_scan_start(std::vector<int32_t> rows, size_t n_first) const;
+    void ple_cache_release() const;
+    std::vector<int32_t> ple_rows_of(const llama_token * tokens, int64_t n_tokens) const;
     mutable bool ple_scanning = false;
     mutable std::atomic<size_t> ple_scanned{0};   // rows [0, ple_scanned) of the sorted batch rows are in ple_data
     mutable std::thread ple_scan_thr;

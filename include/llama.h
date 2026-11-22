@@ -1102,6 +1102,10 @@ extern "C" {
     // n_threads_batch is the number of threads used for prompt and batch processing (multiple tokens)
     LLAMA_API void llama_set_n_threads(struct llama_context * ctx, int32_t n_threads, int32_t n_threads_batch);
 
+    // Hint: these tokens (a long prompt) will be decoded next, in batches; a model may read their weights ahead (Flash-Next: its PLE
+    // rows in one sequential scan). n_tokens 0: the prompt is done (drop what was read ahead). No effect on results.
+    LLAMA_API void llama_prefetch_prompt(struct llama_context * ctx, const llama_token * tokens, int32_t n_tokens);
+
     // Get the number of threads used for generation of a single token.
     LLAMA_API int32_t llama_n_threads(struct llama_context * ctx);
 

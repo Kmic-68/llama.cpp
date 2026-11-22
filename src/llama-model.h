@@ -918,6 +918,8 @@ struct llama_model {
 
     // a hint before a batch is decoded: start reading what its ubatches will need from lazily mapped tensors (default: nothing)
     virtual void prefetch_batch(const llama_token * tokens, int64_t n_tokens) const { (void) tokens; (void) n_tokens; }
+    // the tokens of a long prompt about to be decoded (llama_prefetch_prompt; n_tokens 0: the prompt is done): read their weights ahead
+    virtual void prefetch_prompt(const llama_token * tokens, int64_t n_tokens) const { (void) tokens; (void) n_tokens; }
 
 protected:
     llama_model_params params;

@@ -1632,6 +1632,68 @@ void llama_model_qwen4exp::prefetch_batch(const llama_token * tokens, int64_t n_
     }();
     (void) madv_random;
 #endif
+    std::vector<int32_t> rows = ple_rows_of(tokens, n_tokens);
+    const int64_t n_heads = hparams.ple_n_heads;
+    const auto & hp = hparams;
+    // a whole prompt's rows are being scanned (prefetch_prompt): no scan per batch; once the scan is done, no read-ahead either
+    if (ple_prompt_mode && ple_cache_on.load(std::memory_order_acquire)) {
+        if (ple_scanned.load(std::memory_order_acquire) >= ple_uniq.size()) {
+            return;
+        }
+    } else {
+        static const int64_t scan_min = [] { const char * e = getenv("LLAMA_PLE_SCAN_MIN"); return e ? atoll(e) : 0; }();
+        if (ple_fd >= 0 && scan_min > 0 && n_tokens >= scan_min) {
+            ple_scan_start(std::move(rows), (size_t) n_heads * 4096);
+            return;
+        }
+    }
+    // madvise(WILLNEED) reads nothing ahead through a FUSE filesystem: fault the pages in from 8 threads, in token order, while the
+    // earlier ubatches compute (LLAMA_PLE_PREFETCH_THREADS, 0 = the madvise hint only)
+    static const int n_thr = [] { const char * e = getenv("LLAMA_PLE_PREFETCH_THREADS"); return e ? atoi(e) : 8; }();
+    if (n_thr <= 0) {
+        llama_prefetch_rows(ple, rows.data(), rows.size());
+        return;
+    }
+    // the previous batch's threads are done by now (or nearly: their pages are what that batch read)
+    ple_pf_stop = true;
+    for (auto & th : ple_pf_threads) {
+        th.join();
+    }
+    ple_pf_threads.clear();
+    ple_pf_stop = false;
+    auto shared_rows = std::make_shared<std::vector<int32_t>>(std::move(rows));
+    const char * base = (const char *) ple->data;
+    const size_t nb1 = ple->nb[1];
+    const size_t row_bytes = ggml_row_size(ple->type, ple->ne[0]);
+    std::atomic<bool> * stop = &ple_pf_stop;
+    std::atomic<int64_t> * consumed = &ple_pf_consumed;
+    consumed->store(0);
+    static const int64_t ahead_tok = [] { const char * e = getenv("LLAMA_PLE_PF_AHEAD"); return e ? (int64_t) atoll(e) : (int64_t) 8192; }();
+    const int64_t ahead = ahead_tok > 0 ? ahead_tok*hp.ple_n_heads : INT64_MAX/2;
+    // during a prompt scan, rows it has already copied are not faulted again (the faults compete with the scan for the filesystem)
+    const bool skip_cached = ple_prompt_mode && ple_cache_on.load(std::memory_order_acquire);
+    for (int t = 0; t < n_thr; ++t) {
+        ple_pf_threads.emplace_back([this, shared_rows, base, nb1, row_bytes, t, stop, consumed, ahead, skip_cached]() {
+            const auto & r = *shared_rows;
+            for (size_t i = (size_t) t; i < r.size() && !stop->load(std::memory_order_relaxed); i += (size_t) n_thr) {
+                while ((int64_t) i > consumed->load(std::memory_order_relaxed) + ahead && !stop->load(std::memory_order_relaxed)) {
+                    std::this_thread::sleep_for(std::chrono::microseconds(500));
+                }
+                if (skip_cached) {
+                    auto it = std::lower_bound(ple_uniq.begin(), ple_uniq.end(), r[i]);
+                    if (it != ple_uniq.end() && *it == r[i] && (size_t) (it - ple_uniq.begin()) < ple_scanned.load(std::memory_order_acquire)) {
+                        continue;
+                    }
+                }
+                const volatile char * p = base + (size_t) r[i] * nb1;
+                (void) p[0];
+                (void) p[row_bytes - 1];
+            }
+        });
+    }
+}
+
+std::vector<int32_t> llama_model_qwen4exp::ple_rows_of(const llama_token * tokens, int64_t n_tokens) const {
     const auto & hp = hparams;
     const int64_t n_gram = hp.ple_ngram_size, n_heads = hp.ple_n_heads, per_gram = hp.ple_heads_per_ngram;
     const int64_t eos = hp.ple_eos_token_id;
@@ -1658,118 +1720,111 @@ void llama_model_qwen4exp::prefetch_batch(const llama_token * tokens, int64_t n_
             }
         }
     }
-    static const int64_t scan_min = [] { const char * e = getenv("LLAMA_PLE_SCAN_MIN"); return e ? atoll(e) : 0; }();
+    return rows;
+}
+
+// the PLE rows of `rows` read with large sequential preads in a thread (a FUSE filesystem serves ~1.5 GB/s sequentially but only ~3k
+// random page faults/s), copied compactly into ple_data; ple_row serves them from there once scanned. The first n_first rows (the
+// first ubatch's, which the scan reaches only near the end of the table) are faulted in token order by 8 threads meanwhile.
+void llama_model_qwen4exp::ple_scan_start(std::vector<int32_t> rows, size_t n_first) const {
 #if defined(__linux__)
-    if (ple_fd >= 0 && scan_min > 0 && n_tokens >= scan_min) {
-        if (ple_scan_thr.joinable()) {
-            ple_scan_thr.join();
-        }
-        std::vector<int32_t> uniq(rows);
-        std::sort(uniq.begin(), uniq.end());
-        uniq.erase(std::unique(uniq.begin(), uniq.end()), uniq.end());
-        const size_t rb = ggml_row_size(ple->type, ple->ne[0]);
-        {
-            std::lock_guard<std::mutex> lk(ple_mtx);
-            ple_pos.clear();
-            ple_pos.reserve(uniq.size()*2);
-            for (size_t i = 0; i < uniq.size(); i++) ple_pos[uniq[i]] = (uint32_t) i;
-            ple_data.resize(uniq.size()*rb);
-            ple_scanning = true;
-            ple_scanned.store(0, std::memory_order_release);
-        }
-        const size_t nb1 = ple->nb[1];
-        // the first ubatch cannot wait for the scan (it reaches its rows only near the end of the table): 8 threads fault those in
-        // token order meanwhile, as for a small batch
-        {
-            ple_pf_stop = true;
-            for (auto & th : ple_pf_threads) th.join();
-            ple_pf_threads.clear();
-            ple_pf_stop = false;
-            const size_t n_first = std::min(rows.size(), (size_t) n_heads * 4096);
-            auto first = std::make_shared<std::vector<int32_t>>(rows.begin(), rows.begin() + n_first);
-            const char * base = (const char *) ple->data;
-            std::atomic<bool> * stop = &ple_pf_stop;
-            for (int t = 0; t < 8; ++t) {
-                ple_pf_threads.emplace_back([first, base, nb1, rb, t, stop]() {
-                    for (size_t i = (size_t) t; i < first->size() && !stop->load(std::memory_order_relaxed); i += 8) {
-                        const volatile char * p = base + (size_t) (*first)[i] * nb1;
-                        (void) p[0];
-                        (void) p[rb - 1];
-                    }
-                });
-            }
-        }
-        ple_scan_thr = std::thread([this, uniq = std::move(uniq), rb, nb1]() {
-            const size_t chunk = 8u << 20;
-            std::vector<uint8_t> buf(chunk);
-            size_t i = 0;
-            while (i < uniq.size()) {
-                const size_t start = ple_offs + (size_t) uniq[i]*nb1;
-                const ssize_t got = pread(ple_fd, buf.data(), chunk, (off_t) start);
-                if (got <= 0) {
-                    break;   // the rows left are read from the mapping by ple_row (not in the cache: see below)
-                }
-                size_t j = i;
-                for (; j < uniq.size(); j++) {
-                    const size_t o = ple_offs + (size_t) uniq[j]*nb1 - start;
-                    if (o + rb > (size_t) got) break;
-                    memcpy(ple_data.data() + j*rb, buf.data() + o, rb);
-                }
-                i = j;
-                ple_scanned.store(i, std::memory_order_release);
-                // the 28.8 GB a long prompt streams must not stay in the page cache (it pushed the system into swap)
-                posix_fadvise(ple_fd, (off_t) start, (off_t) got, POSIX_FADV_DONTNEED);
-            }
-            std::lock_guard<std::mutex> lk(ple_mtx);
-            if (i < uniq.size()) {   // a failed read: forget the rows not copied
-                for (size_t j = i; j < uniq.size(); j++) ple_pos.erase(uniq[j]);
-            }
-            ple_scanning = false;
-            ple_cv.notify_all();
-        });
-        return;
-    }
-#endif
-    // madvise(WILLNEED) reads nothing ahead through a FUSE filesystem: fault the pages in from 8 threads, in token order, while the
-    // earlier ubatches compute (LLAMA_PLE_PREFETCH_THREADS, 0 = the madvise hint only)
-    static const int n_thr = [] { const char * e = getenv("LLAMA_PLE_PREFETCH_THREADS"); return e ? atoi(e) : 8; }();
-    if (n_thr <= 0) {
-        llama_prefetch_rows(ple, rows.data(), rows.size());
-        return;
-    }
-    // the previous batch's threads are done by now (or nearly: their pages are what that batch read)
-    ple_pf_stop = true;
-    for (auto & th : ple_pf_threads) {
-        th.join();
-    }
-    ple_pf_threads.clear();
-    ple_pf_stop = false;
-    auto shared_rows = std::make_shared<std::vector<int32_t>>(std::move(rows));
-    const char * base = (const char *) ple->data;
+    ggml_tensor * ple = per_layer_tok_embd;
+    ple_cache_release();
+    std::vector<int32_t> uniq(rows);
+    std::sort(uniq.begin(), uniq.end());
+    uniq.erase(std::unique(uniq.begin(), uniq.end()), uniq.end());
+    const size_t rb = ggml_row_size(ple->type, ple->ne[0]);
     const size_t nb1 = ple->nb[1];
-    const size_t row_bytes = ggml_row_size(ple->type, ple->ne[0]);
-    std::atomic<bool> * stop = &ple_pf_stop;
-    std::atomic<int64_t> * consumed = &ple_pf_consumed;
-    consumed->store(0);
-    static const int64_t ahead_tok = [] { const char * e = getenv("LLAMA_PLE_PF_AHEAD"); return e ? (int64_t) atoll(e) : (int64_t) 8192; }();
-    const int64_t ahead = ahead_tok > 0 ? ahead_tok*hp.ple_n_heads : INT64_MAX/2;
-    for (int t = 0; t < n_thr; ++t) {
-        ple_pf_threads.emplace_back([shared_rows, base, nb1, row_bytes, t, stop, consumed, ahead]() {
-            const auto & r = *shared_rows;
-            for (size_t i = (size_t) t; i < r.size() && !stop->load(std::memory_order_relaxed); i += (size_t) n_thr) {
-                while ((int64_t) i > consumed->load(std::memory_order_relaxed) + ahead && !stop->load(std::memory_order_relaxed)) {
-                    std::this_thread::sleep_for(std::chrono::microseconds(500));
+    ple_data.resize(uniq.size()*rb);
+    ple_uniq = std::move(uniq);
+    ple_scanned.store(0, std::memory_order_release);
+    ple_scan_stop = false;
+    ple_cache_on.store(true, std::memory_order_release);
+    {
+        ple_pf_stop = true;
+        for (auto & th : ple_pf_threads) th.join();
+        ple_pf_threads.clear();
+        ple_pf_stop = false;
+        auto first = std::make_shared<std::vector<int32_t>>(rows.begin(), rows.begin() + std::min(rows.size(), n_first));
+        const char * base = (const char *) ple->data;
+        std::atomic<bool> * stop = &ple_pf_stop;
+        for (int t = 0; t < 8; ++t) {
+            ple_pf_threads.emplace_back([first, base, nb1, rb, t, stop]() {
+                for (size_t i = (size_t) t; i < first->size() && !stop->load(std::memory_order_relaxed); i += 8) {
+                    const volatile char * p = base + (size_t) (*first)[i] * nb1;
+                    (void) p[0];
+                    (void) p[rb - 1];
                 }
-                const volatile char * p = base + (size_t) r[i] * nb1;
-                (void) p[0];
-                (void) p[row_bytes - 1];
-            }
-        });
+            });
+        }
     }
+    const int64_t ts = ggml_time_us();
+    ple_scan_thr = std::thread([this, rb, nb1, ts]() {
+        const auto & uniq = ple_uniq;
+        const size_t chunk = 8u << 20;
+        std::vector<uint8_t> buf(chunk);
+        size_t i = 0;
+        while (i < uniq.size() && !ple_scan_stop.load(std::memory_order_relaxed)) {
+            const size_t start = ple_offs + (size_t) uniq[i]*nb1;
+            const ssize_t got = pread(ple_fd, buf.data(), chunk, (off_t) start);
+            if (got <= 0) {
+                break;   // the rows left are read from the mapping by ple_row
+            }
+            size_t j = i;
+            for (; j < uniq.size(); j++) {
+                const size_t o = ple_offs + (size_t) uniq[j]*nb1 - start;
+                if (o + rb > (size_t) got) break;
+                memcpy(ple_data.data() + j*rb, buf.data() + o, rb);
+            }
+            i = j;
+            ple_scanned.store(i, std::memory_order_release);
+            // the 28.8 GB a long prompt streams must not stay in the page cache (it pushed the system into swap)
+            posix_fadvise(ple_fd, (off_t) start, (off_t) got, POSIX_FADV_DONTNEED);
+        }
+        LLAMA_LOG_INFO("ple_scan: %zu of %zu rows cached in %.1f s\n", i, uniq.size(), (ggml_time_us() - ts) / 1e6);
+    });
+#else
+    (void) rows; (void) n_first;
+#endif
+}
+
+void llama_model_qwen4exp::ple_cache_release() const {
+    ple_scan_stop = true;
+    if (ple_scan_thr.joinable()) {
+        ple_scan_thr.join();
+    }
+    ple_cache_on.store(false, std::memory_order_release);
+    ple_prompt_mode = false;
+    std::vector<int32_t>().swap(ple_uniq);
+    std::vector<uint8_t>().swap(ple_data);
+    ple_scanned.store(0, std::memory_order_release);
+}
+
+// p100-series: a long prompt's PLE rows in ONE sequential scan of the table (not one per -b batch, which streamed the 28.8 GB table
+// through ntfs-3g for every batch), started when the server begins the prompt; the batches then read their rows from the cache
+// (or the mapping, for rows the scan has not reached yet). Only where the rows come from changes. LLAMA_PLE_PROMPT_SCAN: the
+// smallest prompt scanned (default 32768 tokens, 0 = off)
+void llama_model_qwen4exp::prefetch_prompt(const llama_token * tokens, int64_t n_tokens) const {
+    static const int64_t min_tok = [] { const char * e = getenv("LLAMA_PLE_PROMPT_SCAN"); return e ? (int64_t) atoll(e) : (int64_t) 32768; }();
+    if (n_tokens == 0) {
+        if (ple_prompt_mode) {
+            ple_cache_release();
+        }
+        return;
+    }
+    if (min_tok <= 0 || n_tokens < min_tok || tokens == nullptr || per_layer_tok_embd == nullptr || ple_fd < 0) {
+        return;
+    }
+    const int64_t t0 = ggml_time_us();
+    ple_scan_start(ple_rows_of(tokens, n_tokens), (size_t) hparams.ple_n_heads * 4096);
+    ple_prompt_mode = true;
+    LLAMA_LOG_INFO("%s: %lld tokens: %zu PLE rows (%.1f MiB) read in one scan (set up in %.1f ms)\n", __func__, (long long) n_tokens,
+                   ple_uniq.size(), ple_data.size() / 1048576.0, (ggml_time_us() - t0) / 1000.0);
 }
 
 llama_model_qwen4exp::~llama_model_qwen4exp() {
     ple_pf_stop = true;
+    ple_scan_stop = true;
     for (auto & th : ple_pf_threads) {
         th.join();
     }
@@ -1784,18 +1839,15 @@ llama_model_qwen4exp::~llama_model_qwen4exp() {
 }
 
 const uint8_t * llama_model_qwen4exp::ple_row(int32_t r) const {
-    // no scan cache (LLAMA_PLE_SCAN_MIN unset, the default): straight from the mapping, no lock (the PLE gather runs on 8 threads)
-    static const bool scan_on = [] { const char * e = getenv("LLAMA_PLE_SCAN_MIN"); return e && atoll(e) > 0; }();
-    if (!scan_on) {
-        return (const uint8_t *) per_layer_tok_embd->data + (size_t) r * per_layer_tok_embd->nb[1];
-    }
-    {
-        std::unique_lock<std::mutex> lk(ple_mtx);
-        auto it = ple_pos.find(r);
-        // a row the scan has copied comes from the cache; one it has not reached yet is read from the mapping now (no waiting
-        // for the whole table: the first ubatches of a batch overlap the scan)
-        if (it != ple_pos.end() && it->second < ple_scanned.load(std::memory_order_acquire)) {
-            return ple_data.data() + (size_t) it->second * ggml_row_size(per_layer_tok_embd->type, per_layer_tok_embd->ne[0]);
+    // a row the scan has copied comes from the cache; one it has not reached yet (or not in it) from the mapping. No lock: ple_uniq and
+    // ple_data change only between prompts / batches (on the decode thread), the scan publishes its progress with ple_scanned
+    if (ple_cache_on.load(std::memory_order_acquire)) {
+        auto it = std::lower_bound(ple_uniq.begin(), ple_uniq.end(), r);
+        if (it != ple_uniq.end() && *it == r) {
+            const size_t p = (size_t) (it - ple_uniq.begin());
+            if (p < ple_scanned.load(std::memory_order_acquire)) {
+                return ple_data.data() + p * ggml_row_size(per_layer_tok_embd->type, per_layer_tok_embd->ne[0]);
+            }
         }
     }
     return (const uint8_t *) per_layer_tok_embd->data + (size_t) r * per_layer_tok_embd->nb[1];

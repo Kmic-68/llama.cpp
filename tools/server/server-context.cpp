@@ -4323,6 +4323,20 @@ private:
 
                         slot.prompt.tokens.keep_first(n_past);
 
+                        // a long prompt: let the model read its weights ahead (Flash-Next: the PLE rows in one scan), timing only
+                        if (slot.task->n_tokens() - n_past >= 8192) {
+                            std::vector<llama_token> rest;
+                            rest.reserve(slot.task->n_tokens() - n_past);
+                            for (int32_t k = n_past; k < slot.task->n_tokens(); ++k) {
+                                const llama_token t = input_tokens[k];
+                                if (t == LLAMA_TOKEN_NULL) {
+                                    break;
+                                }
+                                rest.push_back(t);
+                            }
+                            llama_prefetch_prompt(ctx_tgt, rest.data(), (int32_t) rest.size());
+                        }
+
                         // this is to signal the client that the request has started processing
                         if (slot.task->params.stream) {
                             if (slot.task->params.return_progress) {
