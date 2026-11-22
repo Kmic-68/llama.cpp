@@ -8,6 +8,7 @@
 #include "ggml-cpu.h"
 
 #include <cstdlib>
+#include <thread>
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
@@ -586,8 +587,25 @@ llama_moe_lru::llama_moe_lru(const llama_model & model, const std::vector<ggml_b
                     GGML_ASSERT(exps[k]->nb[2] % n_split == 0);
                     GGML_ASSERT(k != KIND_DOWN ? exps[k]->ne[1] % n_split == 0 : exps[k]->nb[1] % n_split == 0);
                 }
-                for (int64_t hs = 0; hs < n_host; hs++) {
-                    host_slot_store(L, k, L.host_expert[hs], hs);
+                // the load's biggest cost (~40 GB of experts into the pinned pools): split over threads (each slot its own destination).
+                // LLAMA_MOE_LRU_LOAD_THREADS (default 8; 1 = the old single loop)
+                static const int n_lt = [] { const char * e = getenv("LLAMA_MOE_LRU_LOAD_THREADS"); return e ? std::max(1, atoi(e)) : 8; }();
+                if (n_lt <= 1 || n_host < 2*n_lt) {
+                    for (int64_t hs = 0; hs < n_host; hs++) {
+                        host_slot_store(L, k, L.host_expert[hs], hs);
+                    }
+                } else {
+                    std::vector<std::thread> th;
+                    for (int t = 0; t < n_lt; t++) {
+                        th.emplace_back([&, t]() {
+                            for (int64_t hs = t; hs < n_host; hs += n_lt) {
+                                host_slot_store(L, k, L.host_expert[hs], hs);
+                            }
+                        });
+                    }
+                    for (auto & x : th) {
+                        x.join();
+                    }
                 }
                 L.exps[k] = L.hpool[k];   // the kernels' source: host slots instead of expert rows
             }
