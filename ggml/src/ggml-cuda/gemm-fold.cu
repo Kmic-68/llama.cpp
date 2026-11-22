@@ -637,6 +637,17 @@ static int ggml_cuda_gemm_fold_min_rows() {
     return v;
 }
 
+// p100-series: the rows below which a matmul runs in fp32 cuBLAS. A quantized weight with >= GGML_CUDA_GEMM_FOLD_MINROWS_Q rows
+// (knob, default 512; 1024 = off) at >= 1024 tokens fills the SMs too (Flash-Next's shared-expert gate/up, 640 rows a GPU: fp16
+// products folded into fp32 as the other dense matmuls, KLD 0.0177 vs the fp32 path, below the ~0.026 of any summation-order change); f32 weights
+// (the router) keep the fp32 path
+static int64_t gemm_fold_min_rows_for(const ggml_tensor * src0, const ggml_tensor * src1) {
+    if (ggml_is_quantized(src0->type) && src1->ne[1] >= 1024) {
+        return std::min<int64_t>(ggml_cuda_gemm_fold_min_rows(), ggml_knob_i32("GGML_CUDA_GEMM_FOLD_MINROWS_Q", 512));
+    }
+    return ggml_cuda_gemm_fold_min_rows();
+}
+
 static bool ggml_cuda_gemm_fold_eligible(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
                                          const ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
@@ -648,7 +659,7 @@ static bool ggml_cuda_gemm_fold_eligible(ggml_backend_cuda_context & ctx, const 
 
 bool ggml_cuda_gemm_fold_wants_f32(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
                                    const ggml_tensor * dst) {
-    return ggml_cuda_gemm_fold_eligible(ctx, src0, src1, dst) && src0->ne[1] < ggml_cuda_gemm_fold_min_rows();
+    return ggml_cuda_gemm_fold_eligible(ctx, src0, src1, dst) && src0->ne[1] < gemm_fold_min_rows_for(src0, src1);
 }
 
 // Weight prefetch (see gemm-fold.cuh): per device, which fold weights followed each exchanged matmul
@@ -778,7 +789,7 @@ bool ggml_cuda_gemm_fold_take_partner_done() {
 
 static bool gemm_fold_shape_ok(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
                                const ggml_tensor * dst) {
-    if (!ggml_cuda_gemm_fold_eligible(ctx, src0, src1, dst) || src0->ne[1] < ggml_cuda_gemm_fold_min_rows()) {
+    if (!ggml_cuda_gemm_fold_eligible(ctx, src0, src1, dst) || src0->ne[1] < gemm_fold_min_rows_for(src0, src1)) {
         return false;
     }
     const int64_t K = src0->ne[0];
@@ -931,7 +942,7 @@ bool ggml_cuda_gemm_fold_try(ggml_backend_cuda_context & ctx, const ggml_tensor 
     }
     if (pt != nullptr && u2 && !ctx.xchg_want && M % BM == 0 && pt->op == GGML_OP_MUL_MAT && pt->src[1] == src1 &&
             pt->type == GGML_TYPE_F32 && pt->src[0]->type == src0->type && pt->src[0]->ne[0] == K &&
-            pt->src[0]->ne[1] >= ggml_cuda_gemm_fold_min_rows() && pt->src[0]->ne[1] % 4 == 0 &&
+            pt->src[0]->ne[1] >= gemm_fold_min_rows_for(pt->src[0], src1) && pt->src[0]->ne[1] % 4 == 0 &&
             pt->src[0]->ne[1] + M <= INT_MAX && pt->ne[1] == N && pt->op_params[0] == dst->op_params[0] &&
             ggml_cuda_gemm_fold_eligible(ctx, pt->src[0], src1, pt) && ggml_is_contiguous(pt->src[0]) &&
             ggml_is_contiguous(pt) && pt->src[0]->ne[2] == 1 && pt->src[0]->ne[3] == 1) {
