@@ -1136,6 +1136,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
         GGML_ASSERT(k->ne[3] == 1 && k_set->ne[0] == k->ne[0]*k->ne[1] && v_set->ne[0] == v->ne[0]*v->ne[1]);
         ggml_tensor * k2 = ggml_view_2d(ctx0, k_set, k_set->ne[0], k->ne[2], k_set->nb[1], 0);
         ggml_tensor * v2 = ggml_view_2d(ctx0, v_set, v_set->ne[0], v->ne[2], v_set->nb[1], 0);
+        std::vector<ggml_tensor *> outs;
         for (const auto & ch : qsa_g) {
             const int64_t n_g = ch.gidx->ne[0];
             ggml_tensor * gi = ggml_reshape_1d(ctx0, ch.gidx, n_g*ch.nt);
@@ -1153,8 +1154,21 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
                 oc = ggml_cont(ctx0, oc);
                 ggml_build_forward_expand(gf, oc);
             }
-            cur = cur ? ggml_concat(ctx0, cur, oc, 1) : oc;
+            outs.push_back(oc);
         }
+        // join the chunks pairwise (a balanced tree): appending each chunk to the running result re-copied all earlier ones,
+        // quadratic in the chunks (32 a 4096-token ubatch); concat is a copy, the result is the same
+        while (outs.size() > 1) {
+            std::vector<ggml_tensor *> next;
+            for (size_t i = 0; i + 1 < outs.size(); i += 2) {
+                next.push_back(ggml_concat(ctx0, outs[i], outs[i + 1], 1));
+            }
+            if (outs.size() % 2) {
+                next.push_back(outs.back());
+            }
+            outs.swap(next);
+        }
+        cur = outs.front();
         qsa_g.clear();
     } else if (sel_chunks != nullptr && sel_chunks->size() > 1) {
         // query chunks (see build_qsa_sel): each attends with its own [n_kv, chunk] selection, the outputs are joined
@@ -1576,6 +1590,7 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
         for (size_t k = 0; k < idx.size(); ++k) {
             tr->to_float(qm.ple_row(idx[k]), emb_buf.data() + k*hd, hd);
         }
+        qm.ple_pf_consumed.fetch_add((int64_t) idx.size());
         ggml_backend_tensor_set(emb, emb_buf.data(), 0, emb_buf.size()*sizeof(float));
         return;
     }
@@ -1734,10 +1749,17 @@ void llama_model_qwen4exp::prefetch_batch(const llama_token * tokens, int64_t n_
     const size_t nb1 = ple->nb[1];
     const size_t row_bytes = ggml_row_size(ple->type, ple->ne[0]);
     std::atomic<bool> * stop = &ple_pf_stop;
+    std::atomic<int64_t> * consumed = &ple_pf_consumed;
+    consumed->store(0);
+    static const int64_t ahead_tok = [] { const char * e = getenv("LLAMA_PLE_PF_AHEAD"); return e ? (int64_t) atoll(e) : (int64_t) 8192; }();
+    const int64_t ahead = ahead_tok > 0 ? ahead_tok*hp.ple_n_heads : INT64_MAX/2;
     for (int t = 0; t < n_thr; ++t) {
-        ple_pf_threads.emplace_back([shared_rows, base, nb1, row_bytes, t, stop]() {
+        ple_pf_threads.emplace_back([shared_rows, base, nb1, row_bytes, t, stop, consumed, ahead]() {
             const auto & r = *shared_rows;
             for (size_t i = (size_t) t; i < r.size() && !stop->load(std::memory_order_relaxed); i += (size_t) n_thr) {
+                while ((int64_t) i > consumed->load(std::memory_order_relaxed) + ahead && !stop->load(std::memory_order_relaxed)) {
+                    std::this_thread::sleep_for(std::chrono::microseconds(500));
+                }
                 const volatile char * p = base + (size_t) r[i] * nb1;
                 (void) p[0];
                 (void) p[row_bytes - 1];

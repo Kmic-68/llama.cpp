@@ -2658,6 +2658,9 @@ struct llama_model_qwen4exp : public llama_model_base {
     // the PLE read-ahead threads of the last batch (prefetch_batch); joined before the next batch's and on destruction
     mutable std::vector<std::thread> ple_pf_threads;
     mutable std::atomic<bool> ple_pf_stop{false};
+    // rows of the current batch set_input has consumed: the read-ahead stays at most LLAMA_PLE_PF_AHEAD tokens (8192) ahead of them,
+    // so a large batch (-b 131072) does not fault a whole batch into the page cache at once (that evicted rows still to be read)
+    mutable std::atomic<int64_t> ple_pf_consumed{0};
 
     // PLE row cache of a large batch (prefetch_batch, LLAMA_PLE_SCAN_MIN tokens and up): its rows read with large sequential preads of
     // the model file (a FUSE filesystem serves ~1.5 GB/s sequentially but only ~3k random page faults/s), copied compactly; set_input reads them
