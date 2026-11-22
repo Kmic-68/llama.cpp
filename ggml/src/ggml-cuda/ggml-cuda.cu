@@ -5032,7 +5032,132 @@ bool ggml_cuda_ab_alt() {
     return val.load(std::memory_order_relaxed);
 }
 
+static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst);
+
+// p100-series: MoE prefill gate and up MUL_MAT_IDs (same activations, same ids) in one tile launch: one activation prep, one sort and
+// tile list, twice the row blocks (Flash-Next IQ3_S M = 320 per GPU: 2 x 12.5 ms -> ~22.7 ms). Every output as computed alone.
+// Nodes between the two (the up weights' LRU assembly) that do not read the gate's output run first. GGML_CUDA_TMM_GU (knob) = 0: off
+static int ggml_cuda_try_fuse_gate_up(ggml_backend_cuda_context * ctx, ggml_cgraph * cgraph, int i) {
+    ggml_tensor * g = cgraph->nodes[i];
+    if (g->op != GGML_OP_MUL_MAT_ID || g->src[1]->ne[2] <= 32 || ggml_knob_i32("GGML_CUDA_TMM_GU", 1) == 0) {
+        return 0;
+    }
+    static const bool lru_host = [] { const char * e = getenv("LLAMA_MOE_LRU_HOST"); return e && atoi(e) >= 0; }();
+    if (lru_host) {
+        return 0;
+    }
+    for (int j = i + 1; j < cgraph->n_nodes && j <= i + 3; ++j) {
+        ggml_tensor * u = cgraph->nodes[j];
+        if (u->op == GGML_OP_MUL_MAT_ID && u->src[1] == g->src[1] && u->src[2] == g->src[2] && (u->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+            bool u_tmp = false;
+            for (int k = i + 1; k < j; ++k) {
+                const ggml_tensor * n = cgraph->nodes[k];
+                for (int q = 0; q < GGML_MAX_SRC; ++q) {
+                    if (n->src[q] == g || (n->src[q] && n->src[q]->view_src == g)) {
+                        return 0;
+                    }
+                }
+                if (n->view_src == g || n->op == GGML_OP_MUL_MAT_ID) {
+                    return 0;
+                }
+            }
+            // the pair runs the up (and the nodes between) at the gate's position: the allocator placed them by the original order, so
+            // what they write may sit on what the gate reads (its assembled weights are freed after the gate). Pair only when nothing
+            // written early overlaps the gate's inputs or output
+            {
+                auto ovl = [](const ggml_tensor * x, const ggml_tensor * y) {
+                    if (x == nullptr || y == nullptr || x->data == nullptr || y->data == nullptr) {
+                        return false;
+                    }
+                    const char * x0 = (const char *) x->data, * y0 = (const char *) y->data;
+                    return x0 < y0 + ggml_nbytes(y) && y0 < x0 + ggml_nbytes(x);
+                };
+                const ggml_tensor * gread[4] = { g->src[0], g->src[1], g->src[2], g };
+                // the up's own output may sit on the gate's inputs (written through a temp buffer then, below), never on the gate's output
+                for (const ggml_tensor * r : gread) {
+                    if (ovl(u, r)) {
+                        u_tmp = true;
+                    }
+                }
+                if (ovl(u, g)) {
+                    return 0;
+                }
+                for (int k = i + 1; k < j; ++k) {
+                    const ggml_tensor * w = cgraph->nodes[k];
+                    if (ggml_cuda_is_view_or_noop(w)) {
+                        continue;
+                    }
+                    for (const ggml_tensor * r : gread) {
+                        if (ovl(w, r)) {
+                            return 0;
+                        }
+                    }
+                }
+            }
+            // the graph loop's per-node expert-cache steps (ggml_cuda_graph_compute): for the nodes between and for the up matmul
+            auto lru_pre = [&](const int k) {
+                if (ctx->n_lru_pending > 0) {
+                    ggml_cuda_lru_wait_srcs(*ctx, cgraph, k);
+                }
+                if (ctx->lru_ovl_active) {
+                    ggml_cuda_lru_ovl_guard(*ctx, cgraph, k);
+                }
+            };
+            for (int k = i + 1; k < j; ++k) {
+                ggml_tensor * n = cgraph->nodes[k];
+                if ((n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0 || ggml_cuda_is_view_or_noop(n)) {
+                    continue;
+                }
+                lru_pre(k);
+                if (n->op == GGML_OP_LRU_ASSEMBLE && ggml_cuda_lru_async_enabled()) {
+                    ggml_cuda_lru_assemble_async(*ctx, n);
+                } else if (!ggml_cuda_compute_forward(*ctx, n)) {
+                    GGML_ABORT("gate/up pair: node %s (%s) failed", n->name, ggml_op_name(n->op));
+                }
+            }
+            lru_pre(j);
+            ggml_cuda_lru_ce_pending_wait(*ctx, g->src[0]->data);
+            ggml_cuda_lru_ce_pending_wait(*ctx, u->src[0]->data);
+            ggml_cuda_pool_alloc<char> u_buf(ctx->pool());
+            ggml_tensor u_alt = *u;
+            if (u_tmp) {
+                if (!ggml_is_contiguous(u)) {
+                    return 0;
+                }
+                u_alt.data = u_buf.alloc(ggml_nbytes(u));
+            }
+            if (ggml_cuda_tile_mm_id_try(*ctx, g->src[0], g->src[1], g->src[2], g, u->src[0], u_tmp ? &u_alt : u)) {
+                if (u_tmp) {
+                    CUDA_CHECK(cudaMemcpyAsync(u->data, u_alt.data, ggml_nbytes(u), cudaMemcpyDeviceToDevice, ctx->stream()));
+                }
+                static bool logged = false;
+                if (!logged) {
+                    logged = true;
+                    GGML_LOG_INFO("%s: MoE gate/up in one launch (%s, %lld tokens, %d node(s) between)\n", __func__,
+                                  ggml_type_name(g->src[0]->type), (long long) g->src[1]->ne[2], j - i - 1);
+                }
+                return j - i;
+            }
+            // refused: compute both alone. With nodes between (already run), the gate runs here and the loop resumes at the up
+            if (j == i + 1) {
+                return 0;
+            }
+            if (!ggml_cuda_compute_forward(*ctx, g)) {
+                GGML_ABORT("gate/up pair: gate %s failed", g->name);
+            }
+            return j - i - 1;
+        }
+    }
+    return 0;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    {
+        const int skip = ggml_cuda_try_fuse_gate_up(cuda_ctx, cgraph, i);
+        if (skip > 0) {
+            return skip;
+        }
+    }
 
     // p100-series: routed experts' SWIGLU -> IQ4_NL down projection (one token): the SWIGLU is applied inside the short-row
     // kernel (mmvq.cu, bit-identical). GGML_CUDA_FUSE_MOE_DOWN=0: off, =ab: only while GGML_CUDA_AB_FILE exists

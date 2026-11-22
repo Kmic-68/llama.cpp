@@ -293,6 +293,11 @@ struct tile_mm_params {
     const int    * tiles;       // [ntiles][2] = (expert, first column of the expert's compact rows)
     const int    * ntiles;
     int            M, K, N, nwin, u_per;
+    // MUL_MAT_ID gate/up pair in one launch (tile_mm_rows): row blocks >= mb are the second matrix's (Wb / W2b, dstb)
+    const void   * Wb;
+    const void   * W2b;
+    float        * dstb;
+    int            mb;
 };
 
 // X f32 [N][K] (row stride sx floats) -> XS half [N][K] prescaled by 2^-e per (column, window) so |x| < 1; S[n][w] = 2^e.
@@ -452,15 +457,17 @@ static __global__ void __launch_bounds__(16*RL, 2) tile_mm_rows(const tile_mm_pa
 
     const int tid = threadIdx.x, ni = tid & 15, ti = tid >> 4;
     const int M = prm.M, K = prm.K, nwin = prm.nwin;
-    const int m0 = blockIdx.x*RB;
+    // a gate/up pair: the first mb row blocks are the first matrix's, the rest the second's (same experts, tiles and activations)
+    const bool mat_b = prm.mb > 0 && (int) blockIdx.x >= prm.mb;
+    const int m0 = (mat_b ? (int) blockIdx.x - prm.mb : (int) blockIdx.x)*RB;
     const int tile = blockIdx.y;
     if (tile >= *prm.ntiles) {
         return;
     }
     const int e = prm.tiles[2*tile], n0 = prm.tiles[2*tile + 1];
     const int base = prm.bounds[e], N = prm.bounds[e + 1] - base;
-    const unsigned char * W = e < prm.split ? (const unsigned char *) prm.W2 + (int64_t) e*prm.expert_bytes
-                                            : (const unsigned char *) prm.W + (int64_t) (e - prm.split)*prm.expert_bytes;
+    const unsigned char * W = e < prm.split ? (const unsigned char *) (mat_b ? prm.W2b : prm.W2) + (int64_t) e*prm.expert_bytes
+                                            : (const unsigned char *) (mat_b ? prm.Wb : prm.W) + (int64_t) (e - prm.split)*prm.expert_bytes;
     if constexpr (type == GGML_TYPE_IQ3_S) {
         for (int i = tid; i < 512; i += NT) g3[i] = iq3s_grid[i];
     }
@@ -594,7 +601,7 @@ static __global__ void __launch_bounds__(16*RL, 2) tile_mm_rows(const tile_mm_pa
     for (int i = 0; i < TL; ++i) {
         const int n = n0 + ti*TL + i;
         if (n >= N) continue;
-        float * out = prm.dst + (int64_t) prm.ids_dst[base + n]*prm.s1;
+        float * out = (mat_b ? prm.dstb : prm.dst) + (int64_t) prm.ids_dst[base + n]*prm.s1;
 #pragma unroll
         for (int r = 0; r < RL; ++r) {
             const int m = m0 + ni*RL + r;
@@ -1130,7 +1137,7 @@ bool ggml_cuda_tile_mm_try(ggml_backend_cuda_context & ctx, const ggml_tensor * 
 }
 
 bool ggml_cuda_tile_mm_id_try(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
-                              ggml_tensor * dst) {
+                              ggml_tensor * dst, const ggml_tensor * src0b, ggml_tensor * dstb) {
     // GGML_CUDA_TILE_MMID=0: leave MUL_MAT_ID to MMQ (A/B)
     static const bool on = tmm_env_on("GGML_CUDA_TILE_MMID");
     const ggml_type type = src0->type;
@@ -1159,6 +1166,29 @@ bool ggml_cuda_tile_mm_id_try(ggml_backend_cuda_context & ctx, const ggml_tensor
         zc_base = (const char *) hsrc->data + (size_t) xdev * (size_t) hsrc->ne[2] * es;
     }
     const int64_t K = src0->ne[0], M = src0->ne[1], n_experts = (n_zc > 0 ? n_zc : src0->ne[2]) + (tpool ? tpool->ne[2] : 0);
+    // the pair's second matrix (up of gate/up): the same type, shape, layout and expert split; its own weights
+    const void * wb = nullptr, * w2b = nullptr;
+    if (src0b != nullptr) {
+        const ggml_tensor * tpb = src0b->op == GGML_OP_LRU_ASSEMBLE && ggml_get_op_params_i32(src0b, 5) != 0 ? src0b->src[1] : nullptr;
+        const int n_zcb = tpb ? ggml_get_op_params_i32(src0b, 6) : 0;
+        if (src0b->type != type || !ggml_are_same_shape(src0b, src0) || src0b->nb[1] != src0->nb[1] || src0b->nb[2] != src0->nb[2] ||
+                (tpb == nullptr) != (tpool == nullptr) || (tpb && (tpb->ne[2] != tpool->ne[2] || tpb->nb[1] != tpool->nb[1] ||
+                tpb->nb[2] != tpool->nb[2] || tpb->type != type)) || n_zcb != n_zc || !tmm_weights_ok(src0b) ||
+                dstb == nullptr || !ggml_are_same_shape(dstb, dst) || dstb->nb[1] != dst->nb[1] || dstb->nb[2] != dst->nb[2]) {
+            return false;
+        }
+        wb = src0b->data;
+        if (n_zcb > 0) {
+            ggml_tensor * hsrc;
+            memcpy(&hsrc, src0b->op_params, sizeof(hsrc));
+            int xdev = 0;
+            if (hsrc->nb[2] != tpb->nb[2]) {
+                cudaGetDevice(&xdev);
+            }
+            wb = (const char *) hsrc->data + (size_t) xdev * (size_t) hsrc->ne[2] * tpb->nb[2];
+        }
+        w2b = tpb ? tpb->data : nullptr;
+    }
     const int64_t n_used = ids->ne[0], n_tokens = src1->ne[2], nch = src1->ne[1];
     // dst [M, n_used, n_tokens], rows addressed as token*n_used + slot; src1 [K, nch (1 = shared by the slots, or n_used), n_tokens]
     if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 || !tmm_weights_ok(src0) ||
@@ -1208,8 +1238,15 @@ bool ggml_cuda_tile_mm_id_try(ggml_backend_cuda_context & ctx, const ggml_tensor
     // so the unused tail must hold valid indices, and their dst rows are zeroed (the GEMM never writes them)
     CUDA_CHECK(cudaMemsetAsync(ids_src1.get(), 0, total*sizeof(int32_t), stream));
     CUDA_CHECK(cudaMemsetAsync(ids_dst.get(),  0, total*sizeof(int32_t), stream));
+    if (src0b != nullptr && !rows_k) {
+        return false;   // (before any work is enqueued) the pair runs only through the row-per-thread kernel
+    }
     tile_mm_zero_skipped<<<(int) n_tokens, 256, 0, stream>>>((const int32_t *) ids->data, (float *) dst->data, (int) M, (int) n_used, si1,
                                          (int64_t) (dst->nb[1]/sizeof(float)), (int64_t) (dst->nb[2]/sizeof(float)));
+    if (dstb != nullptr) {
+        tile_mm_zero_skipped<<<(int) n_tokens, 256, 0, stream>>>((const int32_t *) ids->data, (float *) dstb->data, (int) M, (int) n_used, si1,
+                                             (int64_t) (dstb->nb[1]/sizeof(float)), (int64_t) (dstb->nb[2]/sizeof(float)));
+    }
     ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), bounds.get(), (int) n_experts, (int) n_tokens,
                                    (int) n_used, (int) nch, si1, sis1, /*write_inverse =*/ false, stream);
     if (n_experts <= 1024) {
@@ -1228,10 +1265,12 @@ bool ggml_cuda_tile_mm_id_try(ggml_backend_cuda_context & ctx, const ggml_tensor
     prm.XS = xs.get(); prm.S = sc.get(); prm.dst = (float *) dst->data; prm.s1 = (int64_t) (dst->nb[1]/sizeof(float));
     prm.ids_dst = ids_dst.get(); prm.xrow = xtok ? ids_src1.get() : nullptr; prm.bounds = bounds.get(); prm.tiles = tiles.get() + 1; prm.ntiles = tiles.get();
     prm.M = (int) M; prm.K = (int) K; prm.N = 0; prm.nwin = nwin;
+    prm.Wb = wb; prm.W2b = w2b; prm.dstb = dstb ? (float *) dstb->data : nullptr;
     static const int tm_env = [] { const char * e = getenv("GGML_CUDA_TMM_TM"); return e ? atoi(e) : 5; }();
     prm.tm = tm_env == 5 && M % 80 == 0 ? 5 : 4;
     if (rows_k && r160) {
-        const dim3 grid(prm.M/160, max_tiles);
+        prm.mb = src0b ? prm.M/160 : 0;
+        const dim3 grid((src0b ? 2 : 1)*(prm.M/160), max_tiles);
         if (type == GGML_TYPE_IQ3_S) {
             tile_mm_rows<GGML_TYPE_IQ3_S, 10, TMR_TL160><<<grid, 160, 0, stream>>>(prm);
         } else if (type == GGML_TYPE_IQ4_XS) {
@@ -1240,7 +1279,8 @@ bool ggml_cuda_tile_mm_id_try(ggml_backend_cuda_context & ctx, const ggml_tensor
             tile_mm_rows<GGML_TYPE_IQ4_NL, 10, TMR_TL160><<<grid, 160, 0, stream>>>(prm);
         }
     } else if (rows_k) {
-        const dim3 grid((prm.M + TMR_RB - 1)/TMR_RB, max_tiles);
+        prm.mb = src0b ? (prm.M + TMR_RB - 1)/TMR_RB : 0;
+        const dim3 grid((src0b ? 2 : 1)*((prm.M + TMR_RB - 1)/TMR_RB), max_tiles);
         if (type == GGML_TYPE_IQ3_S) {
             tile_mm_rows<GGML_TYPE_IQ3_S><<<grid, TMR_NT, 0, stream>>>(prm);
         } else if (type == GGML_TYPE_Q8_0) {
