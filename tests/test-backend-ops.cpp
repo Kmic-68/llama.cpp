@@ -11791,6 +11791,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0,   GGML_TYPE_F32, 1024, 10, false, 256, n, 128));
     }
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
+    // >= 4096 slots (CUDA: the counting-sort ids helper), with and without skipped slots
+    for (bool skip : { false, true }) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_IQ4_NL, GGML_TYPE_F32, 512, 10, false, 64, 600, 256, 0, false, skip));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_0,   GGML_TYPE_F32,  64,  8, true,  64, 700, 128, 0, false, skip));
+    }
     // short-row q8_0 matvecs (k_q8_0_smallk): Flash-Next hyper-connection up, shared-expert down, Q8_0 expert down per GPU
     for (int n : {1, 3, 8}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 10240, n, 320, {1, 1}, {1, 1}));

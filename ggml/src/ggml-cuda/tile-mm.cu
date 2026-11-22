@@ -776,6 +776,42 @@ static __global__ void __launch_bounds__(256, (tile_mm_min_blocks<type, TN, TM>(
 }
 
 // MUL_MAT_ID: build the tile list (expert, first column) from the expert bounds; one thread, n_experts is small
+// the same list from one block of 1024 threads: each expert's tile count, an exclusive block scan, then each expert writes its tiles at
+// its offset (the single-thread loop took ~110 us for 512 experts). Used when n_experts <= 1024
+static __global__ void tile_mm_id_tiles_par(const int * __restrict__ bounds, const int n_experts, const int bn, int * __restrict__ tiles,
+                                            int * __restrict__ ntiles) {
+    __shared__ int wsum[32];
+    const int e = threadIdx.x, lane = e % 32, wid = e / 32;
+    const int n = e < n_experts ? bounds[e + 1] - bounds[e] : 0;
+    const int t = (n + bn - 1)/bn;
+    int incl = t;
+#pragma unroll
+    for (int o = 1; o < 32; o <<= 1) {
+        const int v = __shfl_up_sync(0xffffffff, incl, o);
+        if (lane >= o) incl += v;
+    }
+    if (lane == 31) wsum[wid] = incl;
+    __syncthreads();
+    if (wid == 0) {
+        int w = wsum[lane];
+#pragma unroll
+        for (int o = 1; o < 32; o <<= 1) {
+            const int v = __shfl_up_sync(0xffffffff, w, o);
+            if (lane >= o) w += v;
+        }
+        wsum[lane] = w;   // inclusive over warps
+    }
+    __syncthreads();
+    const int k0 = (wid > 0 ? wsum[wid - 1] : 0) + incl - t;
+    for (int j = 0; j < t; ++j) {
+        tiles[2*(k0 + j)]     = e;
+        tiles[2*(k0 + j) + 1] = j*bn;
+    }
+    if (e == blockDim.x - 1) {
+        *ntiles = wsum[31];
+    }
+}
+
 static __global__ void tile_mm_id_tiles(const int * __restrict__ bounds, const int n_experts, const int bn, int * __restrict__ tiles,
                                         int * __restrict__ ntiles) {
     int k = 0;
@@ -1114,7 +1150,11 @@ bool ggml_cuda_tile_mm_id_try(ggml_backend_cuda_context & ctx, const ggml_tensor
                                          (int64_t) (dst->nb[1]/sizeof(float)), (int64_t) (dst->nb[2]/sizeof(float)));
     ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), bounds.get(), (int) n_experts, (int) n_tokens,
                                    (int) n_used, (int) nch, si1, sis1, /*write_inverse =*/ false, stream);
-    tile_mm_id_tiles<<<1, 1, 0, stream>>>(bounds.get(), (int) n_experts, bn, tiles.get() + 1, tiles.get());
+    if (n_experts <= 1024) {
+        tile_mm_id_tiles_par<<<1, 1024, 0, stream>>>(bounds.get(), (int) n_experts, bn, tiles.get() + 1, tiles.get());
+    } else {
+        tile_mm_id_tiles<<<1, 1, 0, stream>>>(bounds.get(), (int) n_experts, bn, tiles.get() + 1, tiles.get());
+    }
     {
         const dim3 pb(WARP_SIZE, 4), pg((nwin + 3)/4, (unsigned) nx);
         tile_mm_prep<<<pg, pb, 0, stream>>>((const float *) src1->data, (int64_t) (src1->nb[1]/sizeof(float)), xtok ? nullptr : ids_src1.get(), xs.get(),
