@@ -9955,3 +9955,15 @@ Probes (timing only): expert kernel without decode 8-14% faster, without the fp3
 products and their two barriers a step run at ~40% of HFMA2 peak (gemm_fold's dense GEMM reaches ~75-80%).
 Measurement: the box has ~9 GB of file cache next to the 50 GB pinned pool; ab.py now warms each pair's suffix first, but swap-ins
 of the server's own pages (1.7 GB swapped) still add +-10% noise per pass.
+
+## 344 — Flash-Next fresh 260k 660.8 t/s; shared-expert gate/up on the fold GEMM (KLD 0.0177) (11-22 morning)
+
+| change | result | math |
+|---|---|---|
+| 370e18264 quantized dense matmuls >= 512 rows at >= 1024 tokens on the fold GEMM (shared-expert gate/up) | fast loop 653.8 -> 663.0 (3 ABBA pairs) | KLD 0.0177 vs fp32 (PPL base 1.9982, ppl-orig 8 x 4096); may move the 27B's 512..1023-row weights: gate at merge |
+Fresh 260,060-token prompt, current build: prefill 660.8 t/s (wall 395 s; batches 781 -> 604 t/s over depth; the PLE scan read 28 GB
+once). OPTLOG 343's 597.2 ran on a busier box (swap-ins); this number is the one to compare. His engine: 808.8.
+Found: his 808.8 profile sets FNX_PF_F16ACC=1, i.e. cuBLAS COMPUTE_16F (fp16 accumulation over all of K) for every dense prompt
+matmul including the hc latents, and fp16 sums between the cards (prefill.cu pf_gemm / PfRing). Ours: fp16 sums of <= 64-128
+products folded into fp32, fp32 hc down, fp32 AllReduce. Part of his speed is that arithmetic.
+Rejected again: async AllReduce at default priority (two more 3-pair runs: 0.992, 0.951).
