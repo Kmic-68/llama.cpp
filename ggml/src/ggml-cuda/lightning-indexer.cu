@@ -828,7 +828,7 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
             LIGHTNING_INDEXER_CASE(lightning_indexer_kernel_vec, 128, 32, k, GGML_TYPE_F32)
             GGML_ABORT("fatal error");
         }
-    } else if (n_embd == 128 && n_head == 4 && n_batch >= LI_GEMM_BT &&
+    } else if (n_embd == 128 && n_head == 4 && (n_batch >= LI_GEMM_BT || m->type == GGML_TYPE_I32) &&
                (k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_Q4_0 || k->type == GGML_TYPE_Q8_0) &&
                [] { const char * e = getenv("GGML_CUDA_LI_GEMM"); return !e || atoi(e) != 0; }() &&
                (uintptr_t) q_d % 16 == 0 && nbq1 % 16 == 0 && nbq2 % 16 == 0 && nbq3 % 16 == 0 &&
@@ -917,7 +917,8 @@ bool ggml_cuda_lightning_indexer_supported(int device, const ggml_tensor * dst) 
     }
     if (m->type == GGML_TYPE_I32) {   // range mask: the gemm4 kernel's shapes only
         const char * e = getenv("GGML_CUDA_LI_GEMM");
-        if ((e && atoi(e) == 0) || neq1 != 4 || neq2 < LI_GEMM_BT ||
+        // any chunk size (a ubatch's last QSA chunk can be under 32 queries: rejected, it ran on the CPU with another summation order)
+        if ((e && atoi(e) == 0) || neq1 != 4 ||
                 (k->type != GGML_TYPE_F16 && k->type != GGML_TYPE_Q4_0 && k->type != GGML_TYPE_Q8_0) ||
                 (uintptr_t) nbq1 % 16 != 0 || nbq2 % 16 != 0 || nbq3 % 16 != 0) {
             return false;
