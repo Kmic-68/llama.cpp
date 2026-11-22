@@ -9967,3 +9967,12 @@ Found: his 808.8 profile sets FNX_PF_F16ACC=1, i.e. cuBLAS COMPUTE_16F (fp16 acc
 matmul including the hc latents, and fp16 sums between the cards (prefill.cu pf_gemm / PfRing). Ours: fp16 sums of <= 64-128
 products folded into fp32, fp32 hc down, fp32 AllReduce. Part of his speed is that arithmetic.
 Rejected again: async AllReduce at default priority (two more 3-pair runs: 0.992, 0.951).
+
+## 345 — Flash-Next first decode after a fresh 260k prompt: 16.8 -> 27.6 t/s with --cache-ram 0 (11-22)
+
+Fresh 260,060-token prompt + 128 forced tokens (ignore_eos, model-card sampling): with the server's default --cache-ram 8192 the
+saved prompt states pushed the box into swap (server 3.2 GB swapped; swap 1.4 -> 4.9 GB during one prompt with the PLE scan off):
+prefill 599.7 / decode 16.8 t/s (scan on), 534.8 / 5.2 (scan off). --cache-ram 0 (his engine runs --conversation-cache-mib 0):
+prefill 629.8, decode 27.6 t/s, no swap. His: 808.8 / 29.3. On this box (64 GB, ~50 GB pinned by the expert pool) a long-context
+Flash-Next server needs --cache-ram 0 (or a small value): a serving-flag change, outputs unchanged.
+PLE prompt scan threshold 32768 -> 131072 (a 40k prompt: 688 -> 705 t/s prefill without the 28 GB read).
