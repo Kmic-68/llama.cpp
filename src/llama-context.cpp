@@ -1,5 +1,9 @@
 #include "llama-context.h"
 
+#if defined(__linux__)
+#include <fcntl.h>
+#endif
+
 #include "ggml.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
@@ -3913,6 +3917,11 @@ size_t llama_context::state_seq_load_file(llama_seq_id seq_id, const char * file
         const size_t state_size = file.size() - file.tell();
         llama_io_read_file io(&file);
         const size_t nread = state_seq_read_data(io, seq_id, 0);
+#if defined(__linux__)
+        // p100-series: a restored slot file (GBs at long context) must not push the model's lazily read pages (Flash-Next's PLE rows)
+        // out of the page cache: drop its pages once read
+        posix_fadvise(file.file_id(), 0, 0, POSIX_FADV_DONTNEED);
+#endif
         if (!nread) {
             LLAMA_LOG_ERROR("%s: failed to restore sequence state\n", __func__);
             return 0;
@@ -4516,6 +4525,10 @@ void llama_attach_threadpool(
 
 void llama_detach_threadpool(llama_context * ctx) {
     ctx->detach_threadpool();
+}
+
+void llama_prefetch_prompt(llama_context * ctx, const llama_token * tokens, int32_t n_tokens) {
+    ctx->get_model().prefetch_prompt(tokens, n_tokens);
 }
 
 void llama_set_n_threads(llama_context * ctx, int32_t n_threads, int32_t n_threads_batch) {
