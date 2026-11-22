@@ -1753,6 +1753,11 @@ extern "C" {
             struct ggml_tensor  * b); // row indices
 
     // the rows of a quantized tensor copied as they are (the result has a's type, no dequantization)
+    // p100-series measuring aid: a runtime knob. GGML_KNOB_FILE=<path> holds NAME=VALUE lines (re-read when it changes, checked at
+    // most every 50 ms); a name not in the file falls back to the environment variable of that name, then to def. Lets one server
+    // alternate code paths between requests (qprof/deep.py AB mode) instead of a reload per setting.
+    GGML_API int32_t ggml_knob_i32(const char * name, int32_t def);
+
     GGML_API struct ggml_tensor * ggml_get_rows_raw(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,  // data, quantized

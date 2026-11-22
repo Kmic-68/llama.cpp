@@ -4038,6 +4038,43 @@ struct ggml_tensor * ggml_get_rows(
     return result;
 }
 
+#include <sys/stat.h>
+
+int32_t ggml_knob_i32(const char * name, int32_t def) {
+    static const char * path = NULL;
+    static int path_init = 0;
+    if (!path_init) { path = getenv("GGML_KNOB_FILE"); path_init = 1; }
+    if (path != NULL) {
+        // the file's text, re-read when its mtime changes (checked at most every 50 ms); readers race benignly on a stale copy
+        static char text[4096];
+        static int64_t last_check = 0;
+        static int64_t last_mtime = -1;
+        const int64_t now = ggml_time_us();
+        if (now - last_check > 50000) {
+            last_check = now;
+            struct stat st;
+            const int64_t mt = stat(path, &st) == 0 ? (int64_t) st.st_mtime*1000000000LL + (int64_t) st.st_mtim.tv_nsec : -2;
+            if (mt != last_mtime) {
+                last_mtime = mt;
+                text[0] = 0;
+                FILE * f = mt >= 0 ? fopen(path, "r") : NULL;
+                if (f) { const size_t n = fread(text, 1, sizeof(text) - 1, f); text[n] = 0; fclose(f); }
+            }
+        }
+        const size_t ln = strlen(name);
+        for (const char * p = text; *p; ) {
+            if (strncmp(p, name, ln) == 0 && p[ln] == '=') {
+                return (int32_t) atoi(p + ln + 1);
+            }
+            p = strchr(p, '\n');
+            if (!p) break;
+            ++p;
+        }
+    }
+    const char * e = getenv(name);
+    return e ? (int32_t) atoi(e) : def;
+}
+
 struct ggml_tensor * ggml_get_rows_raw(
         struct ggml_context * ctx,
         struct ggml_tensor  * a,

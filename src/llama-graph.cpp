@@ -2228,7 +2228,7 @@ static ggml_tensor * llama_lru_assemble(ggml_context * ctx0, llama_moe_lru * lru
 // LLAMA_MOE_LRU_PF_FIRST=1 (opt-in: measured slower, 433.6 vs ~460 t/s on a 128k prefill ubatch). Every later pooled layer's assembly is put into the graph by the layer before it (prefetch); the
 // first one had nothing before it, so each prefill ubatch started with the copy engines' whole first-layer transfer exposed.
 void llm_graph_context::build_lru_prefetch_first() const {
-    static const bool on = [] { const char * e = getenv("LLAMA_MOE_LRU_PF_FIRST"); return e && atoi(e) != 0; }();
+    const bool on = ggml_knob_i32("LLAMA_MOE_LRU_PF_FIRST", 0) != 0;   // a runtime knob (GGML_KNOB_FILE)
     if (!on || lru == nullptr || !lru->prefetch() || cparams.warmup || n_tokens == 0 ||
             (int64_t) n_tokens * n_expert_used <= lru->n_slots_min()) {
         return;
