@@ -80,7 +80,8 @@ static __global__ void group_norm_f32(const float * x, float * dst, const int gr
 // do_pair: the upper half of grid z normalises a second tensor (x2 -> dst2) of the same shape and strides
 // do_gate (with do_multiply): the output is then silu(gate) * (norm * mul), the fused SILU -> MUL's
 // arithmetic on the stored value (qwen35's gated norm); gate has dst's layout
-template <int block_size, bool do_multiply = false, bool do_add = false, bool do_scale = false, bool do_pair = false, bool do_gate = false>
+template <int block_size, bool do_multiply = false, bool do_add = false, bool do_scale = false, bool do_pair = false, bool do_gate = false,
+          int MAXR = 8>
 static __global__ void rms_norm_f32(const float * x,
                                     float *       dst,
                                     const int     ncols,
@@ -151,7 +152,7 @@ static __global__ void rms_norm_f32(const float * x,
     // and the row is read twice: once to accumulate the sum of squares and again to scale it.
     // When the row fits in a fixed number of registers per thread, hold it there instead: the
     // loads all issue up front, and the second pass costs nothing.
-    constexpr int max_regs = 8;
+    constexpr int max_regs = MAXR;   // 12 for rows of 8193..12288 (the 10240-wide hyper-connection rows: one read, the same sums)
 
     extern __shared__ float s_sum[];
 
@@ -504,6 +505,13 @@ static void rms_norm_f32_cuda(
         ggml_cuda_kernel_launch(rms_norm_f32<256, false>, launch_params,
             x, dst, ncols, stride_row, stride_channel, stride_sample, eps,
         // underlying cudaLaunchKernelEx does not support default params
+        nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0),
+        nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), 1.0f, 0.0f, nullptr, nullptr, nullptr);
+    } else if (ncols > 1024*8 && ncols <= 1024*12) {
+        // rows held in 12 registers a thread instead of read twice (937 -> 709 us for 10240 x 4096); smaller rows keep 8 (occupancy)
+        const dim3 block_dims(1024, 1, 1);
+        const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, 32 * sizeof(float), stream};
+        ggml_cuda_kernel_launch(rms_norm_f32<1024, false, false, false, false, false, 12>, launch_params, x, dst, ncols, stride_row, stride_channel, stride_sample, eps,
         nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0),
         nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), 1.0f, 0.0f, nullptr, nullptr, nullptr);
     } else {
