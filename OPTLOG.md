@@ -9911,3 +9911,26 @@ nsys at 250k, -ub 4096 (per token, card 0): kernels 1574 us (tile_mm_rows 388, g
 q4p 66, AllReduce 33); inside a prompt the GPU is ~85% busy between multi-second host gaps at the server's context checkpoints
 (4 + n_ubatch and 4 tokens before the end: ~5 s each on a restored 250k slot) -- open. Sporadic stalls (decode 3 t/s) follow
 real disk reads (swap / page cache on a full 62 GB box).
+
+## 342 — Flash-Next 260k prefill 586 -> 633 t/s, first decode 35.2 (exact kernels, AllReduce on the copy engine) (11-22)
+
+Fresh 260,060-token prompt (no cache), 75 slots + LEND 80, LEND_HEAD 1024, -ub 4096, -b 16384, model-card sampling: prefill
+632.8 t/s, decode right after 35.2 t/s (his engine: 808.8 / 29.3). Loop: op perf + opdiff byte check per change, model md5 on the
+250k fast loop (qprof/ab.py, ABBA, knobs in one server). Every change below: model md5 identical.
+| change | op result | fast loop |
+|---|---|---|
+| 8f216b39b IQ4_XS experts (layer 2 gate/up) through tile_mm_rows + LRU tails | 20624 -> 14060 us | ~+1% (math: fp16 acts as the other layers) |
+| f9e0f8a AllReduce > 1 MiB: f32 partial by cudaMemcpyPeerAsync (copy engine) | 40 MiB both ways 6.1 -> 4.3 ms isolated | 611.4 -> 616.4 |
+| tile_mm_prep grid-strides rows (8192-token ubatches crashed: grid.y > 65535) | - | - |
+| db4e49b77 MoE weighting + slot sum fused for in-place prefill graphs, unfused rounding | 5812 -> 1090 us a layer | +5% (3 ABBA runs) |
+| 9f9a7c443 rms_norm 1024..8192 cols by 256 threads playing the 1024-thread tree | 1460 -> 1208 us | - |
+| 7bb2a0f17 Q8_0 experts (5 down layers) through tile_mm_rows; warp skip past an expert's end | 15830 -> 11217 us | - |
+| 71060cbb9 AllReduce copies a chunked GEMM's partial chunk by chunk | - | 623.9 -> 627.3 |
+Rejected: double-buffered IQ4_NL rows kernel (255 regs, 12274 -> 19394 us); -ub 8192 (experts 2.68 -> 2.85 T MAC/s but an 800 MiB
+allocation at the prompt end fails at 262k even with 60 slots).
+Found: the MoE weighted-reduction fusion never matched prefill (in-place MUL: views point at the products); a first version raced
+(the output can land on the freed router weights). AllReduce copies share PCIe with ~3.4 GB/s of expert streaming (9.6 GB/s).
+Per layer at 4096 tokens (shallow, card 0): experts ~32 ms, fold GEMMs ~19, two AllReduces ~10 (copy 4.3 ms each + skew),
+replicated hc/router work ~22 (hc_post, rms, hc down/up, hc_pre, router: both GPUs do every token -- sequence parallelism would
+halve it), cuBLAS fp32 GEMMs run 5-6.7 TFLOPS (fine). His expert kernel: gu 3.45, down 3.07 T MAC/s; ours 2.68 / 2.73 at real
+routing, 3.35 / 3.07 at dense routing (weight loads cost only ~3%).
