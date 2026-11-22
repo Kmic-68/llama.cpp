@@ -382,7 +382,7 @@ static __device__ __forceinline__ void tmr_decode_step(const uint32_t (&w)[NWA],
                 for (int p = 0; p < 4; ++p) {
                     const int q = 4*c + p, sh = q >= 8 ? 4 : 0, j = 2*(q & 7);
                     const int a = (TMR_B(8 + 16*ib + j) >> sh) & 0xF, b = (TMR_B(8 + 16*ib + j + 1) >> sh) & 0xF;
-                    hv[p] = __floats2half2_rn(dl*kvalues_iq4nl[a], dl*kvalues_iq4nl[b]);
+                    hv[p] = __floats2half2_rn(dl*__uint_as_float(g3[a]), dl*__uint_as_float(g3[b]));
                 }
                 o[4*sb + c] = make_uint4(*(const uint32_t *) &hv[0], *(const uint32_t *) &hv[1], *(const uint32_t *) &hv[2], *(const uint32_t *) &hv[3]);
             }
@@ -422,7 +422,7 @@ static __device__ __forceinline__ void tmr_decode_step(const uint32_t (&w)[NWA],
                 for (int p = 0; p < 4; ++p) {
                     const int q = 4*c + p, sh = q >= 8 ? 4 : 0, j = 2*(q & 7);
                     const int a = (TMR_B(18*bk + 2 + j) >> sh) & 0xF, b = (TMR_B(18*bk + 2 + j + 1) >> sh) & 0xF;
-                    hv[p] = __floats2half2_rn(d*kvalues_iq4nl[a], d*kvalues_iq4nl[b]);
+                    hv[p] = __floats2half2_rn(d*__uint_as_float(g3[a]), d*__uint_as_float(g3[b]));
                 }
                 o[4*bk + c] = make_uint4(*(const uint32_t *) &hv[0], *(const uint32_t *) &hv[1], *(const uint32_t *) &hv[2], *(const uint32_t *) &hv[3]);
             }
@@ -453,7 +453,8 @@ static __global__ void __launch_bounds__(16*RL, 2) tile_mm_rows(const tile_mm_pa
     constexpr int NWA = type == GGML_TYPE_IQ4_XS ? 34 : 28;
     __shared__ __align__(16) uint4 sw[RB*LD];                 // decoded rows, row ni*RL + r at slot r*16 + ni
     __shared__ __align__(16) uint4 sx[TB*LD];                 // the step's activations, [token][k-pair quad]
-    __shared__ uint32_t g3[type == GGML_TYPE_IQ3_S ? 512 : 1];
+    // IQ3_S: the grid; IQ4_NL / IQ4_XS: kvalues_iq4nl as floats (a shared-memory lookup instead of a table load + int8 -> float)
+    __shared__ uint32_t g3[type == GGML_TYPE_IQ3_S ? 512 : (type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_IQ4_XS) ? 16 : 1];
 
     const int tid = threadIdx.x, ni = tid & 15, ti = tid >> 4;
     const int M = prm.M, K = prm.K, nwin = prm.nwin;
@@ -470,6 +471,8 @@ static __global__ void __launch_bounds__(16*RL, 2) tile_mm_rows(const tile_mm_pa
                                             : (const unsigned char *) (mat_b ? prm.Wb : prm.W) + (int64_t) (e - prm.split)*prm.expert_bytes;
     if constexpr (type == GGML_TYPE_IQ3_S) {
         for (int i = tid; i < 512; i += NT) g3[i] = iq3s_grid[i];
+    } else if constexpr (type == GGML_TYPE_IQ4_NL || type == GGML_TYPE_IQ4_XS) {
+        if (tid < 16) g3[tid] = __float_as_uint((float) kvalues_iq4nl[tid]);
     }
 
     // this thread's decode row and the window-scale offsets of its activation columns
