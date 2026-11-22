@@ -6374,7 +6374,21 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_DSV4_HC_POST }, { GGML_UNARY_OP_SIGMOID })) {
-        ggml_cuda_op_dsv4_hc_post(*cuda_ctx, cgraph->nodes[i + 3], node, cgraph->nodes[i + 2]);
+        // p100-series: + the next hyper-connection norm (RMS_NORM of the hc_post output rows, MUL by the [n_embd, hc] weight) in the
+        // same kernel, same bits (dsv4-hc.cu). GGML_CUDA_HC_POST_RMS (knob) = 0: off
+        ggml_tensor * hp = cgraph->nodes[i + 3];
+        if (i + 5 < cgraph->n_nodes && ggml_knob_i32("GGML_CUDA_HC_POST_RMS", 1) != 0) {
+            ggml_tensor * rn = cgraph->nodes[i + 4];
+            ggml_tensor * mn = cgraph->nodes[i + 5];
+            const ggml_tensor * rsrc = rn->src[0];
+            if (rn->op == GGML_OP_RMS_NORM && mn->op == GGML_OP_MUL && (rn->flags & GGML_TENSOR_FLAG_COMPUTE) && (mn->flags & GGML_TENSOR_FLAG_COMPUTE) &&
+                    rsrc != nullptr && rsrc->data == hp->data && ggml_are_same_shape(rsrc, hp) && ggml_is_contiguous(rsrc) && ggml_is_contiguous(hp) &&
+                    (mn->src[0] == rn || mn->src[1] == rn) && ggml_node_has_n_uses(cgraph, i + 4, 1) && !(rn->flags & GGML_TENSOR_FLAG_OUTPUT) &&
+                    ggml_cuda_op_dsv4_hc_post_rms(*cuda_ctx, hp, node, cgraph->nodes[i + 2], rn, mn)) {
+                return 5;
+            }
+        }
+        ggml_cuda_op_dsv4_hc_post(*cuda_ctx, hp, node, cgraph->nodes[i + 2]);
         return 3;
     }
 

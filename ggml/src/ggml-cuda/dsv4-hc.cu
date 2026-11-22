@@ -201,16 +201,12 @@ static __global__ void dsv4_hc_post_f32(
 // p100-series: every output stream of an (element, token) in one thread, so x and the residual streams are read once instead of
 // once per output stream (the (embd, stream, token) grid read them hc times). Each output's arithmetic is dsv4_hc_post_f32's in the
 // same order: the same bits. GGML_CUDA_HC_POST_ALL=0: the per-stream kernel
+// one (element, token): every output stream of dsv4_hc_post_f32, in its order (shared by the fused hc_post + rms_norm kernel)
 template <bool has_comb, bool gated, int HC>
-static __global__ void dsv4_hc_post_f32_all(
-        const float * x, const float * residual, const float * post, const float * comb, float * dst,
-        int64_t n_embd, int64_t sx0, int64_t sx1, int64_t sr0, int64_t sr1, int64_t sr2, int64_t sp0, int64_t sp1,
-        int64_t sc0, int64_t sc1, int64_t sc2, int64_t sd0, int64_t sd1, int64_t sd2, float gate_scale_in, float gate_scale_out) {
-    const int64_t i0 = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-    const int64_t it = blockIdx.z;
-    if (i0 >= n_embd) {
-        return;
-    }
+static __device__ __forceinline__ void dsv4_hc_post_elem(
+        const float * x, const float * residual, const float * post, const float * comb, const int64_t i0, const int64_t it,
+        int64_t sx0, int64_t sx1, int64_t sr0, int64_t sr1, int64_t sr2, int64_t sp0, int64_t sp1,
+        int64_t sc0, int64_t sc1, int64_t sc2, float gate_scale_in, float gate_scale_out, float (&out)[HC]) {
     const float xv = x[i0*sx0 + it*sx1];
     float r[HC];
 #pragma unroll
@@ -235,8 +231,141 @@ static __global__ void dsv4_hc_post_f32_all(
         } else {
             sum = __fmaf_rn(xv, p, r[idst]);
         }
-        dst[i0*sd0 + idst*sd1 + it*sd2] = sum;
+        out[idst] = sum;
     }
+}
+
+// p100-series: every output stream of an (element, token) in one thread, so x and the residual streams are read once instead of
+// once per output stream (the (embd, stream, token) grid read them hc times). Each output's arithmetic is dsv4_hc_post_f32's in the
+// same order: the same bits. GGML_CUDA_HC_POST_ALL=0: the per-stream kernel
+template <bool has_comb, bool gated, int HC>
+static __global__ void dsv4_hc_post_f32_all(
+        const float * x, const float * residual, const float * post, const float * comb, float * dst,
+        int64_t n_embd, int64_t sx0, int64_t sx1, int64_t sr0, int64_t sr1, int64_t sr2, int64_t sp0, int64_t sp1,
+        int64_t sc0, int64_t sc1, int64_t sc2, int64_t sd0, int64_t sd1, int64_t sd2, float gate_scale_in, float gate_scale_out) {
+    const int64_t i0 = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    const int64_t it = blockIdx.z;
+    if (i0 >= n_embd) {
+        return;
+    }
+    float o[HC];
+    dsv4_hc_post_elem<has_comb, gated, HC>(x, residual, post, comb, i0, it, sx0, sx1, sr0, sr1, sr2, sp0, sp1, sc0, sc1, sc2,
+                                           gate_scale_in, gate_scale_out, o);
+#pragma unroll
+    for (int idst = 0; idst < HC; ++idst) {
+        dst[i0*sd0 + idst*sd1 + it*sd2] = o[idst];
+    }
+}
+
+// p100-series: hc_post fused with the next hyper-connection RMS norm (+ weight) of each stream: a 1024-thread block per token
+// computes the token's hc_post outputs (dsv4_hc_post_elem, the same bits), stores them, and normalizes each stream row exactly as
+// rms_norm_f32<1024, true> does (thread t sums columns t, t + 1024, t + 2048 with fmas in that order, warp butterflies, a 32-lane
+// butterfly over the warps), so neither output changes; the norm no longer re-reads the 4 streams. Rows of up to 8192 values.
+template <bool has_comb, bool gated, int NU>
+static __global__ void __launch_bounds__(1024) dsv4_hc_post_rms_f32(
+        const float * x, const float * residual, const float * post, const float * comb, float * dst,
+        int n_embd, int64_t sx0, int64_t sx1, int64_t sr0, int64_t sr1, int64_t sr2, int64_t sp0, int64_t sp1,
+        int64_t sc0, int64_t sc1, int64_t sc2, int64_t sd0, int64_t sd1, int64_t sd2, float gate_scale_in, float gate_scale_out,
+        const float * w, int64_t w_s1, const float eps, float * y) {
+    constexpr int HC = 4;   // NU: columns a thread (the 1024-thread rms kernel's u < 8 terms past the row are zeros: skipped, exact)
+    __shared__ float s_sum[HC][32];
+    const int tid = threadIdx.x, lane = tid % WARP_SIZE, warp = tid / WARP_SIZE;
+    const int64_t it = blockIdx.x;
+    float v[HC][NU];
+    float tmp[HC] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+    for (int u = 0; u < NU; ++u) {
+        const int i0 = tid + u*1024;
+        float o[HC] = {0.0f, 0.0f, 0.0f, 0.0f};
+        if (i0 < n_embd) {
+            dsv4_hc_post_elem<has_comb, gated, HC>(x, residual, post, comb, i0, it, sx0, sx1, sr0, sr1, sr2, sp0, sp1, sc0, sc1, sc2,
+                                                   gate_scale_in, gate_scale_out, o);
+#pragma unroll
+            for (int s = 0; s < HC; ++s) {
+                dst[i0*sd0 + s*sd1 + it*sd2] = o[s];
+            }
+        }
+#pragma unroll
+        for (int s = 0; s < HC; ++s) {
+            v[s][u] = o[s];
+            tmp[s] = __fmaf_rn(o[s], o[s], tmp[s]);
+        }
+    }
+#pragma unroll
+    for (int s = 0; s < HC; ++s) {
+        tmp[s] = warp_reduce_sum(tmp[s]);
+        if (lane == 0) {
+            s_sum[s][warp] = tmp[s];
+        }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int s = 0; s < HC; ++s) {
+        const float tot   = warp_reduce_sum(s_sum[s][lane]);
+        const float mean  = tot / n_embd;
+        const float scale = rsqrtf(mean + eps);
+        float * yr = y + (it*HC + s)*n_embd;
+        const float * wr = w + s*w_s1;
+#pragma unroll
+        for (int u = 0; u < NU; ++u) {
+            const int i0 = tid + u*1024;
+            if (i0 < n_embd) {
+                yr[i0] = scale * v[s][u] * wr[i0];
+            }
+        }
+    }
+}
+
+// the fused hc_post (gated or not, as ggml_cuda_op_dsv4_hc_post) + RMS_NORM + MUL(w); false: not this shape (nothing launched)
+bool ggml_cuda_op_dsv4_hc_post_rms(ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_tensor * gate_scale_in,
+                                   const ggml_tensor * gate_scale_out, const ggml_tensor * rms, ggml_tensor * mul) {
+    const ggml_tensor * x        = dst->src[0];
+    const ggml_tensor * residual = dst->src[1];
+    const ggml_tensor * comb     = dst->src[3];
+    const bool          gated = gate_scale_in != nullptr;
+    const ggml_tensor * post  = gated ? gate_scale_in->src[0] : dst->src[2];
+    const ggml_tensor * w     = mul->src[0] == rms ? mul->src[1] : mul->src[0];
+    const int64_t n_embd = x->ne[0], n_tokens = x->ne[1], hc = residual->ne[1];
+    if (hc != 4 || n_embd > 8192 || n_embd < 1024 || n_tokens > 65535 || x->type != GGML_TYPE_F32 || residual->type != GGML_TYPE_F32 ||
+            post->type != GGML_TYPE_F32 || (comb && comb->type != GGML_TYPE_F32) || dst->type != GGML_TYPE_F32 ||
+            w->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 || !ggml_is_contiguous(mul) || !ggml_is_contiguous(w) ||
+            w->ne[0] != n_embd || (w->ne[1] != 1 && w->ne[1] != hc) || w->ne[2] != 1 || w->ne[3] != 1 ||
+            !ggml_are_same_shape(mul, dst) || dst->ne[0] != n_embd || dst->ne[1] != hc || dst->ne[2] != n_tokens) {
+        return false;
+    }
+    // the norm output is written while other blocks still read the hc_post inputs: the unfused graph may have placed it on them
+    auto ovl = [&](const ggml_tensor * t) {
+        if (t == nullptr) {
+            return false;
+        }
+        const char * a0 = (const char *) mul->data, * t0 = (const char *) t->data;
+        return a0 < t0 + ggml_nbytes(t) && t0 < a0 + ggml_nbytes(mul);
+    };
+    if (ovl(x) || ovl(residual) || ovl(post) || ovl(comb) || ovl(dst) || ovl(w)) {
+        return false;
+    }
+    GGML_TENSOR_LOCALS(size_t, nbx, x,        nb);
+    GGML_TENSOR_LOCALS(size_t, nbr, residual, nb);
+    GGML_TENSOR_LOCALS(size_t, nbp, post,     nb);
+    GGML_TENSOR_LOCALS(size_t, nbd, dst,      nb);
+    const size_t nbc0 = comb ? comb->nb[0] : 0, nbc1 = comb ? comb->nb[1] : 0, nbc2 = comb ? comb->nb[2] : 0;
+    const float gate_in  = gated ? ggml_get_op_params_f32(gate_scale_in,  0) : 1.0f;
+    const float gate_out = gated ? ggml_get_op_params_f32(gate_scale_out, 0) : 1.0f;
+    float eps;
+    memcpy(&eps, rms->op_params, sizeof(float));
+    const bool nu3 = n_embd <= 3072;
+    auto k = comb ? (gated ? (nu3 ? dsv4_hc_post_rms_f32<true, true, 3> : dsv4_hc_post_rms_f32<true, true, 8>)
+                           : (nu3 ? dsv4_hc_post_rms_f32<true, false, 3> : dsv4_hc_post_rms_f32<true, false, 8>))
+                  : (gated ? (nu3 ? dsv4_hc_post_rms_f32<false, true, 3> : dsv4_hc_post_rms_f32<false, true, 8>)
+                           : (nu3 ? dsv4_hc_post_rms_f32<false, false, 3> : dsv4_hc_post_rms_f32<false, false, 8>));
+    k<<<(unsigned) n_tokens, 1024, 0, ctx.stream()>>>(
+        (const float *) x->data, (const float *) residual->data, (const float *) post->data, comb ? (const float *) comb->data : nullptr,
+        (float *) dst->data, (int) n_embd, nbx0 / sizeof(float), nbx1 / sizeof(float), nbr0 / sizeof(float), nbr1 / sizeof(float),
+        nbr2 / sizeof(float), nbp0 / sizeof(float), nbp1 / sizeof(float), nbc0 / sizeof(float), nbc1 / sizeof(float), nbc2 / sizeof(float),
+        nbd0 / sizeof(float), nbd1 / sizeof(float), nbd2 / sizeof(float), gate_in, gate_out,
+        (const float *) w->data, w->ne[1] == 1 ? 0 : (int64_t) (w->nb[1] / sizeof(float)), eps, (float *) mul->data);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
 }
 
 void ggml_cuda_op_dsv4_hc_comb(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
