@@ -20,6 +20,7 @@ a client connects) and lower the per-card limit.
 import argparse, json, os, subprocess, sys
 
 here = os.path.dirname(os.path.abspath(__file__))
+MTP_MIB_PER_CARD_DEFAULT = 1250   # Flash-Next mtp-exps-iq4xs at 262144, -ub 2048: peak 15739 MiB at 65 slots vs ~14585 plain (11-23 sweep, OPTLOG 355)
 
 def lstsq(rows, ys):
     # normal equations (small systems)
@@ -59,6 +60,8 @@ def main():
     ap.add_argument("--ctx", type=int, default=None)
     ap.add_argument("--top", type=int, default=8)
     ap.add_argument("--json", action="store_true", help="print the chosen config as JSON only")
+    ap.add_argument("--mtp", default=None, help="MTP draft gguf (default: calib's mtp_draft); MTP is on whenever a draft is known")
+    ap.add_argument("--no-mtp", action="store_true", help="plain decode: no draft model, no VRAM reserved for it")
     a = ap.parse_args()
 
     cal = json.load(open(a.calib))
@@ -80,6 +83,11 @@ def main():
         S, U, pf, tail = p["S"], p["U"], p["prefetch"], p["tail"]
         pred = base + cal["slot_mib"] * S + act * U + asm * (1 + pf) * (1 - tail * S / NE)
         margin = max(margin, p["mib"] - pred)
+    # MTP draft (on by default): its experts, KV and compute pool sit on the cards beside the cache. Reserve its peak per card
+    # (measured at 262144 context through a full prefill), scaled for the draft KV with the context like the main KV.
+    mtp = None if a.no_mtp else (a.mtp or cal.get("mtp_draft"))
+    if mtp:
+        base += cal.get("mtp_mib_per_card", MTP_MIB_PER_CARD_DEFAULT)
     kv_full = cal["kv_mib_per_card_at_ctx"]
     base += kv_full * (ctx / cal["ctx"] - 1.0)
 
@@ -138,10 +146,16 @@ def main():
                    "LLAMA_MOE_LRU_TAIL": str(best["tail"]), "LLAMA_MOE_LRU_SLOTS": best["slot_file"],
                    "LLAMA_UB_KV_BUDGET": str(cal["kv_budget"]) if best["U"] > 512 else "0", "GGML_CUDA_LRU_STASH": "0"}
     best["args"] = ["-c", str(ctx), "--moe-lru-slots", str(best["S"]), "-ub", str(best["U"]), "-b", str(best["U"])]
+    if mtp:
+        best["mtp"] = mtp
+        best["env"].update({"LLAMA_SPEC_SAMPLE_TEMP": "1.0", "LLAMA_SPEC_DRAFT_TOPK": "20"})
+        best["args"] += ["-md", mtp, "--spec-type", "draft-mtp", "--spec-draft-n-max", "1", "-ngld", "99", "-ubd", "16",
+                         "-ctkd", "q4_0", "-ctvd", "q4_0", "-otd", "'^token_embd\\.weight=CPU,^output\\.weight=CPU'"]
     if a.json:
         print(json.dumps(best, indent=1)); return
     print(f"room {room} MiB per card (limit {limits}, other {others}, margin {margin:.0f}), RAM for the host pool {ram} MiB")
-    print(f"workload: {ratio:g} prompt tokens per generated token; ctx {ctx}")
+    print(f"workload: {ratio:g} prompt tokens per generated token; ctx {ctx}; " +
+          (f"MTP draft {mtp} (VRAM reserved per card; decode t/s below are the plain estimates, MTP adds ~25 % at short context)" if mtp else "plain decode (--no-mtp or no draft known)"))
     print("| slots | -ub | prefetch | tail | VRAM/card MiB | prefill t/s | decode t/s | ms per generated token |")
     print("|---|---|---|---|---|---|---|---|")
     for c in cands[:a.top]:
