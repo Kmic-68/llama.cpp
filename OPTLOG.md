@@ -10068,6 +10068,8 @@ llama-perplexity -c 2048 --chunks 2, -ub 1 vs -ub 512 KLD: this branch 0.0323 (s
 (93.3 %): the same on both. Cause: the small-batch (mmvq, q8_1 activations) and large-batch (mmq) expert paths round
 differently and router top-k flips amplify it; PPL is equal within noise either way (4.133 / 4.157 new, 4.198 / 4.144 rel).
 Restore of a saved slot is exact (batch 512 reproduces its golden, KLD 8e-6). realcheck goldens must use a fixed batch.
+Stock upstream (d327bf1f0, this branch's upstream base), same test: KLD 0.0334 (-sm tensor) / 0.0343 (-sm layer), same top
+91.8 %: inherent to llama.cpp's quantized MoE paths; ours (0.0323) is no worse.
 
 ## 354 — LLAMA_MTP_MERGE_CATCHUP default 0: the merged catch-up changed the drafts (11-22)
 
@@ -10078,3 +10080,31 @@ So the merged pass does NOT give the separate pass's rows (the comment's claim);
 Plain decode tg256 ABBA: new 34.19 / 33.30, release 32.56 / 32.25 (+1.3 t/s). VRAM 14517 MiB per card both.
 Also: scripts/ui-assets.cmake accepts SvelteKit's split build (_app/immutable/entry/start.*.js + assets/*.css) and .mjs,
 backport of upstream's check: the HF "latest" UI bundle dropped bundle.js/css and every fresh build failed again.
+
+## 355 — Flash-Next 0-262k sweep with MTP; LLAMA_PLE_HOST default on; config finder reserves the MTP draft (11-23)
+
+Models moved to a 400 GiB ext4 partition (nvme0n1p3 at /mnt/fast/models): direct reads 3.3 GB/s vs 1.6 through ntfs-3g;
+Flash-Next server load 113-122 s warm-ish (was 3-10 min cold through ntfs-3g); realcheck Flash-Next load+run 302 -> 131 s.
+Flash-Next at 262144 with the MTP draft (mtp-exps-iq4xs, n-max 1): 75 slots + LEND 80 runs out of memory on GPU1 at the 32k step
+(draft compute pool, cuMemCreate); 65 + 80 runs the whole sweep, peak 15479 / 15739 MiB per card. One growing prompt, model-card
+sampling, 256 tokens a step (first point = the first request after a cold-ish load):
+| depth | prefill t/s (32k segment) | decode t/s (MTP) | acceptance |
+|---|---|---|---|
+| 0 | - | 15.15 (cold) | 0.80 |
+| 32k | 532.7 | 28.67 | 0.68 |
+| 64k | 543.0 | 29.15 | 0.65 |
+| 96k | 526.1 | 24.22 | 0.73 |
+| 128k | 525.9 | 28.72 | 0.76 |
+| 160k | 504.6 | 26.82 | 0.75 |
+| 192k | 497.5 | 27.45 | 0.83 |
+| 224k | 469.3 | 26.41 | 0.81 |
+| 252k | 453.4 | 23.06 | 0.75 |
+Plain (no draft, 75 + 80) segments in the same session: 754 / 747 / 600 / 738 t/s at 32-128k: the separate draft context
+prefills every prompt token on one card after the main pass (~28 % of prefill). Next for Flash-Next (deferred by the user):
+the MTP layer inside the main graph (one pass, both cards), KV + draft KV in host RAM (QSA reads 2048 rows a token).
+- LLAMA_PLE_HOST default on: the comment said "default on" but the code defaulted off; every measured run set it =1.
+- moe-autoconfig: MTP on by default (--no-mtp for plain; draft from --mtp or calib's mtp_draft): reserves 1250 MiB per card
+  (measured above: ~1150 over plain at the same slots) and prints the draft flags in the chosen command.
+- Testing suite (p100-handoff/testing-suite, mirrored from /mnt/fast/models/Testing Suite): step 1 mini models, step 2 every
+  model at its exact serving config (configs/models.json) at 0 context (MTP code / chat prompts, plain side check) and 260k (MTP
+  speed + accuracy vs golden), speed vs a stored baseline. 27B 260k accuracy: PPL 3.5382, golden reproduces (KLD 1e-05).
