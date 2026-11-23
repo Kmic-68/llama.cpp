@@ -1921,7 +1921,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
 
     // LLAMA_PLE_HOST (default on): the rows are dequantized on the host into an input (from the scan cache of a large batch);
     // =0: a CPU get_rows from the mapped table, as before
-    static const bool ple_host = [] { const char * e = getenv("LLAMA_PLE_HOST"); return e && atoi(e) != 0; }();
+    static const bool ple_host = [] { const char * e = getenv("LLAMA_PLE_HOST"); return !e || atoi(e) != 0; }();
     if (ple_host) {
         ple_inp->emb = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, hparams.ple_head_dim * n_heads, n_tokens);
         ggml_set_input(ple_inp->emb);
