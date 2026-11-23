@@ -1607,7 +1607,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<float>              zero_h;
     int64_t                         n_h_miss = 0;
 
-    // LLAMA_MTP_MERGE_CATCHUP (default 1): a verify-sized catch-up (the rows process() would decode into the draft cache) is kept
+    // LLAMA_MTP_MERGE_CATCHUP (default 0 since 11-22: on, the drafts differ from the separate pass's -- 27B qwen-server acceptance
+    // 0.392 -> 0.307, 44.3 -> 36.9 t/s; off is byte-identical to the release build; OPTLOG 354): a verify-sized catch-up (the rows process() would decode into the draft cache) is kept
     // here instead and decoded by draft() in the same batch as its first draft row, one draft-context pass a round instead of two.
     // accept() drops the rejected rows; anything left is decoded before the next process() (rows a later batch starts at or
     // before are dropped: the cache was cut there). The rows and their KV are the same as the separate pass's.
@@ -1618,7 +1619,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         std::vector<float> h;
     };
     std::vector<deferred_row> deferred;
-    bool merge_catchup = [] { const char * e = getenv("LLAMA_MTP_MERGE_CATCHUP"); return !e || atoi(e) != 0; }();
+    bool merge_catchup = [] { const char * e = getenv("LLAMA_MTP_MERGE_CATCHUP"); return e && atoi(e) != 0; }();
 
     // decode the deferred rows on their own (no draft follows them)
     bool flush_deferred(const common_batch * next) {

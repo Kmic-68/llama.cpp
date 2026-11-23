@@ -142,6 +142,6 @@ Not ported (yet): his fp16 single-token matvec kernels (`mmvq-gp100`, `mmvq-h1`)
 | `GGML_META_AR_MAX_BYTES` | 32 MiB | largest in-kernel AllReduce |
 | `LLAMA_MOE_LRU_LEND`, `LLAMA_MOE_LRU_LEND_HEAD` | 0, 768 | slot loan: borrowed slots per layer, head MiB |
 | `LLAMA_MOE_LRU_ZEROCOPY_MAX` | 176 | ubatches up to this many tokens read the missing experts in place (zero-copy) instead of assembling every host expert; `LLAMA_MOE_LRU_ZEROCOPY=1`/`0` forces it |
-| `LLAMA_MTP_MERGE_CATCHUP`, `LLAMA_MTP_CROP`, `LLAMA_MTP_DRAFT_VOCAB` | 1, 1, 81920 | MTP: catch-up rows in the draft pass, no FFN/head for rows without output, draft head rows |
+| `LLAMA_MTP_MERGE_CATCHUP`, `LLAMA_MTP_CROP`, `LLAMA_MTP_DRAFT_VOCAB` | 0, 1, 81920 | MTP: catch-up rows in the draft pass, no FFN/head for rows without output, draft head rows |
 
 `autoconfig.py` prints the full set for the chosen config.

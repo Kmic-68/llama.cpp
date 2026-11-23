@@ -10068,3 +10068,13 @@ llama-perplexity -c 2048 --chunks 2, -ub 1 vs -ub 512 KLD: this branch 0.0323 (s
 (93.3 %): the same on both. Cause: the small-batch (mmvq, q8_1 activations) and large-batch (mmq) expert paths round
 differently and router top-k flips amplify it; PPL is equal within noise either way (4.133 / 4.157 new, 4.198 / 4.144 rel).
 Restore of a saved slot is exact (batch 512 reproduces its golden, KLD 8e-6). realcheck goldens must use a fixed batch.
+
+## 354 — LLAMA_MTP_MERGE_CATCHUP default 0: the merged catch-up changed the drafts (11-22)
+
+Release gate (27B Q6_K, qwen-server flags, model-card sampling, 3 prompts x 2 seeds x 300 tokens, ABBA vs the release build):
+merge on 36.9 t/s (mean of 37.89 / 35.84), acceptance 0.307, text md5 1ae21ead935e; release 42.4 t/s, 0.392, a9b65356f2d0.
+LLAMA_MTP_MERGE_CATCHUP=0: 44.28 / 44.43 t/s, acceptance 0.392, md5 a9b65356f2d0 = byte-identical to the release.
+So the merged pass does NOT give the separate pass's rows (the comment's claim); default flipped off, cause not chased.
+Plain decode tg256 ABBA: new 34.19 / 33.30, release 32.56 / 32.25 (+1.3 t/s). VRAM 14517 MiB per card both.
+Also: scripts/ui-assets.cmake accepts SvelteKit's split build (_app/immutable/entry/start.*.js + assets/*.css) and .mjs,
+backport of upstream's check: the HF "latest" UI bundle dropped bundle.js/css and every fresh build failed again.
