@@ -10059,3 +10059,12 @@ enqueued (GGML_META_AR_FENCE, default 1); (2) fattn-gemm / gemm-fold SASS module
 loading hung 100 % before, 5/5 pass after, PPL identical in every run (58390.1833); tg128 515.3 -> 518.5 t/s (ABBA, no cost).
 Eager module loading alone also avoids case (1) but costs ~200 MiB per card and not (2) or other driver syncs.
 Found with the new testing suite (mini models, /mnt/fast/p100-scratch/testing-suite); the full-model gates never hit it.
+
+## 353 — batch-split dependence on MoE: pre-existing, not a regression (11-22)
+
+Qwen3.6-35B-A3B Q4_K_M, the same tokens scored in different ubatch sizes: at 260k depth (restored slot) batch 1 / 64 / 256 vs
+512 read KLD 0.066 / 0.093 / 0.059, same top ~93-94 %; at 2k depth batch 1 vs 512 KLD 0.11, so not depth / attention related.
+llama-perplexity -c 2048 --chunks 2, -ub 1 vs -ub 512 KLD: this branch 0.0323 (same top 92.7 %), release build 0.0313
+(93.3 %): the same on both. Cause: the small-batch (mmvq, q8_1 activations) and large-batch (mmq) expert paths round
+differently and router top-k flips amplify it; PPL is equal within noise either way (4.133 / 4.157 new, 4.198 / 4.144 rel).
+Restore of a saved slot is exact (batch 512 reproduces its golden, KLD 8e-6). realcheck goldens must use a fixed batch.
