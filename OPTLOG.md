@@ -10105,6 +10105,6 @@ the MTP layer inside the main graph (one pass, both cards), KV + draft KV in hos
 - LLAMA_PLE_HOST default on: the comment said "default on" but the code defaulted off; every measured run set it =1.
 - moe-autoconfig: MTP on by default (--no-mtp for plain; draft from --mtp or calib's mtp_draft): reserves 1250 MiB per card
   (measured above: ~1150 over plain at the same slots) and prints the draft flags in the chosen command.
-- Testing suite (p100-handoff/testing-suite, mirrored from /mnt/fast/models/Testing Suite): step 1 mini models, step 2 every
+- Testing suite (private, /mnt/fast/models/Testing Suite; not in the repo): step 1 mini models, step 2 every
   model at its exact serving config (configs/models.json) at 0 context (MTP code / chat prompts, plain side check) and 260k (MTP
   speed + accuracy vs golden), speed vs a stored baseline. 27B 260k accuracy: PPL 3.5382, golden reproduces (KLD 1e-05).
