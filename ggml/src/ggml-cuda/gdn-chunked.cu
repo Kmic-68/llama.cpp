@@ -89,6 +89,11 @@ bool ggml_cuda_gdn_alt(ggml_backend_cuda_context & ctx, const ggml_cuda_gdn_alt_
     if (mode == 0 || L < GCH) {
         return false;
     }
+    // q, k, v are read as float4: bases and strides must be 16-byte aligned (odd V strides take the recurrence)
+    if ((((uintptr_t) a.q | (uintptr_t) a.k | (uintptr_t) a.v) & 15) != 0 ||
+        ((a.sq1 | a.sq2 | a.sq3 | a.sv1 | a.sv2 | a.sv3) & 3) != 0) {
+        return false;
+    }
     const size_t n = gdn_f32::gdn_ch_scratch_floats(a.H, a.neqk1, a.n_seqs, L);
     ggml_cuda_pool_alloc<float> scratch(ctx.pool(), n);
 #define GDN_CH_RUN(NS) do { \
